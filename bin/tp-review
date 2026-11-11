@@ -171,6 +171,12 @@ if [[ -e "$dir/capability-request.json" || -L "$dir/capability-request.json" ]];
   [[ "$req_status" == answered ]] ||
     die "subagent '$id' has an unresolved context/tool request; answer it before review (--force does not bypass this)"
 fi
+# capability-request.json mirrors only the newest request (HB4a); any capability request still open in requests/ blocks too.
+if [[ -e "$dir/requests" || -L "$dir/requests" ]]; then
+  [[ ! -L "$dir/requests" ]] && open_caps="$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import hub_records; print(len(hub_records.open_requests(sys.argv[2], ("capability",))))' "$ROOT/lib" "$dir" 2>/dev/null)" || open_caps=unreadable
+  [[ "$open_caps" == 0 ]] ||
+    die "subagent '$id' has an unresolved context/tool request; answer it before review (--force does not bypass this)"
+fi
 [[ -f "$dir/result.md" ]] || die "subagent '$id' has no result yet"
 # Interactive Pi/Claude sessions remain alive after replying and report `waiting`.
 # Accept that settled state as well as a cleanly exited worker.

@@ -425,6 +425,22 @@ class StatusLineTests(RemedyCase):
         run = subprocess.run(["node", "-e", script, json.dumps(lines)], text=True, capture_output=True, timeout=60)
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertEqual(json.loads(run.stdout), [result_status.RESULT_STATUS_LINE.search(f"Done.\n\n{l}\n") is not None for l in lines])
+        # HB4a round 5: pi's reporter (agent/extensions/reporter.ts) raises completedTurn only on a reply its STATUSED reads
+        # as statused; it keeps the same lead and reads the status word as result_status does, on every line above plus
+        # words that only start like one.
+        reporter = (ROOT / "agent/extensions/reporter.ts").read_text()
+        literal = re.search(r"^const RESULT_STATUS_LEAD = (\".*\");$", reporter, re.M)
+        self.assertIsNotNone(literal, "the reporter keeps a RESULT_STATUS_LEAD constant")
+        self.assertEqual(json.loads(literal.group(1)), result_status.RESULT_STATUS_LEAD)
+        statused = re.search(r"^const STATUSED = (new RegExp\(.*\));$", reporter, re.M)
+        self.assertIsNotNone(statused, "the reporter keeps a STATUSED pattern")
+        replies = [f"Done.\n\n{l}\n" for l in lines] + [f"Done.\nRESULT_STATUS: {w}\n" for w in (
+            "completed", "complete_", "complete.", "complete2", "Blocked", "incompleteness", "**empty**", "\ncomplete")]
+        script = (f"const RESULT_STATUS_LEAD = {literal.group(1)}; const STATUSED = {statused.group(1)};"
+                  "console.log(JSON.stringify(JSON.parse(process.argv[1]).map(r => STATUSED.test(r))))")
+        run = subprocess.run(["node", "-e", script, json.dumps(replies)], text=True, capture_output=True, timeout=60)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(json.loads(run.stdout), [result_status.result_status(r) is not None for r in replies])
 
     def test_f5_a_decorated_status_line_is_collected(self):
         for line in ["### RESULT_STATUS: complete", "**RESULT_STATUS: complete**", "`RESULT_STATUS: complete`"]:

@@ -884,6 +884,11 @@ esac
         self.assertEqual((sent["sent"], sent["submitted"], sent["attempts"]), (True, True, 1))
         line = json.loads((task / "messages.jsonl").read_text().splitlines()[-1])
         self.assertEqual((line["text"], line["submitted"], line["attempts"]), ("Use the local HTML renderer.", True, 1))
+        # HB4a: a delivery alone never answers the request; a confirmed message that names it (--resolves) does.
+        self.assertEqual(json.loads((task / "capability-request.json").read_text())["status"], "pending")
+        req = json.loads((task / "capability-request.json").read_text())["id"]
+        sent = self.cli("message", item["id"], "--resolves", req, "--text", "That is the answer.")
+        self.assertEqual(sent["resolves"], {"request": req, "resolved": True, "status": "resolved"})
         self.assertEqual(json.loads((task / "capability-request.json").read_text())["status"], "answered")
 
     def test_message_that_is_never_submitted_exits_nonzero_and_leaves_the_request_pending(self):

@@ -11,10 +11,22 @@
  * tools counts tool calls; toolErrors counts failed tool calls in a row (reset by a
  * success), which tp-contract reads to spot a worker that cannot reach its sources.
  * tp-spawn's run.sh records the process exit separately.
+ *
+ * Turn numbers (HB4a round 5), the same fields and rule as claude/plugins/tmux-pi/hooks/report.sh: promptTurn counts
+ * agent_start; completedTurn is the highest promptTurn whose own agent_settled wrote a reply with a valid RESULT_STATUS line
+ * (lib/result_status.py). It only goes up: the next agent_start withdraws result.md without lowering it, and a restart
+ * carries both over. A pause names the promptTurn it interrupts and is void once completedTurn reaches it
+ * (lib/contract.py pause_void).
+ *
+ * A worker that settles waiting with a reply that has no RESULT_STATUS line waits for an answer: it opens (or finds) an
+ * `input` request under $TP_TASK_DIR/requests/ through lib/hub_records.py (pi-state), and the next start resolves it
+ * (left-state). That bookkeeping never breaks the worker.
  */
 
-import { readFileSync, unlinkSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { ensureDir, refuseLinks, taskStateRoot, writeFileAtomic } from "./lib/state-write.ts";
 
@@ -36,8 +48,18 @@ type State = {
 	byModel: Record<string, Tokens & { cost: number }>;
 	cost: number;
 	error: string;
+	promptTurn: number;
+	completedTurn: number;
 	updated: string;
 };
+
+// The RESULT_STATUS line as lib/result_status.py reads it (RESULT_STATUS_LEAD + RESULT_STATUS_WORD); tests/test_refusal_remedies.py
+// holds this copy to the same answers.
+const RESULT_STATUS_LEAD = "^[ \\t]{0,3}(?:(?:#{1,6}|[-+*]|\\d+[.)])[ \\t]+)*[*_`~]*RESULT_STATUS[ \\t]*[*_`~]*[ \\t]*:";
+const STATUSED = new RegExp(`${RESULT_STATUS_LEAD}[\\s*_\`~]*(complete|empty|blocked|incomplete)(?![\\p{L}\\p{N}])`, "imu");
+
+// lib/hub_records.py, the one writer of request records (TP_HUB_RECORDS_PY overrides it for a copy of this file in a test).
+const hubRecords = (): string => process.env.TP_HUB_RECORDS_PY || fileURLToPath(new URL("../../lib/hub_records.py", import.meta.url));
 
 // A short, single-line hint of what a tool is doing (path, command, pattern).
 function toolLabel(name: string, args: any): string {
@@ -102,6 +124,8 @@ export default function (pi: ExtensionAPI) {
 		byModel: {},
 		cost: 0,
 		error: "",
+		promptTurn: 0,
+		completedTurn: 0,
 		updated: "",
 	};
 	let lastReply = "";
@@ -121,6 +145,7 @@ export default function (pi: ExtensionAPI) {
 
 	// A restarted or resumed worker reuses its task dir; carry over its totals instead of resetting.
 	const num = (v: any) => (typeof v === "number" && Number.isFinite(v) ? v : 0);
+	const turnNumber = (v: any) => (Number.isInteger(v) && v >= 0 ? v : 0);
 	const restore = () => {
 		try {
 			const prev = JSON.parse(readFileSync(join(dir, "state.json"), "utf8"));
@@ -128,10 +153,24 @@ export default function (pi: ExtensionAPI) {
 			s.turns = num(prev.turns);
 			s.tools = num(prev.tools);
 			s.cost = num(prev.cost);
+			s.promptTurn = turnNumber(prev.promptTurn);
+			s.completedTurn = turnNumber(prev.completedTurn);
 			for (const k of Object.keys(s.tokens) as (keyof Tokens)[]) s.tokens[k] = num(prev.tokens?.[k]);
 			for (const [name, u] of Object.entries<any>(prev.byModel ?? {})) {
 				s.byModel[name] = { input: num(u?.input), output: num(u?.output), cacheRead: num(u?.cacheRead), cacheWrite: num(u?.cacheWrite), cost: num(u?.cost) };
 			}
+		} catch {}
+	};
+
+	// The task's request records (lib/hub_records.py pi-state): only a worker's task dir has them, never main's. Nothing to resolve
+	// when the task has no requests/ yet, so a start costs no process then.
+	const requests = (state: string, textFile?: string) => {
+		if (!taskDir || dir !== taskDir) return;
+		if (state !== "waiting" && !existsSync(join(dir, "requests"))) return;
+		try {
+			execFileSync(existsSync("/usr/bin/python3") ? "/usr/bin/python3" : "python3",
+				[hubRecords(), "pi-state", "--task-dir", dir, "--state", state, ...(textFile ? ["--text-file", textFile] : [])],
+				{ stdio: "ignore", timeout: 5000 });
 		} catch {}
 	};
 
@@ -172,12 +211,14 @@ export default function (pi: ExtensionAPI) {
 		save();
 	});
 	pi.on("agent_start", () => {
+		s.promptTurn += 1;
 		s.state = "working";
 		s.error = "";
 		lastReply = "";
 		// A link at tasks/ or the task dir would make this delete a file outside the state dir.
 		try { refuseLinks(root, dir); unlinkSync(join(dir, "result.md")); } catch {}
 		save();
+		requests("working");
 	});
 	pi.on("tool_execution_start", (event) => {
 		s.state = "tool";
@@ -222,11 +263,17 @@ export default function (pi: ExtensionAPI) {
 	pi.on("agent_settled", () => {
 		s.state = s.error ? "error" : "waiting";
 		s.tool = "";
-		save();
+		// result.md first, then state.json (as report.sh does): the state that says the turn completed (completedTurn) is
+		// written only after its reply is on disk, in one write with the settled state.
+		let replied = false;
 		if (lastReply) {
 			try {
 				atomic("result.md", `${lastReply}\n`);
+				replied = true;
 			} catch {}
 		}
+		if (replied && STATUSED.test(lastReply)) s.completedTurn = Math.max(s.completedTurn, s.promptTurn);
+		save();
+		requests(s.state, replied ? join(dir, "result.md") : undefined);
 	});
 }

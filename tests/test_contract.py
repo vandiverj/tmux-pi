@@ -1,4 +1,6 @@
 import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
+import contextlib
+import io
 import json
 import os
 import subprocess
@@ -599,6 +601,21 @@ class ContractTests(unittest.TestCase):
         self.assertIsNone(act(13, draft, [{"action": stall, "at": T0 + 660}]))
         self.assertEqual(act(14, draft, [{"action": stall, "at": T0 + 660}]), "pause")
 
+    def test_an_unconfirmed_pause_is_retried_a_bounded_number_of_times_and_never_every_few_seconds(self):
+        def act(minutes, events):
+            state = {"state": "working", "turns": 3, "toolErrors": 6}
+            r = evaluate(self.meta, state, self.art("draft", now=T0 + 300), T0 + minutes * 60, True, events)
+            return r["action"][0] if r["action"] else None
+
+        nudged = [{"action": "nudge-errors", "at": T0 + 480}]
+        tried = lambda at: [{"action": "pause-requested", "at": at}, {"action": "pause-unverified", "at": at}]
+        self.assertEqual(act(11, nudged), "pause")
+        self.assertIsNone(act(11, nudged + tried(T0 + 630)))  # 30 s after an unverified try: nothing is typed
+        self.assertEqual(act(11, nudged + tried(T0 + 600)), "pause")  # a minute later: one more try
+        three = nudged + tried(T0 + 480) + tried(T0 + 540) + tried(T0 + 600)
+        self.assertIsNone(act(12, three))  # 1 + PAUSE_RETRIES tries, then the hold stays and nothing more is typed
+        self.assertEqual(act(12, nudged + tried(T0 + 600) + [{"action": "pause", "at": T0 + 600, "tools": 0}]), "halted")
+
     def test_halted_and_one_extension(self):
         stop = {"action": "stop", "reason": "time budget used up", "at": T0 + 1200}
         waiting = {"state": "waiting", "turns": 20, "updated": iso(T0 + 1260)}
@@ -686,6 +703,65 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(ledger_row(task, T0 + 1600)["stop"], "escalate to research-3")
 
 
+REAL_RUN = subprocess.run  # EnforceKeepsTheRecordTests.enforce patches subprocess.run; the real reporters run through this
+REPORT_SH = ROOT / "claude/plugins/tmux-pi/hooks/report.sh"
+
+
+class Reporter:
+    """The real reporter of a harness writing one task directory, driven event by event: Claude's report.sh (one hook run
+    per event) or pi's agent/extensions/reporter.ts (one node process, tests/reporter_runtime.mjs --drive). prompt() is a
+    new prompt (UserPromptSubmit / agent_start), tool() a tool call starting, stop(reply) the turn's end (Stop with that
+    reply / the reply as the last message, then agent_settled; stop() ends it with no reply)."""
+
+    def __init__(self, harness, task):
+        self.harness, self.task, self.node = harness, Path(task), None
+        drop = ("TMUX", "TMUX_PANE", "TP_SESSION", "TP_STATE_DIR", "TP_TASK_DIR", "TP_TASK_ID")
+        self.env = dict({k: v for k, v in os.environ.items() if k not in drop},
+                        TP_TASK_DIR=str(self.task), TP_TASK_ID=self.task.name)
+        if harness == "pi":
+            self.node = subprocess.Popen(["node", "--experimental-strip-types", str(ROOT / "tests/reporter_runtime.mjs"),
+                                          "--drive", str(self.task), self.task.name], cwd=ROOT, env=self.env, text=True,
+                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            self.pi("session_start")
+
+    def pi(self, on, **fields):
+        self.node.stdin.write(json.dumps({"on": on, **fields}) + "\n")
+        self.node.stdin.flush()
+        line = self.node.stdout.readline()
+        assert line == "ok\n", (on, line)
+
+    def hook(self, name, **fields):
+        run = REAL_RUN(["bash", str(REPORT_SH)], input=json.dumps({"hook_event_name": name, **fields}), text=True,
+                       capture_output=True, env=self.env, timeout=30)
+        assert run.returncode == 0, run.stderr
+
+    def prompt(self):
+        if self.node:
+            self.pi("agent_start")
+        else:
+            self.hook("UserPromptSubmit", prompt="go on")
+
+    def tool(self):
+        if self.node:
+            self.pi("tool_execution_start", event={"toolName": "bash", "args": {"command": "make test"}})
+        else:
+            self.hook("PreToolUse", tool_name="Bash", tool_input={"command": "make test"})
+
+    def stop(self, reply=""):
+        if self.node:
+            if reply:
+                self.pi("message_end", text=reply)
+            self.pi("agent_settled")
+        else:
+            self.hook("Stop", last_assistant_message=reply)
+
+    def close(self):
+        if self.node and self.node.poll() is None:
+            self.node.stdin.close()
+            self.node.wait(timeout=30)
+            self.node.stdout.close()
+
+
 class EnforceKeepsTheRecordTests(unittest.TestCase):
     """cmd_enforce persists a pause in checkpoints.json; task.md must say so too, even when typing the Escape fails."""
 
@@ -710,32 +786,325 @@ class EnforceKeepsTheRecordTests(unittest.TestCase):
         match = re.search(r"- \*\*Lifecycle State:\*\* `([^`]+)`", (self.task / "task.md").read_text())
         return match.group(1) if match else None
 
-    def enforce(self, send_fails):
+    # Every point of pause_worker (and the cmd_enforce refresh after it) where a worker's write can land, in order: its
+    # working read, the finished-turn check before the Escape, the "pause-requested" save and journal, the Escape, the
+    # confirmation read, the two finished-turn checks after it, the outcome's journal, the outcome's save (the commit), and
+    # the task.md refresh that follows (the printed outcome is decided after it).
+    POINTS = ("read", "check", "requested", "journal-requested", "escape", "confirm", "finished",
+              "final-check", "journal-outcome", "commit", "record")
+
+    def enforce(self, send_fails=False, pane="", after_escape=None, writes=None):
+        """Enforce a pause with a fake tmux: capture-pane shows `pane`, an Escape fails (send_fails) or runs after_escape
+        (the worker's reaction: a new state.json). writes: {point: [callable, ...]} for a point of POINTS, each run just
+        before pause_worker does that step: a worker writing its files at that moment. Returns the tmux calls; what
+        cmd_enforce printed is in self.printed."""
         from unittest import mock
         self.tool.write_record(self.task, lifecycle_state="working", force=True)
         self.assertEqual(self.recorded_state(), "working")
+        calls = []
+        writes = {k: list(v) for k, v in (writes or {}).items()}
+        assert set(writes) <= set(self.POINTS), writes
+        counts = {}
+
+        def fire(point):
+            for write in writes.pop(point, []):
+                write()
+
+        def nth(name, points, real):
+            def wrapped(*args, **kwargs):
+                i = counts[name] = counts.get(name, -1) + 1
+                if i < len(points) and points[i]:
+                    fire(points[i])
+                return real(*args, **kwargs)
+            return wrapped
 
         def run(command, *args, **kwargs):
-            if send_fails:
-                raise subprocess.CalledProcessError(1, command)
-            return subprocess.CompletedProcess(command, 0)
+            calls.append(command[1:])
+            if command[1] == "capture-pane":
+                return subprocess.CompletedProcess(command, 0, stdout=pane, stderr="")
+            if command[-1] == "Escape":
+                if send_fails:
+                    raise subprocess.CalledProcessError(1, command)
+                if after_escape:
+                    (self.task / "state.json").write_text(json.dumps(after_escape))
+                fire("escape")
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+        real_read, real_journal = self.tool.read, self.tool.journal
+
+        def read(path):
+            if Path(path).name == "state.json" and not counts.get("read"):
+                counts["read"] = 1
+                fire("read")
+            return real_read(path)
+
+        def journal(d, kind, *args, **kwargs):
+            if kind == "pause.requested":
+                fire("journal-requested")
+            elif kind != "hold.kept":
+                fire("journal-outcome")
+            return real_journal(d, kind, *args, **kwargs)
         decision = {"action": ("pause", "stalled"), "status": None, "elapsed": 60, "turns": 3}
-        with mock.patch.dict(os.environ, {"TP_STATE_DIR": str(self.state)}), \
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {"TP_STATE_DIR": str(self.state), "TP_PAUSE_CONFIRM_SECONDS": "1"}), \
                 mock.patch.object(self.tool, "panes", return_value={"%1": "alive"}), \
                 mock.patch.object(self.tool, "evaluate", return_value=decision), \
                 mock.patch.object(self.tool.subprocess, "run", side_effect=run), \
-                mock.patch.object(self.tool.time, "sleep"):
+                mock.patch.object(self.tool, "finished_turn",
+                                  side_effect=nth("finished", ["check", "finished", "final-check"], self.tool.finished_turn)), \
+                mock.patch.object(self.tool, "save_events", side_effect=nth("save", ["requested", "commit"], self.tool.save_events)), \
+                mock.patch.object(self.tool, "worker_stopped", side_effect=nth("stopped", ["confirm"], self.tool.worker_stopped)), \
+                mock.patch.object(self.tool, "task_state", side_effect=nth("state", [None, "record"], self.tool.task_state)), \
+                mock.patch.object(self.tool, "journal", side_effect=journal), \
+                mock.patch.object(self.tool, "read", side_effect=read), \
+                mock.patch.object(self.tool.time, "sleep"), contextlib.redirect_stdout(out):
             self.tool.cmd_enforce(None)
+        self.printed = [json.loads(line) for line in out.getvalue().splitlines() if line.startswith("{")]
+        return calls
 
-    def test_a_pause_updates_the_record_with_no_pane_involved(self):
-        self.enforce(send_fails=False)
+    def actions(self):
+        return [e["action"] for e in json.loads((self.task / "checkpoints.json").read_text())["events"]]
+
+    def events(self):
+        path = self.task / "checkpoints.json"
+        return json.loads(path.read_text())["events"] if path.exists() else []
+
+    def outcome(self):
+        """The outcome cmd_enforce printed for its pause, or None when it printed none (an attempt it skipped)."""
+        return next((row.get("outcome") for row in self.printed if row.get("action") == "pause"), None)
+
+    def journal(self):
+        path = self.task / "events.jsonl"
+        return [json.loads(line)["kind"] for line in path.read_text().splitlines()] if path.exists() else []
+
+    def held(self):
+        from contract import satisfies_dependency
+        _life, state, events, reply = self.tool.task_lifecycle(self.task, "alive")
+        # Asked as if the task had ended (settled) with the reply it has: only a pause record (or that reply) can hold it.
+        return not satisfies_dependency("settled", state, events, reply)
+
+    def life(self):
+        return self.tool.task_lifecycle(self.task, "alive")[0]
+
+    def worker(self, harness):
+        """A fresh task (no state, reply, results, requests or checkpoints) for `harness`, with its real reporter (Reporter)."""
+        import shutil
+        for name in ("checkpoints.json", "events.jsonl", "result.md", "state.json"):
+            (self.task / name).unlink(missing_ok=True)
+        for name in ("results", "requests"):
+            shutil.rmtree(self.task / name, ignore_errors=True)
+        meta = json.loads((self.task / "meta.json").read_text())
+        (self.task / "meta.json").write_text(json.dumps(dict(meta, worker=harness)))
+        writer = Reporter(harness, self.task)
+        self.addCleanup(writer.close)
+        return writer
+
+    def state_now(self):
+        return json.loads((self.task / "state.json").read_text())
+
+    def test_a_pause_is_recorded_when_the_escape_is_confirmed(self):
+        calls = self.enforce(pane="some output\n\u276f \n  ? for shortcuts\n")  # Claude's prompt, nothing at work
+        self.assertEqual(self.actions(), ["pause-requested", "pause"])
+        self.assertEqual(self.journal(), ["pause.requested", "pause.confirmed"])
         self.assertEqual(self.tool.task_lifecycle(self.task, "alive")[0], "paused")
         self.assertEqual(self.recorded_state(), "paused")
+        self.assertEqual([c[-1] for c in calls if c[0] == "send-keys"], ["Escape", "C-u", "C-u", "C-u"])
+        self.assertTrue(self.held())
 
-    def test_a_pause_whose_escape_cannot_be_sent_still_updates_the_record(self):
+    def test_an_escape_the_worker_ignores_is_unverified_keeps_the_hold_and_is_not_shown_paused(self):
+        calls = self.enforce(pane="\u273b Working\u2026 (esc to interrupt)\n\u276f \n",
+                             after_escape={"state": "tool", "turns": 3, "tools": 5, "updated": "later"})
+        self.assertEqual(self.actions(), ["pause-requested", "pause-unverified"])
+        self.assertEqual(self.journal(), ["pause.requested", "pause.unverified", "hold.kept"])
+        self.assertEqual(self.tool.task_lifecycle(self.task, "alive")[0], "working")
+        self.assertEqual(self.recorded_state(), "working")
+        self.assertEqual([c[-1] for c in calls if c[0] == "send-keys"], ["Escape"])  # nothing cleared: it was not stopped
+        self.assertTrue(self.held())
+
+    def test_a_pause_whose_escape_cannot_be_sent_is_unverified_and_recorded_once(self):
         self.enforce(send_fails=True)
-        self.assertEqual(json.loads((self.task / "checkpoints.json").read_text())["events"][-1]["action"], "pause")
-        self.assertEqual(self.recorded_state(), "paused")
+        events = json.loads((self.task / "checkpoints.json").read_text())["events"]
+        self.assertEqual([e["action"] for e in events], ["pause-requested", "pause-unverified"])
+        self.assertEqual(events[-1]["why"], "Escape not sent")
+        self.assertEqual(self.recorded_state(), "working")
+        self.assertTrue(self.held())
+        # The next tick a few seconds later types nothing (lib/contract.py pause_may_try).
+        from contract import pause_may_try
+        self.assertFalse(pause_may_try({}, events, events[0]["at"] + 5))
+        self.assertTrue(pause_may_try({}, events, events[0]["at"] + 60))
+
+    def test_a_worker_that_finished_meanwhile_is_not_paused(self):
+        (self.task / "state.json").write_text(json.dumps({"state": "waiting", "turns": 3, "tools": 4}))
+        calls = self.enforce(pane="❯ \n")
+        self.assertFalse((self.task / "checkpoints.json").exists())
+        self.assertEqual(self.journal(), [])
+        self.assertEqual([c for c in calls if c[0] == "send-keys"], [])
+        self.assertEqual(self.printed, [])
+
+        # HB4a round 5 rule 1: a pause is void exactly when its turn, or a later one, completed (state.json completedTurn >=
+        # the event's turn, written by the reporter at the turn's own statused Stop). Real reporter sequences, both harnesses:
+        # report.sh for Claude, agent/extensions/reporter.ts for pi (Reporter). Each pause names its turn; every case below
+        # is checked against the turn it should name and the answer it should get, then the dispatcher's copy against both.
+        cases = []  # (event, state.json, expected pause_void)
+        partial = "I was half way through the second file"
+        for harness in ("claude", "pi"):
+            # (a) F1: turn 1 completes, turn 2 starts, the pause lands in turn 2, then a partial Stop: report.sh puts turn 1's
+            # report back from heldReport (pi writes the partial reply). An earlier turn's report never voids turn 2's pause.
+            with self.subTest(sequence="a", harness=harness):
+                w = self.worker(harness)
+                w.prompt(); w.tool(); w.stop("Turn one.\nRESULT_STATUS: complete")
+                w.prompt(); w.tool()
+                # Claude: the pane confirms (prompt shown, nothing moved). pi: the Escape aborts the turn and pi settles
+                # with what it had written (agent_settled), which is its confirmation.
+                self.enforce(pane="❯ \n", writes={"escape": [lambda: w.stop(partial)]} if harness == "pi" else None)
+                if harness == "claude":
+                    w.stop(partial)  # the partial Stop
+                    self.assertEqual((self.task / "result.md").read_text(), "Turn one.\nRESULT_STATUS: complete\n")
+                state = self.state_now()
+                self.assertEqual(self.actions(), ["pause-requested", "pause"])
+                self.assertEqual(self.outcome(), "confirmed")
+                self.assertEqual([state.get("promptTurn"), state.get("completedTurn")], [2, 1])
+                self.assertEqual({e.get("turn") for e in self.events()}, {2})
+                self.assertEqual(self.life(), "paused")
+                self.assertTrue(self.held())
+                cases += [(e, state, False) for e in self.events()]
+            # (b) F2: the pause lands in turn 1 (Claude: confirmed by its pane; pi: its reporter never says it stopped, so
+            # unverified), turn 1 completes anyway (void), and turn 2 starts with no tool yet: not paused, not held.
+            with self.subTest(sequence="b", harness=harness):
+                w = self.worker(harness)
+                w.prompt(); w.tool()
+                self.enforce(pane="❯ \n" if harness == "claude" else "")
+                self.assertEqual(self.outcome(), "confirmed" if harness == "claude" else "unverified")
+                w.stop("Done anyway.\nRESULT_STATUS: complete")
+                w.prompt()
+                state = self.state_now()
+                self.assertEqual([state.get("promptTurn"), state.get("completedTurn")], [2, 1])
+                self.assertEqual({e.get("turn") for e in self.events()}, {1})
+                self.assertEqual(self.life(), "working")
+                self.assertFalse(self.held())
+                cases += [(e, state, True) for e in self.events()]
+            # (c) a pause after an earlier completed turn stays a pause (pi aborts with nothing written: no reply).
+            with self.subTest(sequence="c", harness=harness):
+                w = self.worker(harness)
+                w.prompt(); w.stop("Turn one.\nRESULT_STATUS: complete")
+                w.prompt(); w.tool()
+                self.enforce(pane="❯ \n", writes={"escape": [lambda: w.stop()]} if harness == "pi" else None)
+                state = self.state_now()
+                self.assertEqual(self.actions(), ["pause-requested", "pause"])
+                self.assertEqual(self.outcome(), "confirmed")
+                self.assertEqual([state.get("promptTurn"), state.get("completedTurn")], [2, 1])
+                self.assertEqual({e.get("turn") for e in self.events()}, {2})
+                self.assertEqual(self.life(), "paused")
+                self.assertTrue(self.held())
+                cases += [(e, state, False) for e in self.events()]
+
+        # (d) F4: the paused turn completes at each boundary of pause_worker. A completion is two writes, result.md (R) and
+        # state.json (S, with completedTurn), in that order for both writers (report.sh; pi's agent_settled writes result.md
+        # first). The snapshots are what each real writer wrote: turn 1 completed, turn 2 at a tool (the state the attempt
+        # reads), then turn 2's statused Stop. Each lands just before any point of POINTS, R no later than S: 66 rows a
+        # harness. Whatever pause_worker recorded, the task is settled afterwards, its dependent is not held, and the
+        # outcome cmd_enforce printed is never "confirmed": "void" when it recorded a pause attempt, "unneeded" when it saw
+        # the completion itself (the event log keeps pause.confirmed where the Escape was confirmed).
+        points = self.POINTS
+        rows, recorded, printed = [], {}, {}
+        for harness in ("claude", "pi"):
+            w = self.worker(harness)
+            w.prompt(); w.stop("Turn one.\nRESULT_STATUS: complete")
+            w.prompt(); w.tool()
+            before = (self.task / "state.json").read_text()
+            w.stop("Turn two.\nRESULT_STATUS: complete")
+            reply, after = (self.task / "result.md").read_text(), (self.task / "state.json").read_text()
+            w.close()
+            self.assertEqual([json.loads(before).get(k) for k in ("state", "promptTurn", "completedTurn")], ["tool", 2, 1])
+            self.assertEqual([json.loads(after).get(k) for k in ("state", "promptTurn", "completedTurn")], ["waiting", 2, 2])
+            rows += [(harness, before, reply, after, r, s) for r in points for s in points if points.index(r) <= points.index(s)]
+        self.assertEqual(len(rows), 132)
+        for harness, before, reply, after, r, s in rows:
+            with self.subTest(sequence="d", harness=harness, result_at=r, state_at=s):
+                for name in ("checkpoints.json", "events.jsonl", "result.md"):
+                    (self.task / name).unlink(missing_ok=True)
+                (self.task / "state.json").write_text(before)
+                meta = json.loads((self.task / "meta.json").read_text())
+                (self.task / "meta.json").write_text(json.dumps(dict(meta, worker=harness)))
+
+                def put_result():
+                    (self.task / "result.md").write_text(reply)
+
+                def put_state():
+                    (self.task / "state.json").write_text(after)
+                writes = {}
+                for point, write in ((r, put_result), (s, put_state)):
+                    writes.setdefault(point, []).append(write)
+                calls = self.enforce(pane="❯ \n", writes=writes)
+                actions = tuple(self.actions()) if (self.task / "checkpoints.json").exists() else ()
+                recorded[actions] = recorded.get(actions, 0) + 1
+                printed[self.outcome()] = printed.get(self.outcome(), 0) + 1
+                self.assertEqual([c[-1] for c in calls if c[0] == "send-keys"][:1], ["Escape"] if actions else [])
+                self.assertEqual(self.outcome(), {(): None, ("pause-requested", "pause-unneeded"): "unneeded"}.get(actions, "void"))
+                if actions[-1:] == ("pause",):
+                    self.assertIn("pause.confirmed", self.journal())  # the history keeps it; the outcome is reconciled
+                self.assertEqual({e.get("turn") for e in self.events()}, {2} if actions else set())
+                put_result(); put_state()  # the worker's turn ends whatever was typed: both files land (again)
+                self.assertEqual(self.life(), "settled")
+                self.assertFalse(self.held())
+                cases += [(e, json.loads(after), True) for e in self.events()]
+        # The table reaches every outcome pause_worker records, a confirmed "pause" among them (Claude's commit-boundary
+        # rows), and prints none of them as "confirmed".
+        self.assertEqual(set(recorded), {(), ("pause-requested", "pause-unneeded"), ("pause-requested", "pause"),
+                                         ("pause-requested", "pause-unverified")}, recorded)
+        self.assertEqual(set(printed), {None, "unneeded", "void"}, printed)
+
+        # The rule on its edges: a turn number written 2.0 is 2; anything else (none, null, round 4's hash, a bool, 0, a
+        # negative, a string) is no turn and never void; a completedTurn that is not a whole number is 0.
+        cases += [({"action": "pause", "turn": 2}, {"completedTurn": 2}, True),
+                  ({"action": "pause", "turn": 2}, {"completedTurn": 3}, True),
+                  ({"action": "pause", "turn": 2}, {"completedTurn": 1}, False),
+                  ({"action": "pause", "turn": 2}, {}, False),
+                  ({"action": "pause", "turn": 2.0}, {"completedTurn": 2}, True),
+                  ({"action": "pause", "turn": 2}, {"completedTurn": 2.0}, True),
+                  ({"action": "pause", "turn": 1}, {"completedTurn": 1.5}, False),
+                  ({"action": "pause", "turn": 2}, {"completedTurn": "2"}, False),
+                  ({"action": "pause", "turn": 1}, {"completedTurn": True}, False),
+                  ({"action": "pause", "turn": 2}, None, False),
+                  ({"action": "pause"}, {"completedTurn": 9}, False),
+                  ({"action": "pause", "turn": None}, {"completedTurn": 9}, False),
+                  ({"action": "pause", "turn": "3f2a9c0d11e4b7a8"}, {"completedTurn": 9}, False),
+                  ({"action": "pause", "turn": True}, {"completedTurn": 9}, False),
+                  ({"action": "pause", "turn": 0}, {"completedTurn": 9}, False),
+                  ({"action": "pause", "turn": -1}, {"completedTurn": 9}, False),
+                  ({"action": "pause", "turn": 1.5}, {"completedTurn": 9}, False),
+                  (None, {"completedTurn": 9}, False)]
+        from contract import pause_void
+        self.assertEqual([pause_void(e, s) for e, s, _ in cases], [want for _, _, want in cases])
+        # agent/extensions/dispatcher.ts keeps its own copy of the rule (contractHalted): the same answers on every case.
+        import re
+        source = (ROOT / "agent/extensions/dispatcher.ts").read_text()
+        block = source[source.index("// pause-void: begin"):source.index("// pause-void: end")]
+        script = (re.sub(r": (number \| null|boolean|any)(?=[ ,)=])", "", block) +
+                  "\nconst cases = JSON.parse(process.argv[1]);\n"
+                  "console.log(JSON.stringify(cases.map(([e, s]) => pauseVoid(e, s))));")
+        run = subprocess.run(["node", "-e", script, json.dumps([[e, s] for e, s, _ in cases])], text=True,
+                             capture_output=True, timeout=60)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(json.loads(run.stdout), [want for _, _, want in cases])
+
+    def test_a_pi_pause_is_confirmed_by_its_reporter_not_by_the_pane(self):
+        meta = json.loads((self.task / "meta.json").read_text())
+        (self.task / "meta.json").write_text(json.dumps(dict(meta, worker="pi")))
+        self.enforce(pane="> \n")  # a prompt-looking pane is not enough for pi
+        self.assertEqual(self.actions(), ["pause-requested", "pause-unverified"])
+        (self.task / "checkpoints.json").unlink()
+        (self.task / "state.json").write_text(json.dumps({"state": "working", "turns": 3, "tools": 4}))
+        self.enforce(after_escape={"state": "waiting", "turns": 3, "tools": 4, "updated": "2026-01-01T00:00:00Z"})
+        self.assertEqual(self.actions(), ["pause-requested", "pause"])
+
+    def test_an_unconfirmed_pause_hold_ends_when_the_worker_settles_on_its_own(self):
+        from contract import satisfies_dependency
+        events = [{"action": "pause-requested", "at": T0}, {"action": "pause-unverified", "at": T0}]
+        reply = "Done.\nRESULT_STATUS: complete"
+        self.assertFalse(satisfies_dependency("settled", {"state": "working"}, events, reply))
+        self.assertFalse(satisfies_dependency("settled", {"state": "waiting", "updated": iso(T0 - 10)}, events, reply))
+        self.assertTrue(satisfies_dependency("settled", {"state": "waiting", "updated": iso(T0 + 10)}, events, reply))
+        self.assertTrue(satisfies_dependency("settled", {"state": "working"}, events + [{"action": "extend", "at": T0 + 1}], reply))
 
     def nudge(self, submit_recorded):
         """Enforce a reminder with a tmux that records keys. The task is a Claude one (meta.json worker), so it is confirmed

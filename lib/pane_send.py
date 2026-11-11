@@ -193,11 +193,13 @@ def paste(pane, text):
         raise
 
 
-def send(pane, text, task_dir=None, settle=SETTLE_SECONDS, confirm=None, retries=RETRIES):
+def send(pane, text, task_dir=None, settle=SETTLE_SECONDS, confirm=None, retries=RETRIES, token=None):
     """Put a new delivery id and `text` (newlines flattened) into the pane, press Enter, confirm. Claude: one bracketed
-    paste; pi or no task dir: typed keys. Raises CalledProcessError if tmux fails."""
+    paste; pi or no task dir: typed keys. Raises CalledProcessError if tmux fails. `token`: the delivery id to use, made by
+    the caller with new_token(len(normalize(flatten(text)))) so it can record it (tp-agent message); a new one otherwise."""
     body = normalize(flatten(text))
-    token = new_token(len(body))
+    if token is None or not TOKEN_RE.fullmatch(token) or token != "[tp:{}/{}]".format(token[4:14], len(body)):
+        token = new_token(len(body))
     text = token + " " + flatten(text)
     if confirm is None:
         try:

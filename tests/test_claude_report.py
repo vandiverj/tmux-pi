@@ -148,6 +148,65 @@ class ClaudeReportTests(unittest.TestCase):
         self.assertEqual((self.task / "result.md").read_text(), "new reply\nRESULT_STATUS: complete\n")
         self.review(accepted=True)
 
+    def requests(self):
+        folder = self.task / "requests"
+        return sorted((json.loads(f.read_text()) for f in folder.glob("req-*.json")), key=lambda r: r["opened"]) \
+            if folder.is_dir() else []
+
+    def journal(self):
+        path = self.task / "events.jsonl"
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+    # HB4a rule 1, Claude hook rows (each test runs at most 5 hooks).
+    ASK = "Claude needs your permission to use Bash"
+
+    def at_tool(self):
+        self.hook("UserPromptSubmit", prompt="go")
+        self.hook("PreToolUse", tool_name="Bash", tool_input={"command": "printf ''"})
+
+    def test_a_permission_prompt_seen_twice_is_one_request_resolved_when_the_tool_runs(self):
+        self.at_tool()
+        self.hook("Notification", message=self.ASK)
+        self.assertEqual(self.state()["state"], "permission")
+        [first] = self.requests()
+        self.assertRegex(first["id"], r"^req-[0-9A-HJKMNP-TV-Z]{26}$")
+        self.assertEqual((first["kind"], first["status"], first["task"]), ("permission", "open", "w1"))
+        self.hook("Notification", message=self.ASK)  # the same prompt seen again
+        self.assertEqual([r["id"] for r in self.requests()], [first["id"]])
+        self.hook("PostToolUse", tool_name="Bash")  # approved: the tool ran, the state left permission
+        [first] = self.requests()
+        self.assertEqual((first["status"], first["resolution"]), ("resolved", {"by": "hook", "how": "left-state", "ref": None}))
+        self.assertEqual([(e["kind"], e["ref"]) for e in self.journal()],
+                         [("request.opened", first["id"]), ("request.resolved", first["id"])])
+        # One tool-name table (lib/hub_records.py): the raw name is kept beside the normalised one.
+        self.assertEqual((self.journal()[0]["detail"]["tool"], self.journal()[0]["detail"]["raw_tool"]), ("shell", "Bash"))
+        self.assertTrue(all(e["v"] == 1 and e["actor"] == "hook" and e["source"] == "hook" for e in self.journal()))
+
+    def test_a_denied_prompt_is_resolved_and_the_same_prompt_after_it_is_a_new_request(self):
+        self.at_tool()
+        self.hook("Notification", message=self.ASK)
+        self.hook("PermissionDenied", tool_name="Bash")  # routed to report.sh (hooks.json): the turn goes on
+        self.assertEqual(self.state()["state"], "working")
+        [first] = self.requests()
+        self.assertEqual((first["status"], first["resolution"]["how"]), ("resolved", "left-state"))
+        self.hook("Notification", message=self.ASK)  # the same text after resolution
+        self.assertEqual([r["status"] for r in self.requests()], ["resolved", "open"])
+        self.assertNotEqual(self.requests()[-1]["id"], first["id"])
+
+    def test_a_second_prompt_before_main_looks_supersedes_the_first(self):
+        self.at_tool()
+        self.hook("Notification", message=self.ASK)
+        self.hook("Notification", message="Claude needs your permission to use Write")
+        self.assertEqual([(r["status"], r["summary"]) for r in self.requests()],
+                         [("superseded", self.ASK), ("open", "Claude needs your permission to use Write")])
+
+    def test_a_turn_with_no_permission_prompt_writes_no_request_records(self):
+        self.at_tool()
+        self.hook("PostToolUse", tool_name="Bash")
+        self.hook("Stop", last_assistant_message="done\nRESULT_STATUS: complete")
+        self.assertFalse((self.task / "requests").exists())
+        self.assertFalse((self.task / "events.jsonl").exists())
+
     def test_parallel_active_hooks_do_not_lose_counts_or_clobber_stop(self):
         self.hook("SessionStart")
         self.hook("UserPromptSubmit")

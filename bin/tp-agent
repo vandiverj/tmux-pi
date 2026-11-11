@@ -21,6 +21,7 @@ import lane_lease  # noqa: E402
 import lane_remove  # noqa: E402
 import lane_steps  # noqa: E402
 import failing_tests  # noqa: E402
+import hub_records  # noqa: E402
 import family_sweep  # noqa: E402
 import index_text  # noqa: E402
 import lanes  # noqa: E402
@@ -172,7 +173,9 @@ def unlabelled_round(path, review_id):
     return None
 
 
-def record(path, include_result=False):
+def record(path, include_result=False, here=None):
+    """Task `path`'s row. `here` is the session the row is read from (main_rows: Main's own); commands the row carries
+    (answer_route's `needs`) name the task's session when it is another one (HB4a round 5 rule 3)."""
     meta = read_json(path / "meta.json")
     state = read_json(path / "state.json")
     result_path = path / "result.md"
@@ -210,6 +213,11 @@ def record(path, include_result=False):
     main = read_json(path / "dispatch.json").get("main")  # the main that dispatched it (main_id), when it had an identity
     if isinstance(main, str) and MAIN_ID.fullmatch(main):
         result["main"] = main
+    asked = hub_records.row_requests(path)
+    if asked:  # HB4a request records; a task with none has no such keys, so its row is what it was before
+        result["requests"] = asked  # every open request and the 20 most recently closed: what list and inspect show
+        result["request_log"] = hub_records.request_log(path)  # every transition, in order: what the notifier delivers from
+        result["answer_route"] = answer_route(path, result["status"], here)  # the command that can answer an open request now
     reported = failing_tests.read(path)
     if reported:  # a report without the block has no such key
         result["failing_tests"] = reported
@@ -346,7 +354,7 @@ def main_rows(base, ident):
         for path in sorted(tasks.iterdir()):
             if path.is_symlink() or not (path / "meta.json").is_file() or read_json(path / "dispatch.json").get("main") != ident:
                 continue
-            rows.append(dict(record(path), state_dir=str(other)))
+            rows.append(dict(record(path, here=base), state_dir=str(other)))
     return sorted(rows, key=lambda row: row.get("updated") or ""), other_main
 
 
@@ -361,6 +369,9 @@ def build_index(base):
         # REQUEST_CHANGES with no Closes by: code finding keeps its verdict and says why it is neither a rejection nor an approval
         out.update({key: row[key] for key in ("verdict", "review_complete", "review_incomplete_reason", "review_unusable", "family_missing", "lane", "lane_step", "later_replies")
                     if key in row})
+        opened = [r["id"] for r in row.get("requests") or () if r.get("status") == "open"]
+        if opened:  # the open request ids the main is shown at start; the notifier counts them as already announced
+            out["open_requests"] = opened
         if row.get("failing_tests"):  # the worker reported failing tests it does not own (T12)
             out["failing_tests"] = len(row["failing_tests"]["entries"]) or 1
         return out
@@ -1440,6 +1451,8 @@ def _main(argv):
     m = sub.add_parser("message")
     m.add_argument("id")
     m.add_argument("--text", required=True)
+    m.add_argument("--resolves", metavar="REQ_ID",
+                   help="the request this message answers (req-...); resolved only when the delivery is confirmed")
     o = sub.add_parser("objective")
     o.add_argument("text")
     q = sub.add_parser("request", help="worker asks main for a skill, tool, or context")
@@ -1567,27 +1580,13 @@ def _main(argv):
         previous = task_dir(base, args.id)
         meta = read_json(previous / "meta.json")
         prior = record(previous)
-        if prior["status"] in {"starting", "working", "needs_input"}:
-            wait = "Wait for it to settle, or end it" if finishes_alone(prior["status"]) else "It will not settle by itself: end it"
-            raise ValueError(f"{args.id} is still {state_words(prior['status'])}, so it cannot be retried yet. "
-                             f"{wait} with {' or '.join(clear_commands(prior['status'], args.id))}, then retry")
-        try:
-            repeated = repeated_family(base, args.id)
-        except review_rounds.Refused as error:  # the same walk the next review makes will refuse too; a retry is not blocked by it
-            repeated = None
-            print(f"tp-agent: the repeated-family gate was not checked: {error}", file=sys.stderr)
+        refused, repeated = retry_admission(base, previous, prior["status"], args.route, args.force_alive,
+                                            warn=lambda text: print(f"tp-agent: {text}", file=sys.stderr))
+        if refused:
+            raise ValueError(refused)
         if repeated and args.route == "park":  # starts nothing, so a process alive on the tree does not stop it
             print(json.dumps(park_retry(base, previous, args.id, *repeated), indent=2))
             return
-        if not args.force_alive:
-            guard_retry(previous)
-        if repeated and not args.route:
-            raise ValueError(f"{family_words(*repeated)}: another retry would "
-                             f"fix one more site of it. Retry again with --route rule-first (the brief changes the rule that lets it recur), "
-                             f"--route design (the brief changes the design), or --route park (no retry; parked.md records it and the owner decides)")
-        if args.route and not repeated:
-            raise ValueError(f"--route {args.route}: the latest review of {args.id} repeats no family an earlier review named and is not the second REQUEST_CHANGES in a row, "
-                             "so there is nothing to route; retry without --route")
         original = (previous / "request.md").read_text().strip()
         # Replay only admitted context and notes; spawn re-applies the sensitive-read omission. Skip
         # prior retry notes (rebuilt below) and dependencies (stale; the prior packet records them).
@@ -1689,7 +1688,12 @@ def _main(argv):
             rel = None
         if rel is None or Path(rel).parts != ("tasks", path.name) or not (path / "meta.json").is_file():
             raise ValueError("invalid worker task directory")
-        value = {"kind": args.kind, "what": args.what, "reason": args.reason,
+        # HB4a: the request record (requests/<req-id>.json, request.opened) is the record; the same request asked again while
+        # it is open is the same id. capability-request.json mirrors this one request for older readers (mirror_capability).
+        ask = json.dumps([args.kind, args.what, args.reason])
+        req, _ = hub_records.open_request(path, "capability", ask, f"{args.kind}: {args.what}", "worker", "file",
+                                          detail={"capability": args.kind, "what": args.what, "reason": args.reason})
+        value = {"id": req["id"], "kind": args.kind, "what": args.what, "reason": args.reason,
                  "status": "pending", "requested": now()}
         atomic_json(path / "capability-request.json", value, base)
         write_index(base)
@@ -1743,25 +1747,31 @@ def _main(argv):
             write_index(base)
         else:
             pane = read_json(path / "meta.json").get("pane")
-            if not pane or lifecycle(path) in {"failed", "stopped"}:
-                raise ValueError("worker cannot receive a message (it has no pane, or it failed or was stopped); "
-                                 f"start it again with: `tp-agent retry {args.id} --reason \"say what changed\"`")
-            if (path / "reaped.json").exists():
-                raise ValueError("worker's process was ended (task collected or reviewed); retry it instead of messaging")
-            sent = pane_send.send(pane, args.text, task_dir=path)
+            refused = message_refusal(path, lifecycle(path))
+            if refused:
+                raise ValueError(refused)
+            answers = None
+            if args.resolves is not None:  # checked before anything is sent: an unknown id is a mistake, not a delivery
+                answers = hub_records.find_request(path, args.resolves)
+                if answers is None:
+                    raise ValueError(f"{args.id} has no request {args.resolves!r}; see `tp-agent inspect {args.id}` (requests)")
+            delivery = pane_send.new_token(len(pane_send.normalize(pane_send.flatten(args.text))))
+            sent = pane_send.send(pane, args.text, task_dir=path, token=delivery)
             submit = {k: sent[k] for k in ("submitted", "attempts", "received", "length") if k in sent}
             (path / "collected.json").unlink(missing_ok=True)
-            value = {"id": args.id, "sent": True, **submit}
+            value = {"id": args.id, "sent": True, **submit, "delivery": delivery}
             try:
-                # Written even when not confirmed: the text may be sitting in the worker's input box.
-                safe_write.append_text(path / "messages.jsonl", json.dumps({"sent": now(), "text": args.text, **submit}) + "\n",
-                                       root=base)
-                requested = path / "capability-request.json"
-                if requested.exists() and sent["submitted"]:  # unconfirmed: the worker has not read the answer
-                    pending = read_json(requested)
-                    if pending.get("status") == "pending":
-                        pending.update({"status": "answered", "answered": now()})
-                        atomic_json(requested, pending, base)
+                # Written even when not confirmed: the text may be sitting in the worker's input box. HB4a: the delivery id
+                # is kept, and a delivery resolves nothing by itself: only --resolves names the request it answers.
+                safe_write.append_text(path / "messages.jsonl", json.dumps(
+                    {"sent": now(), "text": args.text, **submit, "delivery": delivery,
+                     **({"resolves": args.resolves} if args.resolves else {})}) + "\n", root=base)
+                hub_records.event(path, "correction.delivered" if sent["submitted"] else "correction.unverified", "main",
+                                  "hook" if pane_send.uses_record(path) else "pane",
+                                  "exact" if pane_send.uses_record(path) else "derived", ref=args.resolves,
+                                  detail={"delivery": delivery, **submit})
+                if answers is not None:
+                    value["resolves"] = resolve_by_message(base, path, answers, delivery, sent["submitted"])
             finally:  # collected.json is already gone: the record is refreshed even if a later write fails
                 refreshed(base, args.id, value)
             if not sent["submitted"] and "received" in sent:  # MS2: submitted, but only the end of it reached the worker
@@ -1778,6 +1788,121 @@ def _main(argv):
     else:
         raise ValueError("unknown command")
     print(json.dumps(value, indent=2))
+
+
+# The states `tp-agent retry` refuses (the task may still settle or is waiting on main): one set for retry and answer_route.
+RETRY_REFUSED = frozenset({"starting", "working", "needs_input"})
+
+
+def message_blocked(path, life):
+    """Why `tp-agent message` cannot reach this task's worker, as a short phrase, or None when it can: the one check, used
+    by the message command before anything is typed and by answer_route, so a notice never suggests a message the command
+    refuses."""
+    if not read_json(path / "meta.json").get("pane") or life in {"failed", "stopped"}:
+        return "it has no pane, or it failed or was stopped"
+    if (path / "reaped.json").exists():
+        return "its process was ended (task collected or reviewed)"
+    return None
+
+
+def message_refusal(path, life):
+    """The message command's error for message_blocked, naming the command that works instead."""
+    blocked = message_blocked(path, life)
+    if blocked is None:
+        return None
+    if blocked.startswith("it has no pane"):
+        return (f"worker cannot receive a message ({blocked}); "
+                f"start it again with: `tp-agent retry {path.name} --reason \"say what changed\"`")
+    return "worker's process was ended (task collected or reviewed); retry it instead of messaging"
+
+
+def retry_admission(base, path, life, route=None, force_alive=False, warn=None, prefix=""):
+    """Whether `tp-agent retry` takes task `path` (lifecycle `life`) now: (refusal, repeated). `refusal` is the retry command's
+    own error text, or None when it would start an attempt (or park one, for --route park); `repeated` is repeated_family's
+    finding. The one admission, in the command's order: the state (RETRY_REFUSED), the repeated-family gate (a walk that cannot
+    be made does not block: `warn` is told), the live-process guard on the working tree (guard_retry, unless --force-alive;
+    not for --route park, which starts nothing), then the route the gate asks for. The retry command and answer_route both call
+    it (HB4a round 4 invariant 3), so a notice never suggests a retry the command refuses. `prefix` (lib/lane_lease.py
+    in_session) goes before every command the refusal names, so a refusal shown in another session acts on this one."""
+    ident = path.name
+    if life in RETRY_REFUSED:
+        wait = "Wait for it to settle, or end it" if finishes_alone(life) else "It will not settle by itself: end it"
+        return (f"{ident} is still {state_words(life)}, so it cannot be retried yet. "
+                f"{wait} with {' or '.join(clear_commands(life, ident, prefix))}, then retry"), None
+    try:
+        repeated = repeated_family(base, ident)
+    except review_rounds.Refused as error:  # the same walk the next review makes will refuse too; a retry is not blocked by it
+        repeated = None
+        if warn:
+            warn(f"the repeated-family gate was not checked: {error}")
+    if repeated and route == "park":
+        return None, repeated
+    if not force_alive:
+        try:
+            guard_retry(path, prefix)
+        except ValueError as error:
+            return str(error), repeated
+    if repeated and not route:
+        return (f"{family_words(*repeated)}: another retry would "
+                f"fix one more site of it. Retry again with --route rule-first (the brief changes the rule that lets it recur), "
+                f"--route design (the brief changes the design), or --route park (no retry; parked.md records it and the owner decides)"), repeated
+    if route and not repeated:
+        return (f"--route {route}: the latest review of {ident} repeats no family an earlier review named and is not the second REQUEST_CHANGES in a row, "
+                "so there is nothing to route; retry without --route"), repeated
+    return None, repeated
+
+
+def answer_route(path, life, here=None):
+    """How main can answer an open request on this task now (HB4a round 3 rule 3), from the same checks the commands make:
+    {"by": "message"} while `tp-agent message` can reach the worker (message_blocked); {"by": "retry", "why"} when it cannot
+    and `tp-agent retry <id> --reason ...` would start an attempt now (retry_admission, the command's own admission); {"by":
+    "none", "why", "needs"} when neither would: `needs` is the retry command's refusal text, which names what must happen first
+    (end a live process, choose a route, wait for the task to settle). `why` is a short phrase (message_blocked), never a command.
+    `here` is the session the answer is read in (default: the task's own). From another session every command in `needs` carries
+    the task's session (lib/lane_lease.py in_session, the form tp-agent's own refusals print), so the notice prints it unedited."""
+    blocked = message_blocked(path, life)
+    if blocked is None:
+        return {"by": "message"}
+    try:
+        session = path.parent.parent
+        refused, _ = retry_admission(session, path, life,
+                                     prefix=lane_lease.in_session({"session": str(session)}, session if here is None else here))
+    except Exception as error:  # an unreadable record: the command would refuse too; inspect says what is wrong
+        refused = f"retry cannot be checked: {error}"
+    if refused is None:
+        return {"by": "retry", "why": blocked}
+    return {"by": "none", "why": blocked, "needs": refused}
+
+
+def mirror_capability(base, path, request):
+    """capability-request.json for older readers (inspect, tp-list, the notifier's awaiting): it mirrors ONE request, the
+    capability request it names (the one `tp-agent request` asked last), with that request's own id, what and status:
+    "answered" once that request is closed, whatever other request is still open. An aggregate "anything outstanding"
+    reader (lib/contract.py task_lifecycle, bin/tp-review) reads requests/ (hub_records.open_requests), not this file."""
+    file = path / "capability-request.json"
+    legacy = read_json(file) if file.exists() else {}
+    if not isinstance(legacy, dict) or legacy.get("id") != request.get("id") or legacy.get("status") != "pending":
+        return
+    if request.get("status") == "open":
+        return
+    legacy.update({"status": "answered", "answered": now()})
+    atomic_json(file, legacy, base)
+
+
+def resolve_by_message(base, path, request, delivery, confirmed):
+    """--resolves: the request is resolved (by main, how message, ref the delivery id) only when the delivery is confirmed;
+    otherwise it stays open and the answer says so."""
+    if request.get("status") != "open":
+        return {"request": request["id"], "resolved": False, "status": request.get("status"),
+                "why": f"the request was already {request.get('status')}; nothing changed"}
+    if not confirmed:
+        print(f"tp-agent: request {request['id']} stays open: the delivery {delivery} was not confirmed", file=sys.stderr)
+        return {"request": request["id"], "resolved": False, "status": "open",
+                "why": "the delivery was not confirmed; the request stays open"}
+    record, changed = hub_records.resolve(path, request["id"], "main", "message", delivery, "main", "file")
+    if record is not None and record.get("kind") == "capability":
+        mirror_capability(base, path, record)
+    return {"request": request["id"], "resolved": changed, "status": (record or {}).get("status")}
 
 
 def run_find(args):

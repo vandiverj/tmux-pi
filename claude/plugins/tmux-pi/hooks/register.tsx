@@ -4,7 +4,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, SessionStartInput } from 'claude-code'
 
-import type { NotifierState, OtherRow, RequestRef, TaskRow, TaskSummary } from '../types'
+import type { AnswerRoute, NotifierState, OtherRow, RequestEvent, TaskRow, TaskSummary } from '../types'
 
 const TP_AGENT_TIMEOUT_MS = 20000
 const POLL_MS = 5000
@@ -43,13 +43,15 @@ let isActive = false
 // with a higher `epoch`; a module that finds a higher one stored has been replaced and
 // goes quiet without overwriting its successor. An unresolved submit of the old module
 // may still land, so each reload can repeat at most the wake that was in flight then.
-// - `history`: the request ids already closed at this notifier's first good read and never announced: a fresh session does not
-//   replay them. Undefined until that read.
-// A request key (`req:<id>:open`, `req:<id>:resolved`) is delivered only by a submit whose text named that id and transition.
+// - `cursors`: per task (`<state_dir>#<id>`), the count of its request transitions (request_log seq, a count of request events,
+//   not a byte offset) already queued as notices. Taken by the startup snapshot, just before the startup index is read, so a
+//   transition after it is delivered once and none before it is replayed; undefined until then (the first good poll takes it if
+//   the startup read failed). A request notice queued past the cursor stays in `held` until a submit that rendered it succeeded:
+//   it is never dropped because its row changed. Request keys (`req:<id>:open`, `req:<id>:resolved`) are never in `delivered`.
 let delivered = new Set<string>()
 let held: TaskRow[] = []
 let inFlight: TaskRow[] = []
-let history: Set<string> | undefined
+let cursors: Map<string, number> | undefined
 let wakeFailures = 0
 let retryAt = 0
 let isStuck = false
@@ -148,7 +150,7 @@ async function readTasks($: EngineInterface): Promise<Read> {
       result_status: typeof row.result_status === 'string' ? row.result_status : null,
       ...(typeof row.state_dir === 'string' && row.state_dir.startsWith('/') ? { state_dir: row.state_dir } : {}),
       ...(typeof row.failing_tests === 'object' && row.failing_tests !== null ? { failing_tests: true as const } : {}),
-      ...requestRefs(row.requests),
+      ...requestFields(row),
     })
   }
   const left = Array.isArray(parsed?.other_main?.rows) ? parsed.other_main.rows : []
@@ -164,26 +166,31 @@ async function readTasks($: EngineInterface): Promise<Read> {
 // From here to "notice rules: end" is pure (no `$`, no JSX): what the main is told, and when a notice counts as delivered.
 // tests/test_hub_records.py runs this very text under node, fed by the real Python request writers.
 
-// A row's request records (bin/tp-agent record `requests`, lib/hub_records.py row_requests): only well-formed ones, and no key at
-// all for a task that has none, so its row is what it was before.
-function requestRefs(value: unknown): { requests?: RequestRef[] } {
-  if (!Array.isArray(value)) return {}
-  const refs: RequestRef[] = []
-  for (const item of value) {
-    const { id, kind, status, summary, how, opened, resolved } = (item ?? {}) as Record<string, unknown>
-    if (typeof id !== 'string' || !REQUEST_ID.test(id) || typeof kind !== 'string' || typeof status !== 'string') continue
-    refs.push({
+// A row's request transition log and answer route (bin/tp-agent record `request_log`, `answer_route`; lib/hub_records.py
+// request_log): only well-formed entries, and no key at all for a task that has none, so its row is what it was before.
+// The row's `requests` (row_requests) is a display window and is never read here: nothing that delivers notices reads it.
+function requestFields(row: unknown): { requestLog?: RequestEvent[]; answerRoute?: AnswerRoute } {
+  const { request_log: log, answer_route: route } = (row ?? {}) as Record<string, unknown>
+  const events: RequestEvent[] = []
+  for (const item of Array.isArray(log) ? log : []) {
+    const { seq, id, change, kind, summary, how } = (item ?? {}) as Record<string, unknown>
+    if (typeof seq !== 'number' || !Number.isInteger(seq) || seq < 1 || typeof id !== 'string' || !REQUEST_ID.test(id)) continue
+    if (change !== 'opened' && change !== 'closed') continue
+    events.push({
+      seq,
       id,
-      kind,
-      status,
+      change,
+      kind: typeof kind === 'string' ? kind : '',
       summary: typeof summary === 'string' ? summary : '',
-      ...(typeof how === 'string' ? { how } : {}),
-      // When it opened and closed: the order a row's transitions are announced in.
-      ...(typeof opened === 'string' ? { opened } : {}),
-      ...(typeof resolved === 'string' ? { resolved } : {}),
+      ...(typeof how === 'string' && how !== '' ? { how } : {}),
     })
   }
-  return refs.length === 0 ? {} : { requests: refs }
+  const { by, why } = (typeof route === 'object' && route !== null ? route : {}) as Record<string, unknown>
+  const isRoute = by === 'message' || by === 'retry' || by === 'none'
+  return {
+    ...(events.length === 0 ? {} : { requestLog: events }),
+    ...(isRoute ? { answerRoute: { by, ...(typeof why === 'string' && why !== '' ? { why } : {}) } } : {}),
+  }
 }
 
 function summarize(rows: readonly TaskRow[]): TaskSummary {
@@ -247,6 +254,14 @@ function hint(row: TaskRow): string {
     if (notice.state === 'resolved') return `${row.id}: ${about} is closed${notice.how === undefined ? '' : ` (${notice.how})`}`
     // An opening told after its request already closed (both happened between two polls): said, with nothing to answer.
     if (notice.isClosed === true) return `${row.id}: ${about} was opened`
+    // The answer route is tp-agent's own check (bin/tp-agent answer_route, the one `tp-agent message` makes): a message is
+    // suggested only while the worker can take one. A finished task's request is said to be left open, with the command that
+    // works on that task (retry), or none.
+    const why = row.answerRoute?.why === undefined ? '' : ` (${row.answerRoute.why})`
+    if (row.answerRoute?.by === 'retry') {
+      return `${row.id}: ${about} is left open by a finished task${why}: ${agent(row, 'retry')} --reason "..." starts a new attempt, or ${agent(row, 'inspect')}`
+    }
+    if (row.answerRoute?.by === 'none') return `${row.id}: ${about} is open, but no command can answer it now${why}: ${agent(row, 'inspect')}`
     // tp-agent message takes its text only as --text (bin/tp-agent, the `message` parser).
     const answer = notice.kind === 'permission' ? 'answer it in its pane' : `answer with ${agent(row, 'message')} --resolves ${notice.id} --text "..."`
     return `${row.id} has an open ${about}: ${answer}, or ${agent(row, 'inspect')}`
@@ -272,7 +287,7 @@ function hint(row: TaskRow): string {
 
 // The key a row is announced under, or undefined when it is not news: `id:status` for a notable status, and
 // `id:refused` for a queue entry tp-agent will not start (it keeps status queued, so the status alone cannot say).
-// A notice row made for one request (noticeRows) is keyed on the request id, `req:<id>:open` or `req:<id>:resolved`.
+// A notice row made for one request transition (requestNotice) is keyed on the request id, `req:<id>:open` or `req:<id>:resolved`.
 function noticeKey(row: unknown): string | undefined {
   const { id, status, notice } = (row ?? {}) as Record<string, unknown>
   if (typeof notice === 'object' && notice !== null) {
@@ -284,8 +299,8 @@ function noticeKey(row: unknown): string | undefined {
   return isRefused(row) ? `${id}:refused` : undefined
 }
 
-// What the injected index showed the main wakes nobody: the status of each row it listed. A request id is never marked here:
-// the index does not render request ids, and delivered means rendered, so each open request is announced by the first poll.
+// What the injected index showed the main wakes nobody: the status of each row it listed. A request is never marked here: the
+// index does not render request ids, and delivered means rendered; the startup snapshot queues every request still open.
 function baseline(rows: readonly unknown[]) {
   for (const row of rows) {
     const key = noticeKey(row)
@@ -293,73 +308,111 @@ function baseline(rows: readonly unknown[]) {
   }
 }
 
-// The rows to announce, keyed by noticeKey. A task with request records gets, for each request, its transitions in the order they
-// happened: the opening (`req:<id>:open`) and, once it is closed (resolved, superseded or withdrawn), the closing
-// (`req:<id>:resolved`). Each is announced until a submit that rendered it succeeded, so two requests between polls are two
-// openings (and the supersession), and a request opened and closed between polls is heard of with its id. An open request is
-// announced whatever the task row's status (a settled or completed row included): the request does not depend on the row.
-// The one exception is history: a request already closed at this notifier's first read (`history`) is never replayed. The
-// row's own needs_input/paused notice is left out while a request on it is open: the request says more. A task with no request
-// records is announced as before.
-function noticeRows(rows: readonly TaskRow[]): TaskRow[] {
+// The task a cursor counts for: the same id may live in two state directories.
+function taskKey(row: { id: string; state_dir?: string }): string {
+  return `${row.state_dir ?? ''}#${row.id}`
+}
+
+function lastSeq(log: readonly RequestEvent[] | undefined): number {
+  return (log ?? []).reduce((last, event) => Math.max(last, event.seq), 0)
+}
+
+// The requests a log leaves open: opened and not closed since.
+function openIds(log: readonly RequestEvent[] | undefined): Set<string> {
+  const open = new Set<string>()
+  for (const event of log ?? []) {
+    if (event.change === 'opened') open.add(event.id)
+    else open.delete(event.id)
+  }
+  return open
+}
+
+// A row as a notice carries it: never its log (a held row is persisted, and its log is read afresh each poll).
+function plainRow(row: TaskRow): TaskRow {
+  const { requestLog, notice, ...rest } = row
+  return rest
+}
+
+// The notice row for one transition: an opening (`req:<id>:open`, isClosed when the same log already closes it) or a closing
+// (`req:<id>:resolved`, resolved, superseded or withdrawn, with how).
+function requestNotice(row: TaskRow, event: RequestEvent): TaskRow {
+  const about = { id: event.id, kind: event.kind, summary: event.summary }
+  const isClosed = event.change === 'opened' && (row.requestLog ?? []).some(each => each.id === event.id && each.change === 'closed')
+  const notice = event.change === 'opened'
+    ? { ...about, state: 'open' as const, ...(isClosed ? { isClosed: true } : {}) }
+    : { ...about, state: 'resolved' as const, how: event.how ?? 'closed' }
+  return { ...plainRow(row), notice }
+}
+
+// The startup snapshot: each task's cursor is its last transition now, and every request still open is queued once (the index
+// does not render request ids). Closed history is not replayed. Taken just before the startup index is read.
+function snapshot(rows: readonly TaskRow[]): TaskRow[] {
+  cursors = new Map()
   const out: TaskRow[] = []
   for (const row of rows) {
-    const { requests, ...plainRow } = row
-    const said: { at: string; order: number; row: TaskRow }[] = []
-    let isAsking = false
-    for (const req of requests ?? []) {
-      const isOpen = req.status === 'open'
-      isAsking = isAsking || isOpen
-      if (!isOpen && (history === undefined || history.has(req.id))) continue
-      const base = { id: req.id, kind: req.kind, summary: req.summary }
-      said.push({ at: req.opened ?? '', order: 0, row: { ...plainRow, notice: { ...base, state: 'open', ...(isOpen ? {} : { isClosed: true }) } } })
-      if (!isOpen) said.push({ at: req.resolved ?? '', order: 1, row: { ...plainRow, notice: { ...base, how: req.how ?? req.status, state: 'resolved' } } })
-    }
-    // In the order they happened (tp-agent's times; an opening before a closing at the same time, then by id).
-    said.sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : a.order - b.order || String(a.row.notice?.id).localeCompare(String(b.row.notice?.id))))
-    out.push(...said.map(each => each.row))
-    if (!(isAsking && (row.status === 'needs_input' || row.status === 'paused'))) out.push(plainRow)
+    const last = lastSeq(row.requestLog)
+    if (last > 0) cursors.set(taskKey(row), last)
+    const open = openIds(row.requestLog)
+    for (const event of row.requestLog ?? []) if (event.change === 'opened' && open.has(event.id)) out.push(requestNotice(row, event))
   }
   return out
 }
 
-// The notices that are new since the last read and are not already waiting in `held` or `inFlight` (`fresh`), and the
-// notices that are current, by key. They are NOT marked delivered here: only a submit that succeeded does that
-// (acknowledge). A status key leaves `delivered` when its task leaves that status, so a second permission prompt on the same
-// task notifies again; a request key stays for as long as tp-agent lists that request id, so a closed request is never
-// announced again, even after a reload. The first read primes `history`: the requests closed by then whose opening this
-// notifier never delivered (a fresh session does not replay old resolved history).
-function transitions(rows: readonly TaskRow[]): { fresh: TaskRow[]; current: Map<string, TaskRow> } {
-  const all = rows.flatMap(row => row.requests ?? [])
-  const listed = new Set(all.map(req => req.id))
-  if (history === undefined) history = new Set(all.filter(req => req.status !== 'open' && !delivered.has(`req:${req.id}:open`)).map(req => req.id))
-  else for (const id of history) if (!listed.has(id)) history.delete(id)
-  const notices = noticeRows(rows)
+// The request transitions past each task's cursor, in the order the log has them, and the cursor moved to the last. A task
+// not seen before starts at 0. A log that shrank sets the cursor to its last transition and replays nothing; a log that reads
+// empty leaves the cursor alone (a failed read of events.jsonl must not replay the task's whole history next poll).
+function logged(rows: readonly TaskRow[]): TaskRow[] {
+  if (cursors === undefined) return snapshot(rows)
+  const out: TaskRow[] = []
+  for (const row of rows) {
+    const key = taskKey(row)
+    const last = lastSeq(row.requestLog)
+    const cursor = cursors.get(key) ?? 0
+    if (last === 0 || last === cursor) continue
+    for (const event of row.requestLog ?? []) if (event.seq > cursor) out.push(requestNotice(row, event))
+    cursors.set(key, last)
+  }
+  return out
+}
+
+// The notices that are new since the last read and are not already waiting in `held` or `inFlight` (`fresh`), the status
+// notices that are current, by key, and the rows read, by task. Request notices come from the log (logged): each transition
+// once, past the cursor. A status key is NOT marked delivered here: only a submit that succeeded does that (acknowledge),
+// and it leaves `delivered` when its task leaves that status, so a second permission prompt on the same task notifies again.
+// The row's own needs_input/paused notice is left out while its log has a request open: the request says more.
+function transitions(rows: readonly TaskRow[]): { fresh: TaskRow[]; current: Map<string, TaskRow>; listed: Map<string, TaskRow> } {
+  const told = logged(rows)
   const current = new Map<string, TaskRow>()
-  for (const row of notices) {
-    const key = noticeKey(row)
-    if (key !== undefined) current.set(key, row)
+  for (const row of rows) {
+    if (openIds(row.requestLog).size > 0 && (row.status === 'needs_input' || row.status === 'paused')) continue
+    const plain = plainRow(row)
+    const key = noticeKey(plain)
+    if (key !== undefined) current.set(key, plain)
   }
-  for (const key of delivered) {
-    const isKept = key.startsWith('req:') ? listed.has(key.split(':')[1]) : current.has(key)
-    if (!isKept) delivered.delete(key)
-  }
+  for (const key of delivered) if (!current.has(key)) delivered.delete(key)
   const waiting = new Set([...held, ...inFlight].map(noticeKey))
   const fresh: TaskRow[] = []
-  for (const row of notices) {
+  for (const row of [...told, ...current.values()]) {
     const key = noticeKey(row)
     if (key === undefined || delivered.has(key) || waiting.has(key)) continue
     waiting.add(key)
     fresh.push(row)
   }
-  return { fresh, current }
+  return { fresh, current, listed: new Map(rows.map(row => [taskKey(row), row])) }
 }
 
-// One good read: the fresh notices queue behind those already held. A held notice that is no longer current is dropped (its
-// task left that status), and one still current takes its current text (an opening whose request has since closed says so).
+// One good read: the fresh notices queue behind those already held. A held request notice is kept until rendered, whatever its
+// row does since, and takes its row's current fields (an opening whose request has since closed says so; the answer route
+// follows the task). A held status notice that is no longer current is dropped (its task left that status).
 function announce(rows: readonly TaskRow[]): TaskRow[] {
-  const { fresh, current } = transitions(rows)
+  const { fresh, current, listed } = transitions(rows)
   held = [...held, ...fresh].flatMap(row => {
+    if (row.notice !== undefined) {
+      const now = listed.get(taskKey(row))
+      if (now === undefined) return [row]
+      const isClosed = row.notice.state === 'open' && (row.notice.isClosed === true || (now.requestLog ?? []).some(each => each.id === row.notice?.id && each.change === 'closed'))
+      return [{ ...plainRow(now), notice: { ...row.notice, ...(isClosed ? { isClosed: true } : {}) } }]
+    }
     const now = current.get(noticeKey(row) ?? '')
     return now === undefined ? [] : [now]
   })
@@ -371,12 +424,12 @@ function wakeText(batch: readonly TaskRow[]): string {
   return `tmux-pi workers changed state:\n${batch.map(hint).join('\n')}`
 }
 
-// A submit of `batch` succeeded: each row in it was rendered by hint, which names a request notice's id and transition, so
-// exactly those keys are delivered (a status row marks only its status key). Nothing else ever marks a request delivered.
+// A submit of `batch` succeeded: each row in it was rendered by hint. A status row marks its status key delivered; a request
+// notice needs no mark: its transition is behind the cursor, and leaving `held` (rendered) is its delivery.
 function acknowledge(batch: readonly TaskRow[]) {
   for (const row of batch) {
     const key = noticeKey(row)
-    if (key !== undefined) delivered.add(key)
+    if (key !== undefined && !key.startsWith('req:')) delivered.add(key)
   }
 }
 
@@ -412,7 +465,7 @@ async function persist($: EngineInterface) {
     isIndexed,
     delivered: [...delivered].sort(),
     pending: [...inFlight, ...held],
-    ...(history === undefined ? {} : { history: [...history].sort() }),
+    ...(cursors === undefined ? {} : { cursors: Object.fromEntries([...cursors].sort(([a], [b]) => a.localeCompare(b))) }),
   }
   const text = JSON.stringify(next)
   if (text === saved) return
@@ -439,8 +492,10 @@ async function restore($: EngineInterface) {
     delivered = new Set(stored.delivered)
     // Rows its submit had not acknowledged; poll drops those whose task has left that status.
     held = stored.pending
-    // A value from before `history` existed: the first read primes it, leaving out what the old module announced the opening of.
-    history = Array.isArray(stored.history) ? new Set(stored.history) : undefined
+    // The cursors are saved in the same write as `pending`, so a reload neither repeats a queued transition nor loses one. A
+    // value with none (a module before the startup snapshot, or one from before cursors) snapshots again at this start.
+    const kept = typeof stored.cursors === 'object' && stored.cursors !== null ? Object.entries(stored.cursors) : undefined
+    cursors = kept === undefined ? undefined : new Map(kept.filter(([, seq]) => typeof seq === 'number' && Number.isInteger(seq) && seq >= 0))
   } catch {
     // The saved value could not be read, so its epoch is unknown. Claim far above any counter
     // a readable store holds, plus the time, so this module is never taken for a replaced one
@@ -450,9 +505,22 @@ async function restore($: EngineInterface) {
     isIndexed = false
     delivered = new Set()
     held = []
-    history = undefined
+    cursors = undefined
   }
   inFlight = []
+  await persist($)
+}
+
+// Takes the startup snapshot from one read of `tp-agent list`: the cursors, and the requests still open queued (and toasted)
+// as the first poll would. A failed read leaves `cursors` undefined, and the first good poll takes the snapshot instead (a
+// transition between this start and that poll is then counted as before the snapshot: the known limit).
+async function startSnapshot($: EngineInterface) {
+  const read = await readTasks($)
+  if ('failure' in read || !isActive || isSuperseded || cursors !== undefined) return
+  const waiting = new Set([...held, ...inFlight].map(noticeKey))
+  const fresh = snapshot(read.rows).filter(row => !waiting.has(noticeKey(row)))
+  held = [...held, ...fresh]
+  for (const row of fresh) $.ui.toast(hint(row))
   await persist($)
 }
 
@@ -881,6 +949,8 @@ export const register: Register = on => {
       await restore($)
       isLoaded = true
     }
+    // The startup snapshot, just before the startup index: a request transition after it is delivered once, by the first poll.
+    if (cursors === undefined) await startSnapshot($)
     if (!isIndexed) {
       const index = await readIndex($)
       const appended =

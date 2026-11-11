@@ -287,12 +287,25 @@ def reply_mark(d):
     return st.st_mtime_ns, st.st_size
 
 
-def finished_turn(d, mark):
-    """Did the worker finish its turn after `mark` (reply_mark taken before the Escape)? Its reply was rewritten since and has
-    a RESULT_STATUS line. An interrupted partial turn writes no statused reply (Claude reports no Stop on an interrupt; pi's
-    aborted reply carries no RESULT_STATUS line), so only a completed turn passes."""
+def state_mark(d):
+    """st_mtime_ns of state.json, None when there is none: when the worker last reported its state."""
+    try:
+        return (d / "state.json").stat().st_mtime_ns
+    except OSError:
+        return None
+
+
+def finished_turn(d, mark, reported):
+    """Did the worker finish the turn it was at work on? Its reply has a RESULT_STATUS line and was either rewritten after
+    `mark` (reply_mark, taken before the working state was read) or written after `reported` (state_mark, taken before that
+    same read): Claude's report.sh moves result.md into place before it writes state.json, so a statused reply newer than the
+    "working" state it was read with is a completion whose state has not landed yet. An interrupted partial turn writes no
+    statused reply (Claude reports no Stop on an interrupt; pi's aborted reply carries no RESULT_STATUS line), and a new turn
+    withdraws the last reply (report.sh at UserPromptSubmit, reporter.ts at agent_start), so only a completed turn passes."""
     now_mark = reply_mark(d)
-    if now_mark is None or now_mark == mark:
+    if now_mark is None:
+        return False
+    if now_mark == mark and (reported is None or now_mark[0] <= reported):
         return False
     try:
         return bool(RESULT_STATUS_RE.search((d / "result.md").read_text(errors="replace")))
@@ -307,10 +320,13 @@ def pause_worker(d, meta, events, reason, now):
     A pause never overrides a finished turn: when the worker's reply shows a completed turn written after the pause began
     (finished_turn), "pause-unneeded" is recorded instead and the task's lifecycle stays what its result says.
     Returns the outcome: skipped (the worker finished before the Escape), confirmed, unneeded or unverified."""
-    before = read(d / "state.json")
-    if before.get("state") not in ("working", "tool"):
-        return "skipped"
+    # The baselines are taken BEFORE the working state is read (HB4a round 3 rule 2): a completion that lands between them and
+    # the read is a change from them, so it can never be absorbed into the baseline and then paused over.
     mark = reply_mark(d)
+    reported = state_mark(d)
+    before = read(d / "state.json")
+    if before.get("state") not in ("working", "tool") or finished_turn(d, mark, reported):
+        return "skipped"  # finished already (its state, or a statused reply its state has not caught up with): no Escape
     tries = pause_tries(events) + 1
     events.append({"action": "pause-requested", "reason": reason, "at": now, "tools": before.get("tools") or 0, "try": tries})
     save_events(d, events)
@@ -330,7 +346,7 @@ def pause_worker(d, meta, events, reason, now):
             confirmed, why = worker_stopped(d, meta, before)
             if confirmed:
                 break
-        finished = finished_turn(d, mark)
+        finished = finished_turn(d, mark, reported)
         if confirmed and not finished:
             # An interrupted worker puts queued messages (our reminders) back in its input box;
             # clear them so the user's next message is not appended to one.
@@ -340,7 +356,7 @@ def pause_worker(d, meta, events, reason, now):
     except subprocess.CalledProcessError:
         pass  # confirmed stays as it was: an Escape that was not sent is unverified
     # Looked at after the attempt whatever came of it (sent or not, confirmed or not): a finished turn is never paused.
-    if finished_turn(d, mark):
+    if finished_turn(d, mark, reported):
         why = "the worker finished its turn: a reply with a RESULT_STATUS line was written after the pause began"
         events.append({"action": "pause-unneeded", "reason": reason, "at": now, "why": why, "try": tries})
         journal(d, "pause.unneeded", source="file", reason=reason, why=why, attempt=tries)

@@ -211,8 +211,10 @@ def record(path, include_result=False):
     if isinstance(main, str) and MAIN_ID.fullmatch(main):
         result["main"] = main
     asked = hub_records.row_requests(path)
-    if asked:  # HB4a request records (newest 20); a task with none has no such key, so its row is what it was before
-        result["requests"] = asked
+    if asked:  # HB4a request records; a task with none has no such keys, so its row is what it was before
+        result["requests"] = asked  # every open request and the 20 most recently closed: what list and inspect show
+        result["request_log"] = hub_records.request_log(path)  # every transition, in order: what the notifier delivers from
+        result["answer_route"] = answer_route(path, result["status"])  # the command that can answer an open request now
     reported = failing_tests.read(path)
     if reported:  # a report without the block has no such key
         result["failing_tests"] = reported
@@ -1549,7 +1551,7 @@ def _main(argv):
         previous = task_dir(base, args.id)
         meta = read_json(previous / "meta.json")
         prior = record(previous)
-        if prior["status"] in {"starting", "working", "needs_input"}:
+        if prior["status"] in RETRY_REFUSED:
             wait = "Wait for it to settle, or end it" if finishes_alone(prior["status"]) else "It will not settle by itself: end it"
             raise ValueError(f"{args.id} is still {state_words(prior['status'])}, so it cannot be retried yet. "
                              f"{wait} with {' or '.join(clear_commands(prior['status'], args.id))}, then retry")
@@ -1728,11 +1730,9 @@ def _main(argv):
             write_index(base)
         else:
             pane = read_json(path / "meta.json").get("pane")
-            if not pane or lifecycle(path) in {"failed", "stopped"}:
-                raise ValueError("worker cannot receive a message (it has no pane, or it failed or was stopped); "
-                                 f"start it again with: `tp-agent retry {args.id} --reason \"say what changed\"`")
-            if (path / "reaped.json").exists():
-                raise ValueError("worker's process was ended (task collected or reviewed); retry it instead of messaging")
+            refused = message_refusal(path, lifecycle(path))
+            if refused:
+                raise ValueError(refused)
             answers = None
             if args.resolves is not None:  # checked before anything is sent: an unknown id is a mistake, not a delivery
                 answers = hub_records.find_request(path, args.resolves)
@@ -1771,6 +1771,43 @@ def _main(argv):
     else:
         raise ValueError("unknown command")
     print(json.dumps(value, indent=2))
+
+
+# The states `tp-agent retry` refuses (the task may still settle or is waiting on main): one set for retry and answer_route.
+RETRY_REFUSED = frozenset({"starting", "working", "needs_input"})
+
+
+def message_blocked(path, life):
+    """Why `tp-agent message` cannot reach this task's worker, as a short phrase, or None when it can: the one check, used
+    by the message command before anything is typed and by answer_route, so a notice never suggests a message the command
+    refuses."""
+    if not read_json(path / "meta.json").get("pane") or life in {"failed", "stopped"}:
+        return "it has no pane, or it failed or was stopped"
+    if (path / "reaped.json").exists():
+        return "its process was ended (task collected or reviewed)"
+    return None
+
+
+def message_refusal(path, life):
+    """The message command's error for message_blocked, naming the command that works instead."""
+    blocked = message_blocked(path, life)
+    if blocked is None:
+        return None
+    if blocked.startswith("it has no pane"):
+        return (f"worker cannot receive a message ({blocked}); "
+                f"start it again with: `tp-agent retry {path.name} --reason \"say what changed\"`")
+    return "worker's process was ended (task collected or reviewed); retry it instead of messaging"
+
+
+def answer_route(path, life):
+    """How main can answer an open request on this task now (HB4a round 3 rule 3), from the same checks the commands make:
+    {"by": "message"} while `tp-agent message` can reach the worker; {"by": "retry", "why"} when it cannot and `tp-agent
+    retry` takes the task's state (RETRY_REFUSED); {"by": "none", "why"} when neither does (a reaped task still counted as
+    asking). `why` is a short phrase (message_blocked), never a command."""
+    blocked = message_blocked(path, life)
+    if blocked is None:
+        return {"by": "message"}
+    return {"by": "none" if life in RETRY_REFUSED else "retry", "why": blocked}
 
 
 def mirror_capability(base, path, request):

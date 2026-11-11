@@ -268,15 +268,38 @@ def open_requests(task_dir, kinds=None):
     return [r for r in requests(task_dir) if r.get("status") == "open" and (kinds is None or r.get("kind") in kinds)]
 
 
+def request_log(task_dir):
+    """Every request transition of a task, in the order events.jsonl has them: the append-only log a notifier delivers from
+    (never from row_requests, which is a display window). Each is {seq, id, change: "opened"|"closed", kind, summary, state,
+    how?}: seq counts request transitions only, from 1, so a reader keeps "the transitions I have taken" as one number per
+    task. A request.opened or request.resolved event is written for every opening and every closing (resolved, superseded,
+    withdrawn) under the requests/ lock, so the log has each transition once, in the order it happened."""
+    out, summaries = [], {}
+    for line in read_events(task_dir):
+        kind, ref = line.get("kind"), line.get("ref")
+        if kind not in ("request.opened", "request.resolved") or not REQUEST_ID.fullmatch(str(ref or "")):
+            continue
+        detail = line.get("detail") if isinstance(line.get("detail"), dict) else {}
+        if kind == "request.opened":
+            summaries[ref] = str(detail.get("summary") or "")
+        entry = {"seq": len(out) + 1, "id": ref, "change": "opened" if kind == "request.opened" else "closed",
+                 "kind": str(detail.get("kind") or ""), "summary": summaries.get(ref, ""), "state": str(line.get("state") or "")}
+        if kind == "request.resolved":
+            entry["how"] = str(detail.get("how") or line.get("state") or "")
+        out.append(entry)
+    return out
+
+
 def row_requests(task_dir, keep=20):
     """What `tp-agent list` shows of a task's requests, oldest id first, as {id, kind, status, summary, opened, resolved?,
-    how?}: EVERY open request, and the newest `keep` closed ones. Only history is bounded: an open request is never hidden
-    behind closed ones. None when the task has no request files (its row is then what it was before HB4a)."""
+    how?}: EVERY open request, and the `keep` most recently closed ones (by close time, so a request that has just closed
+    shows however old it is). Only history is bounded: an open request is never hidden behind closed ones. A display window
+    only: notices come from request_log. None when the task has no request files (its row is then what it was before HB4a)."""
     found = requests(task_dir)
     if not found:
         return None
-    closed = [r["id"] for r in found if r.get("status") != "open"]
-    shown = set(closed[-keep:]) if keep > 0 else set()
+    closed = sorted((r for r in found if r.get("status") != "open"), key=lambda r: (str(r.get("resolved") or ""), r["id"]))
+    shown = {r["id"] for r in closed[-keep:]} if keep > 0 else set()
     out = []
     for r in (r for r in found if r.get("status") == "open" or r["id"] in shown):
         row = {k: r.get(k) for k in ("id", "kind", "status", "summary", "opened")}

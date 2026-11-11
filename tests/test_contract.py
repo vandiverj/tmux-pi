@@ -725,14 +725,17 @@ class EnforceKeepsTheRecordTests(unittest.TestCase):
         match = re.search(r"- \*\*Lifecycle State:\*\* `([^`]+)`", (self.task / "task.md").read_text())
         return match.group(1) if match else None
 
-    def enforce(self, send_fails=False, pane="", after_escape=None, reply=None):
+    def enforce(self, send_fails=False, pane="", after_escape=None, reply=None, writes=None):
         """Enforce a pause with a fake tmux: capture-pane shows `pane`, an Escape fails (send_fails) or runs after_escape
         (the worker's reaction: a new state.json) and writes `reply` as result.md (a turn that finished meanwhile).
-        Returns the tmux calls."""
+        writes: {"baseline"|"read"|"escape": [callable, ...]}, run just before pause_worker takes its result baseline
+        (reply_mark), just before it reads the working state (its first read of state.json), or at the Escape: a worker
+        writing its files at that moment. Returns the tmux calls."""
         from unittest import mock
         self.tool.write_record(self.task, lifecycle_state="working", force=True)
         self.assertEqual(self.recorded_state(), "working")
         calls = []
+        writes = {k: list(v) for k, v in (writes or {}).items()}
 
         def run(command, *args, **kwargs):
             calls.append(command[1:])
@@ -745,12 +748,28 @@ class EnforceKeepsTheRecordTests(unittest.TestCase):
                     (self.task / "state.json").write_text(json.dumps(after_escape))
                 if reply is not None:
                     (self.task / "result.md").write_text(reply)
+                for write in writes.pop("escape", []):
+                    write()
             return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+        real_mark, real_read = self.tool.reply_mark, self.tool.read
+
+        def mark(d):
+            for write in writes.pop("baseline", []):
+                write()
+            return real_mark(d)
+
+        def read(path):
+            if Path(path).name == "state.json":
+                for write in writes.pop("read", []):
+                    write()
+            return real_read(path)
         decision = {"action": ("pause", "stalled"), "status": None, "elapsed": 60, "turns": 3}
         with mock.patch.dict(os.environ, {"TP_STATE_DIR": str(self.state), "TP_PAUSE_CONFIRM_SECONDS": "1"}), \
                 mock.patch.object(self.tool, "panes", return_value={"%1": "alive"}), \
                 mock.patch.object(self.tool, "evaluate", return_value=decision), \
                 mock.patch.object(self.tool.subprocess, "run", side_effect=run), \
+                mock.patch.object(self.tool, "reply_mark", side_effect=mark), \
+                mock.patch.object(self.tool, "read", side_effect=read), \
                 mock.patch.object(self.tool.time, "sleep"):
             self.tool.cmd_enforce(None)
         return calls
@@ -816,6 +835,43 @@ class EnforceKeepsTheRecordTests(unittest.TestCase):
         self.assertNotEqual(self.tool.task_lifecycle(self.task, "alive")[0], "paused")
         self.assertEqual([c[-1] for c in calls if c[0] == "send-keys"], ["Escape"])  # its reply box is not cleared
         self.assertFalse(self.held())
+
+        # Round 3 rule 2 (review F1): the completion lands at any point around the two reads. A finished turn is two writes,
+        # result.md (R) and state.json waiting (S): Claude's report.sh writes R then S, pi's reporter S then R. Each lands just
+        # before the result baseline, just before the working-state read, or at the Escape: every order of the two over those
+        # three points (12 rows). None is ever paused: a completion seen before the Escape is skipped (nothing typed), one
+        # after it is "pause-unneeded". (baseline, baseline) is the review's probe: at cb5353a the baseline came after the
+        # state read, so R and S landed between the two and the pause was installed.
+        def put_result():
+            (self.task / "result.md").write_text("Done.\nRESULT_STATUS: complete\n")
+
+        def put_waiting():
+            (self.task / "state.json").write_text(json.dumps({"state": "waiting", "turns": 4, "tools": 4}))
+        points = ("baseline", "read", "escape")
+        rows = [("claude", r, s) for r in points for s in points if points.index(r) <= points.index(s)] + \
+               [("pi", r, s) for r in points for s in points if points.index(s) <= points.index(r)]
+        self.assertEqual(len(rows), 12)
+        meta = json.loads((self.task / "meta.json").read_text())
+        for harness, r, s in rows:
+            with self.subTest(harness=harness, result_at=r, state_at=s):
+                for name in ("checkpoints.json", "events.jsonl", "result.md"):
+                    (self.task / name).unlink(missing_ok=True)
+                (self.task / "meta.json").write_text(json.dumps(dict(meta, worker=harness)))
+                (self.task / "state.json").write_text(json.dumps({"state": "working", "turns": 3, "tools": 4}))
+                order = ((r, put_result), (s, put_waiting)) if harness == "claude" else ((s, put_waiting), (r, put_result))
+                writes = {}
+                for point, write in order:
+                    writes.setdefault(point, []).append(write)
+                calls = self.enforce(pane="\u276f \n", writes=writes)
+                escaped = [c[-1] for c in calls if c[0] == "send-keys"]
+                if r == s == "escape":
+                    self.assertEqual((self.actions(), escaped), (["pause-requested", "pause-unneeded"], ["Escape"]))
+                else:  # finished before the Escape: by its state, or by a statused reply its state had not caught up with
+                    self.assertEqual(((self.task / "checkpoints.json").exists(), escaped), (False, []))
+                for _point, write in order:  # the worker's turn ends whatever was typed: both files land (again)
+                    write()
+                self.assertNotEqual(self.tool.task_lifecycle(self.task, "alive")[0], "paused")
+                self.assertFalse(self.held())
 
     def test_a_pi_pause_is_confirmed_by_its_reporter_not_by_the_pane(self):
         meta = json.loads((self.task / "meta.json").read_text())

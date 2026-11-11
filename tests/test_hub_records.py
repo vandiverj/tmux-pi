@@ -8,6 +8,7 @@ import importlib.util
 import io
 import json
 import re
+import shlex
 import sys
 import tempfile
 import unittest
@@ -228,6 +229,17 @@ class TpAgentRequestTests(AgentCase):
         self.assertEqual(len(shown), 21)
         self.assertEqual([r["id"] for r in shown if r["status"] == "open"], [oldest])
         self.assertEqual(shown[0]["id"], oldest)
+        # Round 3 rule 1 (F3): the old request closes after 21 newer closed ones. The display window keeps the most recently
+        # closed (by close time), so it shows; and the transition log, which notices come from, has every transition in order.
+        hub_records.resolve(self.task, oldest, "main", "message", None, "main", "file")
+        row = self.tp.record(self.task)
+        self.assertIn(oldest, [r["id"] for r in row["requests"]])
+        self.assertEqual(len(row["requests"]), 20)
+        log = row["request_log"]
+        self.assertEqual([e["seq"] for e in log], list(range(1, 45)))
+        self.assertEqual((log[0]["id"], log[0]["change"], log[-1]["id"], log[-1]["change"], log[-1]["how"]),
+                         (oldest, "opened", oldest, "closed", "message"))
+        self.assertEqual(log[-1]["summary"], log[0]["summary"])
 
 
 class NoticeRulesTests(AgentCase):
@@ -247,6 +259,8 @@ class NoticeRulesTests(AgentCase):
         task.mkdir(parents=True)
         (task / "meta.json").write_text(json.dumps({"id": name, "worker": "pi", "pane": "%9", "created": "2026-01-01T00:00:00Z"}))
         (task / "state.json").write_text(json.dumps({"state": "working", "harness": "pi"}))
+        (task / "request.md").write_text("Fix the thing.\n")
+        (task / "dispatch.json").write_text(json.dumps({"context": [], "notes": [], "tests": "affected"}))
         return task
 
     def row(self, task, status=None):
@@ -351,6 +365,139 @@ class NoticeRulesTests(AgentCase):
         self.assertTrue(any(" inspect " in c for c in commands))
         for command in sorted(commands):
             self.assertEqual(self.parses(command), command.split("tp-agent ")[1].split()[0], command)
+
+    def test_each_transition_is_delivered_once_from_the_log_past_the_startup_cursor(self):
+        # Round 3 rule 1: notices come from the transition log (request_log), with a cursor per task taken at startup.
+        sc, ids = {}, {}
+        # F2 (the review's probe): open at startup, resolved before the first poll. At cb5353a: no notice at all.
+        t = self.make_task("race")
+        ids["race"] = [self.ask(t, "browser")]
+        start = self.row(t)
+        self.answer(t, ids["race"][0])
+        sc["race"] = [{"start": [start], "rows": [self.row(t)]}, {"rows": [self.row(t)]}]
+        # Opened and resolved after the startup snapshot, before the first poll: both transitions, once.
+        t = self.make_task("between")
+        start = self.row(t)
+        ids["between"] = [self.ask(t, "browser")]
+        self.answer(t, ids["between"][0])
+        sc["between"] = [{"start": [start], "rows": [self.row(t)]}, {"rows": [self.row(t)]}]
+        # Closed before the snapshot: history, never replayed, even when it is the only thing on the task.
+        t = self.make_task("before")
+        ids["before"] = [self.ask(t, "browser")]
+        self.answer(t, ids["before"][0])
+        sc["before"] = [{"start": [self.row(t)], "rows": [self.row(t)]}]
+        # F3 (the review's probe): an old open request closes after 21 newer closed records. At cb5353a its closing is lost.
+        t = self.make_task("window")
+        ids["window"] = [self.ask(t, "browser")]
+        sc["window"] = [{"start": [self.row(t)], "rows": [self.row(t)]}]
+        for n in range(21):
+            req, _ = hub_records.open_request(t, "capability", "tool: t%d" % n, "t%d" % n, "worker", "file")
+            hub_records.resolve(t, req["id"], "main", "message", None, "main", "file")
+            ids["window"].append(req["id"])
+        self.answer(t, ids["window"][0])
+        sc["window"] += [{"rows": [self.row(t)]}, {"rows": [self.row(t)]}]
+        # The display window is not read: a row whose `requests` is emptied still delivers from its log, and a row whose
+        # `requests` lists an open request its log does not have announces nothing.
+        t = self.make_task("display")
+        ids["display"] = [self.ask(t, "browser")]
+        fake = dict(self.row(t), requests=[{"id": "req-01JABCDEFGHJKMNPQRSTVWXYZ0", "kind": "capability", "status": "open",
+                                            "summary": "fake", "opened": "2026-01-01T00:00:00Z"}])
+        sc["display"] = [{"start": [dict(self.row(t), request_log=[], requests=[])], "rows": [dict(fake, requests=[])]},
+                         {"rows": [fake]}]
+
+        got = self.notifier(sc)
+        said = {name: [s["submitted"] or "" for s in steps] for name, steps in got.items()}
+
+        (a,) = ids["race"]
+        self.assertEqual(said["race"][0].split("\n")[1:], [f"race: capability request {a} (tool: browser) was opened",
+                                                          f"race: capability request {a} (tool: browser) is closed (message)"])
+        self.assertEqual(got["race"][0]["toasts"][0], f"race has an open capability request {a} (tool: browser): answer with "
+                         f"tp-agent message race --resolves {a} --text \"...\", or tp-agent inspect race")
+        self.assertEqual(said["race"][1], "")  # delivered once
+        self.assertEqual({k.split("#")[1]: v for k, v in got["race"][1]["cursors"].items()}, {"race": 2})
+        (a,) = ids["between"]
+        self.assertEqual(said["between"][0].split("\n")[1:], [f"between: capability request {a} (tool: browser) was opened",
+                                                             f"between: capability request {a} (tool: browser) is closed (message)"])
+        self.assertEqual(said["between"][1], "")
+        self.assertEqual(said["before"], [""])
+        oldest, newer = ids["window"][0], ids["window"][1:]
+        self.assertIn(f"has an open capability request {oldest}", said["window"][0])
+        lines = said["window"][1].split("\n")[1:]
+        self.assertEqual(len(lines), 43)  # 21 openings, 21 closings, and the old request's closing: each once
+        self.assertEqual(lines[-1], f"window: capability request {oldest} (tool: browser) is closed (message)")
+        self.assertEqual([sum(req in line for line in lines) for req in newer], [2] * 21)
+        self.assertEqual(said["window"][2], "")
+        (a,) = ids["display"]
+        self.assertIn(f"has an open capability request {a}", said["display"][0])
+        self.assertNotIn("req-01JABCDEFGHJKMNPQRSTVWXYZ0", said["display"][0] + said["display"][1])
+        self.assertEqual(said["display"][1], "")
+
+    # The task states a request can be left open in, and the lifecycle each reads as. Each is made from a working task with
+    # one open capability request.
+    STATES = {
+        "waiting": ({"state.json": {"state": "waiting", "harness": "pi"}}, "message"),
+        "working": ({}, "message"),
+        "settled": ({"state.json": {"state": "waiting", "harness": "pi"}, "result.md": "Done.\nRESULT_STATUS: complete\n"}, "message"),
+        "collected": ({"state.json": {"state": "waiting", "harness": "pi"}, "result.md": "Done.\nRESULT_STATUS: complete\n",
+                       "collected.json": {}, "reaped.json": {}}, "retry"),
+        "reaped": ({"state.json": {"state": "waiting", "harness": "pi"}, "result.md": "Done.\nRESULT_STATUS: complete\n",
+                    "reaped.json": {}}, "retry"),
+        "reaped-working": ({"reaped.json": {}}, "none"),
+        "failed": ({"state.json": {"state": "error", "harness": "pi"}}, "retry"),
+        "stopped": ({"stopped.json": {}}, "retry"),
+        "nopane": ({"meta.json": {"id": "nopane", "worker": "pi", "created": "2026-01-01T00:00:00Z"}}, "none"),
+        "nopane-done": ({"meta.json": {"id": "nopane-done", "worker": "pi", "created": "2026-01-01T00:00:00Z"},
+                         "state.json": {"state": "waiting", "harness": "pi"}, "result.md": "Done.\nRESULT_STATUS: complete\n"},
+                        "retry"),
+    }
+
+    def test_a_notice_suggests_only_a_command_that_works_on_the_task_in_its_state(self):
+        # Round 3 rule 3 (F4): `tp-agent message --resolves` only while the worker can take a message (tp-agent's own check);
+        # a finished task's request is left open, with a command that works there (retry), or none. Each suggested command is
+        # then run against the task in that state. The review's probe is "collected": at cb5353a the notice suggested the
+        # message, which the command refused (reaped.json).
+        tasks, reqs = {}, {}
+        for name, (files, _) in self.STATES.items():
+            t = self.make_task(name)
+            reqs[name] = self.ask(t, "browser")
+            for file, body in files.items():
+                (t / file).write_text(body if isinstance(body, str) else json.dumps(body))
+            tasks[name] = t
+        got = self.notifier({name: [{"start": [self.row(t)], "rows": [self.row(t)]}] for name, t in tasks.items()})
+        for name, t in tasks.items():
+            route = self.STATES[name][1]
+            with self.subTest(state=name, life=self.tp.lifecycle(t)):
+                seen = (self.row(t).get("answer_route") or {}).get("by")
+                text = got[name][0]["submitted"]
+                self.assertIn(reqs[name], text)
+                commands = re.findall(r"tp-agent (?:message|retry|inspect) [A-Za-z0-9._-]+(?: --resolves \S+)?(?: --(?:text|reason) \"[^\"]*\")?", text)
+                # First: every command the notice suggests works on the task as it is (the review's probe, at cb5353a: the
+                # collected task was told `tp-agent message`, which refused).
+                for command in commands:
+                    self.assertIsNone(self.runs(t, command.replace('"..."', '"answer"')), command)
+                verbs = sorted({c.split()[1] for c in commands})
+                self.assertEqual(verbs, {"message": ["inspect", "message"], "retry": ["inspect", "retry"], "none": ["inspect"]}[route], text)
+                self.assertEqual(seen, route)
+                if route == "retry":
+                    self.assertIn("left open by a finished task", text)
+                if route == "none":
+                    self.assertIn("no command can answer it now", text)
+                if route == "message":
+                    self.assertEqual(hub_records.requests(t)[0]["status"], "resolved")  # the suggested message answered it
+
+    def runs(self, task, command):
+        """Runs a suggested command in-process against `task` (pane_send.send faked; retry's new attempt is not started:
+        dispatch is replaced by a recorder, and its live-process guard by one that finds none). None when tp-agent took it,
+        else its error."""
+        argv = shlex.split(command)[1:]
+        started = []
+        with mock.patch.object(self.tp, "dispatch", side_effect=lambda args, base: started.append(args) or {"id": "next"}), \
+                mock.patch.object(self.tp, "guard_retry", return_value=None), \
+                mock.patch.object(self.tp, "write_index", return_value=None):
+            value, _, error, err = self.run_agent(*argv)
+        if error is None and argv[0] == "retry" and not started:
+            return "retry did not start a new attempt: " + err
+        return error
 
     def parses(self, command):
         """The verb tp-agent's real parser makes of `command` (an env assignment in front is the shell's, not argv)."""

@@ -50,6 +50,7 @@ import pane_send  # noqa: E402
 import safe_write  # noqa: E402
 from contract import (DONE, RUNNING, ContractError, artifact_info, build, dynamic_terms, evaluate,  # noqa: E402
                       escalation_record, extension, is_local, ledger_row, load_research, message, note, pause_tries,
+                      reply_turn,
                       read_escalations, select_escalation, state_dir, summary_line, task_lifecycle, upsert, satisfies_dependency,
                       write_escalations)
 from result_status import RESULT_STATUS_RE  # noqa: E402
@@ -198,7 +199,7 @@ def cmd_status(args):
                 "stall": 10 ** 9, "grace": 1}
         art = artifact_info(contract["artifact"]) if contract else {"exists": False, "size": 0, "mtime": None,
                                                                      "status": None, "urls": 0}
-        r = evaluate(dict(meta, contract=contract or fake), state, art, now, alive, events)
+        r = evaluate(dict(meta, contract=contract or fake), state, art, now, alive, events, reply)
         parts = [clock(r["elapsed"])]
         fate = next((e for e in reversed(events) if e.get("action") in ("discard", "narrow", "escalate")), None)
         if fate:
@@ -319,16 +320,28 @@ def pause_worker(d, meta, events, reason, now):
     else "pause-unverified" (the dependency hold stays; the next tick may try again, lib/contract.py pause_may_try).
     A pause never overrides a finished turn: when the worker's reply shows a completed turn written after the pause began
     (finished_turn), "pause-unneeded" is recorded instead and the task's lifecycle stays what its result says.
-    Returns the outcome: skipped (the worker finished before the Escape), confirmed, unneeded or unverified."""
+    Returns the outcome: skipped (the worker finished before the Escape), confirmed, unneeded or unverified.
+
+    The checks here only save an Escape or say "unneeded"; they are not what keeps a finished turn from being paused
+    (HB4a round 4 invariant 1). Every attempt event names its turn ("turn": lib/contract.py reply_turn of the reply taken
+    with the baselines, before the working read), and every reader voids it once a statused reply of that turn or a later
+    one is on disk (pause_void), so a completion landing after the last check here, even after the pause is saved, is
+    never reported as a pause. A reply already there at the baseline is either an earlier turn's (older than the working
+    state it was read with: the pause stands) or this turn's (newer: finished_turn skips, nothing is written)."""
     # The baselines are taken BEFORE the working state is read (HB4a round 3 rule 2): a completion that lands between them and
     # the read is a change from them, so it can never be absorbed into the baseline and then paused over.
     mark = reply_mark(d)
+    try:  # read as task_lifecycle reads it (stripped; undecodable counts as none), so the readers hash the same text
+        turn = reply_turn((d / "result.md").read_text())
+    except (OSError, UnicodeDecodeError):
+        turn = None
     reported = state_mark(d)
     before = read(d / "state.json")
     if before.get("state") not in ("working", "tool") or finished_turn(d, mark, reported):
         return "skipped"  # finished already (its state, or a statused reply its state has not caught up with): no Escape
     tries = pause_tries(events) + 1
-    events.append({"action": "pause-requested", "reason": reason, "at": now, "tools": before.get("tools") or 0, "try": tries})
+    events.append({"action": "pause-requested", "reason": reason, "at": now, "tools": before.get("tools") or 0, "try": tries,
+                   "turn": turn})
     save_events(d, events)
     journal(d, "pause.requested", reason=reason, attempt=tries)
     confirmed, why = False, "Escape not sent"
@@ -358,15 +371,15 @@ def pause_worker(d, meta, events, reason, now):
     # Looked at after the attempt whatever came of it (sent or not, confirmed or not): a finished turn is never paused.
     if finished_turn(d, mark, reported):
         why = "the worker finished its turn: a reply with a RESULT_STATUS line was written after the pause began"
-        events.append({"action": "pause-unneeded", "reason": reason, "at": now, "why": why, "try": tries})
+        events.append({"action": "pause-unneeded", "reason": reason, "at": now, "why": why, "try": tries, "turn": turn})
         journal(d, "pause.unneeded", source="file", reason=reason, why=why, attempt=tries)
         save_events(d, events)
         return "unneeded"
     if confirmed:
-        events.append({"action": "pause", "reason": reason, "at": now, "tools": before.get("tools") or 0})
+        events.append({"action": "pause", "reason": reason, "at": now, "tools": before.get("tools") or 0, "turn": turn})
         journal(d, "pause.confirmed", source="pane" if meta.get("worker") != "pi" else "file", reason=reason, why=why)
     else:
-        events.append({"action": "pause-unverified", "reason": reason, "at": now, "why": why, "try": tries})
+        events.append({"action": "pause-unverified", "reason": reason, "at": now, "why": why, "try": tries, "turn": turn})
         journal(d, "pause.unverified", confidence="derived", reason=reason, why=why, attempt=tries)
         journal(d, "hold.kept", confidence="derived", reason="pause not confirmed")
     save_events(d, events)
@@ -379,7 +392,7 @@ def cmd_enforce(_args):
         contract = meta.get("contract")
         if not contract:
             continue
-        life, state, events, _reply = task_state(d, meta, pane_map)
+        life, state, events, reply = task_state(d, meta, pane_map)
         # Each settled contract task goes into the ledger once per settled state.
         mark = "{}@{}".format(life, state.get("updated"))
         if life in DONE + ("needs_input",) and text(d / "ledger") != mark:
@@ -387,7 +400,7 @@ def cmd_enforce(_args):
             safe_write.write_atomic(d / "ledger", mark + "\n", root=safe_write.task_root(d))
         if pane_map.get(meta.get("pane")) != "alive" or (d / "escalated").exists():
             continue
-        r = evaluate(meta, state, artifact_info(contract["artifact"]), now, True, events)
+        r = evaluate(meta, state, artifact_info(contract["artifact"]), now, True, events, reply)
         if not r["action"]:
             continue
         action, reason = r["action"]

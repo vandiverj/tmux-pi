@@ -254,10 +254,14 @@ class NoticeRulesTests(AgentCase):
         self.assertEqual(ran.returncode, 0, ran.stderr)
         return json.loads(ran.stdout)
 
-    def make_task(self, name):
+    def make_task(self, name, tree=None, pane="%9"):
+        """A working pi task with its own working tree (`tree` shares another task's), as tp-spawn records one."""
         task = self.state / "tasks" / name
         task.mkdir(parents=True)
-        (task / "meta.json").write_text(json.dumps({"id": name, "worker": "pi", "pane": "%9", "created": "2026-01-01T00:00:00Z"}))
+        workdir = self.state.parent / "trees" / (tree or name)
+        workdir.mkdir(parents=True, exist_ok=True)
+        (task / "meta.json").write_text(json.dumps({"id": name, "worker": "pi", "pane": pane, "workdir": str(workdir),
+                                                    "created": "2026-01-01T00:00:00Z"}))
         (task / "state.json").write_text(json.dumps({"state": "working", "harness": "pi"}))
         (task / "request.md").write_text("Fix the thing.\n")
         (task / "dispatch.json").write_text(json.dumps({"context": [], "notes": [], "tests": "affected"}))
@@ -294,12 +298,6 @@ class NoticeRulesTests(AgentCase):
         b, _ = hub_records.open_request(t, "permission", "allow Bash 2", "Bash 2", "hook", "hook", supersede=True)
         ids["sup"] = [a["id"], b["id"]]
         sc["sup"].append({"rows": [self.row(t, "needs_input")]})
-        # Opened and resolved between polls (F2): the resolution, with its id.
-        t = self.make_task("quick")
-        sc["quick"] = [{"rows": [self.row(t)]}]
-        ids["quick"] = [self.ask(t, "browser")]
-        self.answer(t, ids["quick"][0])
-        sc["quick"].append({"rows": [self.row(t)]})
         # Startup with N open, the index listing them (F3): each id rendered by the first poll.
         t = self.make_task("start")
         ids["start"] = [self.ask(t, w) for w in ("browser", "network", "gpu")]
@@ -317,11 +315,6 @@ class NoticeRulesTests(AgentCase):
         sc["lost"].append({"rows": [self.row(t)], "submit": False})
         self.answer(t, ids["lost"][0])
         sc["lost"].append({"rows": [self.row(t)]})
-        # History: resolved before the notifier started, never replayed.
-        t = self.make_task("old")
-        ids["old"] = [self.ask(t, "browser")]
-        self.answer(t, ids["old"][0])
-        sc["old"] = [{"rows": [self.row(t)]}]
         # More than 20 resolved and one open (F4): the open one is announced.
         t = self.make_task("many")
         ids["many"] = [self.ask(t, "browser")]
@@ -329,6 +322,8 @@ class NoticeRulesTests(AgentCase):
             req, _ = hub_records.open_request(t, "capability", "tool: t%d" % n, "t%d" % n, "worker", "file")
             hub_records.resolve(t, req["id"], "main", "message", None, "main", "file")
         sc["many"] = [{"rows": [self.row(t)]}]
+        for steps in sc.values():  # each session starts as session.start does: its startup list read is the first rows
+            steps[0].setdefault("start", steps[0]["rows"])
 
         got = self.notifier(sc)
         said = {name: [s["submitted"] or "" for s in steps] for name, steps in got.items()}
@@ -342,9 +337,6 @@ class NoticeRulesTests(AgentCase):
             f"sup: permission request {a} (Bash 1) was opened",
             f"sup has an open permission request {b} (Bash 2): answer it in its pane, or tp-agent inspect sup",
             f"sup: permission request {a} (Bash 1) is closed (superseded)"])
-        (a,) = ids["quick"]
-        self.assertIn(f"capability request {a} (tool: browser) was opened", said["quick"][1])
-        self.assertIn(f"capability request {a} (tool: browser) is closed (message)", said["quick"][1])
         for each in ids["start"]:
             self.assertIn(f"has an open capability request {each}", said["start"][0])
         self.assertIn(f"done1 has an open capability request {ids['done'][0]}", said["done"][1])
@@ -353,7 +345,6 @@ class NoticeRulesTests(AgentCase):
         self.assertIn(f"--resolves {a} --text", said["lost"][1])  # tried; the submit failed
         self.assertIn(f"{a} (tool: browser) was opened", said["lost"][2])
         self.assertIn(f"{a} (tool: browser) is closed (message)", said["lost"][2])
-        self.assertNotIn(ids["old"][0], said["old"][0])
         self.assertIn(f"has an open capability request {ids['many'][0]}", said["many"][0])
         self.assertEqual(said["many"][0].count("is closed"), 0)
 
@@ -367,8 +358,34 @@ class NoticeRulesTests(AgentCase):
             self.assertEqual(self.parses(command), command.split("tp-agent ")[1].split()[0], command)
 
     def test_each_transition_is_delivered_once_from_the_log_past_the_startup_cursor(self):
-        # Round 3 rule 1: notices come from the transition log (request_log), with a cursor per task taken at startup.
+        # Round 3 rule 1: notices come from the transition log (request_log), with a cursor per task taken at startup. Round 4
+        # invariant 2: the cutoff is the log position at the main's view on every start path (a successful startup read, a
+        # failed one, a reload of main's shipped value); with no read at that view every task starts at 0.
         sc, ids = {}, {}
+        # Opened and resolved between two polls (F2, folded in from the table above): both transitions, by id.
+        t = self.make_task("quick")
+        sc["quick"] = [{"start": [self.row(t)], "rows": [self.row(t)]}]
+        ids["quick"] = [self.ask(t, "browser")]
+        self.answer(t, ids["quick"][0])
+        sc["quick"].append({"rows": [self.row(t)]})
+        # Round 4: the startup list read failed, the index was injected with A open, A resolves before the first poll. At
+        # ec566e4 the first poll took the snapshot then, with A already closed: neither its opening nor its closing was told.
+        t = self.make_task("failstart")
+        ids["failstart"] = [self.ask(t, "browser")]
+        index = [{"id": "failstart", "status": "needs_input", "open_requests": ids["failstart"]}]
+        self.answer(t, ids["failstart"][0])
+        sc["failstart"] = [{"start": "failed", "index": index, "rows": [self.row(t)]}, {"rows": [self.row(t)]}]
+        # Round 4: a reload takes up main's shipped value (epoch, isIndexed, `delivered` of id:status keys, no cursors). A still
+        # open: its opening is told once (main's notifier never rendered a request id). A closed meanwhile: its closing is told.
+        shipped = {"epoch": 3, "isIndexed": True, "delivered": ["mainopen:needs_input", "mainclosed:needs_input"], "pending": []}
+        t = self.make_task("mainopen")
+        ids["mainopen"] = [self.ask(t, "browser")]
+        sc["mainopen"] = [{"stored": shipped, "start": [self.row(t)], "rows": [self.row(t, "needs_input")]},
+                          {"rows": [self.row(t, "needs_input")]}]
+        t = self.make_task("mainclosed")
+        ids["mainclosed"] = [self.ask(t, "browser")]
+        self.answer(t, ids["mainclosed"][0])
+        sc["mainclosed"] = [{"stored": dict(shipped), "start": [self.row(t)], "rows": [self.row(t)]}, {"rows": [self.row(t)]}]
         # F2 (the review's probe): open at startup, resolved before the first poll. At cb5353a: no notice at all.
         t = self.make_task("race")
         ids["race"] = [self.ask(t, "browser")]
@@ -407,6 +424,26 @@ class NoticeRulesTests(AgentCase):
 
         got = self.notifier(sc)
         said = {name: [s["submitted"] or "" for s in steps] for name, steps in got.items()}
+
+        def told(text):  # the request each line of a submitted text is about, in order
+            return [found[0] for found in (re.findall(r"req-[0-9A-Z]{26}", line) for line in text.split("\n")) if found]
+        (a,) = ids["quick"]
+        self.assertEqual(said["quick"][0], "")
+        self.assertEqual(said["quick"][1].split("\n")[1:], [f"quick: capability request {a} (tool: browser) was opened",
+                                                            f"quick: capability request {a} (tool: browser) is closed (message)"])
+        (a,) = ids["failstart"]
+        self.assertEqual(said["failstart"][0].split("\n")[1:], [
+            f"failstart: capability request {a} (tool: browser) was opened",
+            f"failstart: capability request {a} (tool: browser) is closed (message)"])
+        self.assertEqual(said["failstart"][1], "")
+        (a,) = ids["mainopen"]
+        self.assertEqual(told(said["mainopen"][0]), [a])
+        self.assertIn(f"mainopen has an open capability request {a}", said["mainopen"][0])
+        self.assertEqual(said["mainopen"][1], "")  # told once
+        (a,) = ids["mainclosed"]
+        self.assertEqual(told(said["mainclosed"][0]), [a, a])
+        self.assertIn(f"mainclosed: capability request {a} (tool: browser) is closed (message)", said["mainclosed"][0])
+        self.assertEqual(said["mainclosed"][1], "")
 
         (a,) = ids["race"]
         self.assertEqual(said["race"][0].split("\n")[1:], [f"race: capability request {a} (tool: browser) was opened",
@@ -449,18 +486,34 @@ class NoticeRulesTests(AgentCase):
         "nopane-done": ({"meta.json": {"id": "nopane-done", "worker": "pi", "created": "2026-01-01T00:00:00Z"},
                          "state.json": {"state": "waiting", "harness": "pi"}, "result.md": "Done.\nRESULT_STATUS: complete\n"},
                         "retry"),
+        # Round 4 invariant 3 (the review's probes): retry's own admission refuses, so the notice names what it needs first.
+        # A failed pi worker whose process is still alive in its pane (%41): guard_retry finds it on its own tree.
+        "failed-alive": ({"meta.json": {"id": "failed-alive", "worker": "pi", "pane": "%41", "created": "2026-01-01T00:00:00Z"},
+                          "state.json": {"state": "error", "harness": "pi"}}, "none"),
+        # A collected author with a live peer (task "peer", pane %42) on its working tree.
+        "collected-peer": ({"state.json": {"state": "waiting", "harness": "pi"}, "result.md": "Done.\nRESULT_STATUS: complete\n",
+                            "collected.json": {}, "reaped.json": {}}, "none"),
     }
+    # The pane table (tmux list-panes) as the guards read it: only the two live panes above. Everything else is real.
+    PANES = {"%41": (True, 4241), "%42": (True, 4242)}
 
     def test_a_notice_suggests_only_a_command_that_works_on_the_task_in_its_state(self):
         # Round 3 rule 3 (F4): `tp-agent message --resolves` only while the worker can take a message (tp-agent's own check);
         # a finished task's request is left open, with a command that works there (retry), or none. Each suggested command is
         # then run against the task in that state. The review's probe is "collected": at cb5353a the notice suggested the
         # message, which the command refused (reaped.json).
+        panes = mock.patch.object(sys.modules["worker_process"], "pane_table", return_value=dict(self.PANES))
+        panes.start()
+        self.addCleanup(panes.stop)
+        peer = self.make_task("peer", tree="collected-peer", pane="%42")  # a writer alive on collected-peer's tree
+        (peer / "meta.json").write_text(json.dumps(dict(json.loads((peer / "meta.json").read_text()), role="coder")))
         tasks, reqs = {}, {}
         for name, (files, _) in self.STATES.items():
             t = self.make_task(name)
             reqs[name] = self.ask(t, "browser")
             for file, body in files.items():
+                if file == "meta.json":  # a recorded working tree, as every spawned task has
+                    body = dict(body, workdir=json.loads((t / "meta.json").read_text())["workdir"])
                 (t / file).write_text(body if isinstance(body, str) else json.dumps(body))
             tasks[name] = t
         got = self.notifier({name: [{"start": [self.row(t)], "rows": [self.row(t)]}] for name, t in tasks.items()})
@@ -482,17 +535,25 @@ class NoticeRulesTests(AgentCase):
                     self.assertIn("left open by a finished task", text)
                 if route == "none":
                     self.assertIn("no command can answer it now", text)
+                    # The prerequisite the notice names is the retry command's own refusal, word for word (the real guard).
+                    needs = self.row(t)["answer_route"]["needs"]
+                    refused = self.runs(t, f'tp-agent retry {name} --reason "answer"')
+                    self.assertEqual(needs, refused)
+                    self.assertIn(f"First: {needs}", text)
+                if name == "failed-alive":
+                    self.assertIn("a process is alive on the same working tree: failed-alive", text)
+                if name == "collected-peer":
+                    self.assertIn("a process is alive on the same working tree: peer (writer", text)
                 if route == "message":
                     self.assertEqual(hub_records.requests(t)[0]["status"], "resolved")  # the suggested message answered it
 
     def runs(self, task, command):
         """Runs a suggested command in-process against `task` (pane_send.send faked; retry's new attempt is not started:
-        dispatch is replaced by a recorder, and its live-process guard by one that finds none). None when tp-agent took it,
-        else its error."""
+        dispatch is replaced by a recorder; its live-process guard is the real one, over the faked pane table). None when
+        tp-agent took it, else its error."""
         argv = shlex.split(command)[1:]
         started = []
         with mock.patch.object(self.tp, "dispatch", side_effect=lambda args, base: started.append(args) or {"id": "next"}), \
-                mock.patch.object(self.tp, "guard_retry", return_value=None), \
                 mock.patch.object(self.tp, "write_index", return_value=None):
             value, _, error, err = self.run_agent(*argv)
         if error is None and argv[0] == "retry" and not started:

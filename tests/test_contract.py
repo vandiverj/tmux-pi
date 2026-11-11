@@ -1,4 +1,6 @@
 import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
+import contextlib
+import io
 import json
 import os
 import subprocess
@@ -725,17 +727,37 @@ class EnforceKeepsTheRecordTests(unittest.TestCase):
         match = re.search(r"- \*\*Lifecycle State:\*\* `([^`]+)`", (self.task / "task.md").read_text())
         return match.group(1) if match else None
 
+    # Every point of pause_worker (and the cmd_enforce refresh after it) where a worker's write can land, in order: its two
+    # reads (result baseline, working state), the finished-turn check before the Escape, the "pause-requested" save and
+    # journal, the Escape, the confirmation read, the two finished-turn checks after it, the outcome's journal, the outcome's
+    # save (the commit), and the task.md refresh that follows.
+    POINTS = ("baseline", "read", "check", "requested", "journal-requested", "escape", "confirm", "finished",
+              "final-check", "journal-outcome", "commit", "record")
+
     def enforce(self, send_fails=False, pane="", after_escape=None, reply=None, writes=None):
         """Enforce a pause with a fake tmux: capture-pane shows `pane`, an Escape fails (send_fails) or runs after_escape
         (the worker's reaction: a new state.json) and writes `reply` as result.md (a turn that finished meanwhile).
-        writes: {"baseline"|"read"|"escape": [callable, ...]}, run just before pause_worker takes its result baseline
-        (reply_mark), just before it reads the working state (its first read of state.json), or at the Escape: a worker
+        writes: {point: [callable, ...]} for a point of POINTS, each run just before pause_worker does that step: a worker
         writing its files at that moment. Returns the tmux calls."""
         from unittest import mock
         self.tool.write_record(self.task, lifecycle_state="working", force=True)
         self.assertEqual(self.recorded_state(), "working")
         calls = []
         writes = {k: list(v) for k, v in (writes or {}).items()}
+        assert set(writes) <= set(self.POINTS), writes
+        counts = {}
+
+        def fire(point):
+            for write in writes.pop(point, []):
+                write()
+
+        def nth(name, points, real):
+            def wrapped(*args, **kwargs):
+                i = counts[name] = counts.get(name, -1) + 1
+                if i < len(points) and points[i]:
+                    fire(points[i])
+                return real(*args, **kwargs)
+            return wrapped
 
         def run(command, *args, **kwargs):
             calls.append(command[1:])
@@ -748,29 +770,36 @@ class EnforceKeepsTheRecordTests(unittest.TestCase):
                     (self.task / "state.json").write_text(json.dumps(after_escape))
                 if reply is not None:
                     (self.task / "result.md").write_text(reply)
-                for write in writes.pop("escape", []):
-                    write()
+                fire("escape")
             return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
-        real_mark, real_read = self.tool.reply_mark, self.tool.read
-
-        def mark(d):
-            for write in writes.pop("baseline", []):
-                write()
-            return real_mark(d)
+        real_read, real_journal = self.tool.read, self.tool.journal
 
         def read(path):
-            if Path(path).name == "state.json":
-                for write in writes.pop("read", []):
-                    write()
+            if Path(path).name == "state.json" and not counts.get("read"):
+                counts["read"] = 1
+                fire("read")
             return real_read(path)
+
+        def journal(d, kind, *args, **kwargs):
+            if kind == "pause.requested":
+                fire("journal-requested")
+            elif kind != "hold.kept":
+                fire("journal-outcome")
+            return real_journal(d, kind, *args, **kwargs)
         decision = {"action": ("pause", "stalled"), "status": None, "elapsed": 60, "turns": 3}
         with mock.patch.dict(os.environ, {"TP_STATE_DIR": str(self.state), "TP_PAUSE_CONFIRM_SECONDS": "1"}), \
                 mock.patch.object(self.tool, "panes", return_value={"%1": "alive"}), \
                 mock.patch.object(self.tool, "evaluate", return_value=decision), \
                 mock.patch.object(self.tool.subprocess, "run", side_effect=run), \
-                mock.patch.object(self.tool, "reply_mark", side_effect=mark), \
+                mock.patch.object(self.tool, "reply_mark", side_effect=nth("mark", ["baseline"], self.tool.reply_mark)), \
+                mock.patch.object(self.tool, "finished_turn",
+                                  side_effect=nth("finished", ["check", "finished", "final-check"], self.tool.finished_turn)), \
+                mock.patch.object(self.tool, "save_events", side_effect=nth("save", ["requested", "commit"], self.tool.save_events)), \
+                mock.patch.object(self.tool, "worker_stopped", side_effect=nth("stopped", ["confirm"], self.tool.worker_stopped)), \
+                mock.patch.object(self.tool, "task_state", side_effect=nth("state", [None, "record"], self.tool.task_state)), \
+                mock.patch.object(self.tool, "journal", side_effect=journal), \
                 mock.patch.object(self.tool, "read", side_effect=read), \
-                mock.patch.object(self.tool.time, "sleep"):
+                mock.patch.object(self.tool.time, "sleep"), contextlib.redirect_stdout(io.StringIO()):
             self.tool.cmd_enforce(None)
         return calls
 
@@ -783,9 +812,9 @@ class EnforceKeepsTheRecordTests(unittest.TestCase):
 
     def held(self):
         from contract import satisfies_dependency
-        _life, state, events, _reply = self.tool.task_lifecycle(self.task, "alive")
-        # Asked as if the task had ended with a good reply: only the pause record can hold it.
-        return not satisfies_dependency("settled", state, events, "RESULT_STATUS: complete")
+        _life, state, events, reply = self.tool.task_lifecycle(self.task, "alive")
+        # Asked as if the task had ended (settled) with the reply it has: only a pause record (or that reply) can hold it.
+        return not satisfies_dependency("settled", state, events, reply)
 
     def test_a_pause_is_recorded_when_the_escape_is_confirmed(self):
         calls = self.enforce(pane="some output\n\u276f \n  ? for shortcuts\n")  # Claude's prompt, nothing at work
@@ -836,22 +865,26 @@ class EnforceKeepsTheRecordTests(unittest.TestCase):
         self.assertEqual([c[-1] for c in calls if c[0] == "send-keys"], ["Escape"])  # its reply box is not cleared
         self.assertFalse(self.held())
 
-        # Round 3 rule 2 (review F1): the completion lands at any point around the two reads. A finished turn is two writes,
-        # result.md (R) and state.json waiting (S): Claude's report.sh writes R then S, pi's reporter S then R. Each lands just
-        # before the result baseline, just before the working-state read, or at the Escape: every order of the two over those
-        # three points (12 rows). None is ever paused: a completion seen before the Escape is skipped (nothing typed), one
-        # after it is "pause-unneeded". (baseline, baseline) is the review's probe: at cb5353a the baseline came after the
-        # state read, so R and S landed between the two and the pause was installed.
+        # HB4a round 4 invariant 1 (review F1 of rounds 1-3): a finished turn is never reported as paused, wherever the
+        # completion lands. A finished turn is two writes, result.md (R) and state.json waiting (S): Claude's report.sh writes
+        # R then S, pi's reporter S then R. Each lands just before any point of POINTS (every observation AND persistence
+        # step of pause_worker, then the task.md refresh), in every order of the two its harness writes them in: 78 rows a
+        # harness. Whatever pause_worker recorded, the lifecycle read afterwards is not paused and the dependency is not
+        # held: the pause names its turn and the readers void it (lib/contract.py pause_void). The rows that land R at
+        # "journal-outcome" or "commit" (after the last check, before the pause is saved) are the round-3 review's probe:
+        # at ec566e4 they read "paused" and held the dependent.
         def put_result():
             (self.task / "result.md").write_text("Done.\nRESULT_STATUS: complete\n")
 
         def put_waiting():
             (self.task / "state.json").write_text(json.dumps({"state": "waiting", "turns": 4, "tools": 4}))
-        points = ("baseline", "read", "escape")
+        points = self.POINTS
         rows = [("claude", r, s) for r in points for s in points if points.index(r) <= points.index(s)] + \
                [("pi", r, s) for r in points for s in points if points.index(s) <= points.index(r)]
-        self.assertEqual(len(rows), 12)
+        self.assertEqual(len(rows), 156)
         meta = json.loads((self.task / "meta.json").read_text())
+        recorded = {}
+        self.void_cases = []  # (event, reply, python's pause_void) for the dispatcher's copy, below
         for harness, r, s in rows:
             with self.subTest(harness=harness, result_at=r, state_at=s):
                 for name in ("checkpoints.json", "events.jsonl", "result.md"):
@@ -863,15 +896,59 @@ class EnforceKeepsTheRecordTests(unittest.TestCase):
                 for point, write in order:
                     writes.setdefault(point, []).append(write)
                 calls = self.enforce(pane="\u276f \n", writes=writes)
-                escaped = [c[-1] for c in calls if c[0] == "send-keys"]
-                if r == s == "escape":
-                    self.assertEqual((self.actions(), escaped), (["pause-requested", "pause-unneeded"], ["Escape"]))
-                else:  # finished before the Escape: by its state, or by a statused reply its state had not caught up with
-                    self.assertEqual(((self.task / "checkpoints.json").exists(), escaped), (False, []))
+                escaped = [c[-1] for c in calls if c[0] == "send-keys"][:1]
+                actions = self.actions() if (self.task / "checkpoints.json").exists() else []
+                recorded[tuple(actions)] = recorded.get(tuple(actions), 0) + 1
+                self.assertEqual(escaped, ["Escape"] if actions else [])
                 for _point, write in order:  # the worker's turn ends whatever was typed: both files land (again)
                     write()
                 self.assertNotEqual(self.tool.task_lifecycle(self.task, "alive")[0], "paused")
                 self.assertFalse(self.held())
+                reply = (self.task / "result.md").read_text()
+                self.void_cases += [(e, reply) for e in json.loads((self.task / "checkpoints.json").read_text())["events"]] \
+                    if actions else []
+        # The table reaches every outcome pause_worker records, a confirmed "pause" among them (the commit-boundary rows).
+        self.assertEqual(set(recorded), {(), ("pause-requested", "pause-unneeded"), ("pause-requested", "pause"),
+                                         ("pause-requested", "pause-unverified")}, recorded)
+
+        # A pause after an earlier completed turn stays a pause: the earlier turn's statused reply is on disk (older than the
+        # working state it was read with), the Escape is confirmed, nothing new is written. Both harnesses.
+        for harness in ("claude", "pi"):
+            with self.subTest(earlier_turn=harness):
+                for name in ("checkpoints.json", "events.jsonl"):
+                    (self.task / name).unlink(missing_ok=True)
+                (self.task / "meta.json").write_text(json.dumps(dict(meta, worker=harness)))
+                (self.task / "result.md").write_text("Earlier turn.\nRESULT_STATUS: complete\n")
+                (self.task / "state.json").write_text(json.dumps({"state": "working", "turns": 5, "tools": 4}))
+                self.enforce(pane="\u276f \n", after_escape={"state": "waiting", "turns": 5, "tools": 4,
+                                                             "updated": "2026-01-01T00:00:00Z"} if harness == "pi" else None)
+                self.assertEqual(self.actions(), ["pause-requested", "pause"])
+                self.assertEqual(self.tool.task_lifecycle(self.task, "alive")[0], "paused")
+                self.assertTrue(self.held())
+                reply = (self.task / "result.md").read_text()
+                self.void_cases += [(e, reply) for e in json.loads((self.task / "checkpoints.json").read_text())["events"]]
+
+        # agent/extensions/dispatcher.ts keeps its own copy of the rule (contractHalted): it answers as pause_void does on
+        # every event and reply above, plus replies Python and JavaScript strip differently.
+        import re
+        from contract import pause_void, reply_turn
+        source = (ROOT / "agent/extensions/dispatcher.ts").read_text()
+        lead = re.search(r"^const RESULT_STATUS_LEAD = (\".*\");$", source, re.M).group(1)
+        block = source[source.index("// pause-void: begin"):source.index("// pause-void: end")]
+        cases = self.void_cases + [({"action": "pause", "turn": reply_turn(text)}, other) for text, other in (
+            ("\ufeffDone.\nRESULT_STATUS: complete", "\ufeffDone.\nRESULT_STATUS: complete\n"),
+            ("Done.\nRESULT_STATUS: complete", "Done.\nRESULT_STATUS: complete\u00a0\n"),
+            ("Done.\nRESULT_STATUS: complete", "Done.\nRESULT_STATUS: complete\x1c"),
+            (None, "Done.\n**RESULT_STATUS**: complete__"), (None, "Done.\nRESULT_STATUS: completed"),
+            (None, "Done.\n    RESULT_STATUS: complete"), (None, ""))] + [({"action": "pause"}, "RESULT_STATUS: complete")]
+        script = ("const { createHash } = require('node:crypto');\nconst RESULT_STATUS_LEAD = " + lead + ";\n"
+                  "const sha256 = (text) => createHash('sha256').update(text, 'utf8').digest('hex');\n" +
+                  re.sub(r": (string \| null|boolean|string|any)\b", "", block) +
+                  "\nconst cases = JSON.parse(process.argv[1]);\n"
+                  "console.log(JSON.stringify(cases.map(([e, r]) => pauseVoid(e, r))));")
+        run = subprocess.run(["node", "-e", script, json.dumps(cases)], text=True, capture_output=True, timeout=60)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(json.loads(run.stdout), [pause_void(e, r) for e, r in cases])
 
     def test_a_pi_pause_is_confirmed_by_its_reporter_not_by_the_pane(self):
         meta = json.loads((self.task / "meta.json").read_text())

@@ -2,9 +2,11 @@
 // "notice rules: begin" and "notice rules: end", with the file's top-level constants) under node, with no port: the
 // TypeScript is stripped of its types (node:module stripTypeScriptTypes) and evaluated as is.
 // stdin: {"source": <path of register.tsx>, "scenarios": {name: [step, ...]}}. A step is {"rows": [...], "submit": bool,
-// "index"?: [...], "start"?: [...]}: `rows` are tp-agent list rows (their `request_log` and `answer_route` go through the
-// plugin's own requestFields, as readTasks does), "start" the rows the startup snapshot read (session.start, before the
-// index), "index" the rows of an injected index (baseline), and "submit" whether this poll's wake succeeds.
+// "index"?: [...], "start"?: [...] | "failed", "stored"?: {...} | "unreadable"}: `rows` are tp-agent list rows (their
+// `request_log` and `answer_route` go through the plugin's own requestFields, as readTasks does), "start" the rows the startup
+// list read gave the start cutoff (session.start, before the index; "failed" when that read failed: startCut), "stored" the
+// notifier value a new module takes up first (restore: storedCursors, `delivered`, `pending`), "index" the rows of an injected
+// index (baseline), and "submit" whether this poll's wake succeeds.
 // stdout: {name: [{"toasts": [...], "submitted": text | null, "cursors": {...}}, ...]}: per step, the hints toasted (the
 // snapshot's first), the text submitted and the cursors after it.
 import { readFileSync } from 'node:fs'
@@ -29,11 +31,16 @@ const parse = rows => rows.map(row => {
   const { request_log, answer_route, requests, ...rest } = row
   return { ...rest, ...requestFields(row) }
 })
-globalThis.step = (rows, submit, index, start) => {
+globalThis.step = (rows, submit, index, start, stored) => {
   const toasts = []
+  if (stored !== undefined) {
+    cursors = storedCursors(stored === 'unreadable' ? undefined : stored)
+    delivered = new Set(stored === 'unreadable' ? [] : stored.delivered)
+    held = stored === 'unreadable' ? [] : stored.pending
+  }
   if (start !== undefined) {
     const waiting = new Set([...held, ...inFlight].map(noticeKey))
-    const first = snapshot(parse(start)).filter(row => !waiting.has(noticeKey(row)))
+    const first = startCut(start === 'failed' ? undefined : parse(start)).filter(row => !waiting.has(noticeKey(row)))
     held = [...held, ...first]
     toasts.push(...first.map(hint))
   }
@@ -51,6 +58,6 @@ globalThis.step = (rows, submit, index, start) => {
   }
   return { toasts, submitted, cursors: cursors === undefined ? null : Object.fromEntries(cursors) }
 }`, context)
-  out[name] = steps.map(s => context.step(s.rows, s.submit !== false, s.index, s.start))
+  out[name] = steps.map(s => context.step(s.rows, s.submit !== false, s.index, s.start, s.stored))
 }
 process.stdout.write(JSON.stringify(out))

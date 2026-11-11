@@ -44,9 +44,11 @@ let isActive = false
 // goes quiet without overwriting its successor. An unresolved submit of the old module
 // may still land, so each reload can repeat at most the wake that was in flight then.
 // - `cursors`: per task (`<state_dir>#<id>`), the count of its request transitions (request_log seq, a count of request events,
-//   not a byte offset) already queued as notices. Taken by the startup snapshot, just before the startup index is read, so a
-//   transition after it is delivered once and none before it is replayed; undefined until then (the first good poll takes it if
-//   the startup read failed). A request notice queued past the cursor stays in `held` until a submit that rendered it succeeded:
+//   not a byte offset) already queued as notices. The start cutoff is the log position at the main's view, never a later read
+//   (HB4a round 4 invariant 2): taken by the startup snapshot, just before the startup index is read, so a transition after it
+//   is delivered once and none before it is replayed. When there is no such read (the startup list read failed, a stored value
+//   from a module without cursors, or one that cannot be read), every task starts at 0 (startCut, storedCursors): a closing
+//   already behind the main's view may be told again, none is lost. A request notice queued past the cursor stays in `held` until a submit that rendered it succeeded:
 //   it is never dropped because its row changed. Request keys (`req:<id>:open`, `req:<id>:resolved`) are never in `delivered`.
 let delivered = new Set<string>()
 let held: TaskRow[] = []
@@ -185,11 +187,13 @@ function requestFields(row: unknown): { requestLog?: RequestEvent[]; answerRoute
       ...(typeof how === 'string' && how !== '' ? { how } : {}),
     })
   }
-  const { by, why } = (typeof route === 'object' && route !== null ? route : {}) as Record<string, unknown>
+  const { by, why, needs } = (typeof route === 'object' && route !== null ? route : {}) as Record<string, unknown>
   const isRoute = by === 'message' || by === 'retry' || by === 'none'
+  const text = (value: unknown) => (typeof value === 'string' && value.trim() !== '' ? value.replace(/\s+/g, ' ').trim() : undefined)
+  const [said, first] = [text(why), text(needs)]
   return {
     ...(events.length === 0 ? {} : { requestLog: events }),
-    ...(isRoute ? { answerRoute: { by, ...(typeof why === 'string' && why !== '' ? { why } : {}) } } : {}),
+    ...(isRoute ? { answerRoute: { by, ...(said === undefined ? {} : { why: said }), ...(first === undefined ? {} : { needs: first }) } } : {}),
   }
 }
 
@@ -254,14 +258,19 @@ function hint(row: TaskRow): string {
     if (notice.state === 'resolved') return `${row.id}: ${about} is closed${notice.how === undefined ? '' : ` (${notice.how})`}`
     // An opening told after its request already closed (both happened between two polls): said, with nothing to answer.
     if (notice.isClosed === true) return `${row.id}: ${about} was opened`
-    // The answer route is tp-agent's own check (bin/tp-agent answer_route, the one `tp-agent message` makes): a message is
-    // suggested only while the worker can take one. A finished task's request is said to be left open, with the command that
-    // works on that task (retry), or none.
+    // The answer route is tp-agent's own check (bin/tp-agent answer_route: the one `tp-agent message` makes, and the retry
+    // command's own admission, retry_admission): a message is suggested only while the worker can take one, and a retry only
+    // while the command would start it. A finished task's request is said to be left open, with the command that works on that
+    // task (retry), or, when retry would refuse too, what its refusal says must happen first (`needs`) and inspect.
     const why = row.answerRoute?.why === undefined ? '' : ` (${row.answerRoute.why})`
     if (row.answerRoute?.by === 'retry') {
       return `${row.id}: ${about} is left open by a finished task${why}: ${agent(row, 'retry')} --reason "..." starts a new attempt, or ${agent(row, 'inspect')}`
     }
-    if (row.answerRoute?.by === 'none') return `${row.id}: ${about} is open, but no command can answer it now${why}: ${agent(row, 'inspect')}`
+    if (row.answerRoute?.by === 'none') {
+      const needs = row.answerRoute.needs
+      if (needs === undefined) return `${row.id}: ${about} is open, but no command can answer it now${why}: ${agent(row, 'inspect')}`
+      return `${row.id}: ${about} is open, but no command can answer it now${why}. First: ${needs}${/[.!?]$/.test(needs) ? '' : '.'} Then retry it, or ${agent(row, 'inspect')}`
+    }
     // tp-agent message takes its text only as --text (bin/tp-agent, the `message` parser).
     const answer = notice.kind === 'permission' ? 'answer it in its pane' : `answer with ${agent(row, 'message')} --resolves ${notice.id} --text "..."`
     return `${row.id} has an open ${about}: ${answer}, or ${agent(row, 'inspect')}`
@@ -345,7 +354,8 @@ function requestNotice(row: TaskRow, event: RequestEvent): TaskRow {
 }
 
 // The startup snapshot: each task's cursor is its last transition now, and every request still open is queued once (the index
-// does not render request ids). Closed history is not replayed. Taken just before the startup index is read.
+// does not render request ids). Closed history is not replayed. Taken just before the startup index is read, and only there
+// (startCut): no later read stands in for it.
 function snapshot(rows: readonly TaskRow[]): TaskRow[] {
   cursors = new Map()
   const out: TaskRow[] = []
@@ -358,11 +368,40 @@ function snapshot(rows: readonly TaskRow[]): TaskRow[] {
   return out
 }
 
+// The start cutoff, once per module (session.start, just before the startup index is read): `rows` from the startup list read
+// (the snapshot), or undefined when that read failed. With no read made at the main's view, every task starts at 0: the
+// requests already closed are told as transitions (a closing may be told again; none is lost). Cursors already taken up from a
+// stored value stand. Returns the openings the snapshot queued.
+function startCut(rows: readonly TaskRow[] | undefined): TaskRow[] {
+  if (cursors !== undefined) return []
+  if (rows === undefined) {
+    cursors = new Map()
+    return []
+  }
+  return snapshot(rows)
+}
+
+// The cursors a new module takes up from the stored notifier value (`undefined`: it could not be read). Saved cursors stand.
+// A value with none that a module wrote (epoch above 0: main's shipped notifier, keyed `id:status`, which had no cursors) or one
+// that cannot be read: that module may have shown the main its view at a log position nobody recorded, so every task starts at
+// 0 (a still-open request's opening may be told again, once; no closing is lost). Only the never-written default (epoch 0)
+// leaves them undefined, for the startup snapshot.
+function storedCursors(stored: { epoch?: unknown; cursors?: unknown } | undefined): Map<string, number> | undefined {
+  if (stored === undefined) return new Map()
+  const kept = stored.cursors
+  if (typeof kept === 'object' && kept !== null) {
+    return new Map(Object.entries(kept).filter((entry): entry is [string, number] => Number.isInteger(entry[1]) && (entry[1] as number) >= 0))
+  }
+  return typeof stored.epoch === 'number' && stored.epoch > 0 ? new Map() : undefined
+}
+
 // The request transitions past each task's cursor, in the order the log has them, and the cursor moved to the last. A task
-// not seen before starts at 0. A log that shrank sets the cursor to its last transition and replays nothing; a log that reads
-// empty leaves the cursor alone (a failed read of events.jsonl must not replay the task's whole history next poll).
+// not seen before starts at 0, and so does every task when no start cutoff was taken (never a snapshot here: that would count
+// a transition after the main's view as history). A log that shrank sets the cursor to its last transition and replays
+// nothing; a log that reads empty leaves the cursor alone (a failed read of events.jsonl must not replay the task's whole
+// history next poll).
 function logged(rows: readonly TaskRow[]): TaskRow[] {
-  if (cursors === undefined) return snapshot(rows)
+  if (cursors === undefined) cursors = new Map()
   const out: TaskRow[] = []
   for (const row of rows) {
     const key = taskKey(row)
@@ -493,9 +532,8 @@ async function restore($: EngineInterface) {
     // Rows its submit had not acknowledged; poll drops those whose task has left that status.
     held = stored.pending
     // The cursors are saved in the same write as `pending`, so a reload neither repeats a queued transition nor loses one. A
-    // value with none (a module before the startup snapshot, or one from before cursors) snapshots again at this start.
-    const kept = typeof stored.cursors === 'object' && stored.cursors !== null ? Object.entries(stored.cursors) : undefined
-    cursors = kept === undefined ? undefined : new Map(kept.filter(([, seq]) => typeof seq === 'number' && Number.isInteger(seq) && seq >= 0))
+    // value a module wrote without them (main's shipped notifier) starts every task at 0; never a snapshot (storedCursors).
+    cursors = storedCursors(stored)
   } catch {
     // The saved value could not be read, so its epoch is unknown. Claim far above any counter
     // a readable store holds, plus the time, so this module is never taken for a replaced one
@@ -505,20 +543,19 @@ async function restore($: EngineInterface) {
     isIndexed = false
     delivered = new Set()
     held = []
-    cursors = undefined
+    cursors = storedCursors(undefined)
   }
   inFlight = []
   await persist($)
 }
 
 // Takes the startup snapshot from one read of `tp-agent list`: the cursors, and the requests still open queued (and toasted)
-// as the first poll would. A failed read leaves `cursors` undefined, and the first good poll takes the snapshot instead (a
-// transition between this start and that poll is then counted as before the snapshot: the known limit).
+// as the first poll would. A failed read starts every task at 0 (startCut): no later read is taken as the cutoff.
 async function startSnapshot($: EngineInterface) {
   const read = await readTasks($)
-  if ('failure' in read || !isActive || isSuperseded || cursors !== undefined) return
+  if (!isActive || isSuperseded || cursors !== undefined) return
   const waiting = new Set([...held, ...inFlight].map(noticeKey))
-  const fresh = snapshot(read.rows).filter(row => !waiting.has(noticeKey(row)))
+  const fresh = startCut('failure' in read ? undefined : read.rows).filter(row => !waiting.has(noticeKey(row)))
   held = [...held, ...fresh]
   for (const row of fresh) $.ui.toast(hint(row))
   await persist($)
@@ -949,7 +986,8 @@ export const register: Register = on => {
       await restore($)
       isLoaded = true
     }
-    // The startup snapshot, just before the startup index: a request transition after it is delivered once, by the first poll.
+    // The start cutoff, just before the startup index: a request transition after it is delivered once, by the first poll; a
+    // failed read starts every task at 0 (startCut).
     if (cursors === undefined) await startSnapshot($)
     if (!isIndexed) {
       const index = await readIndex($)

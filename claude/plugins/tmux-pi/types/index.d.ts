@@ -23,7 +23,8 @@ export type TaskRow = {
 export type RequestEvent = { seq: number; id: string; change: 'opened' | 'closed'; kind: string; summary: string; how?: string }
 
 // message: `tp-agent message` reaches the worker; retry: it cannot and `tp-agent retry` takes the task; none: neither does.
-export type AnswerRoute = { by: 'message' | 'retry' | 'none'; why?: string }
+// needs: with by none, the retry command's own refusal text (bin/tp-agent retry_admission): what must happen first.
+export type AnswerRoute = { by: 'message' | 'retry' | 'none'; why?: string; needs?: string }
 
 // isClosed: an opening announced after its request had already closed (both between two polls), so there is nothing to answer.
 export type RequestNotice = { id: string; kind: string; state: 'open' | 'resolved'; summary: string; how?: string; isClosed?: boolean }
@@ -49,7 +50,7 @@ export type NotifierState = {
   delivered: string[]
   pending: TaskRow[]
   // Per task (`<state_dir>#<id>`), how many of its request transitions (request_log seq) have been queued as notices. Absent
-  // until the startup snapshot (and in older values, which carried `history` instead: a new module snapshots again).
+  // until the start cutoff, and in main's shipped value (no cursors): a module that takes that up starts every task at 0.
   cursors?: Record<string, number>
 }
 

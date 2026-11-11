@@ -1551,27 +1551,13 @@ def _main(argv):
         previous = task_dir(base, args.id)
         meta = read_json(previous / "meta.json")
         prior = record(previous)
-        if prior["status"] in RETRY_REFUSED:
-            wait = "Wait for it to settle, or end it" if finishes_alone(prior["status"]) else "It will not settle by itself: end it"
-            raise ValueError(f"{args.id} is still {state_words(prior['status'])}, so it cannot be retried yet. "
-                             f"{wait} with {' or '.join(clear_commands(prior['status'], args.id))}, then retry")
-        try:
-            repeated = repeated_family(base, args.id)
-        except review_rounds.Refused as error:  # the same walk the next review makes will refuse too; a retry is not blocked by it
-            repeated = None
-            print(f"tp-agent: the repeated-family gate was not checked: {error}", file=sys.stderr)
+        refused, repeated = retry_admission(base, previous, prior["status"], args.route, args.force_alive,
+                                            warn=lambda text: print(f"tp-agent: {text}", file=sys.stderr))
+        if refused:
+            raise ValueError(refused)
         if repeated and args.route == "park":  # starts nothing, so a process alive on the tree does not stop it
             print(json.dumps(park_retry(base, previous, args.id, *repeated), indent=2))
             return
-        if not args.force_alive:
-            guard_retry(previous)
-        if repeated and not args.route:
-            raise ValueError(f"{family_words(*repeated)}: another retry would "
-                             f"fix one more site of it. Retry again with --route rule-first (the brief changes the rule that lets it recur), "
-                             f"--route design (the brief changes the design), or --route park (no retry; parked.md records it and the owner decides)")
-        if args.route and not repeated:
-            raise ValueError(f"--route {args.route}: the latest review of {args.id} repeats no family an earlier review named and is not the second REQUEST_CHANGES in a row, "
-                             "so there is nothing to route; retry without --route")
         original = (previous / "request.md").read_text().strip()
         # Replay only admitted context and notes; spawn re-applies the sensitive-read omission. Skip
         # prior retry notes (rebuilt below) and dependencies (stale; the prior packet records them).
@@ -1799,15 +1785,57 @@ def message_refusal(path, life):
     return "worker's process was ended (task collected or reviewed); retry it instead of messaging"
 
 
+def retry_admission(base, path, life, route=None, force_alive=False, warn=None):
+    """Whether `tp-agent retry` takes task `path` (lifecycle `life`) now: (refusal, repeated). `refusal` is the retry command's
+    own error text, or None when it would start an attempt (or park one, for --route park); `repeated` is repeated_family's
+    finding. The one admission, in the command's order: the state (RETRY_REFUSED), the repeated-family gate (a walk that cannot
+    be made does not block: `warn` is told), the live-process guard on the working tree (guard_retry, unless --force-alive;
+    not for --route park, which starts nothing), then the route the gate asks for. The retry command and answer_route both call
+    it (HB4a round 4 invariant 3), so a notice never suggests a retry the command refuses."""
+    ident = path.name
+    if life in RETRY_REFUSED:
+        wait = "Wait for it to settle, or end it" if finishes_alone(life) else "It will not settle by itself: end it"
+        return (f"{ident} is still {state_words(life)}, so it cannot be retried yet. "
+                f"{wait} with {' or '.join(clear_commands(life, ident))}, then retry"), None
+    try:
+        repeated = repeated_family(base, ident)
+    except review_rounds.Refused as error:  # the same walk the next review makes will refuse too; a retry is not blocked by it
+        repeated = None
+        if warn:
+            warn(f"the repeated-family gate was not checked: {error}")
+    if repeated and route == "park":
+        return None, repeated
+    if not force_alive:
+        try:
+            guard_retry(path)
+        except ValueError as error:
+            return str(error), repeated
+    if repeated and not route:
+        return (f"{family_words(*repeated)}: another retry would "
+                f"fix one more site of it. Retry again with --route rule-first (the brief changes the rule that lets it recur), "
+                f"--route design (the brief changes the design), or --route park (no retry; parked.md records it and the owner decides)"), repeated
+    if route and not repeated:
+        return (f"--route {route}: the latest review of {ident} repeats no family an earlier review named and is not the second REQUEST_CHANGES in a row, "
+                "so there is nothing to route; retry without --route"), repeated
+    return None, repeated
+
+
 def answer_route(path, life):
     """How main can answer an open request on this task now (HB4a round 3 rule 3), from the same checks the commands make:
-    {"by": "message"} while `tp-agent message` can reach the worker; {"by": "retry", "why"} when it cannot and `tp-agent
-    retry` takes the task's state (RETRY_REFUSED); {"by": "none", "why"} when neither does (a reaped task still counted as
-    asking). `why` is a short phrase (message_blocked), never a command."""
+    {"by": "message"} while `tp-agent message` can reach the worker (message_blocked); {"by": "retry", "why"} when it cannot
+    and `tp-agent retry <id> --reason ...` would start an attempt now (retry_admission, the command's own admission); {"by":
+    "none", "why", "needs"} when neither would: `needs` is the retry command's refusal text, which names what must happen first
+    (end a live process, choose a route, wait for the task to settle). `why` is a short phrase (message_blocked), never a command."""
     blocked = message_blocked(path, life)
     if blocked is None:
         return {"by": "message"}
-    return {"by": "none" if life in RETRY_REFUSED else "retry", "why": blocked}
+    try:
+        refused, _ = retry_admission(path.parent.parent, path, life)
+    except Exception as error:  # an unreadable record: the command would refuse too; inspect says what is wrong
+        refused = f"retry cannot be checked: {error}"
+    if refused is None:
+        return {"by": "retry", "why": blocked}
+    return {"by": "none", "why": blocked, "needs": refused}
 
 
 def mirror_capability(base, path, request):

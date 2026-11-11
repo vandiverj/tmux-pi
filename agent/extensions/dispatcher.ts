@@ -248,6 +248,19 @@ function readText(file: string): string {
 }
 
 const sha256 = (text: string) => createHash("sha256").update(text, "utf8").digest("hex");
+// pause-void: begin (tests/test_contract.py runs this block against lib/contract.py pause_void)
+// HB4a round 4 invariant 1, as lib/contract.py pause_void decides it: a pause attempt that names its turn (reply_turn: sha256,
+// 16 hex, of result.md stripped as Python's str.strip strips) is void once a statused reply of another, later turn is on disk.
+const PY_SPACE = "[\\t\\n\\v\\f\\r\\x1c-\\x1f \\x85\\xa0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000]";
+const PY_STRIP = new RegExp(`^${PY_SPACE}+|${PY_SPACE}+$`, "g");
+const STATUSED = new RegExp(`${RESULT_STATUS_LEAD}[\\s*_\`~]*(complete|empty|blocked|incomplete)(?![\\p{L}\\p{N}])`, "imu");
+const replyTurn = (reply: string): string | null => {
+	const text = reply.replace(PY_STRIP, "");
+	return text ? sha256(text).slice(0, 16) : null;
+};
+const pauseVoid = (event: any, reply: string): boolean =>
+	!!event && typeof event === "object" && "turn" in event && STATUSED.test(reply) && replyTurn(reply) !== event.turn;
+// pause-void: end
 const nowIso = () => new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
 const handshakeId = () => `r5-${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`;
 
@@ -604,11 +617,14 @@ export default function (pi: ExtensionAPI) {
 		const result = await run(bin("tp-contract"), ["collect", id]);
 		if (result.code !== 0) throw new Error(`Cannot collect ${id}: ${(result.stderr || result.stdout).trim()}`);
 	};
-	// Stopped or paused by its contract since the last "continue": main's halted dialog takes over.
+	// Stopped or paused by its contract since the last "continue": main's halted dialog takes over. A pause voided by a
+	// completed reply of its turn or a later one (pauseVoid) is no pause: that reply is delivered as the result.
 	const contractHalted = (dir: string) => {
 		const events: any[] = readJson(join(dir, "checkpoints.json")).events ?? [];
 		const last = events.map((e) => e.action).lastIndexOf("extend");
-		return events.slice(last + 1).some((e) => e.action === "stop" || e.action === "pause");
+		let reply = "";
+		try { reply = readFileSync(join(dir, "result.md"), "utf8"); } catch {}
+		return events.slice(last + 1).some((e) => e.action === "stop" || (e.action === "pause" && !pauseVoid(e, reply)));
 	};
 	const summary = (reply: string, path: string) =>
 		reply ? `${clip(reply, REPLY_LIMIT)}${reply.length > REPLY_LIMIT ? `\n(full reply: ${path})` : ""}` : "(no reply)";

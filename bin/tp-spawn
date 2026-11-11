@@ -817,7 +817,7 @@ fi
 
 # launch.json (HB2b, lib/launch_record.py): what this worker is started with, written atomically now that the system prompt,
 # packet and harness command are final and before the window that starts the harness. Paths, hashes, names and versions only.
-# A failure here ends the start like any other failure before the pane: undo_start removes the task directory, so no record stays.
+# A failure of the record never stops the start (the record then says status error, or one stderr line).
 json_list() { jq -nc '$ARGS.positional' --args -- "$@"; }
 launch_kind="$kind"; if [[ "$contract" != null ]]; then launch_kind="${kind:-task}"; fi
 # The pane takes its environment from the tmux session, not from this process: the TP_PI_NODE bin/tp-pi will see there (the
@@ -836,7 +836,7 @@ jq -n --arg id "$id" --arg task_dir "$task_dir" --arg state_dir "$state_dir" --a
   '{id:$id, task_dir:$task_dir, state_dir:$state_dir, workdir:$workdir, harness:$harness, role:$role, preamble_role:$preamble_role,
     model:$model, launch_model:$launch_model, parent:$parent, review_of:$review_of, kind:$kind, lane:$lane, lane_step:$lane_step,
     preamble_from:$preamble_from, session:$session, ctx_tools:($ctx == "1"), pane_pi_node:$pane_pi_node, argv:$argv, worker_env:$worker_env, evidence:$evidence}' |
-  python3 "$ROOT/lib/launch_record.py" worker || exit 1
+  python3 "$ROOT/lib/launch_record.py" worker || echo "tp-spawn: launch record failed; starting without it" >&2
 
 pane="$(tmux new-window -d -P -F '#{pane_id}' -t "=$session:" -n "sa:$id" -c "$workdir" \
   "bash $(printf %q "$task_dir/run.sh")")"

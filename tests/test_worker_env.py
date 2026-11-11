@@ -261,7 +261,8 @@ class PreambleArgsTests(WorkerEnvCase):
             if (ROOT / name).exists():
                 subprocess.run(["cp", "-R", str(ROOT / name), str(cls.copy / name)], check=True, capture_output=True)
         (cls.copy / "lib" / "preamble.py").write_text(
-            "import os, sys\nopen(os.environ['PREAMBLE_PROBE'], 'w').write(' '.join(sys.argv[1:]))\nprint('PREAMBLE')\n")
+            "import os, sys\nif __name__ == '__main__':  # lib/launch_record.py imports this module too (HB2b); only the run as a script is probed\n"
+            "    open(os.environ['PREAMBLE_PROBE'], 'w').write(' '.join(sys.argv[1:]))\n    print('PREAMBLE')\n")
 
     def spawn_probed(self, task, *args):
         probe = self.base / ("preamble-args-" + task)

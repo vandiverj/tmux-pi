@@ -609,6 +609,33 @@ esac
                 self.assertEqual(record["status"], status, record)
                 self.assertEqual(record["harness_version"], "9.9.9" if status == "prepared" else None)
 
+    def test_a_launch_record_that_cannot_be_built_never_stops_the_launch(self):
+        # HB2b round 2: the record is never what decides whether a worker starts. A copied tree with an older lib (a preamble without
+        # `contract`) and a worker whose packet is missing both end with exit 0 and an error record (or one stderr line), never a traceback.
+        import shutil
+        tree = self.root / "old-tree" / "lib"
+        tree.mkdir(parents=True)
+        for name in ("launch_record.py", "safe_write.py"):
+            shutil.copy(ROOT / "lib" / name, tree / name)
+        (tree / "preamble.py").write_text("HARNESS_ADAPTER = {'pi': {}, 'claude': {}}\n")
+        task = self.state / "tasks" / "coder-old0001"
+        task.mkdir(parents=True)
+        (task / "packet.md").write_text("x\n")
+        facts = json.dumps({"id": "coder-old0001", "task_dir": str(task), "state_dir": str(self.state), "workdir": str(self.project),
+                            "harness": "pi", "role": "coder"})
+        run = subprocess.run(["python3", str(tree / "launch_record.py"), "worker"], input=facts, text=True, capture_output=True)
+        self.assertEqual((run.returncode, run.stderr), (0, ""))
+        record = json.loads((task / "launch.json").read_text())
+        self.assertEqual((record["schema"], record["status"], record["task"], record["role"], record["harness"]),
+                         ("tp-launch:v1", "error", "coder-old0001", "coder", "pi"))
+        self.assertIn("AttributeError", record["error"])
+        # Nothing to write to (facts that are not JSON; a state dir that is gone): one stderr line, still exit 0.
+        for stdin, argv in (("not json", ["worker"]), ("", ["main", "--state-dir", str(self.root / "gone"), "--harness", "pi"])):
+            run = subprocess.run(["python3", str(ROOT / "lib/launch_record.py"), *argv], input=stdin, text=True, capture_output=True)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertTrue(run.stderr.startswith("launch record: "), run.stderr)
+            self.assertNotIn("Traceback", run.stderr)
+
     def test_a_start_that_fails_before_the_harness_leaves_no_launch_record(self):
         # HB2b: tp-spawn removes the task directory of a start that fails before the window (here the window itself fails).
         fake_tmux(self.root / "bin", 'case "$1" in has-session) exit 0 ;; show-options) printf "%s\\n" "$TP_STATE_DIR" ;; '

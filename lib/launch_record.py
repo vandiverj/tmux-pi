@@ -11,7 +11,7 @@ reason. Every field a source cannot supply is null, with its reason under `null_
 
 `status`: "prepared" when the harness binary resolves the way bin/tp-claude / bin/tp-pi would resolve it; "failed" (with `failure`)
 when it does not, so a launch whose harness cannot start is never recorded as a good one. The record is written before the harness
-starts and never claims that it started. A tp-spawn failure before the record (or after it, before the task is registered) removes
+starts and never claims that it started. A record error never stops a launch: status "error" with `error` (or one stderr line). A tp-spawn failure before the record (or after it, before the task is registered) removes
 the task directory, so it leaves no record.
 
     python3 launch_record.py worker < facts.json      (bin/tp-spawn; facts below in `worker`)
@@ -386,15 +386,19 @@ def summary(record):
     parts.append("unsupported " + ("+".join(unsupported) if unsupported else "none"))
     if record.get("status") == "failed":
         parts.insert(0, "FAILED (" + str(record.get("failure", "")) + ")")
+    if record.get("status") == "error":
+        parts.insert(0, "ERROR (" + str(record.get("error", "")) + ")")
     return ", ".join(parts)
 
 
-def _main(argv):
+def _run(argv, facts_text=None):
+    """Build and write the record the arguments name. Returns (path, known) as soon as they are known, so a failure after that point
+    can still leave an error record at the same path."""
     if argv[:1] == ["worker"]:
-        facts = json.loads(sys.stdin.read())
-        record = worker(facts)
-        write(Path(facts["task_dir"]) / NAME, record, facts["state_dir"])
-        return 0
+        facts = json.loads(facts_text if facts_text is not None else sys.stdin.read())
+        known = {"task": facts.get("id"), "role": facts.get("role") or facts.get("preamble_role") or None,
+                 "harness": facts.get("harness")}
+        return Path(facts["task_dir"]) / NAME, facts["state_dir"], known, lambda: worker(facts)
     if argv[:1] == ["main"]:
         options, rest = {}, []
         i = 1
@@ -410,16 +414,33 @@ def _main(argv):
         state = options.get("state-dir")
         if not state or not Path(state).is_dir():
             raise RecordError("--state-dir must be an existing directory")
+        known = {"task": options.get("main-id") or None, "role": "main", "harness": options.get("harness"), "route": "main"}
         if options.get("harness") not in preamble.HARNESS_ADAPTER:
             raise RecordError("--harness must be pi or claude")
-        write(Path(state) / MAIN_NAME, main_record(state, options["harness"], options.get("main-id") or None, rest,
-                                                       root=options.get("root") or ROOT), state)
-        return 0
+        return (Path(state) / MAIN_NAME, state, known,
+                lambda: main_record(state, options["harness"], options.get("main-id") or None, rest, root=options.get("root") or ROOT))
     raise RecordError("usage: launch_record.py worker < facts.json | main --state-dir DIR --harness H --main-id ID -- ARGS")
 
 
-if __name__ == "__main__":
+def _main(argv):
+    """Always 0: a launch record never stops a launch. Any error leaves an error record at the same path (atomic) with what is known,
+    or, when even that cannot be written, one line on stderr."""
+    path = state = None
+    known = {}
     try:
-        sys.exit(_main(sys.argv[1:]))
-    except (RecordError, ValueError, OSError, KeyError) as error:
-        sys.exit(f"launch record: {error}")
+        path, state, known, build = _run(argv)
+        write(path, build(), state)
+    except Exception as error:  # noqa: BLE001 -- nothing here may change the caller's exit code
+        message = f"{type(error).__name__}: {error}"
+        try:
+            if path is None:
+                raise RecordError("no record path is known")
+            write(path, {"schema": SCHEMA, "status": "error", "error": message, **{k: v for k, v in known.items() if v is not None},
+                         "recorded": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}, state)
+        except Exception:  # noqa: BLE001
+            print(f"launch record: {message}", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(_main(sys.argv[1:]))

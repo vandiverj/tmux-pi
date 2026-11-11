@@ -224,6 +224,11 @@ class Brief:
     def add(self, text):
         self.lines.append(_clip(text))
 
+    def add_whole(self, prose, *whole):
+        """Prose may be clipped; a command, record id or workspace id Main is told to use never is: each goes whole on its own line."""
+        self.lines.append(_clip(prose))
+        self.lines.extend("  " + _clip(line, 10 ** 9) for line in whole)
+
 
 def build(state_dir, workdir=None, attach=False, index=None):
     """(text, info). `index`: a callable giving the session index value (bin/tp-agent build_index), or None when there is no session;
@@ -260,7 +265,7 @@ def build(state_dir, workdir=None, attach=False, index=None):
         brief.add(note)
     others = [w.id for w in found if w.id not in attached]
     if not attached and others:
-        brief.add("matching workspaces (newest first): " + ", ".join(others) + "; attach one with `tp-agent work attach ID`")
+        brief.add_whole("matching workspaces (newest first; attach one with `tp-agent work attach ID`):", ", ".join(others))
     docs = {}
     for ws_id in attached:
         try:
@@ -268,12 +273,13 @@ def build(state_dir, workdir=None, attach=False, index=None):
         except Exception as error:  # noqa: BLE001
             doc, health = None, f"corrupt: {type(error).__name__}"
         if doc is None:
-            brief.add(f"workspace {ws_id}: unavailable ({health}); `tp-agent work recover {ws_id}` prints its last checkpoint")
+            brief.add_whole(f"workspace {ws_id}: unavailable ({_clip(health, 80)}); its last checkpoint is printed by:", f"tp-agent work recover {ws_id}")
             continue
         docs[ws_id] = doc
         how = "attached automatically: the newest active workspace for this project" if ws_id == auto else "attached"
-        brief.add(f"workspace {ws_id} \"{doc.meta.get('title', ws_id)}\" ({how}; status {doc.meta.get('status')})"
-                  + (f"; also matching: {', '.join(others)}" if ws_id == auto and others else ""))
+        tail = f" ({how}; status {doc.meta.get('status')})"
+        brief.add_whole(f"workspace {ws_id} \"{_clip(doc.meta.get('title', ws_id), 80)}\"" + tail,
+                        *([f"also matching: {', '.join(others)}"] if ws_id == auto and others else []))
         objective = (work.get_section(doc.body, "Objective") or "").strip()  # each part's own write time (`work set` stores it); never the file's
         brief.head("outcome", _when(doc.meta.get("objective_at")), objective or f"not recorded (tp-agent work set {ws_id} --objective TEXT)",
                    unknown=bool(objective))
@@ -289,7 +295,7 @@ def build(state_dir, workdir=None, attach=False, index=None):
     if work.skipped_count(skipped):
         brief.add(work.skipped_line(skipped))
     ws = attached[0] if attached else "ID"
-    brief.add(f"pointers: tp-agent work show {ws} | tp-agent work records | tp-agent work decisions | tp-agent work recover | tp-agent list")
+    brief.add_whole("pointers:", f"tp-agent work show {ws} | tp-agent work records | tp-agent work decisions | tp-agent work recover | tp-agent list")
     lines = brief.lines
     if len(lines) > MAX_LINES:
         lines = lines[:MAX_LINES - 1] + [f"(+{len(lines) - MAX_LINES + 1} lines cut; tp-agent brief prints the same)"]
@@ -314,15 +320,15 @@ def _rules(brief, project, attached, skipped):
     if len(shown) > RULES_SHOWN:
         brief.add(f"- +{len(shown) - RULES_SHOWN} more: tp-agent work records --status active")
     for group in conflicts:
-        brief.add(f"CONFLICT: {', '.join(r['id'] for r in group)} are active in one scope and answer the same question; ask the owner "
-                  "which stands (`work decide ... --supersedes ID --by owner --quote ...`)")
+        brief.add_whole("CONFLICT: these are active in one scope and answer the same question; ask the owner which stands "
+                        "(`work decide ... --supersedes ID --by owner --quote ...`):", ", ".join(r['id'] for r in group))
     for new, old in uncommitted(records, project, attached):
-        brief.add(f"pending: {new['id']} replaces {old['id']}, not yet committed ({old['id']} stays in force); finish with "
-                  f"tp-agent work decision confirm {new['id']} --quote \"their exact words\"")
+        brief.add_whole(f"pending: {new['id']} replaces {old['id']}, not yet committed ({old['id']} stays in force); finish with:",
+                        f"tp-agent work decision confirm {new['id']} --quote \"their exact words\"")
     waiting = [r["id"] for r in records if r["status"] == "provisional" and covers(r, project, attached)]
     if waiting:
-        brief.add(f"provisional (not in force until the owner confirms): {', '.join(waiting[:8])}"
-                  + (f" +{len(waiting) - 8}" if len(waiting) > 8 else "") + "; tp-agent work decision confirm ID --quote ...")
+        brief.add_whole("provisional (not in force until the owner confirms; tp-agent work decision confirm ID --quote ...):",
+                        ", ".join(waiting[:8]) + (f" +{len(waiting) - 8}" if len(waiting) > 8 else ""))
 
 
 def _scope_label(scope):

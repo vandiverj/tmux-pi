@@ -368,26 +368,27 @@ class Realistic(Base):
         """Round 3: the old workspace's save fails after the replacement was saved. The brief keeps the old rule and lists the new one
         as pending with the completion command; `confirm` commits it; a withdrawn pending replacement leaves the old rule in force."""
         import errno
-        for ws in ("old", "new"):
+        OLD, NEW = "owner-process-rules-original-store", "owner-process-rules-replacement-store"
+        for ws in (OLD, NEW):
             self.ok("work", "new", ws.title(), "--id", ws)
-        self.ok("work", "attach", "old")
-        old = self.ok("work", "decide", "old", "old rule text", "--scope", "global", *OWNER, "yes")["record"]["id"]
+        self.ok("work", "attach", OLD)
+        old = self.ok("work", "decide", OLD, "old rule text", "--scope", "global", *OWNER, "yes")["record"]["id"]
         real = work.Doc.save
 
         def save(doc):
-            if doc.id == "old":
+            if doc.id == OLD:
                 raise OSError(errno.ENOSPC, "injected disk full")
             return real(doc)
 
         with mock.patch.object(work.Doc, "save", save):
-            code, _, _ = self.call("work", "decide", "new", "new rule text", "--scope", "global", "--supersedes", old, *OWNER, "yes")
+            code, _, _ = self.call("work", "decide", NEW, "new rule text", "--scope", "global", "--supersedes", old, *OWNER, "yes")
         self.assertEqual(code, 1)
         text = self.brief()
         self.assertIn("old rule text", text)
         self.assertNotIn("- [design global] new rule text", text)
-        self.assertIn(f"pending: new/R1 replaces {old}, not yet committed", text)
-        self.assertIn("tp-agent work decision confirm new/R1", text)
-        self.assertTrue(self.ok("work", "decision", "confirm", "new/R1", "--quote", "yes")["changed"])
+        self.assertIn(f"pending: {NEW}/R1 replaces {old}, not yet committed", text)
+        self.assertIn(f"\n  tp-agent work decision confirm {NEW}/R1 --quote \"their exact words\"\n", text + "\n")  # whole, never clipped
+        self.assertTrue(self.ok("work", "decision", "confirm", f"{NEW}/R1", "--quote", "yes")["changed"])
         text = self.brief()
         self.assertNotIn("old rule text", text)
         self.assertIn("new rule text", text)
@@ -415,7 +416,7 @@ class Realistic(Base):
         self.assertIn("acceptance [", text)
         self.assertIn("obligations (HB5): no obligation records exist yet", text)
         self.assertIn("launch record (HB2): no launch record exists yet", text)
-        self.assertIn("provisional (not in force until the owner confirms): hub/R9", text)
+        self.assertIn("provisional (not in force until the owner confirms; tp-agent work decision confirm ID --quote ...):\n  hub/R9", text)
         self.assertNotIn("a main guess", text)
         self.assertNotIn("no workspace attached", text)
 

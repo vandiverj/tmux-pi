@@ -1,0 +1,71 @@
+{
+  "schema": "tp-episode:v1",
+  "id": "E3n",
+  "row": "E3",
+  "variant": "negative",
+  "title": "README-only change: build and tests are irrelevant; git diff --check is the check",
+  "baseline_finding": ["O6 Verification duplicated, evidence unchecked"],
+  "project": {"test_command": "npm test", "build_command": "npm run build", "deps": "node_modules"},
+  "timeout_seconds": 900,
+  "steps": [
+    {"id": "goal", "do": "owner", "tag": "goal",
+     "text": "In the README Commands section, add one line after the code block saying that npm run test runs the unit tests once and exits."},
+    {"id": "done", "do": "wait", "timeout": 600,
+     "until": {"kind": "any", "of": [
+       {"kind": "task", "state": ["waiting", "completed", "failed", "escalated"], "result": "any"},
+       {"kind": "file", "path": "README.md", "pattern": "(?i)npm run test` runs the unit tests once|runs the unit tests once"}]}},
+    {"id": "settle", "do": "wait", "timeout": 300, "until": {"kind": "main_quiet", "seconds": 30}}
+  ],
+  "expected": {
+    "records": ["episode_log", "observations", "state_dir", "main_transcript", "worker_transcripts", "worker_results", "worker_packets", "final_check", "clone"],
+    "measures": {"verification": 0},
+    "checks": [
+      {"id": "readme", "check": "change_present", "measure": "evidence", "path": "README.md", "pattern": "(?i)runs the unit tests once",
+       "why": "the line is in the README"},
+      {"id": "only-readme", "check": "change_absent", "measure": "evidence", "path": "src/game/gameState.ts", "pattern": "runs the unit tests once",
+       "why": "nothing else changed (the diff stat in completed shows the rest)"},
+      {"id": "no-build", "check": "command", "measure": "irrelevant_check", "by": "any", "pattern": "npm run build|tsc -b", "expect": false,
+       "why": "a build proves nothing for a README line"},
+      {"id": "no-tests", "check": "command", "measure": "irrelevant_check", "by": "any", "pattern": "npm (run )?test(?! runs)|vitest run", "expect": false,
+       "why": "the unit tests prove nothing for a README line"}
+    ]
+  },
+  "fake": {
+    "pass": {
+      "start": [{"say": "Ready."}],
+      "on": {
+        "goal": [
+          {"spawn": {"id": "coder-e3n", "role": "coder",
+                     "packet": "Add one line to README.md after the Commands code block: npm run test runs the unit tests once and exits. Doc-only change: run git diff --check; build and tests are not needed. End with RESULT_STATUS.",
+                     "steps": [
+                       {"call": "mcp__tmux-pi-safe__safe_read", "input": {"path": "README.md"}},
+                       {"edit": {"path": "README.md", "old": "npm run build\n```\n\nUse `npm run dev`", "new": "npm run build\n```\n\n`npm run test` runs the unit tests once and exits.\n\nUse `npm run dev`"}},
+                       {"call": "Bash", "input": {"command": "git diff --check"}},
+                       {"result": "complete", "text": "README line added; git diff --check is clean. Build and tests not run: README-only change."}
+                     ]}},
+          {"wait_task": {"id": "coder-e3n", "state": "waiting", "result": "complete", "timeout": 600}},
+          {"say": "Done: the README line is in; git diff --check is clean."}
+        ]
+      }
+    },
+    "fail": {
+      "start": [{"say": "Ready."}],
+      "on": {
+        "goal": [
+          {"spawn": {"id": "coder-e3n", "role": "coder",
+                     "packet": "Add one line to README.md about npm run test. Run {test}, {build} and git diff --check before reporting. End with RESULT_STATUS.",
+                     "steps": [
+                       {"call": "Bash", "input": {"command": "sed -n 20,40p README.md"}},
+                       {"edit": {"path": "README.md", "old": "npm run build\n```\n\nUse `npm run dev`", "new": "npm run build\n```\n\n`npm run test` runs the unit tests once and exits.\n\nUse `npm run dev`"}},
+                       {"test_run": "{test}"},
+                       {"test_run": "{build}"},
+                       {"test_run": "{test}"},
+                       {"result": "complete", "text": "Done."}
+                     ]}},
+          {"wait_task": {"id": "coder-e3n", "state": "waiting", "result": "complete", "timeout": 600}},
+          {"say": "Done."}
+        ]
+      }
+    }
+  }
+}

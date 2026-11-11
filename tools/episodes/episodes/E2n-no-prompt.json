@@ -1,0 +1,76 @@
+{
+  "schema": "tp-episode:v1",
+  "id": "E2n",
+  "row": "E2",
+  "variant": "negative",
+  "title": "Worker finishes without any prompt: no correction, no message to a finished worker",
+  "baseline_finding": ["5 No cancel-and-redirect", "O3 Messages sent into prompts / lost / clobbering results"],
+  "project": {"test_command": "npm test", "build_command": "npm run build", "deps": "node_modules"},
+  "timeout_seconds": 1500,
+  "steps": [
+    {"id": "goal", "do": "owner", "tag": "goal",
+     "text": "Derby computer turns drag a little. Make them 650 ms instead of 700 and add a unit test for it."},
+    {"id": "coder-done", "do": "wait", "timeout": 1200, "on_timeout": "fail",
+     "until": {"kind": "task", "role": "coder", "state": ["waiting", "completed", "failed", "escalated"], "result": "any"}},
+    {"id": "settle", "do": "wait", "timeout": 300, "until": {"kind": "main_quiet", "seconds": 30}}
+  ],
+  "expected": {
+    "records": ["episode_log", "observations", "state_dir", "main_transcript", "worker_transcripts", "worker_results", "worker_packets", "final_check", "clone"],
+    "measures": {"into_prompt": 0},
+    "checks": [
+      {"id": "delay-650", "check": "change_present", "measure": "evidence", "path": "src/game/gameState.ts", "pattern": "\\bderby:\\s*650\\b",
+       "why": "the derby delay is 650"},
+      {"id": "unit-test", "check": "change_present", "measure": "evidence", "path": "src/game/gameState.test.ts",
+       "pattern": "COMPUTER_TURN_DELAYS_MS\\.derby\\)\\.toBe\\(650\\)", "why": "a unit test pins it"},
+      {"id": "no-prompt", "check": "state_seen", "measure": "evidence", "role": "coder", "state": ["permission", "input"], "expect": false,
+       "why": "the control: no prompt happened (if one did, this run is not the negative variant)"},
+      {"id": "no-message-to-done", "check": "message_to_done", "measure": "leak", "role": "coder", "expect": false,
+       "why": "nothing is sent into a finished worker"},
+      {"id": "no-redirect", "check": "message_count", "measure": "leak", "role": "coder", "max": 0, "after": "goal",
+       "why": "no correction is sent to a worker that is not stuck"}
+    ]
+  },
+  "fake": {
+    "pass": {
+      "start": [{"say": "Ready."}],
+      "on": {
+        "goal": [
+          {"spawn": {"id": "coder-e2n", "role": "coder",
+                     "packet": "Set COMPUTER_TURN_DELAYS_MS.derby to 650 in src/game/gameState.ts and add a unit test. Search with safe_grep, read with safe_read. Run {test}. End with RESULT_STATUS.",
+                     "steps": [
+                       {"call": "mcp__tmux-pi-safe__safe_read", "input": {"path": "src/game/gameState.ts"}},
+                       {"edit": {"path": "src/game/gameState.ts", "old": "  derby: 700,", "new": "  derby: 650,"}},
+                       {"edit": {"path": "src/game/gameState.test.ts", "old": "  MATCH_SHOT_LIMITS,\n", "new": "  MATCH_SHOT_LIMITS,\n  COMPUTER_TURN_DELAYS_MS,\n"}},
+                       {"edit": {"path": "src/game/gameState.test.ts", "old": "",
+                                 "new": "\ndescribe('derby delay', () => {\n  it('plays derby turns after 650 ms', () => {\n    expect(COMPUTER_TURN_DELAYS_MS.derby).toBe(650);\n  });\n});\n"}},
+                       {"test_run": "{test}"},
+                       {"result": "complete", "text": "Derby delay is 650 ms with a unit test; {test} passed."}
+                     ]}},
+          {"wait_task": {"id": "coder-e2n", "state": "waiting", "result": "complete", "timeout": 600}},
+          {"say": "Done: derby turns are 650 ms with a unit test, and the coder's test run passed."}
+        ]
+      }
+    },
+    "fail": {
+      "start": [{"say": "Ready."}],
+      "on": {
+        "goal": [
+          {"spawn": {"id": "coder-e2n", "role": "coder",
+                     "packet": "Set COMPUTER_TURN_DELAYS_MS.derby to 650 and add a unit test. End with RESULT_STATUS.",
+                     "steps": [
+                       {"edit": {"path": "src/game/gameState.ts", "old": "  derby: 700,", "new": "  derby: 650,"}},
+                       {"edit": {"path": "src/game/gameState.test.ts", "old": "  MATCH_SHOT_LIMITS,\n", "new": "  MATCH_SHOT_LIMITS,\n  COMPUTER_TURN_DELAYS_MS,\n"}},
+                       {"edit": {"path": "src/game/gameState.test.ts", "old": "",
+                                 "new": "\ndescribe('derby delay', () => {\n  it('plays derby turns after 650 ms', () => {\n    expect(COMPUTER_TURN_DELAYS_MS.derby).toBe(650);\n  });\n});\n"}},
+                       {"test_run": "{test}"},
+                       {"result": "complete", "text": "Done."}
+                     ]}},
+          {"wait_task": {"id": "coder-e2n", "state": "waiting", "result": "complete", "timeout": 600}},
+          {"sleep": 1},
+          {"message": {"to": "coder-e2n", "escape_first": true, "text": "If you are stuck at a prompt, stop and tell me what it asks."}},
+          {"say": "Done."}
+        ]
+      }
+    }
+  }
+}

@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+"""Scripted stand-in for Claude Code as Main (HB8 --fake). bin/tp -> tp-main -> tp-claude exec `claude`; with
+tools/episodes/fake first on PATH this script is that `claude`. No model, no network.
+
+It records the arguments tp-claude passed (RUN_DIR/run/fake-main-launches.jsonl: flags, and the length and sha256 of the appended
+system prompt), writes a Claude-format transcript under CLAUDE_CONFIG_DIR/projects/<slug of cwd>/<session>.jsonl, and acts out the
+episode's fake script (TP_EPISODE_FAKE, written by run.py): `start` actions on the first launch, `restart` actions on a later one,
+then for each line typed into the pane the actions under `on[<owner turn id>]` (matched by the turn's whole text) or `on["/compact"]`.
+
+Actions (closed list): say {text}; tool {name, input} (a transcript entry only); bash {command}; test_run {command}
+(tools/agent/test-run.sh on the clone, no TP_TASK_DIR); sleep {seconds};
+spawn {id, role, lane?, packet, steps}; wait_task {id, state, result?, submits?, timeout} (submits: the worker's promptSubmits
+has reached this count); message {to, text, escape_first?, clear_first?}; record {path, json | jsonl}; lane {name, state, deps?}.
+spawn writes the task dir a dispatch writes (meta.json with the pane, packet.md, task.md, state.json) and starts fake/worker.py in
+a new window of the same (private) tmux server. message writes messages.jsonl, then pastes the text into the worker's pane and
+presses Enter (escape_first: Escape, then wait for the worker to leave `permission`; clear_first: C-u)."""
+import hashlib
+import json
+import os
+import shlex
+import subprocess
+import sys
+import time
+import uuid
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parent.parent.parent
+sys.path.insert(0, str(HERE.parent))
+import episode_lib as el  # noqa: E402
+
+config = el.read_json(os.environ["TP_EPISODE_FAKE"])
+script = config["script"]
+clone = Path(config["clone"])
+run_dir = Path(config["run_dir"])
+state_dir = Path(os.environ["TP_STATE_DIR"])
+session = str(uuid.uuid4())
+transcript = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "projects" / el.claude_project_slug(Path.cwd().resolve()) / (session + ".jsonl")
+launches = run_dir / "run" / "fake-main-launches.jsonl"
+
+
+def record_launch():
+    args = sys.argv[1:]
+    prompt = ""
+    if "--append-system-prompt" in args:
+        prompt = args[args.index("--append-system-prompt") + 1]
+    flags = [a for i, a in enumerate(args) if a.startswith("--") and not (i and args[i - 1] == "--append-system-prompt")]
+    previous = el.read_jsonl(launches) or []
+    el.append_jsonl(launches, {"at": el.utc_now(), "n": len(previous) + 1, "flags": flags, "session": session,
+                               "append_prompt_chars": len(prompt), "append_prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
+                               "tp_mode": os.environ.get("TP_MODE"), "tp_main_id": os.environ.get("TP_MAIN_ID"),
+                               "transcript": str(transcript)})
+    return len(previous) + 1
+
+
+def entry(role, content):
+    el.append_jsonl(transcript, {"type": role, "timestamp": el.utc_now(), "sessionId": session,
+                                 "message": {"role": role, "content": content}})
+
+
+def say(text):
+    entry("assistant", [{"type": "text", "text": text}])
+    print(text, flush=True)
+
+
+def tool(name, inp):
+    call_id = "toolu_%d" % time.time_ns()
+    entry("assistant", [{"type": "tool_use", "id": call_id, "name": name, "input": inp}])
+    return call_id
+
+
+def tool_result(call_id, code, output=""):
+    """The call's result as Claude writes it: an error result names the exit code (round 4 rule 5 reads it)."""
+    error = code != 0
+    text = ("Exit code %s\n%s" % (code, output) if code is not None else "timed out\n" + output) if error else output
+    entry("user", [{"type": "tool_result", "tool_use_id": call_id, "content": text[-2000:], "is_error": error}])
+
+
+def tmux(*args):
+    return subprocess.run(["tmux", *args], capture_output=True, text=True, timeout=15)
+
+
+def task_state(ident):
+    return el.task_snapshot(state_dir / "tasks" / ident)
+
+
+def wait_task(ident, states, result=None, timeout=120, submits=0):
+    states = [states] if isinstance(states, str) else states
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        state = el.read_json(state_dir / "tasks" / ident / "state.json", {}) or {}     # one read: state and count agree
+        if (state.get("state") in states and int(state.get("promptSubmits", 0)) >= submits
+                and (not result or el.result_status(state_dir / "tasks" / ident) == result)):
+            return True
+        time.sleep(0.1)
+    say("(fake) gave up waiting for %s" % ident)
+    return False
+
+
+def spawn(spec):
+    ident = spec["id"]
+    task_dir = state_dir / "tasks" / ident
+    task_dir.mkdir(parents=True, exist_ok=True)
+    (task_dir / "packet.md").write_text(spec.get("packet", ""))
+    (task_dir / "task.md").write_text(spec.get("packet", ""))
+    steps_path = task_dir / "fake-steps.json"
+    steps_path.write_text(json.dumps(spec.get("steps", [])))
+    el.write_json(task_dir / "state.json", {"id": ident, "harness": "claude", "state": "starting", "tool": "",
+                                            "updated": el.utc_now()[:19] + "Z"})
+    workdir = clone
+    if spec.get("lane"):
+        workdir = Path(str(clone) + "-wt-" + spec["lane"])
+        if not workdir.exists():
+            subprocess.run(["git", "-C", str(clone), "worktree", "add", "-q", "-b", "lane/" + spec["lane"], str(workdir)],
+                           capture_output=True, timeout=60)
+    command = " ".join("'%s'" % part for part in (sys.executable, str(HERE / "worker.py"), str(task_dir), str(steps_path), str(workdir)))
+    made = tmux("new-window", "-d", "-P", "-F", "#{pane_id}", "-n", ident, "-c", str(workdir), command)
+    pane = made.stdout.strip()
+    el.write_json(task_dir / "meta.json", {"id": ident, "worker": "claude", "model": "fake", "role": spec.get("role", "coder"),
+                                           "lane": spec.get("lane"), "pane": pane, "workdir": str(workdir),
+                                           "created": el.utc_now()[:19] + "Z"})
+    tool("Bash", {"command": "tp-agent spawn --role %s --brief %s/packet.md" % (spec.get("role", "coder"), task_dir)})
+
+
+def message(spec):
+    ident = spec["to"]
+    snap = task_state(ident)
+    pane = snap["pane"]
+    if spec.get("escape_first"):
+        tmux("send-keys", "-t", pane, "Escape")
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and task_state(ident)["state"] == "permission":
+            time.sleep(0.05)
+    if spec.get("clear_first"):
+        tmux("send-keys", "-t", pane, "C-u")
+    el.append_jsonl(state_dir / "tasks" / ident / "messages.jsonl",
+                    {"sent": el.utc_now(), "text": spec["text"], "submitted": True, "attempts": 1})
+    tool("Bash", {"command": "tp-agent message %s --text %s" % (ident, json.dumps(spec["text"]))})
+    tmux("set-buffer", "-b", "fakemsg", "--", spec["text"])
+    tmux("paste-buffer", "-p", "-d", "-b", "fakemsg", "-t", pane)
+    time.sleep(0.3)
+    tmux("send-keys", "-t", pane, "Enter")
+
+
+def act(actions):
+    for action in actions:
+        kind = next(iter(action))
+        spec = action[kind]
+        if kind == "say":
+            say(spec)
+        elif kind == "tool":
+            tool(spec["name"], spec.get("input", {}))
+        elif kind == "sleep":
+            time.sleep(float(spec))
+        elif kind == "bash":
+            call_id = tool("Bash", {"command": spec})
+            try:
+                done = subprocess.run(["/bin/sh", "-c", spec], cwd=str(clone), capture_output=True, text=True, timeout=900)
+                tool_result(call_id, done.returncode, (done.stdout + done.stderr)[-2000:])
+            except subprocess.TimeoutExpired:
+                tool_result(call_id, None)
+        elif kind == "test_run":
+            # Round 8 rule 5: Main runs its tests through tools/agent/test-run.sh with no TP_TASK_DIR; the record goes beside
+            # the runner's log under ${TMPDIR}/tp-tools, the directory run.json names as main_test_runs.
+            words = shlex.split(spec)
+            argv = [str(ROOT / "tools" / "agent" / "test-run.sh"), str(clone), "--label", spec, "--"] + words
+            call_id = tool("Bash", {"command": shlex.join(argv)})
+            env = {k: v for k, v in os.environ.items() if k != "TP_TASK_DIR"}
+            try:
+                done = subprocess.run(argv, cwd=str(clone), capture_output=True, text=True, timeout=960, env=env)
+                tool_result(call_id, done.returncode, (done.stdout + done.stderr)[-2000:])
+            except subprocess.TimeoutExpired:
+                tool_result(call_id, None)
+        elif kind == "spawn":
+            spawn(spec)
+        elif kind == "wait_task":
+            wait_task(spec["id"], spec.get("state", "waiting"), spec.get("result"), spec.get("timeout", 120), spec.get("submits", 0))
+        elif kind == "message":
+            message(spec)
+        elif kind == "record":
+            target = state_dir / spec["path"]
+            if "jsonl" in spec:
+                el.append_jsonl(target, dict(spec["jsonl"], at=el.utc_now()))
+            else:
+                el.write_json(target, spec["json"])
+        elif kind == "lane":
+            el.write_json(clone / ".git" / "tmux-pi" / "lanes" / spec["name"] / "lane.json",
+                          {"schema": "tp-lane:v1", "name": spec["name"], "state": spec.get("state", "open"),
+                           "deps": spec.get("deps", "own"), "updated": el.utc_now()})
+        else:
+            say("(fake) unknown action %s" % kind)
+
+
+def main():
+    n = record_launch()
+    print("fake claude main ready (launch %d)" % n, flush=True)
+    act(script.get("start" if n == 1 else "restart", []))
+    turns = {" ".join(text.split()): ident for ident, text in config["turns"].items()}
+    for line in sys.stdin:
+        text = " ".join(line.split())
+        if not text:
+            continue
+        if text == "/compact":
+            el.append_jsonl(transcript, {"type": "system", "subtype": "compact_boundary", "timestamp": el.utc_now(), "sessionId": session})
+            act(script.get("on", {}).get("/compact", []))
+            continue
+        entry("user", text)
+        ident = turns.get(text)
+        act(script.get("on", {}).get(ident, []) if ident else [{"say": "(fake) no script for: %s" % text[:60]}])
+
+
+if __name__ == "__main__":
+    main()

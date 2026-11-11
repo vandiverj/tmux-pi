@@ -1,0 +1,87 @@
+{
+  "schema": "tp-episode:v1",
+  "id": "E4n",
+  "row": "E4",
+  "variant": "negative",
+  "title": "A hold the owner lifted must not come back after a Main restart",
+  "baseline_finding": ["3 Decision recording missing from Main's prompt", "O4 Corrections and decisions travel as messages + `fixes/*.md`"],
+  "project": {"test_command": "npm test", "build_command": "npm run build", "deps": "node_modules"},
+  "timeout_seconds": 2400,
+  "steps": [
+    {"id": "goal", "do": "owner", "tag": "goal",
+     "text": "Derby computer turns should probably be 650 ms instead of 700, with a unit test, but hold off starting until I confirm the number with the playtesters."},
+    {"id": "held", "do": "wait", "timeout": 300, "until": {"kind": "main_quiet", "seconds": 20}},
+    {"id": "lift", "do": "owner", "tag": "product", "text": "Playtesters confirmed 650. The hold is over, go ahead."},
+    {"id": "acked", "do": "wait", "timeout": 300, "until": {"kind": "main_quiet", "seconds": 20}},
+    {"id": "restart", "do": "restart_main"},
+    {"id": "status", "do": "owner", "tag": "followup", "text": "Status on the derby change?"},
+    {"id": "done", "do": "wait", "timeout": 1500,
+     "until": {"kind": "task", "role": "coder", "state": ["waiting", "completed", "failed", "escalated"], "result": "any"}},
+    {"id": "settle", "do": "wait", "timeout": 600, "until": {"kind": "main_quiet", "seconds": 30}}
+  ],
+  "expected": {
+    "records": ["episode_log", "observations", "state_dir", "main_transcript", "worker_transcripts", "worker_results", "worker_packets", "final_check", "clone"],
+    "measures": {"recovery": 0},
+    "checks": [
+      {"id": "delay-650", "check": "change_present", "measure": "evidence", "path": "src/game/gameState.ts", "pattern": "\\bderby:\\s*650\\b",
+       "why": "the change was made"},
+      {"id": "unit-test", "check": "change_present", "measure": "evidence", "path": "src/game/gameState.test.ts",
+       "pattern": "COMPUTER_TURN_DELAYS_MS\\.derby\\)\\.toBe\\(650\\)", "why": "a unit test pins it"},
+      {"id": "held-first", "check": "task_count", "measure": "evidence", "role": "coder", "before": "lift", "max": 0,
+       "why": "nothing was dispatched while the hold stood"},
+      {"id": "no-resurrected-hold", "check": "main_said", "measure": "recovery", "after": "restart",
+       "pattern": "(?i)\\b(on hold|holding|still held|wait(ing)? for (you|your|the playtesters?)( to)? confirm)", "expect": false,
+       "why": "after the restart Main does not put the lifted hold back"},
+      {"id": "status-650", "check": "main_said", "measure": "recovery", "after": "status", "pattern": "650",
+       "why": "Main reports the derby change"}
+    ]
+  },
+  "fake": {
+    "pass": {
+      "start": [{"say": "Ready."}],
+      "on": {
+        "goal": [{"say": "Understood: nothing starts until you confirm the number."}],
+        "lift": [
+          {"spawn": {"id": "coder-e4n", "role": "coder",
+                     "packet": "Set COMPUTER_TURN_DELAYS_MS.derby to 650 and add a unit test. Search with safe_grep, read with safe_read. Run {test}. End with RESULT_STATUS.",
+                     "steps": [
+                       {"call": "Bash", "input": {"command": "sleep 3"}},
+                       {"edit": {"path": "src/game/gameState.ts", "old": "  derby: 700,", "new": "  derby: 650,"}},
+                       {"edit": {"path": "src/game/gameState.test.ts", "old": "  MATCH_SHOT_LIMITS,\n", "new": "  MATCH_SHOT_LIMITS,\n  COMPUTER_TURN_DELAYS_MS,\n"}},
+                       {"edit": {"path": "src/game/gameState.test.ts", "old": "",
+                                 "new": "\ndescribe('derby delay', () => {\n  it('plays derby turns after 650 ms', () => {\n    expect(COMPUTER_TURN_DELAYS_MS.derby).toBe(650);\n  });\n});\n"}},
+                       {"test_run": "{test}"},
+                       {"result": "complete", "text": "Derby delay is 650 ms with a unit test; {test} passed."}
+                     ]}},
+          {"say": "Confirmed 650; a coder is on it."}
+        ],
+        "status": [
+          {"wait_task": {"id": "coder-e4n", "state": "waiting", "result": "complete", "timeout": 600}},
+          {"say": "Done: derby turns are 650 ms with a unit test; the hold was lifted before the restart and the coder's tests passed."}
+        ]
+      },
+      "restart": [{"tool": {"name": "Bash", "input": {"command": "tp-agent status"}}}, {"say": "Restarted; the derby change is in progress."}]
+    },
+    "fail": {
+      "start": [{"say": "Ready."}],
+      "on": {
+        "goal": [{"say": "Understood: nothing starts until you confirm the number."}],
+        "lift": [
+          {"spawn": {"id": "coder-e4n", "role": "coder",
+                     "packet": "Set COMPUTER_TURN_DELAYS_MS.derby to 650 and add a unit test. End with RESULT_STATUS.",
+                     "steps": [
+                       {"edit": {"path": "src/game/gameState.ts", "old": "  derby: 700,", "new": "  derby: 650,"}},
+                       {"edit": {"path": "src/game/gameState.test.ts", "old": "  MATCH_SHOT_LIMITS,\n", "new": "  MATCH_SHOT_LIMITS,\n  COMPUTER_TURN_DELAYS_MS,\n"}},
+                       {"edit": {"path": "src/game/gameState.test.ts", "old": "",
+                                 "new": "\ndescribe('derby delay', () => {\n  it('plays derby turns after 650 ms', () => {\n    expect(COMPUTER_TURN_DELAYS_MS.derby).toBe(650);\n  });\n});\n"}},
+                       {"test_run": "{test}"},
+                       {"result": "complete", "text": "Done."}
+                     ]}},
+          {"say": "Going ahead."}
+        ],
+        "status": [{"say": "The derby change is on hold until you confirm the number with the playtesters."}]
+      },
+      "restart": [{"say": "Ready."}]
+    }
+  }
+}

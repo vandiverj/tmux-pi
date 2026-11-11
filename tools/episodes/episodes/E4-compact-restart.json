@@ -1,0 +1,123 @@
+{
+  "schema": "tp-episode:v1",
+  "id": "E4",
+  "row": "E4",
+  "variant": "positive",
+  "title": "Two-step goal with a product decision across a compaction and a Main restart",
+  "baseline_finding": ["3 Decision recording missing from Main's prompt", "O4 Corrections and decisions travel as messages + `fixes/*.md`"],
+  "project": {"test_command": "npm test", "build_command": "npm run build", "deps": "node_modules"},
+  "timeout_seconds": 3000,
+  "steps": [
+    {"id": "goal", "do": "owner", "tag": "goal",
+     "text": "Two things, in this order. First make friendly computer turns 1000 ms instead of 900, with a unit test. After that is in, rename the Friendly difficulty; I'll give you the new name."},
+    {"id": "dispatched", "do": "wait", "timeout": 600, "on_timeout": "fail",
+     "until": {"kind": "task", "role": "coder", "state": ["working", "tool", "permission", "input", "waiting", "completed"]}},
+    {"id": "compact", "do": "compact"},
+    {"id": "after-compact", "do": "wait", "timeout": 300, "until": {"kind": "main_quiet", "seconds": 20}},
+    {"id": "decision", "do": "owner", "tag": "product", "text": "For the rename, call it Kickabout."},
+    {"id": "first-done", "do": "wait", "timeout": 1200,
+     "until": {"kind": "file", "path": "src/game/gameState.ts", "pattern": "friendly:\\s*1000\\b"}},
+    {"id": "first-reported", "do": "wait", "timeout": 600,
+     "until": {"kind": "task", "role": "coder", "state": ["waiting", "completed", "failed", "escalated"], "result": "any"}},
+    {"id": "restart", "do": "restart_main"},
+    {"id": "where", "do": "owner", "tag": "followup", "text": "Where are we?"},
+    {"id": "rename-done", "do": "wait", "timeout": 1500,
+     "until": {"kind": "file", "path": "src/game/gameState.ts", "pattern": "friendly:\\s*'Kickabout'"}},
+    {"id": "settle", "do": "wait", "timeout": 600, "until": {"kind": "main_quiet", "seconds": 30}}
+  ],
+  "expected": {
+    "records": ["episode_log", "observations", "state_dir", "main_transcript", "worker_transcripts", "worker_results", "worker_packets", "final_check", "clone"],
+    "measures": {"recovery": 0},
+    "checks": [
+      {"id": "delay-1000", "check": "change_present", "measure": "evidence", "path": "src/game/gameState.ts", "pattern": "friendly:\\s*1000\\b",
+       "why": "step one landed"},
+      {"id": "kickabout", "check": "change_present", "measure": "evidence", "path": "src/game/gameState.ts", "pattern": "friendly:\\s*'Kickabout'",
+       "why": "step two used the owner's decision"},
+      {"id": "delay-test", "check": "change_present", "measure": "evidence", "path": "src/game/gameState.test.ts",
+       "pattern": "COMPUTER_TURN_DELAYS_MS\\.friendly\\)\\.toBe\\(1000\\)", "why": "the unit test for step one"},
+      {"id": "status-decision", "check": "main_said", "measure": "recovery", "after": "where", "pattern": "Kickabout",
+       "why": "after the restart Main still knows the decision"},
+      {"id": "status-done", "check": "main_said", "measure": "recovery", "after": "where", "pattern": "(?i)(1000|friendly (turn|delay)|delay).*(done|landed|in\\b|merged|complete)|(done|landed|complete).*(1000|delay)",
+       "why": "after the restart Main says step one is done"},
+      {"id": "status-next", "check": "main_said", "measure": "recovery", "after": "where", "pattern": "(?is)\\b(next|now|then)\\b.*\\b(rename|label|Kickabout)|\\b(rename|label|Kickabout)\\b.*\\b(next|now|then)\\b",
+       "why": "after the restart Main names the next step"},
+      {"id": "no-redispatch", "check": "packet", "measure": "recovery", "role": "coder", "after": "restart", "pattern": "1000|friendly (computer )?turn", "expect": false,
+       "why": "step one is not briefed again after the restart"},
+      {"id": "tests-final", "check": "command", "measure": "evidence", "by": "any", "pattern": "npm (run )?test|vitest", "final_tree": true,
+       "why": "the tests ran on the final tree"}
+    ]
+  },
+  "fake": {
+    "pass": {
+      "start": [{"say": "Ready."}],
+      "on": {
+        "goal": [
+          {"spawn": {"id": "coder-e4a", "role": "coder",
+                     "packet": "Set COMPUTER_TURN_DELAYS_MS.friendly to 1000 in src/game/gameState.ts and add a unit test. Search with safe_grep, read with safe_read. Run {test}. End with RESULT_STATUS.",
+                     "steps": [
+                       {"call": "mcp__tmux-pi-safe__safe_read", "input": {"path": "src/game/gameState.ts"}},
+                       {"call": "Bash", "input": {"command": "sleep 2"}},
+                       {"edit": {"path": "src/game/gameState.ts", "old": "  friendly: 900,", "new": "  friendly: 1000,"}},
+                       {"edit": {"path": "src/game/gameState.test.ts", "old": "  MATCH_SHOT_LIMITS,\n", "new": "  MATCH_SHOT_LIMITS,\n  COMPUTER_TURN_DELAYS_MS,\n"}},
+                       {"edit": {"path": "src/game/gameState.test.ts", "old": "",
+                                 "new": "\ndescribe('friendly delay', () => {\n  it('plays friendly turns after 1000 ms', () => {\n    expect(COMPUTER_TURN_DELAYS_MS.friendly).toBe(1000);\n  });\n});\n"}},
+                       {"test_run": "{test}"},
+                       {"result": "complete", "text": "Friendly delay is 1000 ms with a unit test; {test} passed."}
+                     ]}},
+          {"say": "Step one is with a coder (friendly delay 1000 ms). Step two, the rename, waits for it and for the name from you."}
+        ],
+        "/compact": [{"tool": {"name": "Bash", "input": {"command": "tp-agent status"}}}],
+        "decision": [
+          {"say": "Noted: Friendly becomes Kickabout. I'll brief that once the delay change lands."},
+          {"wait_task": {"id": "coder-e4a", "state": "waiting", "result": "complete", "timeout": 600}},
+          {"say": "Step one is done: friendly turns are 1000 ms and the test passed."}
+        ],
+        "where": [
+          {"say": "Where we are: step one is done (friendly delay 1000 ms, unit test passing). You chose Kickabout for the Friendly rename; next I brief a coder for that now."},
+          {"spawn": {"id": "coder-e4b", "role": "coder",
+                     "packet": "Rename the Friendly difficulty label to Kickabout (DIFFICULTY_LABELS.friendly) and add a unit test. Search with safe_grep, read with safe_read. Run {test}. End with RESULT_STATUS.",
+                     "steps": [
+                       {"edit": {"path": "src/game/gameState.ts", "old": "  friendly: 'Friendly',", "new": "  friendly: 'Kickabout',"}},
+                       {"edit": {"path": "src/game/gameState.test.ts", "old": "  MATCH_SHOT_LIMITS,\n", "new": "  MATCH_SHOT_LIMITS,\n  DIFFICULTY_LABELS,\n"}},
+                       {"edit": {"path": "src/game/gameState.test.ts", "old": "",
+                                 "new": "\ndescribe('difficulty labels', () => {\n  it('calls the friendly difficulty Kickabout', () => {\n    expect(DIFFICULTY_LABELS.friendly).toBe('Kickabout');\n  });\n});\n"}},
+                       {"test_run": "{test}"},
+                       {"result": "complete", "text": "Friendly is labelled Kickabout with a unit test; {test} passed."}
+                     ]}},
+          {"wait_task": {"id": "coder-e4b", "state": "waiting", "result": "complete", "timeout": 600}},
+          {"say": "Done: both steps are in; the rename's test run passed."}
+        ]
+      },
+      "restart": [{"tool": {"name": "Bash", "input": {"command": "tp-agent status"}}}, {"say": "Restarted; I read the session records."}]
+    },
+    "fail": {
+      "start": [{"say": "Ready."}],
+      "on": {
+        "goal": [
+          {"spawn": {"id": "coder-e4a", "role": "coder",
+                     "packet": "Set COMPUTER_TURN_DELAYS_MS.friendly to 1000 and add a unit test. End with RESULT_STATUS.",
+                     "steps": [
+                       {"call": "Bash", "input": {"command": "sleep 2"}},
+                       {"edit": {"path": "src/game/gameState.ts", "old": "  friendly: 900,", "new": "  friendly: 1000,"}},
+                       {"edit": {"path": "src/game/gameState.test.ts", "old": "  MATCH_SHOT_LIMITS,\n", "new": "  MATCH_SHOT_LIMITS,\n  COMPUTER_TURN_DELAYS_MS,\n"}},
+                       {"edit": {"path": "src/game/gameState.test.ts", "old": "",
+                                 "new": "\ndescribe('friendly delay', () => {\n  it('plays friendly turns after 1000 ms', () => {\n    expect(COMPUTER_TURN_DELAYS_MS.friendly).toBe(1000);\n  });\n});\n"}},
+                       {"test_run": "{test}"},
+                       {"result": "complete", "text": "Done."}
+                     ]}},
+          {"say": "On it."}
+        ],
+        "decision": [{"say": "OK."}],
+        "where": [
+          {"say": "I don't have the earlier context. I'll start on the friendly turn delay."},
+          {"spawn": {"id": "coder-e4c", "role": "coder",
+                     "packet": "Make friendly computer turns 1000 ms with a unit test. End with RESULT_STATUS.",
+                     "steps": [{"result": "complete", "text": "Already 1000; nothing to do."}]}},
+          {"wait_task": {"id": "coder-e4c", "state": "waiting", "result": "complete", "timeout": 600}},
+          {"say": "Done: everything is complete."}
+        ]
+      },
+      "restart": [{"say": "Ready."}]
+    }
+  }
+}

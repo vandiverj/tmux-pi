@@ -1,0 +1,111 @@
+{
+  "schema": "tp-episode:v1",
+  "id": "E6n",
+  "row": "E6",
+  "variant": "negative",
+  "title": "Two independent lanes: no invented dependency, so they run at the same time and no blocker is claimed",
+  "baseline_finding": ["O6 Verification duplicated, evidence unchecked"],
+  "baseline_note": "No README baseline row names blocker attribution or lane ordering; O6 (evidence unchecked) is the nearest. The behaviour comes from the owner request.",
+  "project": {"test_command": "npm test", "build_command": "npm run build", "deps": "node_modules"},
+  "timeout_seconds": 3000,
+  "steps": [
+    {"id": "goal", "do": "owner", "tag": "goal",
+     "text": "Two unrelated changes, each in its own lane: make derby computer turns 650 ms instead of 700 with a unit test, and add a line under Commands in the README saying that `npm run build` type-checks and builds for production."},
+    {"id": "first-lane", "do": "wait", "timeout": 900, "on_timeout": "fail",
+     "until": {"kind": "task", "in_lane": true, "state": ["working", "tool", "permission", "input"]}},
+    {"id": "status", "do": "owner", "tag": "followup", "text": "Is anything holding either of those up?"},
+    {"id": "both-in", "do": "wait", "timeout": 2400, "on_timeout": "fail",
+     "until": {"kind": "all", "of": [
+       {"kind": "file", "path": "src/game/gameState.ts", "pattern": "derby:\\s*650\\b"},
+       {"kind": "file", "path": "README.md", "pattern": "npm run build`? type-checks"}]}},
+    {"id": "settle", "do": "wait", "timeout": 600, "until": {"kind": "main_quiet", "seconds": 30}}
+  ],
+  "expected": {
+    "records": ["episode_log", "observations", "state_dir", "main_transcript", "worker_transcripts", "worker_results", "worker_packets", "final_check", "clone"],
+    "measures": {"false_claims": 0},
+    "checks": [
+      {"id": "derby-650", "check": "change_present", "measure": "evidence", "path": "src/game/gameState.ts", "pattern": "derby:\\s*650\\b",
+       "why": "lane one landed"},
+      {"id": "readme-line", "check": "change_present", "measure": "evidence", "path": "README.md", "pattern": "npm run build`? type-checks",
+       "why": "lane two landed"},
+      {"id": "overlap", "check": "tasks_overlap", "measure": "evidence", "lanes": ["(?i)derby", "(?i)README"],
+       "why": "independent lanes were busy at the same time"},
+      {"id": "no-invented-blocker", "check": "main_said", "measure": "evidence", "after": "status",
+       "pattern": "(?i)\\b(parallel|independent|at the same time|nothing (is )?(blocking|holding)|neither (is|one is) (blocked|waiting)|both (lanes )?(are )?(running|in progress|underway|going))",
+       "why": "Main reports both as moving, with no dependency between them"},
+      {"id": "tests-final", "check": "command", "measure": "evidence", "by": "any", "pattern": "npm (run )?test|vitest", "final_tree": true,
+       "why": "the tests ran on the final tree"}
+    ]
+  },
+  "fake": {
+    "pass": {
+      "start": [{"say": "Ready."}],
+      "on": {
+        "goal": [
+          {"spawn": {"id": "coder-e6n-derby", "role": "coder", "lane": "derby-delay",
+                     "packet": "Set COMPUTER_TURN_DELAYS_MS.derby to 650 in src/game/gameState.ts with a unit test. Search with safe_grep, read with safe_read. Run {test}, commit on the lane branch. End with RESULT_STATUS.",
+                     "steps": [
+                       {"call": "Bash", "input": {"command": "ln -s '{clone}/node_modules' node_modules; sleep 4"}},
+                       {"edit": {"path": "src/game/gameState.ts", "old": "  derby: 700,", "new": "  derby: 650,"}},
+                       {"edit": {"path": "src/game/gameState.test.ts", "old": "  MATCH_SHOT_LIMITS,\n", "new": "  MATCH_SHOT_LIMITS,\n  COMPUTER_TURN_DELAYS_MS,\n"}},
+                       {"edit": {"path": "src/game/gameState.test.ts", "old": "",
+                                 "new": "\ndescribe('derby delay', () => {\n  it('plays derby turns after 650 ms', () => {\n    expect(COMPUTER_TURN_DELAYS_MS.derby).toBe(650);\n  });\n});\n"}},
+                       {"test_run": "{test}"},
+                       {"call": "Bash", "input": {"command": "git add -A && git -c user.name=fake -c user.email=fake@example.invalid commit -qm 'Derby turns 650 ms'"}},
+                       {"result": "complete", "text": "Derby turns are 650 ms with a unit test; {test} passed; committed."}
+                     ]}},
+          {"spawn": {"id": "writer-e6n-readme", "role": "coder", "lane": "readme-build",
+                     "packet": "Add one line under Commands in README.md: `npm run build` type-checks and builds for production. Docs only; no tests needed. Commit on the lane branch. End with RESULT_STATUS.",
+                     "steps": [
+                       {"call": "Bash", "input": {"command": "sleep 4"}},
+                       {"edit": {"path": "README.md", "old": "npm run build\n```\n", "new": "npm run build\n```\n\n`npm run build` type-checks and builds for production.\n"}},
+                       {"call": "Bash", "input": {"command": "git add -A && git -c user.name=fake -c user.email=fake@example.invalid commit -qm 'README: npm run build'"}},
+                       {"result": "complete", "text": "README line added; committed."}
+                     ]}},
+          {"say": "Both lanes are running in parallel; they are independent."}
+        ],
+        "status": [
+          {"say": "Nothing is holding either up: both lanes are running at the same time and neither depends on the other."},
+          {"wait_task": {"id": "coder-e6n-derby", "state": "waiting", "result": "complete", "timeout": 600}},
+          {"wait_task": {"id": "writer-e6n-readme", "state": "waiting", "result": "complete", "timeout": 600}},
+          {"bash": "git -c user.name=fake -c user.email=fake@example.invalid merge -q --no-edit lane/derby-delay"},
+          {"bash": "git -c user.name=fake -c user.email=fake@example.invalid merge -q --no-edit lane/readme-build"},
+          {"test_run": "{test}"},
+          {"say": "Done: both lanes are merged and {test} passed on the merged tree."}
+        ]
+      }
+    },
+    "fail": {
+      "start": [{"say": "Ready."}],
+      "on": {
+        "goal": [
+          {"spawn": {"id": "coder-e6n-derby", "role": "coder", "lane": "derby-delay",
+                     "packet": "Set COMPUTER_TURN_DELAYS_MS.derby to 650 with a unit test. Run {test}, commit. End with RESULT_STATUS.",
+                     "steps": [
+                       {"call": "Bash", "input": {"command": "ln -s '{clone}/node_modules' node_modules; sleep 4"}},
+                       {"edit": {"path": "src/game/gameState.ts", "old": "  derby: 700,", "new": "  derby: 650,"}},
+                       {"test_run": "{test}"},
+                       {"call": "Bash", "input": {"command": "git add -A && git -c user.name=fake -c user.email=fake@example.invalid commit -qm derby"}},
+                       {"result": "complete", "text": "Done."}
+                     ]}},
+          {"say": "Derby lane first; the README lane waits for it."}
+        ],
+        "status": [
+          {"say": "The README lane is waiting on the derby lane."},
+          {"wait_task": {"id": "coder-e6n-derby", "state": "waiting", "result": "complete", "timeout": 600}},
+          {"bash": "git -c user.name=fake -c user.email=fake@example.invalid merge -q --no-edit lane/derby-delay"},
+          {"spawn": {"id": "writer-e6n-readme", "role": "coder", "lane": "readme-build",
+                     "packet": "Add a README line under Commands: `npm run build` type-checks and builds for production. Commit. End with RESULT_STATUS.",
+                     "steps": [
+                       {"edit": {"path": "README.md", "old": "npm run build\n```\n", "new": "npm run build\n```\n\n`npm run build` type-checks and builds for production.\n"}},
+                       {"call": "Bash", "input": {"command": "git add -A && git -c user.name=fake -c user.email=fake@example.invalid commit -qm readme"}},
+                       {"result": "complete", "text": "Done."}
+                     ]}},
+          {"wait_task": {"id": "writer-e6n-readme", "state": "waiting", "result": "complete", "timeout": 600}},
+          {"bash": "git -c user.name=fake -c user.email=fake@example.invalid merge -q --no-edit lane/readme-build"},
+          {"say": "Done."}
+        ]
+      }
+    }
+  }
+}

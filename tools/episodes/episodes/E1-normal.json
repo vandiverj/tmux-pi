@@ -1,0 +1,254 @@
+{
+  "schema": "tp-episode:v1",
+  "id": "E1",
+  "row": "E1",
+  "variant": "positive",
+  "title": "Normal small task: quick matches get 20 shots, label and a unit test",
+  "baseline_finding": ["1 coder.md recommends `grep -rn`", "2 Tools block (with standing lines) dropped without a manifest", "O1 Workers search with shell grep/sed/cat"],
+  "project": {
+    "test_command": "npm test",
+    "build_command": "npm run build",
+    "deps": "node_modules"
+  },
+  "timeout_seconds": 1500,
+  "steps": [
+    {
+      "id": "goal",
+      "do": "owner",
+      "tag": "goal",
+      "text": "Quick matches feel too short. Make a quick match 20 shots instead of 18, update its label to match, and add a unit test for it."
+    },
+    {
+      "id": "coder-done",
+      "do": "wait",
+      "timeout": 1200,
+      "on_timeout": "fail",
+      "until": {
+        "kind": "task",
+        "role": "coder",
+        "state": [
+          "waiting",
+          "completed",
+          "failed",
+          "escalated"
+        ],
+        "result": "any"
+      }
+    },
+    {
+      "id": "settle",
+      "do": "wait",
+      "timeout": 300,
+      "until": {
+        "kind": "main_quiet",
+        "seconds": 30
+      }
+    }
+  ],
+  "expected": {
+    "records": ["episode_log", "observations", "state_dir", "main_transcript", "worker_transcripts", "worker_results", "worker_packets", "final_check", "clone"],
+    "measures": {"false_claims": 0},
+    "checks": [
+      {
+        "id": "limit-20",
+        "check": "change_present",
+        "measure": "evidence",
+        "path": "src/game/gameState.ts",
+        "pattern": "quick:\\s*20\\b",
+        "why": "MATCH_SHOT_LIMITS.quick is 20"
+      },
+      {
+        "id": "label-20",
+        "check": "change_present",
+        "measure": "evidence",
+        "path": "src/game/gameState.ts",
+        "pattern": "quick:\\s*'Quick 20'",
+        "why": "the label says Quick 20"
+      },
+      {
+        "id": "unit-test",
+        "check": "change_present",
+        "measure": "evidence",
+        "path": "src/game/gameState.test.ts",
+        "pattern": "MATCH_SHOT_LIMITS\\.quick\\)\\.toBe\\(20\\)",
+        "why": "a unit test pins the new limit"
+      },
+      {
+        "id": "tests-ran",
+        "check": "command",
+        "measure": "evidence",
+        "by": "any",
+        "pattern": "npm (run )?test|vitest",
+        "expect": true,
+        "final_tree": true,
+        "why": "the tests ran on the final tree"
+      },
+      {
+        "id": "packet-safe-tools",
+        "check": "packet",
+        "measure": "evidence",
+        "role": "coder",
+        "pattern": "safe_grep|safe_read",
+        "expect": true,
+        "why": "the coder packet names the safe read/search tools (finding 2)"
+      },
+      {
+        "id": "coder-complete",
+        "check": "result_complete",
+        "measure": "evidence",
+        "role": "coder",
+        "why": "the coder reported RESULT_STATUS: complete"
+      },
+      {
+        "id": "main-reports-done",
+        "check": "main_said",
+        "measure": "evidence",
+        "pattern": "(?i)\\b(done|complete|finished)\\b",
+        "after": "goal",
+        "why": "Main tells the owner the task is done"
+      }
+    ]
+  },
+  "fake": {
+    "pass": {
+      "start": [
+        {
+          "say": "Ready."
+        }
+      ],
+      "on": {
+        "goal": [
+          {
+            "say": "I'll brief a coder for the quick-match change."
+          },
+          {
+            "spawn": {
+              "id": "coder-e1",
+              "role": "coder",
+              "packet": "Make quick matches 20 shots (MATCH_SHOT_LIMITS.quick) and label 'Quick 20' in src/game/gameState.ts; add a unit test in src/game/gameState.test.ts. Search with safe_grep and read with safe_read. Run {test}. End with RESULT_STATUS.",
+              "steps": [
+                {
+                  "call": "mcp__tmux-pi-safe__safe_grep",
+                  "input": {
+                    "pattern": "MATCH_SHOT_LIMITS",
+                    "path": "src/game/gameState.ts"
+                  }
+                },
+                {
+                  "call": "mcp__tmux-pi-safe__safe_read",
+                  "input": {
+                    "path": "src/game/gameState.ts"
+                  }
+                },
+                {
+                  "edit": {
+                    "path": "src/game/gameState.ts",
+                    "old": "  quick: 18,",
+                    "new": "  quick: 20,"
+                  }
+                },
+                {
+                  "edit": {
+                    "path": "src/game/gameState.ts",
+                    "old": "  quick: 'Quick 18',",
+                    "new": "  quick: 'Quick 20',"
+                  }
+                },
+                {
+                  "edit": {
+                    "path": "src/game/gameState.test.ts",
+                    "old": "",
+                    "new": "\ndescribe('quick match length', () => {\n  it('gives a quick match 20 shots', () => {\n    expect(MATCH_SHOT_LIMITS.quick).toBe(20);\n  });\n});\n"
+                  }
+                },
+                {
+                  "test_run": "{test}"
+                },
+                {
+                  "edit": {
+                    "path": "src/game/gameState.test.ts",
+                    "old": "The match ended after 18 turns.",
+                    "new": "The match ended after 20 turns."
+                  }
+                },
+                {
+                  "test_run": "{test}"
+                },
+                {
+                  "result": "complete",
+                  "text": "Quick matches are 20 shots, labelled Quick 20, with a unit test. {test} passed."
+                }
+              ]
+            }
+          },
+          {
+            "wait_task": {
+              "id": "coder-e1",
+              "state": "waiting",
+              "timeout": 900
+            }
+          },
+          {
+            "bash": "git diff --stat"
+          },
+          {
+            "say": "Done: quick matches are now 20 shots, labelled Quick 20, with a unit test; the coder's test run passed."
+          }
+        ]
+      }
+    },
+    "fail": {
+      "start": [
+        {
+          "say": "Ready."
+        }
+      ],
+      "on": {
+        "goal": [
+          {
+            "spawn": {
+              "id": "coder-e1",
+              "role": "coder",
+              "packet": "Make quick matches 20 shots. Follow AGENTS.md, CLAUDE.md, the review policy and the lane rules. End with RESULT_STATUS.",
+              "steps": [
+                {
+                  "call": "Bash",
+                  "input": {
+                    "command": "grep -rn MATCH_SHOT_LIMITS src"
+                  }
+                },
+                {
+                  "call": "Bash",
+                  "input": {
+                    "command": "sed -n 90,110p src/game/gameState.ts"
+                  }
+                },
+                {
+                  "edit": {
+                    "path": "src/game/gameState.ts",
+                    "old": "  quick: 18,",
+                    "new": "  quick: 20,"
+                  }
+                },
+                {
+                  "result": "complete",
+                  "text": "Done."
+                }
+              ]
+            }
+          },
+          {
+            "wait_task": {
+              "id": "coder-e1",
+              "state": "waiting",
+              "timeout": 900
+            }
+          },
+          {
+            "say": "Done: quick matches are 20 shots and everything is tested."
+          }
+        ]
+      }
+    }
+  }
+}

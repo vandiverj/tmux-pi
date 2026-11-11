@@ -776,7 +776,7 @@ class EnforceKeepsTheRecordTests(unittest.TestCase):
         contract = build("task", str(self.task / "artifact.md"), "time=20m", "", "6m", "3m")
         (self.task / "meta.json").write_text(json.dumps({"id": "coder-1", "created": iso(T0), "contract": contract,
                                                          "pane": "%1", "worker": "claude"}))
-        (self.task / "state.json").write_text(json.dumps({"state": "working", "turns": 3, "tools": 4}))
+        (self.task / "state.json").write_text(json.dumps({"state": "working", "turns": 3, "tools": 4, "promptTurn": 1}))
         loader = importlib.machinery.SourceFileLoader("tp_contract_for_enforce", str(ROOT / "bin/tp-contract"))
         self.tool = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
         loader.exec_module(self.tool)
@@ -909,6 +909,14 @@ class EnforceKeepsTheRecordTests(unittest.TestCase):
         self.assertEqual(self.recorded_state(), "paused")
         self.assertEqual([c[-1] for c in calls if c[0] == "send-keys"], ["Escape", "C-u", "C-u", "C-u"])
         self.assertTrue(self.held())
+        # HB4b rule 1: the same stopped worker, but the turn cannot be read after the Escape (no promptTurn): unverified.
+        (self.task / "checkpoints.json").unlink()
+        (self.task / "state.json").write_text(json.dumps({"state": "working", "turns": 3, "tools": 4, "promptTurn": 1}))
+        self.enforce(pane="❯ \n", after_escape={"state": "working", "turns": 3, "tools": 4})
+        self.assertEqual(self.actions(), ["pause-requested", "pause-unverified"])
+        self.assertEqual([self.events()[-1].get(k) for k in ("turn", "turnBefore")], [None, 1])
+        self.assertIn("turn could not be read", self.events()[-1]["why"])
+        self.assertTrue(self.held())
 
     def test_an_escape_the_worker_ignores_is_unverified_keeps_the_hold_and_is_not_shown_paused(self):
         calls = self.enforce(pane="\u273b Working\u2026 (esc to interrupt)\n\u276f \n",
@@ -992,6 +1000,47 @@ class EnforceKeepsTheRecordTests(unittest.TestCase):
                 self.assertEqual(self.actions(), ["pause-requested", "pause"])
                 self.assertEqual(self.outcome(), "confirmed")
                 self.assertEqual([state.get("promptTurn"), state.get("completedTurn")], [2, 1])
+                self.assertEqual({e.get("turn") for e in self.events()}, {2})
+                self.assertEqual(self.life(), "paused")
+                self.assertTrue(self.held())
+                cases += [(e, state, False) for e in self.events()]
+            # (e) HB4b K1: the attempt reads turn 1 at a tool; between that read and the Escape turn 1 completes and turn 2
+            # starts, so the Escape interrupts turn 2, and a partial Stop then puts turn 1's report back. The outcome names
+            # turn 2 (read after the Escape, with turnBefore 1) and the task stays paused. Claude's confirmation compares with
+            # the state when the Escape landed (turn 2 at its tool), not the earlier read; pi settles on the Escape.
+            with self.subTest(sequence="e", harness=harness):
+                w = self.worker(harness)
+                w.prompt(); w.tool()
+
+                def next_turn(w=w):
+                    w.stop("Turn one.\nRESULT_STATUS: complete"); w.prompt(); w.tool()
+                writes = {"requested": [next_turn]}
+                if harness == "pi":
+                    writes["escape"] = [lambda w=w: w.stop(partial)]
+                self.enforce(pane="❯ \n", writes=writes)
+                if harness == "claude":
+                    w.stop(partial)
+                    self.assertEqual((self.task / "result.md").read_text(), "Turn one.\nRESULT_STATUS: complete\n")
+                state = self.state_now()
+                self.assertEqual([state.get("promptTurn"), state.get("completedTurn")], [2, 1])
+                self.assertEqual([(e["action"], e.get("turn"), e.get("turnBefore")) for e in self.events()],
+                                 [("pause-requested", 1, None),
+                                  ("pause", 2, 1)])
+                self.assertEqual(self.life(), "paused")
+                self.assertTrue(self.held())
+                cases += [(e, state, e["action"] == "pause-requested") for e in self.events()]
+            # (f) HB4b K2: overlapping prompts. Turn 2's prompt arrives while turn 1's reply runs, the pause names turn 2,
+            # then turn 1's own statused Stop: it completes turn 1, never turn 2, so turn 2's pause stays.
+            with self.subTest(sequence="f", harness=harness):
+                w = self.worker(harness)
+                w.prompt(); w.tool(); w.prompt()
+                first = "First turn finished.\nRESULT_STATUS: complete"
+                self.enforce(pane="❯ \n", writes={"escape": [lambda w=w: w.stop(first)]} if harness == "pi" else None)
+                if harness == "claude":
+                    w.stop(first)
+                state = self.state_now()
+                self.assertEqual([state.get("promptTurn"), state.get("completedTurn")], [2, 1])
+                self.assertEqual(self.actions(), ["pause-requested", "pause"])
                 self.assertEqual({e.get("turn") for e in self.events()}, {2})
                 self.assertEqual(self.life(), "paused")
                 self.assertTrue(self.held())
@@ -1093,8 +1142,9 @@ class EnforceKeepsTheRecordTests(unittest.TestCase):
         self.enforce(pane="> \n")  # a prompt-looking pane is not enough for pi
         self.assertEqual(self.actions(), ["pause-requested", "pause-unverified"])
         (self.task / "checkpoints.json").unlink()
-        (self.task / "state.json").write_text(json.dumps({"state": "working", "turns": 3, "tools": 4}))
-        self.enforce(after_escape={"state": "waiting", "turns": 3, "tools": 4, "updated": "2026-01-01T00:00:00Z"})
+        (self.task / "state.json").write_text(json.dumps({"state": "working", "turns": 3, "tools": 4, "promptTurn": 1}))
+        self.enforce(after_escape={"state": "waiting", "turns": 3, "tools": 4, "updated": "2026-01-01T00:00:00Z",
+                                     "promptTurn": 1})
         self.assertEqual(self.actions(), ["pause-requested", "pause"])
 
     def test_an_unconfirmed_pause_hold_ends_when_the_worker_settles_on_its_own(self):

@@ -6,6 +6,7 @@ an unreadable pane table, a task record that is not a JSON object, a live task w
 import json
 import os
 from pathlib import Path
+import shlex
 import signal
 import subprocess
 import sys
@@ -205,16 +206,24 @@ def state_words(life):
     return STATE_WORDS.get(life, "running")
 
 
-def clear_commands(life, ident, prefix=""):
+def clear_commands(life, ident, prefix="", argv=False):
     """The commands that end the process of task `ident` when it is in lifecycle state `life`, the cheapest first. Each is in
-    backticks, so a sentence can go on after it without its punctuation becoming part of a pasted command (an id may end in a dot)."""
+    backticks, so a sentence can go on after it without its punctuation becoming part of a pasted command (an id may end in a dot).
+    argv: each command as data instead, its argument list (for tp-agent) (HB4b rule 3), which needs_text renders as that text."""
     commands = []
     if life in {"settled", "completed"}:
-        commands.append(f"`{prefix}tp-agent collect {ident}`")
+        commands.append(["collect", ident])
     if life in {"completed", "stopped"}:
-        commands.append(f"`{prefix}tp-agent reap {ident} --yes`")
-    commands.append(f"`{prefix}tp-agent stop {ident}`")
-    return commands
+        commands.append(["reap", ident, "--yes"])
+    commands.append(["stop", ident])
+    return commands if argv else [needs_text([command], prefix) for command in commands]
+
+
+def needs_text(parts, prefix=""):
+    """A refusal given as data (HB4b rule 3) as the text the command prints: `parts` is a list of prose (str) and commands (a
+    list of arguments to tp-agent); each command is quoted once (shlex) after `prefix` (lib/lane_lease.py in_session) and put in
+    backticks. claude/plugins/tmux-pi/hooks/register.tsx renders the same parts with its own copy of the quoting."""
+    return "".join(part if isinstance(part, str) else f"`{prefix}tp-agent {shlex.join(part)}`" for part in parts)
 
 
 def finishes_alone(life):
@@ -245,15 +254,25 @@ def _lane_tagged(path):
 
 def guard_retry(path, prefix=""):
     """Refuses a retry of task `path` while a process is alive on its working tree, naming what ends it. `prefix` goes before
-    each command named (HB4a round 5 rule 3: a notice read in another session suggests commands that act on this one)."""
+    each command named (HB4a round 5 rule 3: a notice read in another session suggests commands that act on this one). The
+    ValueError's `parts` is the same refusal as data (needs_text; HB4b rule 3), its commands without the prefix."""
     path = Path(path)
     busy = alive_on_tree(path)
     if busy:
         tasks = path.parent
-        seen = f"a process is alive on the same working tree: {describe_state(tasks, busy)}. End it with {_ending(tasks, busy, prefix)}"
+        parts = [f"a process is alive on the same working tree: {describe_state(tasks, busy)}. End it with "]
+        for n, row in enumerate(busy):  # what ends each task, in the state it is in: "A or B", "; " between tasks (as _ending)
+            for i, command in enumerate(clear_commands(task_state(tasks, row[0]), row[0], argv=True)):
+                if n or i:
+                    parts.append(" or " if i else "; ")
+                parts.append(command)
         if _lane_tagged(path):  # the lane's lease refuses a second writer whatever the flag says, so the flag is not offered
-            raise ValueError(f"{seen}. --force-alive does not apply to a lane's working tree; only ending it helps")
-        raise ValueError(f"{seen}, or pass --force-alive to start the attempt beside it")
+            parts.append(". --force-alive does not apply to a lane's working tree; only ending it helps")
+        else:
+            parts.append(", or pass --force-alive to start the attempt beside it")
+        error = ValueError(needs_text(parts, prefix))
+        error.parts = parts
+        raise error
 
 
 def guard_review(path):

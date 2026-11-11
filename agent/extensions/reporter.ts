@@ -16,7 +16,8 @@
  * agent_start; completedTurn is the highest promptTurn whose own agent_settled wrote a reply with a valid RESULT_STATUS line
  * (lib/result_status.py). It only goes up: the next agent_start withdraws result.md without lowering it, and a restart
  * carries both over. A pause names the promptTurn it interrupts and is void once completedTurn reaches it
- * (lib/contract.py pause_void).
+ * (lib/contract.py pause_void). An agent_settled answers the turn its reply started from (replyTurn, HB4b rule 2): the
+ * agent_start that opened the reply, not one that arrived while it ran; a settle with no open reply completes nothing.
  *
  * A worker that settles waiting with a reply that has no RESULT_STATUS line waits for an answer: it opens (or finds) an
  * `input` request under $TP_TASK_DIR/requests/ through lib/hub_records.py (pi-state), and the next start resolves it
@@ -50,6 +51,7 @@ type State = {
 	error: string;
 	promptTurn: number;
 	completedTurn: number;
+	replyTurn: number;
 	updated: string;
 };
 
@@ -126,9 +128,11 @@ export default function (pi: ExtensionAPI) {
 		error: "",
 		promptTurn: 0,
 		completedTurn: 0,
+		replyTurn: 0,
 		updated: "",
 	};
 	let lastReply = "";
+	let replyOpen = false; // an agent_start opened a reply that no agent_settled has ended yet
 
 	// Write via rename so the status pane never reads a half-written file.
 	const atomic = (name: string, body: string) => {
@@ -212,6 +216,8 @@ export default function (pi: ExtensionAPI) {
 	});
 	pi.on("agent_start", () => {
 		s.promptTurn += 1;
+		if (!replyOpen) s.replyTurn = s.promptTurn;
+		replyOpen = true;
 		s.state = "working";
 		s.error = "";
 		lastReply = "";
@@ -272,7 +278,8 @@ export default function (pi: ExtensionAPI) {
 				replied = true;
 			} catch {}
 		}
-		if (replied && STATUSED.test(lastReply)) s.completedTurn = Math.max(s.completedTurn, s.promptTurn);
+		if (replyOpen && replied && STATUSED.test(lastReply)) s.completedTurn = Math.max(s.completedTurn, s.replyTurn);
+		replyOpen = false;
 		save();
 		requests(s.state, replied ? join(dir, "result.md") : undefined);
 	});

@@ -285,6 +285,17 @@ def prompt_turn(state):
     return turn if isinstance(turn, int) and not isinstance(turn, bool) and turn >= 1 else None
 
 
+def pause_turn(d, before):
+    """The turn a pause attempt interrupts, read after its key is delivered (HB4b rule 1): ({"turn": state.json's promptTurn
+    now (prompt_turn), or None when it cannot be read, plus "turnBefore" (the turn read before the send) when the two differ,
+    so the event says both}, the state.json read). Read before the send, the turn can be stale: a worker may complete it and
+    start the next one in between, and the key then interrupts the newer turn. Every pause attempt (Claude and pi) takes its
+    turn from here, and the state read here is what "since the Escape" is measured from (worker_stopped)."""
+    state = read(d / "state.json")
+    turn = prompt_turn(state)
+    return {"turn": turn, **({} if turn == before else {"turnBefore": before})}, state
+
+
 def finished_turn(d, turn):
     """Did the worker complete turn `turn`, or a later one, on its own? The one rule every reader applies (lib/contract.py
     pause_void: state.json completedTurn >= turn), read now. Nothing here reads result.md."""
@@ -299,8 +310,9 @@ def pause_worker(d, meta, events, reason, now):
     Returns the outcome: skipped (the worker finished before the Escape), confirmed, unneeded or unverified.
 
     The checks here only save an Escape or say "unneeded"; they are not what keeps a finished turn from being paused
-    (HB4a round 5 rule 1). Every attempt event names its turn ("turn": state.json promptTurn in the working read the attempt
-    is decided on, prompt_turn), and every reader voids it once completedTurn reaches that turn (lib/contract.py pause_void),
+    (HB4a round 5 rule 1). Every attempt event names its turn: "pause-requested" the promptTurn of the working read the
+    attempt is decided on (prompt_turn); its outcome the promptTurn read after the Escape is delivered (pause_turn, HB4b
+    rule 1), and an outcome whose turn cannot be read then is never "confirmed". Every reader voids it once completedTurn reaches that turn (lib/contract.py pause_void),
     so a completion landing after the last check here, even after the pause is saved, is never reported as a pause. An earlier
     turn's report, restored or not, never voids it: completedTurn moves only when the turn's own Stop writes a statused reply."""
     before = read(d / "state.json")
@@ -313,8 +325,13 @@ def pause_worker(d, meta, events, reason, now):
     save_events(d, events)
     journal(d, "pause.requested", reason=reason, attempt=tries)
     confirmed, why = False, "Escape not sent"
+    named = {"turn": turn}  # an Escape that was not sent interrupted nothing: the attempt keeps the turn it was decided on
     try:
         subprocess.run(["tmux", "send-keys", "-t", meta["pane"], "Escape"], check=True)
+        named, at_escape = pause_turn(d, turn)
+        turn = named["turn"]
+        if turn is not None:
+            before = at_escape  # the worker's state when the key landed: what worker_stopped and the pause's tools compare to
         try:
             wait = float(os.environ.get("TP_PAUSE_CONFIRM_SECONDS", PAUSE_CONFIRM_SECONDS))
         except ValueError:
@@ -327,6 +344,8 @@ def pause_worker(d, meta, events, reason, now):
             confirmed, why = worker_stopped(d, meta, before)
             if confirmed:
                 break
+        if turn is None:  # the turn the Escape interrupted is unknown: never a confirmed pause (HB4b rule 1)
+            confirmed, why = False, "the turn could not be read after the Escape (state.json promptTurn)"
         finished = finished_turn(d, turn)
         if confirmed and not finished:
             # An interrupted worker puts queued messages (our reminders) back in its input box;
@@ -339,15 +358,15 @@ def pause_worker(d, meta, events, reason, now):
     # Looked at after the attempt whatever came of it (sent or not, confirmed or not): a finished turn is never paused.
     if finished_turn(d, turn):
         why = "the worker completed turn {} on its own (state.json completedTurn)".format(turn)
-        events.append({"action": "pause-unneeded", "reason": reason, "at": now, "why": why, "try": tries, "turn": turn})
+        events.append({"action": "pause-unneeded", "reason": reason, "at": now, "why": why, "try": tries, **named})
         journal(d, "pause.unneeded", source="file", reason=reason, why=why, attempt=tries)
         save_events(d, events)
         return "unneeded"
     if confirmed:
-        events.append({"action": "pause", "reason": reason, "at": now, "tools": before.get("tools") or 0, "turn": turn})
+        events.append({"action": "pause", "reason": reason, "at": now, "tools": before.get("tools") or 0, **named})
         journal(d, "pause.confirmed", source="pane" if meta.get("worker") != "pi" else "file", reason=reason, why=why)
     else:
-        events.append({"action": "pause-unverified", "reason": reason, "at": now, "why": why, "try": tries, "turn": turn})
+        events.append({"action": "pause-unverified", "reason": reason, "at": now, "why": why, "try": tries, **named})
         journal(d, "pause.unverified", confidence="derived", reason=reason, why=why, attempt=tries)
         journal(d, "hold.kept", confidence="derived", reason="pause not confirmed")
     save_events(d, events)

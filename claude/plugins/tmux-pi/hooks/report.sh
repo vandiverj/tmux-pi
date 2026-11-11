@@ -9,7 +9,9 @@
 #   $TP_TASK_DIR/results/    each reply or result.md the hook replaced or held back, never overwritten
 #
 # Turn numbers (HB4a round 5): promptTurn counts prompts (UserPromptSubmit); completedTurn is the highest promptTurn whose
-# own Stop carried a reply with a valid RESULT_STATUS line (lib/result_status.py). completedTurn only goes up: a report put
+# own Stop carried a reply with a valid RESULT_STATUS line (lib/result_status.py). A Stop answers the turn its reply started
+# from (replyTurn, HB4b rule 2): the prompt that opened the reply, not a prompt that arrived while it ran, so with
+# overlapping prompts turn 1's Stop completes turn 1, never turn 2. completedTurn only goes up: a report put
 # back from heldReport, a late or duplicate Stop, and the next prompt's withdrawal of result.md never move it. A pause names
 # the promptTurn it interrupts and is void once completedTurn reaches it (lib/contract.py pause_void).
 #
@@ -243,6 +245,9 @@ jq -n --argjson prev "$prev" --argjson in "$input" --argjson usage "$usage" \
   def settled: ($prev.settledTurn // (if $prev.state == "waiting" then turn else 0 end));
   def active: turn > settled;
   def completed: ($prev.completedTurn // 0 | if type == "number" and . >= 0 and . == floor then . else 0 end);
+  # The turn the open reply started from (HB4b rule 2): set by the UserPromptSubmit that opens a reply, kept by one that
+  # arrives while a reply is open (overlapping prompts). Missing or out of range: the oldest open turn.
+  def reply: ($prev.replyTurn | if type == "number" and . == floor and . > settled and . <= turn then . else settled + 1 end);
   def hint: ((.tool_input.file_path // .tool_input.path // .tool_input.command // .tool_input.pattern // "") | tostring);
   def clip: gsub("\\s+"; " ") | if length > 80 then .[0:79] + "…" else . end;
   # Transcripts carry no cost. cost stays numeric 0 because lib/goal.py treats a
@@ -253,6 +258,7 @@ jq -n --argjson prev "$prev" --argjson in "$input" --argjson usage "$usage" \
   + ( if $in.hook_event_name == "SessionStart" then { state: "starting", model: ($in.model // $prev.model // "") }
       elif $in.hook_event_name == "UserPromptSubmit" then
         { state: "working", tool: "", error: "", promptTurn: (turn + 1), settledTurn: settled,
+          replyTurn: (if active then reply else turn + 1 end),
           promptSubmits: (($prev.promptSubmits // 0) + 1),
           promptLog: ((($prev.promptLog // []) + [{ n: (($prev.promptSubmits // 0) + 1), at: $now, tokens: $record.tokens, marks: $record.marks }]) | .[-8:]) }
       elif $in.hook_event_name == "PreToolUse" and active then
@@ -265,7 +271,7 @@ jq -n --argjson prev "$prev" --argjson in "$input" --argjson usage "$usage" \
       elif $in.hook_event_name == "PermissionDenied" and active then { state: "working", tool: "" }
       elif $in.hook_event_name == "Stop" and active then
         { state: "waiting", tool: "", promptTurn: turn, settledTurn: turn,
-          completedTurn: (if $done == "yes" then ([completed, turn] | max) else completed end) }
+          completedTurn: (if $done == "yes" then ([completed, reply] | max) else completed end) }
       else {} end )
   + ( if ($in.hook_event_name == "UserPromptSubmit" or ($in.hook_event_name == "Stop" and active)) and $usage != null
       then $usage | if .model == "" then del(.model) else . end else {} end )

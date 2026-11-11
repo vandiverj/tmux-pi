@@ -1816,19 +1816,28 @@ def message_refusal(path, life):
     return "worker's process was ended (task collected or reviewed); retry it instead of messaging"
 
 
-def retry_admission(base, path, life, route=None, force_alive=False, warn=None, prefix=""):
+def retry_admission(base, path, life, route=None, force_alive=False, warn=None, prefix="", parts=False):
     """Whether `tp-agent retry` takes task `path` (lifecycle `life`) now: (refusal, repeated). `refusal` is the retry command's
     own error text, or None when it would start an attempt (or park one, for --route park); `repeated` is repeated_family's
     finding. The one admission, in the command's order: the state (RETRY_REFUSED), the repeated-family gate (a walk that cannot
     be made does not block: `warn` is told), the live-process guard on the working tree (guard_retry, unless --force-alive;
     not for --route park, which starts nothing), then the route the gate asks for. The retry command and answer_route both call
     it (HB4a round 4 invariant 3), so a notice never suggests a retry the command refuses. `prefix` (lib/lane_lease.py
-    in_session) goes before every command the refusal names, so a refusal shown in another session acts on this one."""
+    in_session) goes before every command the refusal names, so a refusal shown in another session acts on this one.
+    parts: the refusal as data instead of text (HB4b rule 3): prose and argument lists (for tp-agent), without `prefix`
+    (lib/worker_process.py needs_text renders them as the text; answer_route carries them to the notice)."""
+    from worker_process import needs_text
     ident = path.name
+
+    def said(refusal):  # the refusal (a list of parts) as the caller asked for it
+        return refusal if parts else needs_text(refusal, prefix)
     if life in RETRY_REFUSED:
         wait = "Wait for it to settle, or end it" if finishes_alone(life) else "It will not settle by itself: end it"
-        return (f"{ident} is still {state_words(life)}, so it cannot be retried yet. "
-                f"{wait} with {' or '.join(clear_commands(life, ident, prefix))}, then retry"), None
+        ends = []
+        for command in clear_commands(life, ident, argv=True):
+            ends += [" or "] * bool(ends) + [command]
+        return said([f"{ident} is still {state_words(life)}, so it cannot be retried yet. {wait} with ", *ends,
+                     ", then retry"]), None
     try:
         repeated = repeated_family(base, ident)
     except review_rounds.Refused as error:  # the same walk the next review makes will refuse too; a retry is not blocked by it
@@ -1841,14 +1850,14 @@ def retry_admission(base, path, life, route=None, force_alive=False, warn=None, 
         try:
             guard_retry(path, prefix)
         except ValueError as error:
-            return str(error), repeated
+            return said(getattr(error, "parts", [str(error)])), repeated
     if repeated and not route:
-        return (f"{family_words(*repeated)}: another retry would "
-                f"fix one more site of it. Retry again with --route rule-first (the brief changes the rule that lets it recur), "
-                f"--route design (the brief changes the design), or --route park (no retry; parked.md records it and the owner decides)"), repeated
+        return said([f"{family_words(*repeated)}: another retry would "
+                     f"fix one more site of it. Retry again with --route rule-first (the brief changes the rule that lets it recur), "
+                     f"--route design (the brief changes the design), or --route park (no retry; parked.md records it and the owner decides)"]), repeated
     if route and not repeated:
-        return (f"--route {route}: the latest review of {ident} repeats no family an earlier review named and is not the second REQUEST_CHANGES in a row, "
-                "so there is nothing to route; retry without --route"), repeated
+        return said([f"--route {route}: the latest review of {ident} repeats no family an earlier review named and is not the second REQUEST_CHANGES in a row, "
+                     "so there is nothing to route; retry without --route"]), repeated
     return None, repeated
 
 
@@ -1856,19 +1865,20 @@ def answer_route(path, life, here=None):
     """How main can answer an open request on this task now (HB4a round 3 rule 3), from the same checks the commands make:
     {"by": "message"} while `tp-agent message` can reach the worker (message_blocked); {"by": "retry", "why"} when it cannot
     and `tp-agent retry <id> --reason ...` would start an attempt now (retry_admission, the command's own admission); {"by":
-    "none", "why", "needs"} when neither would: `needs` is the retry command's refusal text, which names what must happen first
-    (end a live process, choose a route, wait for the task to settle). `why` is a short phrase (message_blocked), never a command.
-    `here` is the session the answer is read in (default: the task's own). From another session every command in `needs` carries
-    the task's session (lib/lane_lease.py in_session, the form tp-agent's own refusals print), so the notice prints it unedited."""
+    "none", "why", "needs"} when neither would: `needs` is the retry command's refusal as data (retry_admission parts=True,
+    HB4b rule 3): a list of prose strings and commands, each an argument list for tp-agent, never text to parse. It names what
+    must happen first (end a live process, choose a route, wait for the task to settle); lib/worker_process.py needs_text is the
+    command's own text of it. `why` is a short phrase (message_blocked), never a command. `here` (the session the answer is read
+    in) no longer changes `needs`: a row read from another session carries `state_dir` (main_rows), and the notice puts that
+    session before each command when it quotes the arguments (register.tsx, the form tp-agent's own refusals print)."""
     blocked = message_blocked(path, life)
     if blocked is None:
         return {"by": "message"}
     try:
         session = path.parent.parent
-        refused, _ = retry_admission(session, path, life,
-                                     prefix=lane_lease.in_session({"session": str(session)}, session if here is None else here))
+        refused, _ = retry_admission(session, path, life, parts=True)
     except Exception as error:  # an unreadable record: the command would refuse too; inspect says what is wrong
-        refused = f"retry cannot be checked: {error}"
+        refused = [f"retry cannot be checked: {error}"]
     if refused is None:
         return {"by": "retry", "why": blocked}
     return {"by": "none", "why": blocked, "needs": refused}

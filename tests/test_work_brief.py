@@ -38,6 +38,16 @@ def expected_shown(writer, scope, life):
     return active and life not in ("superseded", "withdrawn") and scope in ("global", "project", "workspace")
 
 
+def assert_structure_whole(case, text, wholes):
+    """Round 5 rule: every command, id and name that went in is in the output whole, and only a single overlong whole value makes a
+    line longer than LINE_CHARS (prose is the only thing clipped)."""
+    for value in wholes:
+        case.assertIn(value, text, value[:60])
+    for line in text.split("\n"):
+        if len(line) > work_brief.LINE_CHARS:
+            case.assertIn(line.strip(), wholes, f"an overlong line that is not one whole value: {line[:100]!r}")
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
@@ -261,6 +271,14 @@ class Start(Base):
             finally:
                 os.chmod(locked, 0o700)
 
+    def test_no_workspace_command_is_never_clipped_whatever_the_project_path(self):
+        long = self.tmp / ("p" * 120) / ("q" * 113)  # 233+ characters with the temp prefix: a valid path, not an attack
+        long.mkdir(parents=True)
+        text = self.brief("--workdir", str(long))
+        line = f"no workspace attached: `tp-agent work new TITLE --repo {long.resolve()} --objective TEXT && tp-agent work attach ID`"
+        assert_structure_whole(self, text, [line])
+        self.assertTrue(text.startswith(line), text[:300])
+
 
 class Compaction(Base):
     def test_precompact_then_sessionstart_compact_with_and_without_a_decision_between(self):
@@ -476,6 +494,27 @@ class Realistic(Base):
         line = [l for l in self.brief().splitlines() if l.startswith("last approved review")][0]
         self.assertIn("review-5 of coder-a", line)
         self.assertIn("evidence it was given: none attached", line)
+
+    def test_every_structural_value_made_long_comes_out_whole(self):
+        """Round 5: ids, lane names, 20 lanes, long workspace ids and titles, a long project path: nothing structural is clipped."""
+        ws = "w" * 46
+        project = self.tmp / ("p" * 100) / ("r" * 100)
+        project.mkdir(parents=True)
+        self.ok("work", "new", "T" * 200, "--id", ws, "--repo", str(project), "--objective", "o" * 400)
+        for i in range(3):
+            self.ok("work", "decide", ws, f"rule {i} " + "x" * 300, "--kind", "preference", "--scope", "global", *OWNER, "q" * 200)
+        self.ok("work", "decide", ws, "a main guess", "--by", "main")
+        lanes = {f"lane-{i:02d}-" + "n" * 24: {"by_status": {"working": 2, "settled": i}} for i in range(20)}
+        rows = [{"id": f"coder-{'i' * 60}-{n}", "role": "coder", "status": "working", "lane": "lane-00-" + "n" * 24, "lane_step": "S" * 20}
+                for n in range(4)]
+        index = {"active": rows, "paused": [], "unstatused": [], "pending": [], "lanes": lanes}
+        with mock.patch.dict(os.environ, {"TP_WORK_DIR": self.env["TP_WORK_DIR"]}):
+            text, _ = work_brief.build(self.state, str(project), True, index)
+        wholes = [ws, f"tp-agent work show {ws}"]
+        wholes += [f"{name} settled {e['by_status']['settled']}, working 2" for name, e in lanes.items()]
+        wholes += [f"- {r['id']} coder working lane {r['lane']}/{r['lane_step']}" for r in rows]
+        wholes += [f"{ws}/R{n}" for n in (1, 2, 3)]
+        assert_structure_whole(self, text, wholes)
 
 
 if __name__ == "__main__":

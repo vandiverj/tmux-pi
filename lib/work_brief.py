@@ -27,7 +27,7 @@ RULES_SHOWN = 20
 TASKS_SHOWN = 10
 DECISIONS_SHOWN = 8
 MAIN_SCOPES = ("global", "project", "workspace")
-NO_WORKSPACE = "no workspace attached: `tp-agent work new TITLE --repo {project} --objective TEXT && tp-agent work attach ID`"
+NO_WORKSPACE = "no workspace attached: `tp-agent work new TITLE --repo {project} --objective TEXT && tp-agent work attach ID`"  # a Whole
 _CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 
 
@@ -42,7 +42,12 @@ def add_parser(sub):
                    help="the SessionStart source; with compact the task index text follows the brief (register.tsx injects it only at startup)")
 
 
+class Whole(str):
+    """A command, id, path or name Main must be able to use: never clipped, never split. Everything that is not a Whole is prose."""
+
+
 def _clip(text, size=LINE_CHARS):
+    """Clip PROSE. A command, id, path or list of them is never passed here: it is a Whole (Brief.line, add_whole, add_list)."""
     text = re.sub(r"\s+", " ", _CONTROL.sub("", str(text or ""))).strip()
     return text if len(text) <= size else text[:size - 1] + "…"
 
@@ -204,6 +209,10 @@ def _approved_review(state_dir):
 
 
 class Brief:
+    """The brief's lines. Prose is clipped; a Whole (command, id, path, lane name) is not, and there is no call that clips one:
+    `add` takes prose only; `line` composes prose with Wholes (the prose shrinks to leave them room); `add_whole` puts Wholes on their own
+    lines; `add_list` packs whole items on as many lines as they need. Only a single Whole longer than LINE_CHARS makes a longer line."""
+
     def __init__(self, compaction):
         self.lines, self.compaction = [], compaction
 
@@ -215,19 +224,68 @@ class Brief:
             return " STALE (no record time; cannot be called fresh)"
         return " STALE (recorded before the last compaction at " + _stamp(self.compaction) + ")" if when < self.compaction else ""
 
-    def head(self, name, when, text="", unknown=False):
-        """`unknown`: the part exists but nothing says when it was written (shown as `time unknown`); otherwise no time = no record."""
+    def head(self, name, when, *parts, unknown=False):
+        """`unknown`: the part exists but nothing says when it was written (shown as `time unknown`); otherwise no time = no record.
+        `parts`: prose and Wholes, as for `line`."""
         label = _stamp(when) if when else ("time unknown" if unknown else "no record")
         stale = self.stale(when) if (when is not None or unknown) else ""
-        self.lines.append(_clip(f"{name} [{label}]{stale}:" + (f" {text}" if text else "")))
+        self.line(f"{name} [{label}]{stale}:" + (" " if parts else ""), *parts)
 
     def add(self, text):
+        """One line of prose (clipped). Never a command, id, path or list: those are Wholes."""
+        assert not isinstance(text, Whole), "a Whole is added with line/add_whole, never clipped"
         self.lines.append(_clip(text))
 
+    def line(self, *parts):
+        """One line from prose (str, clipped to what the Wholes leave) and Wholes (kept as they are). When the Wholes leave the prose
+        less than 20 characters a piece, the prose is one line and each Whole follows on its own indented line."""
+        wholes = [p for p in parts if isinstance(p, Whole)]
+        prose = [(i, re.sub(r"\s+", " ", _CONTROL.sub("", str(p)))) for i, p in enumerate(parts) if not isinstance(p, Whole)]
+        budget = LINE_CHARS - sum(len(w) for w in wholes)
+        if not prose:
+            if len(wholes) <= 1:
+                self.lines.append("".join(wholes))
+            else:
+                self.lines.extend(("" if i == 0 else "  ") + w for i, w in enumerate(wholes))
+            return
+        caps = {i: len(t) for i, t in prose}
+        if budget >= 20 * len(prose):
+            while sum(caps.values()) > budget:
+                caps[max(caps, key=caps.get)] -= 1
+            out = list(parts)
+            for i, t in prose:
+                out[i] = t if caps[i] >= len(t) else t[:max(caps[i] - 1, 0)] + "…"
+            self.lines.append("".join(out).strip())
+            return
+        self.lines.append(_clip("".join(t for _, t in prose)))
+        self.lines.extend("  " + w for w in wholes)
+
     def add_whole(self, prose, *whole):
-        """Prose may be clipped; a command, record id or workspace id Main is told to use never is: each goes whole on its own line."""
+        """Prose line, then each command or id list Main is told to use whole on its own line (a list is joined by the caller only when
+        it is short and fixed; otherwise use add_list)."""
         self.lines.append(_clip(prose))
-        self.lines.extend("  " + _clip(line, 10 ** 9) for line in whole)
+        self.lines.extend("  " + w for w in map(Whole, whole))
+
+    def add_value(self, text):
+        """One indented line that is a single command: whole."""
+        self.lines.append("  " + Whole(text))
+
+    def add_list(self, label, items, sep=", ", below=False):
+        """`label` (prose) then whole `items` packed onto as many lines as they need: an item is never split or dropped; one longer
+        than LINE_CHARS has a line of its own. Continuation lines are indented."""
+        current = _clip(label, LINE_CHARS)
+        if below:
+            self.lines.append(current)
+            current = ""
+        fresh = False  # whether `current` already holds an item
+        for item in map(str, items):
+            joined = current + (sep.rstrip() + " " if fresh else " ") + item if current else "  " + item
+            if fresh and len(joined) > LINE_CHARS:
+                self.lines.append(current + sep.rstrip())
+                current, fresh = "  " + item, True
+            else:
+                current, fresh = joined, True
+        self.lines.append(current)
 
 
 def build(state_dir, workdir=None, attach=False, index=None):
@@ -239,33 +297,33 @@ def build(state_dir, workdir=None, attach=False, index=None):
     if problem:  # not "none recorded": the store is there and cannot be read, so nothing below could say what is recorded
         root = work.store_root()
         brief = Brief(last_compaction(state_dir))
-        brief.add(f"working brief unavailable: work store {root} unusable: {problem}")
+        brief.line("working brief unavailable: work store ", Whole(root), " unusable: ", problem)
         _work(brief, index() if callable(index) else index)
-        brief.add("pointers: tp-agent work show ID | tp-agent work records | tp-agent list (the work store must be fixed first)")
+        brief.add_whole("pointers (the work store must be fixed first):", "tp-agent work show ID | tp-agent work records | tp-agent list")
         return "\n".join(brief.lines), {"attached": [], "auto_attached": None, "matching": [], "store_problem": problem}
     skipped, notes = [], []
     attached = list(dict.fromkeys(work_index.attached_ids(state_dir))) if state_dir else []
     try:
         found = matching(project, skipped)
     except Exception as error:  # noqa: BLE001 - one part
-        found, notes = [], [f"workspace match unavailable: {_clip(error, 120)}"]
+        found, notes = [], [("workspace match unavailable: ", _clip(error, 120))]
     auto = None
     if attach and not attached and found and state_dir is not None:
         try:
             attach_newest(state_dir, found[0].id)
             attached, auto = [found[0].id], found[0].id
         except Exception as error:  # noqa: BLE001 - attaching is an extra; the brief still says what it found
-            notes.append(f"auto-attach of {found[0].id} failed: {_clip(error, 160)}")
+            notes.append(("auto-attach of ", Whole(found[0].id), " failed: ", _clip(error, 160)))
     brief = Brief(last_compaction(state_dir))
     if not attached:
-        brief.add(NO_WORKSPACE.format(project=project or "PATH"))
+        brief.line(Whole(NO_WORKSPACE.format(project=project or "PATH")))
     brief.add(f"working brief (tp-agent brief; from records only; built {work.now()}; last compaction "
               f"{_stamp(brief.compaction) if brief.compaction else 'none recorded'})")
     for note in notes:
-        brief.add(note)
+        brief.line(*note)
     others = [w.id for w in found if w.id not in attached]
     if not attached and others:
-        brief.add_whole("matching workspaces (newest first; attach one with `tp-agent work attach ID`):", ", ".join(others))
+        brief.add_list("matching workspaces (newest first; attach one with `tp-agent work attach ID`):", others, below=True)
     docs = {}
     for ws_id in attached:
         try:
@@ -273,18 +331,21 @@ def build(state_dir, workdir=None, attach=False, index=None):
         except Exception as error:  # noqa: BLE001
             doc, health = None, f"corrupt: {type(error).__name__}"
         if doc is None:
-            brief.add_whole(f"workspace {ws_id}: unavailable ({_clip(health, 80)}); its last checkpoint is printed by:", f"tp-agent work recover {ws_id}")
+            brief.line("workspace ", Whole(ws_id), f": unavailable ({_clip(health, 80)}); its last checkpoint is printed by:")
+            brief.add_value(f"tp-agent work recover {ws_id}")
             continue
         docs[ws_id] = doc
         how = "attached automatically: the newest active workspace for this project" if ws_id == auto else "attached"
-        tail = f" ({how}; status {doc.meta.get('status')})"
-        brief.add_whole(f"workspace {ws_id} \"{_clip(doc.meta.get('title', ws_id), 80)}\"" + tail,
-                        *([f"also matching: {', '.join(others)}"] if ws_id == auto and others else []))
+        brief.line("workspace ", Whole(ws_id), f" \"{_clip(doc.meta.get('title', ws_id), 80)}\" ({how}; status {_clip(doc.meta.get('status'), 20)})")
+        if ws_id == auto and others:
+            brief.add_list("  also matching:", others)
         objective = (work.get_section(doc.body, "Objective") or "").strip()  # each part's own write time (`work set` stores it); never the file's
-        brief.head("outcome", _when(doc.meta.get("objective_at")), objective or f"not recorded (tp-agent work set {ws_id} --objective TEXT)",
+        brief.head("outcome", _when(doc.meta.get("objective_at")),
+                   *([_clip(objective, 10 ** 6)] if objective else ["not recorded (", Whole(f"tp-agent work set {ws_id} --objective TEXT"), ")"]),
                    unknown=bool(objective))
         acceptance = (work.get_section(doc.body, "Acceptance") or "").strip()
-        brief.head("acceptance", _when(doc.meta.get("acceptance_at")), acceptance or f"not recorded (tp-agent work set {ws_id} --acceptance TEXT)",
+        brief.head("acceptance", _when(doc.meta.get("acceptance_at")),
+                   *([_clip(acceptance, 10 ** 6)] if acceptance else ["not recorded (", Whole(f"tp-agent work set {ws_id} --acceptance TEXT"), ")"]),
                    unknown=bool(acceptance))
     _rules(brief, project, attached, skipped)
     _work(brief, index() if callable(index) else index)
@@ -314,21 +375,21 @@ def _rules(brief, project, attached, skipped):
     for r in shown[:RULES_SHOWN]:
         quote = r["provenance"]["quote"] or ""
         at = _when(r["provenance"]["at"])
-        tail = f" ({r['id']}, {_stamp(at)}{', STALE' if brief.stale(at) else ''})"  # kept whole: the head is clipped, never the id and time
-        head = f"- [{r['kind']} {_clip(_scope_label(r['scope']), 40)}] {_clip(r['text'], 120)} — owner: \"{_clip(quote, 60)}\""
-        brief.add(_clip(head, LINE_CHARS - len(tail)) + tail)
+        tail = Whole(f" ({r['id']}, {_stamp(at)}{', STALE' if brief.stale(at) else ''})")  # whole: only the prose before it is clipped
+        brief.line(f"- [{r['kind']} ", _clip(_scope_label(r['scope']), 40), "] ", _clip(r["text"], 120), " — owner: \"", _clip(quote, 60), "\"", tail)
     if len(shown) > RULES_SHOWN:
-        brief.add(f"- +{len(shown) - RULES_SHOWN} more: tp-agent work records --status active")
+        brief.line(f"- +{len(shown) - RULES_SHOWN} more: ", Whole("tp-agent work records --status active"))
     for group in conflicts:
-        brief.add_whole("CONFLICT: these are active in one scope and answer the same question; ask the owner which stands "
-                        "(`work decide ... --supersedes ID --by owner --quote ...`):", ", ".join(r['id'] for r in group))
+        brief.add_list("CONFLICT: these are active in one scope and answer the same question; ask the owner which stands "
+                        "(`work decide ... --supersedes ID --by owner --quote ...`):", [r["id"] for r in group], below=True)
     for new, old in uncommitted(records, project, attached):
-        brief.add_whole(f"pending: {new['id']} replaces {old['id']}, not yet committed ({old['id']} stays in force); finish with:",
-                        f"tp-agent work decision confirm {new['id']} --quote \"their exact words\"")
+        brief.line("pending: ", Whole(new["id"]), " replaces ", Whole(old["id"]), ", not yet committed (", Whole(old["id"]),
+                   " stays in force); finish with:")
+        brief.add_value(f"tp-agent work decision confirm {new['id']} --quote \"their exact words\"")
     waiting = [r["id"] for r in records if r["status"] == "provisional" and covers(r, project, attached)]
     if waiting:
-        brief.add_whole("provisional (not in force until the owner confirms; tp-agent work decision confirm ID --quote ...):",
-                        ", ".join(waiting[:8]) + (f" +{len(waiting) - 8}" if len(waiting) > 8 else ""))
+        brief.add_list("provisional (not in force until the owner confirms; tp-agent work decision confirm ID --quote ...):",
+                       waiting[:8] + ([f"+{len(waiting) - 8}"] if len(waiting) > 8 else []), below=True)
 
 
 def _scope_label(scope):
@@ -348,13 +409,13 @@ def _work(brief, index):
     for r in rows[:TASKS_SHOWN]:
         extra = "".join(f" {k}: {r[k]}" for k in ("verdict", "result_status") if r.get(k))
         lane = f" lane {r['lane']}/{r['lane_step']}" if r.get("lane") else ""
-        brief.add(f"- {r.get('id')} {r.get('role')} {r.get('status')}{extra}{lane}")
+        brief.line(Whole(f"- {r.get('id')} {r.get('role')} {r.get('status')}{extra}{lane}"))
     if len(rows) > TASKS_SHOWN:
-        brief.add(f"- +{len(rows) - TASKS_SHOWN} more: tp-agent list")
+        brief.line(f"- +{len(rows) - TASKS_SHOWN} more: ", Whole("tp-agent list"))
     lanes = index.get("lanes") or {}
     if lanes:
-        brief.add("lanes: " + "; ".join(f"{name} " + ", ".join(f"{k} {v}" for k, v in sorted(e.get("by_status", {}).items()))
-                                        for name, e in sorted(lanes.items())))
+        brief.add_list("lanes:", [f"{name} " + ", ".join(f"{k} {v}" for k, v in sorted(e.get("by_status", {}).items()))
+                                  for name, e in sorted(lanes.items())], sep="; ")
 
 
 def _entry_time(entry):
@@ -372,20 +433,20 @@ def _decisions(brief, docs):
         try:
             entries = [e for e in work.decisions_of(doc) if e["status"] == "open"]
         except Exception as error:  # noqa: BLE001
-            brief.add(f"open decisions of {ws_id}: unavailable ({_clip(error, 120)})")
+            brief.line("open decisions of ", Whole(ws_id), f": unavailable ({_clip(error, 120)})")
             continue
         rows += [(e, _entry_time(e)) for e in entries]
     if not docs:
         return
     rows.sort(key=lambda row: (not row[0]["blocking"], work.PRIORITY_RANK.get(row[0]["priority"], 9)))
     known = [when for _, when in rows if when]
-    brief.head("open decisions", max(known, default=None), "none" if not rows else "tp-agent work decisions shows each question",
+    brief.head("open decisions", max(known, default=None), *(["none"] if not rows else [Whole("tp-agent work decisions"), " shows each question"]),
                unknown=bool(rows) and not known)
     for e, when in rows[:DECISIONS_SHOWN]:
-        brief.add(f"- {e['id']} [{e['priority']}{' blocking' if e['blocking'] else ''}] "
-                  f"{_stamp(when) if when else 'time unknown'}{brief.stale(when)}")
+        brief.line(Whole(f"- {e['id']} [{e['priority']}{' blocking' if e['blocking'] else ''}] "
+                         f"{_stamp(when) if when else 'time unknown'}{brief.stale(when)}"))
     if len(rows) > DECISIONS_SHOWN:
-        brief.add(f"- +{len(rows) - DECISIONS_SHOWN} more: tp-agent work decisions")
+        brief.line(f"- +{len(rows) - DECISIONS_SHOWN} more: ", Whole("tp-agent work decisions"))
 
 
 def _evidence_part(brief, state_dir, attached):
@@ -396,8 +457,9 @@ def _evidence_part(brief, state_dir, attached):
         for name in given:
             path = Path(state_dir) / "tasks" / reviewed / "main-evidence" / name
             names.append(path.relative_to(state_dir).as_posix() if path.is_file() else name)
-        brief.head("last approved review", when, f"{review} of {reviewed}, approved {_stamp(when)}; evidence it was given: "
-                   + (", ".join(names) if names else "none attached"))
+        shown = [part for i, name in enumerate(names) for part in ((", ",) if i else ()) + (Whole(name),)]
+        brief.head("last approved review", when, Whole(f"{review} of {reviewed}"), f", approved {_stamp(when)}; evidence it was given: ",
+                   *(shown or ["none attached"]))
     else:
         brief.add("last approved review: none")
     if attached:
@@ -406,9 +468,9 @@ def _evidence_part(brief, state_dir, attached):
         except Exception:  # noqa: BLE001
             latest = None
         if latest:
-            brief.head("last checkpoint", _when(latest[1].get("at")), f"{attached[0]} {latest[0].name} ({latest[1].get('trigger')})")
+            brief.head("last checkpoint", _when(latest[1].get("at")), Whole(f"{attached[0]} {latest[0].name}"), f" ({_clip(latest[1].get('trigger'), 40)})")
         else:
-            brief.add(f"last checkpoint: none valid for {attached[0]}")
+            brief.line("last checkpoint: none valid for ", Whole(attached[0]))
 
 
 def text_or_unavailable(build_text):

@@ -22,7 +22,6 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
 if str(ROOT / "lib") not in sys.path:
     sys.path.insert(0, str(ROOT / "lib"))
-from routines import HEREDOC  # noqa: E402  (heredoc bodies are not commands; shared with lib/routines.py)
 
 SCHEMA = "tp-episode:v1"
 RUN_SCHEMA = "tp-episode-run:v1"
@@ -716,7 +715,7 @@ def shell_stages(command, _piped=False):
     if isinstance(command, (list, tuple)):
         parts = [(list(command), None)]
     elif isinstance(command, str):
-        parts = [(_words(text), sep) for text, sep in _segments(HEREDOC.sub("", command))]
+        parts = [(_words(text), sep) for text, sep in _segments(strip_heredocs(command)[0])]
     else:
         return []
     out = []
@@ -909,6 +908,282 @@ def record_command(record):
     if isinstance(cmd, list) and cmd:
         return [str(w) for w in cmd]
     return record.get("label") or ""
+
+
+# ---- the stated grammar (round 5 rule 1) ------------------------------------------------------------------------------------
+GRAMMAR = """A Bash call is read only if, after comment stripping (and heredoc bodies removed), it is a list of simple
+commands joined by newline, `;` or `&&`. Each command is optional env assignments, a word list and optional redirects,
+optionally followed by a pipeline (`|`) whose first stage is the command; every pipeline stage is itself a simple command.
+The wrappers env, timeout, nice, time, command, exec, nohup, npx and `tools/agent/test-run.sh WORKTREE [--timeout S]
+[--label N] --` are stripped from a command (the test-run.sh call itself is counted). `cd DIR` as its own command (not in a
+pipeline) changes the cwd of the following commands of that call only when it ran (stage_runs: certain). Anything else makes
+the WHOLE call uncertain: `||`, background `&`, if/case/loops/select/functions/`!`/`[[`, `( … )`, `{ … }`, process
+substitution, `sh -c`/`bash -c`/`eval`/`source`/`.`, `$( … )` or backticks containing a runner or a write, xargs/parallel/
+`find -exec` running a runner, a write or a shell (or `find -delete`), a program word that is a variable, pushd/popd, cd in a
+pipeline, unbalanced quotes or parentheses. An uncertain call never counts as a verification or a write-free interval: every
+execution in it may not have run (no exit), it may have written anything (a write of unknown place that may have run), and
+when it holds a cd the cwd after it is unknown."""
+GRAMMAR_KEYWORDS = ("if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done", "case", "esac", "select",
+                    "function", "!", "[[", "]]", "in", "coproc")
+SUB = "$__SUB"                     # a $( … ) or backtick substitution, replaced before the call is split
+
+
+HEREDOC_OP = re.compile(r"(?<!<)<<(-?)[ \t]*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\2")
+
+
+def strip_heredocs(text):
+    """(text without heredoc bodies, unterminated). Each `<<WORD` (`<<-WORD`, quoted WORD) takes the following lines up to a
+    line that is WORD (tabs stripped for <<-); the command line and everything after the delimiter stay. lib/routines'
+    HEREDOC drops the rest of the call from `<<` on, commands after the heredoc included, so it is not used here."""
+    out, pending = [], []
+    for line in text.split("\n"):
+        if pending:
+            dash, word = pending[0]
+            if (line.lstrip("\t") if dash else line) == word:
+                pending.pop(0)
+            continue
+        out.append(line)
+        pending.extend((m.group(1), m.group(3)) for m in HEREDOC_OP.finditer(line))
+    return "\n".join(out), bool(pending)
+
+
+def _close_paren(text, start):
+    """Index of the `)` matching the `(` at text[start], quotes respected; None when unbalanced."""
+    depth, quote, i = 0, None, start
+    while i < len(text):
+        c = text[i]
+        if quote:
+            if c == "\\" and quote == '"':
+                i += 1
+            elif c == quote:
+                quote = None
+        elif c == "\\":
+            i += 1
+        elif c in "'\"":
+            quote = c
+        elif c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return None
+
+
+def _structure(text):
+    """(text with comments dropped and every $( … ) / backtick substitution replaced by SUB, [substitution texts],
+    [reasons the call is outside the grammar]). Single quotes hide everything; double quotes hide all but substitutions."""
+    out, subs, reasons = [], [], []
+    quote, i, n, depth = None, 0, len(text), 0
+
+    def last():
+        return out[-1][-1:] if out else ""
+
+    while i < n:
+        c = text[i]
+        if quote == "'":
+            out.append(c)
+            quote = None if c == "'" else quote
+            i += 1
+            continue
+        if c == "\\":
+            out.append(text[i:i + 2])
+            i += 2
+            continue
+        if c == "$" and text.startswith("$((", i):
+            end = _close_paren(text, i + 1)
+            if end is None:
+                reasons.append("unbalanced parentheses")
+                break
+            out.append("$__ARITH")                    # arithmetic: no command runs in it
+            i = end + 1
+            continue
+        if c == "$" and text.startswith("$(", i):
+            end = _close_paren(text, i + 1)
+            if end is None:
+                reasons.append("unbalanced parentheses")
+                break
+            subs.append(text[i + 2:end])
+            out.append(SUB)
+            i = end + 1
+            continue
+        if c == "`":
+            end = i + 1
+            while end < n and text[end] != "`":
+                end += 2 if text[end] == "\\" else 1
+            if end >= n:
+                reasons.append("unbalanced backtick")
+                break
+            subs.append(text[i + 1:end])
+            out.append(SUB)
+            i = end + 1
+            continue
+        if quote == '"':
+            out.append(c)
+            quote = None if c == '"' else quote
+            i += 1
+            continue
+        if c in "'\"":
+            quote = c
+        elif c == "#" and (not out or last() in " \t\n;&|()"):
+            end = text.find("\n", i)
+            i = n if end < 0 else end
+            continue
+        elif c == "(":
+            if last() in ("<", ">"):
+                reasons.append("process substitution")
+            elif text.startswith("()", i) and last() and last() not in " \t\n;&|":
+                reasons.append("a function definition")
+            else:
+                reasons.append("( … ) subshell")
+            depth += 1
+        elif c == ")":
+            if depth:
+                depth -= 1                            # closes a ( already given as the reason
+            else:
+                reasons.append("a case pattern `)`")
+        elif c in "{}" and (not out or last() in " \t\n;&|") and (i + 1 == n or text[i + 1] in " \t\n;&|"):
+            reasons.append("{ … } group")
+        out.append(c)
+        i += 1
+    if quote:
+        reasons.append("unbalanced quotes")
+    return "".join(out), subs, list(dict.fromkeys(reasons))
+
+
+def _program_args(words, takes=()):
+    """The command after a runner's own options (xargs -n 1 -I {} CMD ...): words from the first non-option."""
+    i = 0
+    while i < len(words) and words[i].startswith("-"):
+        i += 2 if words[i] in takes else 1
+    return words[i:]
+
+
+def _runs_something(words):
+    """Whether a word list runs a verification runner, writes, or starts a shell (xargs/find -exec targets)."""
+    if not words:
+        return False
+    inner, nested = _unwrap(words)
+    if nested is not None or (inner and os.path.basename(inner[0]) in SHELLS + ("eval", "source", ".")):
+        return True
+    return bool(inner and (check_identity([os.path.basename(inner[0])] + inner[1:])
+                           or stage_writes({"words": [os.path.basename(inner[0])] + inner[1:], "outputs": []})))
+
+
+def _grammar_stage(words, sep, next_sep):
+    """(stage or None, reason or None) for one simple command of a call inside the grammar."""
+    if words[0] in GRAMMAR_KEYWORDS:
+        return None, "if/case/loop/function/`!`/`[[` (%s)" % words[0]
+    kept, inputs, outputs = _redirects(words)
+    bare = list(kept)
+    while bare and ASSIGN.match(bare[0]):
+        bare = bare[1:]
+    via = "test-run.sh" if bare and os.path.basename(bare[0]) == "test-run.sh" else None
+    inner, nested = _unwrap(kept)
+    if nested is not None:
+        return None, "sh -c"
+    if not inner:
+        return (None, "test-run.sh with no `--` command") if via else (None, None)     # assignments only: nothing runs
+    program, args = os.path.basename(inner[0]), inner[1:]
+    if "$" in inner[0]:
+        return None, "a program word that is a variable"
+    if program in ("eval", "source", "."):
+        return None, program
+    if program in SHELLS and any(re.match(r"^-[a-zA-Z]*c", a) for a in args if a.startswith("-") and not a.startswith("--")):
+        return None, "sh -c"
+    if program in ("xargs", "parallel") and _runs_something(_program_args(args, ("-n", "-I", "-L", "-P", "-d", "-E", "-s", "-j"))):
+        return None, "%s running a runner, a write or a shell" % program
+    if program == "find":
+        if "-delete" in args:
+            return None, "find -delete"
+        for flag in ("-exec", "-execdir", "-ok", "-okdir"):
+            if flag in args and _runs_something(args[args.index(flag) + 1:]):
+                return None, "find %s running a runner, a write or a shell" % flag
+    if program in ("pushd", "popd"):
+        return None, program
+    if program == "cd" and "|" in (sep, next_sep):
+        return None, "cd in a pipeline"
+    text = " ".join([program] + args)
+    return {"words": [program] + args, "inputs": inputs, "outputs": outputs, "piped": sep == "|", "sep": sep, "cond": False,
+            "cd": (args[0] if args else "~") if program == "cd" else None, "sub": 0, "via": via,
+            "opaque": SUB in text or any("$" in w for w in args + inputs) or program in OPAQUE_PROGRAMS}, None
+
+
+def grammar_call(command):
+    """(stages, reason) for one Bash call (round 5 rule 1). reason None: the call is inside the grammar (GRAMMAR) and
+    stages are its simple commands in order (sep: None ; && |). reason text: the whole call is uncertain; stages are then
+    shell_stages' best-effort parse, candidates only (each may not have run). A list of words (a record's cmd) is one
+    simple command."""
+    if isinstance(command, (list, tuple)):
+        words = [str(w) for w in command]
+        if not words:
+            return [], None
+        stage, why = _grammar_stage(words, None, None)
+        return ([stage] if stage else [], None) if why is None else (shell_stages(words), why)
+    if not isinstance(command, str):
+        return [], None
+    text, unterminated = strip_heredocs(command)
+    flat, subs, reasons = _structure(text)
+    if unterminated:
+        reasons.append("an unterminated heredoc")
+    for inner in subs:
+        inner_stages, inner_why = grammar_call(inner)
+        if inner_why or any(check_identity(s["words"]) or stage_writes(s) for s in inner_stages):
+            reasons.append("$( … ) containing a runner or a write")
+    stages, segments, pending = [], _segments(flat) if not reasons else [], None
+    for k, (text, sep) in enumerate(segments):
+        if sep in ("||", "&"):
+            reasons.append("||" if sep == "||" else "background &")
+            continue
+        if pending and sep in (";", None):
+            sep, pending = pending, None              # `a &&\n b`: the line break after && or | continues the list
+        try:
+            words = shlex.split(text, posix=True)
+        except ValueError:
+            reasons.append("unbalanced quotes")
+            continue
+        if not words:
+            if sep in ("&&", "|"):
+                pending = sep
+            continue
+        stage, why = _grammar_stage(words, sep, segments[k + 1][1] if k + 1 < len(segments) else None)
+        if why:
+            reasons.append(why)
+        elif stage:
+            stages.append(stage)
+    if reasons:
+        seen = []
+        for r in reasons:
+            if r not in seen:
+                seen.append(r)
+        return shell_stages(command), "; ".join(seen)
+    return stages, None
+
+
+def call_stages(command, exit=None, blocked=False):
+    """(stages, [(ran, exit)] per stage, reason) for one Bash call under the grammar: an uncertain call (reason set) gives
+    every stage (None, None): it may not have run and its exit is unknown."""
+    stages, reason = grammar_call(command)
+    if reason:
+        return stages, [(None, None)] * len(stages), reason
+    return stages, stage_runs(stages, exit, blocked), None
+
+
+def record_shape(record):
+    """(stage, identity, reason) of a tp-test-run:v1 record (round 5 rule 3): its exit backs a verification only when its
+    cmd is one simple command inside the grammar, with no shell wrapper; identity is its check identity, else its own text.
+    A shell (`sh -c …`), a compound list, a cd, or nothing to run: (None, None, reason): an uncertain execution."""
+    stages, why = grammar_call(record_command(record))
+    if why:
+        return None, None, "the record's cmd is outside the grammar (%s): its exit is the shell's" % why
+    if len(stages) != 1:
+        return None, None, "the record's cmd is %s: its exit is the last command's" % (
+            "a compound list" if stages else "empty")
+    stage = stages[0]
+    if stage["cd"] is not None:
+        return None, None, "the record's cmd is a cd"
+    return stage, check_identity(stage["words"]) or " ".join(stage["words"]), None
 
 
 def shell_read_scan(command, cwd=None, project_dirs=(), private_dirs=()):

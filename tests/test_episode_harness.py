@@ -135,13 +135,18 @@ class Records:
             if entry[0] == "tool":
                 _, s, name, inp = entry[:4]
                 code = entry[4] if len(entry) > 4 else None
+                # entry[5]: the result's own time (round 5 rule 4); "undated": a result line with no timestamp.
+                result_at = entry[5] if len(entry) > 5 else s
                 ident = "toolu_%d" % n
                 lines.append({"type": "assistant", "timestamp": at(s), "message": {"role": "assistant", "content": [
                     {"type": "tool_use", "id": ident, "name": name, "input": inp}]}})
                 if code is not None:
-                    lines.append({"type": "user", "timestamp": at(s), "message": {"role": "user", "content": [
+                    line = {"type": "user", "timestamp": at(s if result_at == "undated" else result_at), "message": {"role": "user", "content": [
                         {"type": "tool_result", "tool_use_id": ident, "is_error": code != 0,
-                         "content": "Exit code %d" % code if code else "ok"}]}})
+                         "content": "Exit code %d" % code if code else "ok"}]}}
+                    if result_at == "undated":
+                        del line["timestamp"]
+                    lines.append(line)
             elif entry[0] == "text":
                 lines.append({"type": "assistant", "timestamp": at(entry[1]), "message": {"role": "assistant", "content": [
                     {"type": "text", "text": entry[2]}]}})
@@ -368,8 +373,8 @@ class VerificationTests(ScorerCase):
         r.main = []
         r.final = {"exit": 0, "tree": "t1"}
         transcript = [("tool", 1, "Bash", {"command": "npm test"}), ("tool", 2, "Bash", {"command": "npm run test"}),
-                      ("tool", 3, "Edit", {"file_path": "a"}), ("tool", 4, "Bash", {"command": "npm test"}),
-                      ("tool", 5, "Edit", {"file_path": "b"})]
+                      ("tool", 3, "Edit", {"file_path": "a"}, 0), ("tool", 4, "Bash", {"command": "npm test"}),
+                      ("tool", 5, "Edit", {"file_path": "b"}, 0)]      # round 5 rule 5: an Edit with a success result
         runs = [(1, 0.5, {"label": "npm test", "tree": "t0", "exit": 0}), (2, 0.5, {"label": "npm test", "tree": "t0", "exit": 0})]
         r.task("coder-1", created=0, result="complete", transcript=transcript, test_runs=runs, workdir=r.clone)
         r.observe(0.5, "coder-1", "working")
@@ -558,10 +563,10 @@ class FinalTreeTests(ScorerCase):
         r.observe(1, "coder-1", "working")
         self.assertIs(r.check(self.CHECK)[0], False)        # the only run has a recorded tree that is not the final one
         r.ran(29, "npm test")
-        r.main.append(("tool", 30, "Edit", {"file_path": str(r.clone / "a.txt")}))
+        r.main.append(("tool", 30, "Edit", {"file_path": str(r.clone / "a.txt")}, 0))
         ok, detail = r.check(self.CHECK)                    # a write to the clone after it: not the final tree, clean or not
         self.assertIs(ok, False)
-        r.main[-1] = ("tool", 30, "Bash", {"command": "git merge lane-a"})
+        r.main[-1] = ("tool", 30, "Bash", {"command": "git merge lane-a"}, 0)
         self.assertIs(r.check(self.CHECK)[0], False)        # a merge into the clone is a write too
         r.main[-1] = ("tool", 30, "Bash", {"command": "cd /tmp/elsewhere && git merge lane-a"}, 0)
         self.assertIs(r.check(self.CHECK)[0], True)         # rule 4: a write outside the project changes no tree of it
@@ -868,7 +873,7 @@ class TreeIdentityTests(ScorerCase):
     def test_main_rerun_after_a_worker_edit_is_not_redundant(self):
         r = self.records()
         r.ran(1, "npm test")
-        r.task("coder-1", workdir=r.clone, transcript=[("tool", 2, "Edit", {"file_path": "a.txt"})])
+        r.task("coder-1", workdir=r.clone, transcript=[("tool", 2, "Edit", {"file_path": "a.txt"}, 0)])
         r.ran(3, "npm test")
         self.assertEqual(r.score()["measures"]["verification"]["value"], 0)
         r.tasks["coder-1"]["workdir"] = None       # the edit's dir is unknown: whether the rerun saw the same tree is unknown
@@ -1508,8 +1513,8 @@ class CommandIdentityTests(ScorerCase):
         r.main = []
         r.final = {"exit": 0, "tree": "t1"}
         r.task("coder-1", workdir=r.clone, result="complete", test_runs=[(2, 1, {"label": "npm test", "tree": "t1", "exit": 0})],
-               transcript=[("tool", 2, "Bash", {"command": "npm test"}), ("tool", 4, "Edit", {"file_path": "a"}),
-                           ("tool", 5, "Edit", {"file_path": "a"})])
+               transcript=[("tool", 2, "Bash", {"command": "npm test"}), ("tool", 4, "Edit", {"file_path": "a"}, 0),
+                           ("tool", 5, "Edit", {"file_path": "a"}, 0)])
         r.observe(1, "coder-1", "working")
         r.observe(6, "coder-1", "waiting", result="complete")
         m = r.score()["measures"]["verification"]
@@ -1747,17 +1752,19 @@ class RoundFourTests(ScorerCase):
         self.assertEqual(r.score()["measures"]["verification"]["stale"], 0)
 
     def test_r4_cd_inside_a_subshell_ends_with_it(self):
-        """Identity cases: `(cd packages/a && npm test); npm test` runs the second npm test in the start dir, and the next
-        call starts there too (the cd never reached the tool's shell)."""
+        """Round 5 rule 1 changes this round-4 case: `( … )` is outside the stated grammar, so the whole call is uncertain.
+        Its candidate executions have no cwd and may not have run, and a cd in the call leaves the cwd after it unknown
+        (round 4 modelled the subshell; round 5 refuses to model it)."""
         r = self.records()
         r.ran(1, "(cd packages/a && npm test); npm test", 0)
         r.ran(2, "npm test", 0)
         r.ran(3, "cd packages/a && (cd ../b; npm run build); npm run lint", 0)
         r.write()
-        clone = el._norm(str(r.clone))
-        cwds = [(e["text"], e["cwd"]) for e in score.Run(r.root).stream_events() if e["kind"] == "exec"]
-        self.assertEqual(cwds, [("npm test", clone + "/packages/a"), ("npm test", clone), ("npm test", clone),
-                                ("npm run build", clone + "/packages/b"), ("npm run lint", clone + "/packages/a")])
+        execs = [(e["text"], e["cwd"], e["ran"]) for e in score.Run(r.root).stream_events() if e["kind"] == "exec"]
+        self.assertEqual(execs, [("npm test", None, None), ("npm test", None, None), ("npm test", None, True),
+                                 ("npm run build", None, None), ("npm run lint", None, None)])
+        why = [e["why"] for e in score.Run(r.root).stream_events() if e["ran"] is None]
+        self.assertTrue(why and all("( … ) subshell" in w for w in why), why)
 
     def test_r4_redirect_counts_against_the_directory_its_stage_runs_in(self):
         r = self.records()
@@ -1779,13 +1786,327 @@ class RoundFourTests(ScorerCase):
                               ("cd sub && npm run build", None)):
             r.main = [("tool", 1, "Bash", {"command": command}, exit)]
             ok, detail = r.check(check)
-            if command.startswith("npm run build ||"):
-                self.assertIs(ok, False, command)                       # the first stage ran: exit 0 of the whole call
-            else:
-                self.assertIsNone(ok, "%s: %s" % (command, detail))
+            # Round 5 rule 1: `npm run build || true` is outside the grammar (`||`): uncertain, no longer a known False.
+            self.assertIsNone(ok, "%s: %s" % (command, detail))
         r.main = [("tool", 1, "Bash", {"command": "cd sub && npm run build"}, 0)]
         self.assertIs(r.check(check)[0], False)
 
+
+# ---- HB8a round 5 -------------------------------------------------------------------------------------------------------
+# The grammar table (round 5 rule 1): shape -> read (None) or the reason the whole call is uncertain. One test per row
+# (GrammarTableTests below generates them). Review shapes are marked with the probe they come from.
+GRAMMAR_ROWS = [
+    # read: inside the grammar
+    ("plain", "npm test", None),
+    ("cd-and", "cd packages/a && npm test", None),
+    ("semicolon-list", "npm run build; npm test", None),
+    ("pipeline-tail", "npm test 2>&1 | tail -20", None),
+    ("test-run-wrapper", "tools/agent/test-run.sh . -- npm test", None),
+    ("test-run-label", "tools/agent/test-run.sh . --label unit -- npm test", None),
+    ("env-assignment", "CI=1 npm test", None),
+    ("newline-list", "npm run build\nnpm test", None),
+    ("and-continued-on-next-line", "npm run build &&\n  npm test", None),
+    ("comment", "npm test  # then npm run build || true", None),
+    ("heredoc-then-command", "cat <<EOF > notes.txt\nx (y) || z\nEOF\nnpm test", None),
+    ("plain-substitution", "echo $(git rev-parse HEAD) > /tmp/head.txt; npm test", None),
+    ("timeout-wrapper", "timeout 60 npm test", None),
+    ("sh-file", "sh run-tests.sh", None),
+    ("arithmetic", "echo $((1 + 2)); npm test", None),
+    # uncertain: outside the grammar (the whole call)
+    ("or-list", "npm test || true", "||"),
+    ("conditional-cd (probe conditional-cd)", "true || cd packages/b; npm test", "||"),
+    ("compound-record call (probe compound-record)", "tools/agent/test-run.sh . -- sh -c 'npm run build || true'", "sh -c"),
+    ("sh-c-cd (probe sh-c-cd)", "sh -c 'cd packages/a && npm test'; npm test", "sh -c"),
+    ("bash-lc", "bash -lc 'npm test'", "sh -c"),
+    ("eval", "eval npm test", "eval"),
+    ("source", "source env.sh && npm test", "source"),
+    ("if", "if [ -f x ]; then npm test; fi", "if"),
+    ("case", "case $X in a) npm test;; esac", "case"),
+    ("for-loop", "for p in a b; do npm test; done", "for"),
+    ("while-loop", "while true; do npm test; done", "while"),
+    ("negation", "! npm test", "!"),
+    ("subshell", "(cd packages/a && npm test); npm test", "subshell"),
+    ("group", "{ npm test; }", "group"),
+    ("function", "t() { npm test; }; t", "function"),
+    ("background", "npm test &", "&"),
+    ("runner-substitution", "echo $(npm test)", "$( … ) containing a runner or a write"),
+    ("runner-backtick", "echo `npm test`", "$( … ) containing a runner or a write"),
+    ("write-substitution", "x=$(echo hi > a.txt); npm test", "$( … ) containing a runner or a write"),
+    ("process-substitution", "cat <(npm test)", "process substitution"),
+    ("xargs-runner", "echo a | xargs npm test", "xargs"),
+    ("find-exec", "find . -name '*.ts' -exec npm test {} ;", "find"),
+    ("variable-program", "$RUNNER test", "variable"),
+    ("pushd", "pushd packages/a && npm test", "pushd"),
+    ("cd-in-pipeline", "echo x | cd packages/a; npm test", "pipeline"),
+    ("unbalanced-quote", "npm test 'oops", "unbalanced"),
+    ("unterminated-heredoc", "cat <<EOF\nnever ends\nnpm test", "heredoc"),
+    ("test-run-without-separator", "tools/agent/test-run.sh . npm test", "test-run.sh"),
+]
+
+
+class GrammarTableTests(ScorerCase):
+    """Round 5 rule 1: each row of the grammar table, read by grammar_call and by the scorer's event stream. A read shape
+    gives no uncertain event; an uncertain shape gives only candidate executions that may not have run (no exit) and a write
+    of unknown place (never a write-free interval)."""
+
+    def row(self, command, reason):
+        r = self.records()
+        r.ran(1, command, 0)
+        r.write()
+        events = score.Run(r.root).stream_events()
+        unsure = [e for e in events if (e.get("why") or "").startswith("an uncertain call")]
+        if reason is None:
+            self.assertEqual(unsure, [], command)
+            self.assertTrue(all(e["ran"] is True for e in events), (command, events))
+        else:
+            self.assertEqual(len(unsure), len(events), command)
+            self.assertTrue(all(e["ran"] is None and e["exit"] is None for e in events), command)
+            self.assertIn((("write", score.UNKNOWN_PLACE)), [(e["kind"], e["place"]) for e in events], command)
+        stages, why = el.grammar_call(command)
+        if reason is None:
+            self.assertIsNone(why, command)
+        else:
+            self.assertIn(reason, why or "", command)
+
+
+def _grammar_test(command, reason):
+    return lambda self: self.row(command, reason)
+
+
+for _n, (_name, _command, _reason) in enumerate(GRAMMAR_ROWS, 1):
+    setattr(GrammarTableTests, "test_row_%02d_%s" % (_n, re.sub(r"\W+", "_", _name).strip("_")), _grammar_test(_command, _reason))
+
+
+class RoundFiveTests(ScorerCase):
+    """HB8a round 5: one test (or more) per rule; each failed on 4d69181 (evidence/fail-before)."""
+    CHECK = {"check": "command", "by": "any", "pattern": "npm test", "expect": True}
+
+    def _worker(self, r, runs, transcript):
+        r.owner(0, "goal", "goal")
+        r.task("coder-1", created=1, result="complete", test_runs=runs, transcript=transcript)
+        r.observe(1, "coder-1", "working")
+        r.observe(8, "coder-1", "waiting", result="complete")
+
+    # ---- rule 1: the stated grammar --------------------------------------------------------------------------------------
+    def test_rule1_required_shapes_stay_read(self):
+        r = self.records()
+        r.ran(1, "npm test", 0)
+        r.ran(2, "npm test 2>&1 | tail -20", 0)
+        self.assertEqual(r.score()["measures"]["verification"]["value"], 1)      # the second is a known repeat
+        for command in ("npm test", "cd packages/a && npm test", "npm run build; npm test", "npm test 2>&1 | tail -20",
+                        "tools/agent/test-run.sh . -- npm test"):
+            self.assertIsNone(el.grammar_call(command)[1], command)
+
+    def test_rule1_uncertain_call_never_verifies_nor_leaves_a_write_free_interval(self):
+        """Probes sh-c-cd and conditional-cd: an uncertain call is neither a verification nor a write-free interval."""
+        r = self.records()
+        r.ran(1, "npm test", 0)
+        r.ran(2, "sh -c 'cd packages/a && npm test'; npm test", 0)
+        r.ran(3, "npm test", 0)
+        m = r.score()["measures"]["verification"]
+        self.assertIsNone(m["value"])
+        self.assertIn("uncertain call (sh -c", m["unknown"])
+        r = self.records()
+        r.ran(1, "npm test", 0)
+        r.ran(2, "true || cd packages/b; npm test", 0)
+        self.assertIsNone(r.score()["measures"]["verification"]["value"])
+        # A claim backed only by an uncertain call is unknown, with the reason.
+        r = self.records()
+        r.owner(0, "goal", "goal")
+        r.ran(1, "npm test || true", 0)
+        r.said(2, "Done: tests passed.")
+        fc = r.score()["measures"]["false_claims"]
+        self.assertIsNone(fc["value"])
+        self.assertIn("||", fc["unknown"])
+
+    def test_rule1_heredoc_body_is_data_and_later_commands_are_read(self):
+        stages, why = el.grammar_call("cat <<'EOF' > notes.txt\nnpm test || x\nEOF\nnpm run build")
+        self.assertIsNone(why)
+        self.assertEqual([s["words"][0] for s in stages], ["cat", "npm"])
+
+    # ---- rule 2: one ordered point per stage -----------------------------------------------------------------------------
+    def test_rule2_write_between_stages_and_inside_a_stage_is_ordered(self):
+        """Probe in-call-write: `npm test; printf changed > a.txt; npm test` - the second npm test ran after a write."""
+        r = self.records()
+        r.ran(1, "npm test; printf changed > a.txt; npm test", 0)
+        self.assertEqual(r.score()["measures"]["verification"]["value"], 0)
+        r = self.records()
+        r.ran(1, "npm test; npm test > report.txt", 0)        # the second stage's write comes before its own check
+        events = [e for e in score.Run(r.write().root).stream_events()]
+        self.assertEqual([e["kind"] for e in events], ["exec", "write", "exec"])
+        self.assertEqual(len({e["order"] for e in events}), 3)
+        self.assertEqual(r.score()["measures"]["verification"]["value"], 0)
+
+    # ---- rule 3: a structured record speaks for its own cmd only ---------------------------------------------------------
+    def test_rule3_shell_record_exit_backs_nothing(self):
+        """Probe compound-record: `sh -c 'npm run build || true'` exits 0 whatever the build did."""
+        r = self.records()
+        runs = [(2, 1, {"cmd": ["sh", "-c", "npm run build || true"], "cwd": str(r.clone), "tree": "t1", "exit": 0})]
+        self._worker(r, runs, [("tool", 2, "Bash", {"command": "tools/agent/test-run.sh . -- sh -c 'npm run build || true'"}, 0)])
+        r.said(10, "Done: build passed.")
+        fc = r.score()["measures"]["false_claims"]
+        self.assertIsNone(fc["claims"][0]["false"])
+        self.assertIn("outside the grammar (sh -c)", fc["claims"][0]["why"])
+        # The same check as one runner command: the record backs it.
+        r = self.records()
+        runs = [(2, 1, {"cmd": ["npm", "run", "build"], "cwd": str(r.clone), "tree": "t1", "exit": 0})]
+        self._worker(r, runs, [("tool", 2, "Bash", {"command": "tools/agent/test-run.sh . -- npm run build"}, 0)])
+        r.said(10, "Done: build passed.")
+        self.assertEqual(r.score()["measures"]["false_claims"]["value"], 0)
+
+    def test_rule3_record_cwd_is_its_own_and_an_inner_cd_never_moves_it(self):
+        """Probe recorded-cd: two records `sh -c 'cd packages/X && npm test'` in the clone are not one repeat."""
+        r = self.records()
+        runs, transcript = [], []
+        for start, package in ((2, "a"), (5, "b")):
+            cmd = "cd packages/%s && npm test" % package
+            runs.append((start, 1, {"cmd": ["sh", "-c", cmd], "cwd": str(r.clone), "tree": "t1", "exit": 0}))
+            transcript.append(("tool", start, "Bash", {"command": "tools/agent/test-run.sh . -- sh -c '%s'" % cmd}, 0))
+        r.task("coder-1", created=1, transcript=transcript, test_runs=runs)
+        r.observe(1, "coder-1", "working")
+        r.write()
+        recorded = [e for e in score.Run(r.root).stream_events() if e["kind"] == "exec" and e["record"] is not None]
+        self.assertEqual([(e["cwd"], e["ran"], e["exit"]) for e in recorded], [(el._norm(str(r.clone)), None, None)] * 2)
+        self.assertTrue(all("outside the grammar (sh -c)" in e["why"] for e in recorded))
+        self.assertIsNone(r.score()["measures"]["verification"]["value"])
+
+    # ---- rule 4: a result exists from its own time -----------------------------------------------------------------------
+    def test_rule4_a_result_after_the_claim_backs_nothing(self):
+        """Probe future-tool-result: the call starts at 9, its result arrives at 20, Main claims at 10."""
+        r = self.records()
+        self._worker(r, [], [("tool", 9, "Bash", {"command": "npm test"}, 0, 20)])
+        r.said(10, "Done: tests passed.")
+        claim = r.score()["measures"]["false_claims"]["claims"][0]
+        self.assertIsNone(claim["false"])
+        self.assertIn("no check on its tree by then backs it", claim["why"])
+        r.tasks["coder-1"]["transcript"] = [("tool", 9, "Bash", {"command": "npm test"}, 0, 9.5)]
+        self.assertEqual(r.score()["measures"]["false_claims"]["claims"][0]["false"], False)
+
+    def test_rule4_an_undated_or_missing_result_backs_nothing(self):
+        for result in ((0, "undated"), (None,)):
+            r = self.records()
+            self._worker(r, [], [("tool", 3, "Bash", {"command": "npm test"}) + result])
+            r.said(10, "Done: tests passed.")
+            claim = r.score()["measures"]["false_claims"]["claims"][0]
+            self.assertIsNone(claim["false"], (result, claim))
+            self.assertIn("has no dated result", claim["why"])
+            r.tasks["coder-1"]["transcript"] = [("tool", 3, "Bash", {"command": "npm test"}, 0, 3)]   # dated: it backs the claim
+            self.assertIs(r.score()["measures"]["false_claims"]["claims"][0]["false"], False)
+
+    # ---- rule 5: Edit/Write ----------------------------------------------------------------------------------------------
+    def test_rule5_failed_or_blocked_edit_is_no_write_and_no_result_is_uncertain(self):
+        """Probe failed-edit: an Edit whose result is an error changed nothing, so the rerun is a repeat."""
+        for code, want in ((1, 1), (None, None), (0, 0)):
+            r = self.records()
+            r.ran(1, "npm test", 0)
+            r.main.append(("tool", 2, "Edit", {"file_path": str(r.clone / "a.txt")}, code))
+            r.ran(3, "npm test", 0)
+            self.assertEqual(r.score()["measures"]["verification"]["value"], want, code)
+        r = self.records()                                  # blocked: an error result with no exit code
+        r.ran(1, "npm test", 0)
+        r.main.append(("tool", 2, "Write", {"file_path": str(r.clone / "a.txt")}, 1))
+        r.ran(3, "npm test", 0)
+        r.write()
+        lines = [json.loads(x) for x in (r.root / "main.jsonl").read_text().splitlines()]
+        for line in lines:
+            for part in line["message"]["content"] if isinstance(line["message"]["content"], list) else []:
+                if part.get("type") == "tool_result" and part.get("is_error"):
+                    part["content"] = "Permission denied by hook"
+        (r.root / "main.jsonl").write_text("".join(json.dumps(x) + "\n" for x in lines))
+        self.assertEqual(score.score(r.root)["measures"]["verification"]["value"], 1)
+
+    # ---- rule 6: the episode file ----------------------------------------------------------------------------------------
+    def _lost_episode(self, how, hash_of=None):
+        import hashlib
+        r = self.records()
+        r.ran(1, "echo ready", 0)
+        r.said(2, "ready")
+        r.final = {"exit": 0, "tree": "t1"}
+        r.checks = [{"id": "said", "check": "main_said", "pattern": "ready"}]
+        r.write()
+        snapshot = r.root / "run/episode.json"
+        source = r.root / "source-episode.json"
+        source.write_bytes(snapshot.read_bytes())
+        if hash_of == "edited":
+            ep = json.loads(source.read_text())
+            ep["expected"]["checks"][0]["pattern"] = "other"
+            source.write_text(json.dumps(ep))
+            digest = hashlib.sha256(snapshot.read_bytes()).hexdigest()
+        else:
+            digest = hashlib.sha256(source.read_bytes()).hexdigest()
+        rec = json.loads((r.root / "run/run.json").read_text())
+        rec.update(episode_file=str(source), episode_sha256=digest)
+        el.write_json(r.root / "run/run.json", rec)
+        if how == "missing":
+            snapshot.unlink()
+        else:
+            snapshot.write_text("")
+        return score.score(r.root)
+
+    def test_rule6_missing_or_empty_episode_snapshot_is_incomplete(self):
+        """Probe lost-episode: the snapshot lost and the source file edited since: never scored by the edited file."""
+        for how in ("missing", "empty"):
+            s = self._lost_episode(how, hash_of="edited")
+            self.assertEqual(s["records"], "incomplete-records", how)
+            self.assertIn("episode snapshot", s["manifest"], how)
+            self.assertIsNot(s["expected_met"], False, how)
+            self.assertFalse([c for c in s["checks"] if c.get("ok") is False], how)
+
+    def test_rule6_original_file_with_the_recorded_hash_stands_in_and_says_so(self):
+        s = self._lost_episode("missing")
+        self.assertNotEqual(s["records"], "incomplete-records")
+        self.assertEqual([c["ok"] for c in s["checks"]], [True])
+        self.assertTrue(any("sha256" in n for n in s["notes"]), s["notes"])
+
+    # ---- rule 7: every object the run names is read ----------------------------------------------------------------------
+    def test_rule7_request_named_by_an_event_or_a_notice_without_a_file_is_unknown(self):
+        check = {"check": "requests_distinct", "count": 2}
+        r = self.records()
+        r.task("coder-1", created=1, requests=[{"id": "req-a", "opened": at(2), "status": "resolved", "resolved": at(3)}],
+               events=[{"at": at(2), "kind": "request.opened", "ref": "req-a"}, {"at": at(4), "kind": "request.opened", "ref": "req-b"}])
+        r.observe(1, "coder-1", "working")
+        r.observe(2, "coder-1", "input")
+        ok, detail = r.check(check)
+        self.assertIsNone(ok)
+        self.assertIn("req-b", detail)
+        r.tasks["coder-1"]["events"] = [{"at": at(2), "kind": "request.opened", "ref": "req-a"}]
+        self.assertIs(r.check(check)[0], False)            # every named id read: one request, a known answer
+        r.main = []
+        r.owner(5, "notice", text="tp-agent: request req-c from coder-1 is waiting for an answer")
+        ok, detail = r.check(check)                          # a notice in Main's transcript names an id with no file
+        self.assertIsNone(ok)
+        self.assertIn("req-c", detail)
+
+    def test_rule7_wrapper_count_is_executed_stages_only(self):
+        """Probes comment-wrapper and quoted-wrapper; and a wrapper after a failed && never ran, so it wrote no record."""
+        for command, exit in (("# tools/agent/test-run.sh . -- npm test\necho inspected", 0),
+                              ("rg 'tools/agent/test-run.sh . -- npm test' README.md", 0),
+                              ("false && tools/agent/test-run.sh . -- npm test", 1),
+                              ("tools/agent/test-run.sh . -- npm test || true", 0)):
+            r = self.records()
+            r.task("coder-1", created=1, transcript=[("tool", 2, "Bash", {"command": command}, exit)])
+            r.observe(1, "coder-1", "working")
+            self.assertNotIn("test-runs of coder-1", r.score()["manifest"], command)
+        for command in ("tools/agent/test-run.sh . -- npm test", "cd sub && tools/agent/test-run.sh . -- npm test 2>&1 | tail -5"):
+            r = self.records()
+            r.task("coder-1", created=1, transcript=[("tool", 2, "Bash", {"command": command}, 1 if "&&" not in command else 0)])
+            r.observe(1, "coder-1", "working")
+            self.assertIn("test-runs of coder-1", r.score()["manifest"], command)   # it ran: it wrote a record
+
+    # ---- rule 8: the dead-pane test kills only its own worker -----------------------------------------------------------
+    def test_rule8_no_host_wide_kill_in_the_harness_or_its_tests(self):
+        """F1: a `pkill -f` pattern matched every parallel copy's coder. The dead-pane test kills the pid its own worker
+        wrote, checked against its private pane's pane_pid; nothing in the harness or this file kills by pattern."""
+        sources = [Path(__file__)] + sorted(EPISODES.rglob("*.py")) + [EPISODES / "fake" / "claude"]
+        pattern = re.compile(r"(?<!`)\b(pkill|killall)\b")
+        hits = []
+        for path in sources:
+            for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+                code = line.split("#", 1)[0]
+                if pattern.search(code) and "re.compile" not in code:
+                    hits.append("%s:%d" % (path.name, n))
+        self.assertEqual(hits, [])
+        self.assertIn('(task_dir / "worker.pid").write_text', (EPISODES / "fake" / "worker.py").read_text())
 
 class ShellReadDiagnosticTests(unittest.TestCase):
     """Rule 5 (F8): shell-read counts are diagnostic; only file operands (and -f/--file) count, against the tracked cwd."""
@@ -2006,7 +2327,11 @@ class RunnerTests(unittest.TestCase):
                                         "needs": ["draft"]}], "measures": {"into_prompt": 0}}
         dead["expected"]["records"] = el.required_records(dead)
         dead["fake"]["pass"]["on"]["goal"].append(
-            {"bash": "tmux set-option -w -t coder-mini remain-on-exit on; pkill -f 'worker.py.*tasks/coder-mini/'; "
+            # Round 5 rule 8 (F1): kill only this run's worker, by the pid file it wrote, and only if that pid is the
+            # private pane's own process (pane_pid) or its child. A host-wide `pkill -f` matched every parallel copy's coder.
+            {"bash": "tmux set-option -w -t coder-mini remain-on-exit on; "
+                     "w=$(cat \"$TP_STATE_DIR/tasks/coder-mini/worker.pid\"); p=$(tmux display-message -p -t coder-mini '#{pane_pid}'); "
+                     "if [ \"$w\" = \"$p\" ] || [ \"$(ps -o ppid= -p \"$w\" | tr -d ' ')\" = \"$p\" ]; then kill \"$w\"; fi; "
                      "for i in $(seq 1 200); do [ \"$(tmux display-message -p -t coder-mini '#{pane_dead}')\" = 1 ] "
                      "&& echo dead > .git/pane-dead && break; sleep 0.05; done"})
         dead["fake"]["pass"]["on"]["goal"].append({"say": "The coder is gone."})

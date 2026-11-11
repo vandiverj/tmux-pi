@@ -41,6 +41,8 @@ if not transcript.exists():
         "role": "user", "content": first.read_text(encoding="utf-8") if first else "(no packet)"}})
 fd = sys.stdin.fileno()
 box = []
+# The pid a test kills to make this worker's pane die (never a host-wide pkill: round 5 rule 8).
+(task_dir / "worker.pid").write_text("%d\n" % os.getpid())
 
 
 def out(text):
@@ -160,14 +162,17 @@ def main():
             head, tree = gate_record.fingerprint(workdir)
             # A real worker runs its checks through tools/agent/test-run.sh, so its transcript shows the call that wrote
             # each record (the scorer counts them: a record lost from test-runs/ is then missing, round 4 rule 1).
-            call_id = tool_use("Bash", {"command": "tools/agent/test-run.sh . --label %s -- /bin/sh -c %s" % (
-                shlex.quote(command), shlex.quote(command))})
+            # Round 5 rule 3: a record speaks for its own cmd only, so cmd is the runner command itself (the episode's
+            # checks are simple commands), never a shell wrapper around it.
+            words = shlex.split(command)
+            call_id = tool_use("Bash", {"command": "tools/agent/test-run.sh . --label %s -- %s" % (
+                shlex.quote(command), shlex.join(words))})
             t0 = time.monotonic()
-            code, tail = run(command)
+            code, tail = run(shlex.join(words))
             tool_result(call_id, code, tail)
             test_runs += 1
             el.write_json(task_dir / "test-runs" / ("%d.json" % test_runs), {
-                "schema": "tp-test-run:v1", "label": command, "cmd": ["/bin/sh", "-c", command], "cwd": str(workdir),
+                "schema": "tp-test-run:v1", "label": command, "cmd": words, "cwd": str(workdir),
                 "head": head, "tree": tree, "exit": code, "timed_out": code is None,
                 "seconds": round(time.monotonic() - t0, 2), "log": None, "summary": tail.strip().splitlines()[-1:] or ""})
         elif "await" in step:

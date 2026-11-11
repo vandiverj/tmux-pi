@@ -127,19 +127,40 @@ def lineage_meta(state_dir, task_id):
     return list(reversed(chain))
 
 
+def dispatched_parent_sweep(meta, parent):
+    """True when the task's own dispatch.json `context` lists the sweep.md of `parent` (…/tasks/<parent>/sweep.md): what tp-agent
+    retry attached to a gated retry before it recorded `gate` in meta.json. Reads nothing of the parent's directory."""
+    return any(isinstance(spec, str) and Path(spec).name == "sweep.md" and Path(spec).parent.name == parent
+               and Path(spec).parent.parent.name == "tasks" for spec in (meta or {}).get("context") or [])
+
+
+def legacy_trigger(state_dir, parent, parent_meta, created):
+    """The parent's newest review with a result.md whose meta.json `created` is earlier than `created` (both are %Y-%m-%dT%H:%M:%SZ
+    UTC strings, compared as strings), else None: the review a gated retry made before `gate_review` existed was made after."""
+    found = None
+    for review in review_ids(parent_meta):
+        made = (read_json(task_path(state_dir, review) / "meta.json") or {}).get("created")
+        if isinstance(made, str) and isinstance(created, str) and made < created and (task_path(state_dir, review) / "result.md").exists():
+            if found is None or made >= found[0]:
+                found = (made, review)
+    return found[1] if found else None
+
+
 def gated_author(state_dir, task_id):
-    """The newest author in the chain of `task_id` that a gated retry started, else None. Gated: its meta.json `gate` is rule-first
-    or design, or (a task started before retry wrote `gate`) the author it replaced holds the sweep.md that only a gated retry
-    writes there (a regular file, not a link). A task without either is not gated."""
+    """(author, route, trigger review id or None) for the newest author in the chain of `task_id` that a gated retry started, else
+    None. Gated: its meta.json `gate` is rule-first or design (`gate_review` names the parent's review that triggered it), or, with
+    no `gate` key at all (a task made before retry wrote it), its own dispatch.json lists the sweep.md of the author it replaced; the
+    trigger is then that parent's newest review made before the task was. The parent's sweep.md on disk is never read: a later
+    sibling retry or a failed gated dispatch writes one there too. A task without either is not gated."""
     found, before = None, None
     for author, meta in lineage_meta(state_dir, task_id):
         if meta.get("gate") in GATES:
-            found = (author, meta["gate"])
+            found = (author, meta["gate"], meta.get("gate_review") or None)
         elif "gate" not in meta and before is not None:
-            sweep = task_path(state_dir, before) / "sweep.md"
-            if sweep.is_file() and not sweep.is_symlink():
-                found = (author, "sweep.md")
-        before = author
+            dispatch = read_json(task_path(state_dir, author) / "dispatch.json")
+            if dispatched_parent_sweep(dispatch, before[0]):
+                found = (author, "sweep.md", legacy_trigger(state_dir, before[0], before[1], meta.get("created")) or "")
+        before = (author, meta)
     return found
 
 
@@ -974,15 +995,25 @@ def reviewed_history(top, state, lane):
 
 
 def findings_window(state_dir, task_id, rows):
-    """The round number the attached findings start at: the review that triggered the newest gated retry of the chain (the last
-    review with a reply before the gated author's own rows), so a round before it is an older window (summary_line); 0 (all rounds
-    in full) when no author of the chain is gated or nothing was reviewed before the gate."""
+    """The round number the attached findings start at: the round of the review that triggered the newest gated retry of the chain
+    (`gate_review`, or for a legacy task the parent's newest review made before it), so a round before it is an older window
+    (summary_line); 0 (all rounds in full) when no author of the chain is gated or nothing was reviewed before the gate. A gate with
+    no recorded trigger (made between the first and second round of RR1) starts at the last review before the gated author's rows.
+    Raises Refused when `gate_review` is not a review of the chain that has a reply."""
     gated = gated_author(state_dir, task_id)
     if gated is None:
         return 0
+    author, _, trigger = gated
+    if trigger == "":
+        return 0
+    if trigger is not None:
+        for _, review, _, _, number in rows:
+            if review == trigger and number:
+                return number
+        raise Refused(f"gate_review '{trigger}' of '{author}' is not a review with a reply in the retry chain of '{task_id}'")
     start = 0
-    for author, _, _, _, number in rows:
-        if author == gated[0]:
+    for row_author, _, _, _, number in rows:
+        if row_author == author:
             break
         if number:
             start = number

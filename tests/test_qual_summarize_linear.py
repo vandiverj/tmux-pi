@@ -229,8 +229,9 @@ DEPTH_BUDGET = 1.1  # steps per character, at both depths (the ratio of the two 
 class LinearTimeTests(unittest.TestCase):
     ANSWER = base.CheckerTests.ANSWER
     C = base.CheckerTests.C  # [src/cache.py:6]
-    # TQ1 Q2: the shapes were 1 MB each; every size is now a tenth of that. The count of steps per character is the same at both sizes (to
-    # three digits, for every shape, so the budgets below did not change), and a reader that walks the text for each of k candidates takes k
+    # TQ1 Q2: the shapes were 1 MB each; every size is now a tenth of that. The count of steps per character is the same at both sizes to
+    # three digits for every shape except the backtick runs, whose RUNS also changed (reverse in backticks: 0.402 -> 0.239, under its
+    # 0.51 budget), so the budgets below did not change; and a reader that walks the text for each of k candidates takes k
     # times the steps: the four tests that failed on the quadratic reader of 8560cf6 at 1 MB fail on it at this size too, with the same
     # message. "MB" below is the size of one input: 100,000 characters.
     SCALE = 10

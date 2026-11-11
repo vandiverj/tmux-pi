@@ -239,7 +239,62 @@ def _closed_entry(value, index):
         if not isinstance(reason, str) or not reason.strip():
             raise ValueError(f"{where}.override_reason must say why the owner closed over the review ({OWNER_OVERRIDE})")
         entry["override_reason"] = reason
+    if "stop_rule" in value:  # SR1: a step Main closed under the owner's stop-rule authorization (lane close --stop-rule)
+        if not overridden:
+            raise ValueError(f"{where}.stop_rule goes only with verdict {OWNER_OVERRIDE}")
+        entry["stop_rule"] = _stop_rule(value["stop_rule"], f"{where}.stop_rule")
     return entry
+
+
+STOP_ID = re.compile(r"^stop-[0-9a-f]{12}$")
+FAMILY_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]*$")  # review_verdict.FAMILY's names, folded to lower case
+MAX_REASON = 2000
+
+
+def _families(value, what):
+    if not isinstance(value, list) or not all(isinstance(name, str) and FAMILY_NAME.fullmatch(name) for name in value) \
+            or len(set(value)) != len(value):
+        raise ValueError(f"{what} must be a list of distinct Family: names (lower-case a-z, 0-9, _ and -)")
+    return list(value)
+
+
+def _authorization_fields(value, where, keys):
+    if not isinstance(value, dict):
+        raise ValueError(f"{where} is not an object")
+    for key in keys:
+        if key not in value:
+            raise ValueError(f"{where} has no {key}")
+    if not isinstance(value["id"], str) or not STOP_ID.fullmatch(value["id"]):
+        raise ValueError(f"{where}.id {value['id']!r} is not a stop-rule authorization id (stop-<12 hex>)")
+    if not isinstance(value["gate_review"], str) or not TASK_ID.fullmatch(value["gate_review"]):
+        raise ValueError(f"{where}.gate_review {value['gate_review']!r} is not a task id")
+    return {"id": value["id"], "authorized_at": _timestamp(value["authorized_at"], f"{where}.authorized_at"),
+            "gate_review": value["gate_review"], "families": _families(value["families"], f"{where}.families")}
+
+
+def _stop_rule(value, where):
+    """The `stop_rule` object of a closed entry: the authorization it was closed under and the committed known-limits file."""
+    out = _authorization_fields(value, where, ("id", "authorized_at", "gate_review", "families", "known_limits", "known_limits_blob"))
+    try:
+        out["known_limits"] = path_prefix(value["known_limits"])
+    except ValueError as error:
+        raise ValueError(f"{where}.known_limits: {error}")
+    out["known_limits_blob"] = _hex(value["known_limits_blob"], f"{where}.known_limits_blob")
+    return out
+
+
+def _stop_authorization(value, index):
+    """One entry of `stop_authorizations`: the owner's authorization (lane authorize-stop) for Main to close one step under the
+    stop rule: the step, the gate review it binds to, the families of that review's code findings, and the owner's reason."""
+    where = f"stop_authorizations[{index}]"
+    out = _authorization_fields(value, where, ("id", "authorized_at", "reason", "step", "gate_review", "families"))
+    if not isinstance(value["step"], str) or not STEP_ID.fullmatch(value["step"]):
+        raise ValueError(f"{where}.step {value['step']!r} is not a valid step id")
+    reason = value["reason"]
+    if not isinstance(reason, str) or not reason.strip() or len(reason) > MAX_REASON:
+        raise ValueError(f"{where}.reason must say, in 1-{MAX_REASON} characters, why the owner authorizes the stop")
+    return {"id": out["id"], "authorized_at": out["authorized_at"], "reason": reason, "step": value["step"],
+            "gate_review": out["gate_review"], "families": out["families"]}
 
 
 def lane_record(value, name=None):
@@ -302,9 +357,18 @@ def lane_record(value, name=None):
     deps = value.get("deps", "own")  # optional: a record from before shared dependencies has its own
     if deps not in DEPS:
         raise ValueError(f"deps {deps!r} is not one of {', '.join(DEPS)}")
-    return {"schema": SCHEMA, "name": lane, "kind": value["kind"], "state": value["state"], "repo": repo, "git_common_dir": common,
-            "branch": branch, "worktree": worktree, "base": base, "created": _timestamp(value["created"], "created"),
-            "domain": domain, "touches": touches, "closed": closed, "integrated": integrated, "defaulted": list(defaulted), "deps": deps}
+    stops = value.get("stop_authorizations", [])  # optional (SR1): kept in the record only while one is held
+    if not isinstance(stops, list):
+        raise ValueError("stop_authorizations is not a list")
+    stops = [_stop_authorization(entry, i) for i, entry in enumerate(stops)]
+    if len({entry["step"] for entry in stops}) != len(stops):
+        raise ValueError("stop_authorizations has two authorizations for one step")
+    clean = {"schema": SCHEMA, "name": lane, "kind": value["kind"], "state": value["state"], "repo": repo, "git_common_dir": common,
+             "branch": branch, "worktree": worktree, "base": base, "created": _timestamp(value["created"], "created"),
+             "domain": domain, "touches": touches, "closed": closed, "integrated": integrated, "defaulted": list(defaulted), "deps": deps}
+    if stops:
+        clean["stop_authorizations"] = stops
+    return clean
 
 
 # ---------------------------------------------------------------- the files

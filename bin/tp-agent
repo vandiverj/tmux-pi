@@ -1478,6 +1478,19 @@ def _main(argv):
     lcl.add_argument("--override-review", action="store_true", help="owner only, at a terminal with a typed-back code: close over a review "
                                                                      "that asked for changes to this tree; every other check still applies")
     lcl.add_argument("--reason", help="why the owner closes over the review (required with --override-review; recorded in the entry)")
+    lcl.add_argument("--stop-rule", action="store_true",
+                     help="close over the last round's review under the owner's stop-rule authorization (lane authorize-stop), with no code: "
+                          "only when that review asked for changes to the committed tree, its author is the retry of the authorized gate "
+                          "review, every code finding has an authorized Family:, and --known-limits names them; not with --override-review")
+    lcl.add_argument("--known-limits", metavar="PATH",
+                     help="with --stop-rule: a file committed at the main repository's or the lane's HEAD (relative to the repository) "
+                          "that names the closing review id and each of its code findings (F1, F2, ...)")
+    las = ln.add_parser("authorize-stop", help="owner only, at a terminal with a typed-back code: let Main close step STEP once, after the "
+                                               "last round, under the stop rule (lane authorize-stop NAME STEP --reason TEXT)")
+    las.add_argument("name")
+    las.add_argument("step")
+    las.add_argument("--repo", default=".", help="the repository (default: the current directory)")
+    las.add_argument("--reason", required=True, help="why the owner stops after this round (recorded, and used as the closed entry's reason)")
     lr = ln.add_parser("remove", help="remove an integrated lane (or, with --abandon, an open one): worktree, branch; the record is archived")
     lr.add_argument("name")
     lr.add_argument("--abandon", action="store_true", help="remove an open lane whose work is not integrated; its tip is printed first so the branch can be restored")
@@ -1534,6 +1547,11 @@ def _main(argv):
             except (OSError, subprocess.CalledProcessError) as error:
                 raise ValueError("no tmux-pi state directory; start a workspace with tp, or set TP_STATE_DIR") from error
             common, _ = lane_commands._main_repo(args.repo)
+            if args.stop_rule and args.override_review:
+                raise ValueError("--stop-rule and --override-review are exclusive: the stop rule closes under the owner's earlier authorization, "
+                                 "the override is the owner at a terminal now")
+            if args.stop_rule != (args.known_limits is not None):
+                raise ValueError("--stop-rule needs --known-limits PATH, and --known-limits goes only with --stop-rule")
             if args.reason is not None and not args.override_review:
                 raise ValueError("--reason goes with --override-review")
             if args.override_review:
@@ -1541,7 +1559,16 @@ def _main(argv):
                     raise ValueError("--override-review needs a --reason that says why the owner closes over the review")
                 owner_confirm.confirm(f"Close step {args.step} of lane {args.name} over the review that asked for changes.\nReason: {args.reason}")
             print(json.dumps(lane_steps.close_step(state, common, args.name, args.step,
-                                                   override_reason=args.reason if args.override_review else None), indent=2))
+                                                   override_reason=args.reason if args.override_review else None,
+                                                   known_limits=args.known_limits if args.stop_rule else None), indent=2))
+            return
+        if args.lane_command == "authorize-stop":
+            try:
+                state = state_dir()
+            except (OSError, subprocess.CalledProcessError) as error:
+                raise ValueError("no tmux-pi state directory; start a workspace with tp, or set TP_STATE_DIR") from error
+            common, _ = lane_commands._main_repo(args.repo)
+            print(json.dumps(lane_steps.authorize_stop(state, common, args.name, args.step, args.reason, owner_confirm.confirm), indent=2))
             return
         if args.lane_command == "remove":
             try:

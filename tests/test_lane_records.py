@@ -113,6 +113,36 @@ class RecordTests(unittest.TestCase):
         missing = dict(entry)
         del missing["review"]
         self.refuses(good(closed=[missing]), "no review")
+        # SR1: a step closed under the stop rule carries the authorization and the committed known-limits file
+        stop = {"id": "stop-0123456789ab", "authorized_at": "2026-11-11T10:00:00+00:00", "gate_review": "review-1",
+                "families": ["stale-cache"], "known_limits": "docs/limits.md", "known_limits_blob": SHA2}
+        over = dict(entry, verdict="OWNER_OVERRIDE", override_reason="last round", stop_rule=stop)
+        self.assertEqual(lanes.lane_record(good(closed=[over]))["closed"], [over])
+        self.refuses(good(closed=[dict(over, verdict="APPROVED")]), "stop_rule goes only with verdict OWNER_OVERRIDE")
+        for key, bad, text in (("id", "stop-xyz", "authorization id"), ("authorized_at", "2026-11-11T10:00:00", "UTC"),
+                               ("gate_review", "", "task id"), ("families", ["Stale"], "Family: names"), ("families", ["a", "a"], "Family: names"),
+                               ("families", "stale-cache", "Family: names"), ("known_limits", "/abs.md", "absolute"),
+                               ("known_limits_blob", "abc", "hex")):
+            with self.subTest(stop_rule=key, bad=bad):
+                self.refuses(good(closed=[dict(over, stop_rule=dict(stop, **{key: bad}))]), text)
+        self.refuses(good(closed=[dict(over, stop_rule={k: v for k, v in stop.items() if k != "known_limits_blob"})]), "no known_limits_blob")
+        self.refuses(good(closed=[dict(over, stop_rule="yes")]), "not an object")
+
+    def test_stop_authorizations(self):
+        """SR1: the owner's stop-rule authorizations, one per step; absent from a record that holds none, so older records read the same."""
+        auth = {"id": "stop-0123456789ab", "authorized_at": "2026-11-11T10:00:00+00:00", "reason": "last round", "step": "L1",
+                "gate_review": "review-1", "families": ["stale-cache", "path-form"]}
+        self.assertEqual(lanes.lane_record(good(stop_authorizations=[auth]))["stop_authorizations"], [auth])
+        self.assertNotIn("stop_authorizations", lanes.lane_record(good(stop_authorizations=[])))
+        self.refuses(good(stop_authorizations=[auth, dict(auth, id="stop-ba9876543210")]), "two authorizations for one step")
+        self.refuses(good(stop_authorizations=auth), "not a list")
+        self.refuses(good(stop_authorizations=["x"]), "not an object")
+        for key, bad, text in (("id", "auth-1", "authorization id"), ("reason", "  ", "why the owner"), ("reason", "x" * 2001, "why the owner"),
+                               ("step", "bad step", "step id"), ("gate_review", None, "task id"), ("families", [1], "Family: names"),
+                               ("authorized_at", "soon", "ISO-8601")):
+            with self.subTest(authorization=key, bad=bad):
+                self.refuses(good(stop_authorizations=[dict(auth, **{key: bad})]), text)
+        self.refuses(good(stop_authorizations=[{k: v for k, v in auth.items() if k != "reason"}]), "no reason")
 
     def test_a_boolean_is_not_a_number_or_text(self):
         self.refuses(good(name=True), "invalid lane name")

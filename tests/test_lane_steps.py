@@ -967,5 +967,205 @@ class OwnerOverrideTests(StepCase):
         self.assertEqual(self.record()["closed"], [])
 
 
+def finding(number, text, family=None, closes="code"):
+    return f"F{number} [defect] {text}.\n" + (f"Family: {family}\n" if family else "") + f"Closes by: {closes}\n"
+
+
+# the gate review: one code finding in family stale-cache; the check finding's family is not one a code change closes
+GATE = "REQUEST_CHANGES\n\n" + finding(1, "the cache is read stale", "stale-cache") + finding(2, "no log", "path-form", "check") + COVERAGE
+# the last round's review: the same family twice (F1, F3) and a check finding between them
+LAST = ("REQUEST_CHANGES\n\n" + finding(1, "another stale read", "stale-cache") + finding(2, "no log", None, "check")
+        + finding(3, "a third stale read", "stale-cache") + COVERAGE)
+
+
+class StopRuleTests(StepCase):
+    """SR1: the owner authorizes a last round once (`lane authorize-stop`, typed-back code); Main closes under it with `lane close
+    --stop-rule --known-limits PATH` only when the tool proves the case. Driven in-process as OwnerOverrideTests drives the override:
+    the code is the CLI's (`confirm` is owner_confirm.confirm there, a recorder here)."""
+
+    def common(self):
+        return lane_steps.lane_commands._main_repo(str(self.repo))[0]
+
+    def authorize(self, step="s1", reason="families recur: merge with them as known limits"):
+        shown = []
+        record = lane_steps.authorize_stop(self.state, self.common(), "alpha", step, reason, shown.append)
+        return record, shown
+
+    def stop_close(self, path="docs/limits.md", **extra):
+        return lane_steps.close_step(self.state, self.common(), "alpha", "s1", known_limits=path, **extra)
+
+    def commit_main(self, rel, text):
+        (self.repo / rel).write_text(text)
+        git(self.repo, "add", rel)
+        git(self.repo, "commit", "-q", "-m", f"add {rel}")
+
+    def set_authorizations(self, auths):
+        common = self.common()
+        with lane_steps.lanes.lane_lock(common):
+            record = dict(lane_steps.lanes.read_lane(common, "alpha"))
+            record.pop("stop_authorizations", None)
+            if auths:
+                record["stop_authorizations"] = auths
+            lane_steps.lanes.write_lane(common, record)
+
+    def last_round(self):
+        """Round n asked for changes (the gate), the owner authorized, the gated retry committed its work and its review asked for
+        changes again in the authorized family; a known-limits file naming that review and F1, F3 is committed in the main repository."""
+        first, _ = self.writer()
+        self.edit(text="v1\n")
+        self.commit()
+        gate, _ = self.review(first, GATE)
+        record, shown = self.authorize()
+        retry, retry_task = self.writer()
+        meta = json.loads((retry_task / "meta.json").read_text())
+        meta.update(parent=first, gate="rule-first", gate_review=gate)  # what `tp-agent retry --route rule-first` records since RR1
+        (retry_task / "meta.json").write_text(json.dumps(meta))
+        self.edit(text="v2\n")
+        self.commit()
+        closing, closing_task = self.review(retry, LAST)
+        self.commit_main("docs/limits.md", f"Known limits of s1 (review {closing}): F1 and F3 recur as stale-cache.\n")
+        return {"gate": gate, "retry": retry, "retry_task": retry_task, "closing": closing, "closing_task": closing_task,
+                "auth": record["stop_authorizations"][0], "shown": shown}
+
+    def test_authorize_binds_the_newest_changes_review_and_its_code_families_and_again_replaces_it(self):
+        first, _ = self.writer()
+        self.edit()
+        self.commit()
+        self.review(first, CHANGES)  # older, no families
+        gate, _ = self.review(first, GATE)
+        record, shown = self.authorize()
+        auth = record["stop_authorizations"][0]
+        self.assertEqual({k: auth[k] for k in ("step", "gate_review", "families", "reason")},
+                         {"step": "s1", "gate_review": gate, "families": ["stale-cache"],
+                          "reason": "families recur: merge with them as known limits"})
+        self.assertRegex(auth["id"], r"^stop-[0-9a-f]{12}$")
+        for word in ("lane alpha", "step s1", gate, "Families: stale-cache", "Reason: families recur"):
+            self.assertIn(word, shown[0])
+        again, shown = self.authorize(reason="second thoughts")
+        self.assertEqual([(a["step"], a["reason"]) for a in again["stop_authorizations"]], [("s1", "second thoughts")])
+        self.assertNotEqual(again["stop_authorizations"][0]["id"], auth["id"])
+        self.assertIn(f"replaces the step's authorization {auth['id']}", shown[0])
+        self.assertEqual(self.record()["stop_authorizations"], again["stop_authorizations"])  # it survives the record's check on read
+
+    def test_authorize_refuses_a_step_with_no_changes_review_or_a_closed_one_before_asking(self):
+        author, _ = self.approved_and_committed()
+        refused = []
+        with self.assertRaisesRegex(ValueError, "has no review that asked for changes"):
+            lane_steps.authorize_stop(self.state, self.common(), "alpha", "s1", "x", refused.append)
+        self.closes()
+        with self.assertRaisesRegex(ValueError, "already closed"):
+            lane_steps.authorize_stop(self.state, self.common(), "alpha", "s1", "x", refused.append)
+        with self.assertRaisesRegex(ValueError, "needs a --reason"):
+            lane_steps.authorize_stop(self.state, self.common(), "alpha", "s1", "  ", refused.append)
+        self.assertEqual(refused, [])  # the owner is never asked for a refused authorization
+        self.assertNotIn("stop_authorizations", self.record())
+
+    def cli(self, *args, env=None):
+        return subprocess.run([str(ROOT / "bin/tp-agent"), "lane", *args, "--repo", str(self.repo)], env=env or self.env, text=True,
+                              capture_output=True, timeout=60, stdin=subprocess.DEVNULL)
+
+    def test_the_cli_asks_the_owner_at_a_terminal_and_pairs_the_flags(self):
+        """authorize-stop takes owner_confirm's refusals (an agent session, no terminal) after its own checks; lane close takes
+        --stop-rule only with --known-limits and never with --override-review. Each refusal writes nothing."""
+        first, _ = self.writer()
+        self.edit()
+        self.commit()
+        self.review(first, GATE)
+        bare = {k: v for k, v in self.env.items() if k not in ("TP_TASK_ID", "TP_TASK_DIR", "TP_MODE")}
+        self.untouched(lambda: self.cli("authorize-stop", "alpha", "s1", "--reason", "x", env=bare), "must be a terminal")
+        self.untouched(lambda: self.cli("authorize-stop", "alpha", "s1", "--reason", "x", env={**bare, "TP_TASK_ID": "coder-0000000000"}),
+                       "TP_TASK_ID is set")
+        self.untouched(lambda: self.cli("close", "alpha", "s1", "--stop-rule", "--known-limits", "d.md", "--override-review", "--reason", "x"),
+                       "exclusive")
+        self.untouched(lambda: self.cli("close", "alpha", "s1", "--stop-rule"), "--stop-rule needs --known-limits")
+        self.untouched(lambda: self.cli("close", "alpha", "s1", "--known-limits", "d.md"), "--known-limits goes only with --stop-rule")
+        self.untouched(lambda: self.cli("close", "alpha", "s1", "--stop-rule", "--known-limits", "d.md"), "(a): it has no authorization")
+
+    def test_the_close_attack_table(self):
+        """Every row is refused by name and changes nothing, except the last, which closes."""
+        case = self.last_round()
+        common, auth, closing = self.common(), case["auth"], case["closing_task"] / "result.md"
+        meta_path = case["retry_task"] / "meta.json"
+        meta = meta_path.read_text()
+
+        def rewrite(path, text):
+            old = path.read_text()
+            path.write_text(text)
+            return lambda: path.write_text(old)
+
+        def scratch(path):
+            path.write_text("F1 F3\n")
+            return path.unlink
+
+        rows = [
+            ("no authorization", lambda: self.set_authorizations([]) or (lambda: self.set_authorizations([auth])), {}, "(a): it has no authorization"),
+            ("authorization for another step", lambda: self.set_authorizations([dict(auth, step="s0")]) or (lambda: self.set_authorizations([auth])),
+             {}, "holds one for step(s) s0 only"),
+            ("review approved", lambda: rewrite(closing, APPROVED), {}, "nothing to override"),
+            ("tree changed after the review", lambda: scratch(self.worktree / "lib" / "late.py"), {}, "1 uncommitted path(s)"),
+            ("a second retry: another gate_review", lambda: rewrite(meta_path, meta.replace(case["gate"], "review-later")), {},
+             "(c): the closing review"),
+            ("a gated author with no gate_review", lambda: rewrite(meta_path, json.dumps({k: v for k, v in json.loads(meta).items() if k != "gate_review"})),
+             {}, "no gate_review"),
+            ("finding with a new family", lambda: rewrite(closing, LAST.replace("a third stale read.\nFamily: stale-cache", "a third stale read.\nFamily: path-form")),
+             {}, "(d): finding F3"),
+            ("code finding with no family", lambda: rewrite(closing, LAST.replace("Family: stale-cache\nCloses by: code\nF2", "Closes by: code\nF2")),
+             {}, "(d): finding F1"),
+            ("known-limits file missing", lambda: None, {"path": "docs/none.md"}, "(e): docs/none.md is not a file committed"),
+            ("known-limits file uncommitted", lambda: scratch(self.repo / "docs" / "draft.md"), {"path": "docs/draft.md"}, "is not a file committed"),
+            ("known-limits file is a directory", lambda: None, {"path": "docs"}, "is not a file committed"),
+            ("known-limits misses F3", lambda: self.commit_main("docs/part.md", f"{case['closing']}: F1\n"), {"path": "docs/part.md"},
+             "does not name F3"),
+            ("known-limits misses the review id", lambda: self.commit_main("docs/noid.md", "F1 F3\n"), {"path": "docs/noid.md"},
+             f"does not name {case['closing']}"),
+            ("known-limits names F30, not F3", lambda: self.commit_main("docs/f30.md", f"{case['closing']}: F1 F30\n"), {"path": "docs/f30.md"},
+             "does not name F3"),
+            ("known-limits outside both trees", lambda: None, {"path": str(self.root / "elsewhere.md")}, "is not inside"),
+            ("--stop-rule with --override-review", lambda: None, {"override_reason": "x"}, "exclusive"),
+        ]
+        table = []
+        for name, arrange, kw, words in rows:
+            with self.subTest(case=name):
+                undo = arrange()
+                before = self.snap()
+                try:
+                    with self.assertRaises(ValueError) as caught:
+                        self.stop_close(**kw)
+                    table.append((name, words, str(caught.exception)))
+                    self.assertIn(words, str(caught.exception))
+                    self.assertEqual(self.snap(), before, "a refusal changed something")
+                finally:
+                    if undo:
+                        undo()
+        record = self.stop_close()
+        entry = record["closed"][0]
+        blob = git(self.repo, "rev-parse", "HEAD:docs/limits.md")
+        self.assertEqual({k: entry[k] for k in ("step", "review", "verdict", "override_reason")},
+                         {"step": "s1", "review": case["closing"], "verdict": "OWNER_OVERRIDE", "override_reason": auth["reason"]})
+        self.assertEqual(entry["stop_rule"], {"id": auth["id"], "authorized_at": auth["authorized_at"], "gate_review": case["gate"],
+                                              "families": ["stale-cache"], "known_limits": "docs/limits.md", "known_limits_blob": blob})
+        self.assertNotIn("stop_authorizations", self.record())  # used once: removed in the same write
+        self.assertEqual(self.record()["closed"][0], entry)
+        if os.environ.get("TP_STOP_RULE_TABLE"):  # the report's Case | Expected | Got table
+            Path(os.environ["TP_STOP_RULE_TABLE"]).write_text(json.dumps(table + [("authorized and every condition holds", "closes", entry["verdict"])], indent=1))
+
+    def test_an_approved_close_drops_a_held_authorization(self):
+        """An authorization ends with its step whatever closes it: a later approval closes normally and takes it out of the record."""
+        first, _ = self.writer()
+        self.edit(text="v1\n")
+        self.commit()
+        self.review(first, GATE)
+        self.authorize()
+        retry, _ = self.writer()
+        self.edit(text="v2\n")
+        self.commit()
+        self.review(retry, APPROVED)
+        with self.assertRaisesRegex(ValueError, "nothing to override"):
+            self.stop_close()
+        entry = self.closes()["closed"][0]
+        self.assertEqual(entry["verdict"], "APPROVED")
+        self.assertNotIn("stop_authorizations", self.record())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -36,6 +36,16 @@ no labels at all (older reviewers, other templates), rejects as before. Reviews 
 for changes to this tree. Every other part of 1 to 3 still holds (no running review, clean and committed), and the entry is recorded
 with verdict OWNER_OVERRIDE, the newest such review and the owner's reason.
 
+The stop rule (SR1) moves the owner's confirmation of a last round to the moment the owner chooses it. `lane authorize-stop NAME
+STEP --reason TEXT` (owner, typed-back code) records, in the lane record, an authorization bound to the step's gate review (its
+newest review that asked for changes) and the Family: names of that review's code findings. `lane close NAME STEP --stop-rule
+--known-limits PATH` (Main, no code) then closes as the override does, only when: the step has an authorization; a review of the
+clean HEAD tree asked for changes (the override's checks); the closing review's author is the retry whose meta.json gate_review is
+the authorization's; every code finding of each review of this tree that asked for changes has a family the authorization lists;
+and PATH is committed at the main repository's or the lane's HEAD and names each such review and its code findings (F<n>, the n-th
+finding as family_sweep.findings splits the reply). The entry is an OWNER_OVERRIDE with the authorization's reason and a stop_rule
+object; the authorization leaves the record in the same write (any close of the step removes it).
+
 Reading chosen on purpose (it is the least strict one that keeps the rule): a review that FINISHED without a usable verdict
 (unreadable, unparseable, no Coverage section, or failed, killed or stopped) is not a vote. It never approves, and it is named
 when nothing approves, but a second review of the same tree that approves is enough. Counting it as a rejection would leave a
@@ -49,6 +59,8 @@ session sees only its own tasks, so another session's steps are not seen here (t
 workers out of the lane)."""
 import json
 import os
+import re
+import secrets
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -57,6 +69,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import lane_commands  # noqa: E402
 import lane_lease  # noqa: E402
 import lanes  # noqa: E402
+import family_sweep  # noqa: E402
 import review_rounds  # noqa: E402
 import review_verdict  # noqa: E402
 import worker_process  # noqa: E402
@@ -360,8 +373,9 @@ def evaluate(session, record, step, override=False):
     if override:
         if not rejecting:
             return refuse(owner, f"no review of this tree ({where}) asked for changes, so there is nothing to override; "
-                                 f"close the step without --override-review once a review of it approves")
-        facts.update(review=max(rejecting, key=lambda j: j[0]["when"])[0]["id"], verdict=lanes.OWNER_OVERRIDE)
+                                 f"close the step without --override-review or --stop-rule once a review of it approves")
+        facts.update(review=max(rejecting, key=lambda j: j[0]["when"])[0]["id"], verdict=lanes.OWNER_OVERRIDE,
+                     rejecting=[j[0]["id"] for j in rejecting])
         return _committed(facts, refuse, where, worktree, name, step)
     approving = [j for j in judged if j[1] == "approves"]
     if not approving:
@@ -398,47 +412,251 @@ def _previous(record):
     return record["closed"][-1]["commit"] if record["closed"] else record["base"]["commit"]
 
 
-def close_step(state, common, name, step, override_reason=None):
-    """Record that `step` of lane `name` is finished and bound to the commit the reviewed work is committed as. Every refusal
-    is raised before anything is written; the one write is the new entry in `closed`, under the lane lock. Returns the record.
-    `override_reason` (the owner's, confirmed at a terminal by the caller) closes over a review that asked for changes."""
-    if override_reason is not None and not override_reason.strip():
-        raise ValueError("--override-review needs a --reason that says why the owner closes over the review")
+def _named(common, name, step):
     lane_commands.check_lane_name(name)
     if not lanes.STEP_ID.fullmatch(step):
         raise ValueError(f"invalid step id {step!r}: use up to 40 characters of letters, digits, . _ -")
     if name not in lanes.lane_names(common):
         raise ValueError(f"there is no lane {name} in {lanes.lanes_dir(common)}; `tp-agent lanes` lists the lanes")
+
+
+def _step_here(session, record, step, state, command):
+    """Refuse a step this session has no task of, or one that is closed (`command` is what to run again from elsewhere)."""
+    name = record["name"]
+    seen = session.steps(name)
+    entry = _closed_entry(record, step)
+    if step not in seen and not entry:
+        here = f"its steps in this session are {', '.join(seen)}" if seen else "no task of this session belongs to the lane"
+        raise ValueError(f"lane {name} has no step {step} in this session ({state}): {here}. Check the id with `tp-agent lanes {name}`; if the "
+                         f"step ran in another session, run this from that session's workspace (or TP_STATE_DIR=<its state directory> tp-agent {command})")
+    if entry:
+        raise ValueError(f"step {step} is already closed at {entry['commit']}; it is recorded, so there is nothing to do. The next step takes a "
+                         f"new id: `tp-agent dispatch --lane {name} --step NEW-ID --role ROLE --task \"...\"`")
+
+
+def close_step(state, common, name, step, override_reason=None, known_limits=None):
+    """Record that `step` of lane `name` is finished and bound to the commit the reviewed work is committed as. Every refusal
+    is raised before anything is written; the one write is the new entry in `closed`, under the lane lock. Returns the record.
+    `override_reason` (the owner's, confirmed at a terminal by the caller) closes over a review that asked for changes.
+    `known_limits` (a path; `--stop-rule`) closes over it under the owner's stop-rule authorization of the step (stop_rule_checks)."""
+    if override_reason is not None and known_limits is not None:
+        raise ValueError("--stop-rule and --override-review are exclusive: the stop rule closes under the owner's earlier authorization, "
+                         "the override is the owner at a terminal now")
+    if override_reason is not None and not override_reason.strip():
+        raise ValueError("--override-review needs a --reason that says why the owner closes over the review")
+    if known_limits is not None and not str(known_limits).strip():
+        raise ValueError("--stop-rule needs --known-limits PATH: the committed file that names the closing review and its code findings")
+    _named(common, name, step)
     with lanes.lane_lock(common):
         record = lanes.read_lane(common, name)
         lane_use_checks(record)
         session = Session(state)
-        seen = session.steps(name)
-        entry = _closed_entry(record, step)
-        if step not in seen and not entry:
-            here = f"its steps in this session are {', '.join(seen)}" if seen else "no task of this session belongs to the lane"
-            raise ValueError(f"lane {name} has no step {step} in this session ({state}): {here}. Check the id with `tp-agent lanes {name}`; if the "
-                             f"step ran in another session, run this from that session's workspace (or TP_STATE_DIR=<its state directory> tp-agent lane close {name} {step})")
-        if entry:
-            raise ValueError(f"step {step} is already closed at {entry['commit']}; it is recorded, so there is nothing to do. The next step takes a "
-                             f"new id: `tp-agent dispatch --lane {name} --step NEW-ID --role ROLE --task \"...\"`")
+        _step_here(session, record, step, state, f"lane close {name} {step}")
         current = open_step(session, record)  # a step with tasks that is not closed is open, so `current` is set whenever `step` is
         if current != step:
             raise ValueError(f"step {step} is not lane {name}'s open step ({current}, the oldest that is not closed); close that one first with "
                              f"`tp-agent lane close {name} {current}`")
-        override = override_reason is not None
+        stop = None
+        if known_limits is not None:
+            stop = _authorization(record, step)
+            if stop is None:  # (a)
+                held = ", ".join(a["step"] for a in record.get("stop_authorizations", []))
+                raise ValueError(f"step {step} of lane {name} cannot be closed under the stop rule (a): it has no authorization"
+                                 f"{f' (the lane holds one for step(s) {held} only)' if held else ''}. Only the owner gives one, at a terminal: "
+                                 f"`tp-agent lane authorize-stop {name} {step} --reason \"...\"`")
+        override = override_reason is not None or stop is not None
         facts = evaluate(session, record, step, override=override)
         if not facts["ok"]:
             raise ValueError(f"step {step} of lane {name} cannot be closed: {facts['why']}")
         if override and facts["verdict"] != lanes.OWNER_OVERRIDE:
-            raise ValueError(f"step {step} of lane {name} needs no override ({facts['verdict']}); close it without --override-review")
+            raise ValueError(f"step {step} of lane {name} needs no override ({facts['verdict']}); close it without --override-review or --stop-rule")
+        stop_rule = stop_rule_checks(session, record, step, facts, stop, known_limits) if stop else None
         head, head_tree = _head(record["worktree"])  # the clean tree evaluate judged: its commit is what the step is recorded as
         entry = {"step": step, "commit": head, "tree": head_tree, "review": facts["review"], "verdict": facts["verdict"], "closed_at": lanes.utc_now()}
-        if override:
+        if override_reason is not None:
             entry["override_reason"] = override_reason.strip()
+        if stop_rule:
+            entry["override_reason"] = stop["reason"]
+            entry["stop_rule"] = stop_rule
         updated = dict(record, closed=record["closed"] + [entry])
+        _without_authorization(updated, step)  # a closed step needs none: it leaves in the same write
         lanes.lane_reality(updated)  # the new entry is checked against git before it is written, never after
         return lanes.write_lane(common, updated)
+
+
+# --- the stop rule (SR1) --------------------------------------------------------------------------------------------
+
+def _authorization(record, step):
+    return next((a for a in record.get("stop_authorizations", []) if a["step"] == step), None)
+
+
+def _without_authorization(record, step):
+    kept = [a for a in record.get("stop_authorizations", []) if a["step"] != step]
+    if kept:
+        record["stop_authorizations"] = kept
+    else:
+        record.pop("stop_authorizations", None)
+
+
+def code_findings(task):
+    """[(finding id, [Family: names])] of the findings of review `task` that close by code (labelled `Closes by: code`, or with no
+    label), in order. The reply is split by family_sweep.findings, the one splitter of findings and their Family: names; the id is
+    `F<n>`, the n-th finding it yields. Raises ValueError when the reply cannot be read."""
+    text = review_verdict.read_review(task["path"] / "result.md")
+    return [(f"F{number}", names) for number, (block, names, _, _) in enumerate(family_sweep.findings(text), 1)
+            if family_sweep._asks_for_code(block)]
+
+
+def _task(session, ident):
+    return next((t for t in session.tasks if t["id"] == ident), None)
+
+
+def stop_plan(session, record, step, state="this session"):
+    """What `lane authorize-stop` binds to: {step, gate_review, families, replaces}. The gate review is the newest review of the
+    step (of any tree) that asks for changes (_judge: rejects); families are the Family: names of its code findings. Reads only;
+    refuses a closed step, a step this session has no task of, and a step no review of which asked for changes."""
+    name = record["name"]
+    _step_here(session, record, step, state, f"lane authorize-stop {name} {step} --reason \"...\"")
+    writer_ids = {w["id"] for w in session.writers(name, step)}
+    rejecting = [t for t in session.tasks if t["review_of"] in writer_ids and _judge(t)[0] == "rejects"]
+    if not rejecting:
+        raise ValueError(f"step {step} of lane {name} has no review that asked for changes, so there is no last round to authorize; "
+                         f"a step whose review approves closes with `tp-agent lane close {name} {step}`")
+    gate = max(rejecting, key=lambda t: t["when"])
+    try:
+        found = code_findings(gate)
+    except ValueError as error:
+        raise ValueError(f"cannot read the findings of gate review {gate['id']} ({error})")
+    families = list(dict.fromkeys(family for _, names in found for family in names))
+    held = _authorization(record, step)
+    return {"step": step, "gate_review": gate["id"], "families": families, "replaces": held["id"] if held else None}
+
+
+def stop_confirm_text(name, plan, reason):
+    """What the owner reads above the code: the lane, the step, the gate review, the families and the reason."""
+    families = ", ".join(plan["families"]) or "none (no close can pass: a code finding needs an authorized family)"
+    again = f"\nIt replaces the step's authorization {plan['replaces']}." if plan["replaces"] else ""
+    return (f"Authorize Main to close step {plan['step']} of lane {name} under the stop rule, for one last round.\n"
+            f"Gate review: {plan['gate_review']} (the retry it triggered is the last round)\n"
+            f"Families: {families}\nReason: {reason}{again}\n"
+            f"Main may then close over that retry's review only if it asks for changes on the committed tree, its code findings are all in "
+            f"these families, and a committed known-limits file names them.")
+
+
+def authorize_stop(state, common, name, step, reason, confirm):
+    """Record the owner's stop-rule authorization of `step` (one per step; a new one replaces the old). `confirm(text)` is the
+    owner's typed-back code (owner_confirm.confirm); it is asked after the plan is read and before the lock is taken, and the plan
+    is read again under the lock: a gate review or families that changed meanwhile refuse, so what is written is what was shown."""
+    if not (reason or "").strip():
+        raise ValueError("authorize-stop needs a --reason that says why the owner stops after this round")
+    if len(reason) > lanes.MAX_REASON:
+        raise ValueError(f"the --reason is longer than {lanes.MAX_REASON} characters")
+    _named(common, name, step)
+    record = lanes.read_lane(common, name)
+    lane_use_checks(record)
+    plan = stop_plan(Session(state), record, step, state)
+    confirm(stop_confirm_text(name, plan, reason.strip()))
+    with lanes.lane_lock(common):
+        record = lanes.read_lane(common, name)
+        lane_use_checks(record)
+        now = stop_plan(Session(state), record, step, state)
+        if now != plan:
+            raise ValueError(f"step {step} of lane {name} changed while the owner confirmed (gate review {plan['gate_review']} -> "
+                             f"{now['gate_review']}, families {plan['families']} -> {now['families']}); nothing was written, run it again")
+        auth = {"id": f"stop-{secrets.token_hex(6)}", "authorized_at": lanes.utc_now(), "reason": reason.strip(), "step": step,
+                "gate_review": plan["gate_review"], "families": plan["families"]}
+        updated = dict(record)
+        _without_authorization(updated, step)
+        updated["stop_authorizations"] = updated.get("stop_authorizations", []) + [auth]
+        return lanes.write_lane(common, updated)
+
+
+MAX_KNOWN_LIMITS = 1 << 20
+
+
+def _mentions(text, word):
+    return re.search(r"(?<![A-Za-z0-9._-])" + re.escape(word) + r"(?![A-Za-z0-9_])", text) is not None
+
+
+def stop_rule_checks(session, record, step, facts, stop, known_limits):
+    """Checks c, d and e of `lane close --stop-rule` for the facts evaluate judged (a and b are close_step's). Returns the entry's
+    stop_rule object; refuses naming the check and why. Reads only."""
+    name = record["name"]
+    back = (f"It goes back to the owner: a new authorization (`tp-agent lane authorize-stop {name} {step} --reason \"...\"`) or "
+            f"`tp-agent lane close {name} {step} --override-review --reason \"...\"`, both at their terminal")
+    closing = _task(session, facts["review"])
+    author = _task(session, closing["review_of"]) if closing else None
+    gate = author["meta"].get("gate_review") if author else None
+    if gate != stop["gate_review"]:  # (c)
+        whose = (f"its author {author['id']} records gate_review {gate}" if gate else
+                 f"its author {author['id'] if author else closing and closing['review_of']} is not a retry triggered by a review (no gate_review)")
+        raise ValueError(f"step {step} of lane {name} cannot be closed under the stop rule (c): the closing review {facts['review']} reviewed "
+                         f"work that is not the last round the owner authorized ({whose}; the authorization {stop['id']} is for the retry of "
+                         f"gate review {stop['gate_review']}). An authorization covers one last round. {back}")
+    needed = {}
+    for ident in facts["rejecting"]:
+        try:
+            found = code_findings(_task(session, ident))
+        except ValueError as error:
+            raise ValueError(f"step {step} of lane {name} cannot be closed under the stop rule (d): the findings of {ident} cannot be read ({error})")
+        for finding, names in found:  # (d)
+            if not names:
+                raise ValueError(f"step {step} of lane {name} cannot be closed under the stop rule (d): finding {finding} of {ident} closes by code "
+                                 f"and names no Family:, so it cannot be shown to be one the owner authorized. {back}")
+            new = [family for family in names if family not in stop["families"]]
+            if new:
+                raise ValueError(f"step {step} of lane {name} cannot be closed under the stop rule (d): finding {finding} of {ident} is in "
+                                 f"famil{'ies' if len(new) > 1 else 'y'} {', '.join(new)}, which the authorization {stop['id']} does not list "
+                                 f"({', '.join(stop['families']) or 'none'}). {back}")
+        needed[ident] = [finding for finding, _ in found]
+    path, blob = _known_limits(record, known_limits, needed, step)
+    return {"id": stop["id"], "authorized_at": stop["authorized_at"], "gate_review": stop["gate_review"], "families": stop["families"],
+            "known_limits": path, "known_limits_blob": blob}
+
+
+def _known_limits(record, given, needed, step):
+    """(repo-relative path, blob id) of the known-limits file (e): a regular file committed at the main repository's HEAD or the
+    lane's HEAD (relative to the repository, or absolute inside one of the two worktrees) whose committed text names every review
+    in `needed` and each of its code finding ids. The committed blob is read, never the file on disk."""
+    name = record["name"]
+    main = lanes.main_worktree(record["git_common_dir"])
+    tops = (("the main repository", main), ("the lane", record["worktree"]))
+    raw = str(given)
+    if raw.startswith("/"):
+        real = os.path.realpath(raw)
+        inside = [os.path.relpath(real, top) for _, top in tops if lanes._inside(real, top)]
+        if not inside:
+            raise ValueError(f"step {step} of lane {name} cannot be closed under the stop rule (e): --known-limits {raw} is not inside {main} or "
+                             f"{record['worktree']}; give the path relative to the repository")
+        raw = inside[0]
+    try:
+        path = lanes.path_prefix(raw)
+    except ValueError as error:
+        raise ValueError(f"step {step} of lane {name} cannot be closed under the stop rule (e): --known-limits {error}")
+    words = [word for ident, findings in needed.items() for word in [ident, *findings]]
+    tried = []
+    for where, top in tops:
+        _, out = lanes._git(["ls-tree", "-z", "--full-tree", "HEAD", "--", path], top)
+        rows = [row for row in out.split("\0") if row]
+        meta, _, listed = rows[0].partition("\t") if len(rows) == 1 else ("", "", "")
+        mode, kind, blob = (meta.split() + ["", "", ""])[:3]
+        if listed != path or kind != "blob" or mode not in ("100644", "100755"):
+            continue
+        _, size = lanes._git(["cat-file", "-s", blob], top)
+        if int(size.strip() or 0) > MAX_KNOWN_LIMITS:
+            tried.append(f"at {where}'s HEAD it is over {MAX_KNOWN_LIMITS} bytes")
+            continue
+        _, text = lanes._git(["cat-file", "blob", blob], top)
+        missing = [word for word in words if not _mentions(text, word)]
+        if not missing:
+            return path, blob
+        tried.append(f"at {where}'s HEAD it does not name {', '.join(missing)}")
+    if not tried:
+        names = "; ".join(f"{ident}: {', '.join(findings)}" for ident, findings in needed.items())
+        raise ValueError(f"step {step} of lane {name} cannot be closed under the stop rule (e): {path} is not a file committed at the HEAD of "
+                         f"the main repository ({main}) or of the lane ({record['worktree']}). Write it, naming {names}, and commit it")
+    raise ValueError(f"step {step} of lane {name} cannot be closed under the stop rule (e): the known-limits file {path} must name every review "
+                     f"of this tree that asked for changes and each of its code findings ({'; '.join(tried)}). Add them and commit it")
 
 
 # --- the next-step rule (design checks 15-17) -----------------------------------------------------------------------

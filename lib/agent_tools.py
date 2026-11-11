@@ -1,4 +1,4 @@
-"""The "Tools" block of a worker's standing instructions, rendered from <workdir>/.tmux-pi/agent-tools.json.
+"""The "# Project Tools" block of a worker's system prompt, rendered from <workdir>/.tmux-pi/agent-tools.json.
 
 The file is the project's own list of helper scripts (the shared ones live in tools/agent/ in this repository). It is a JSON
 list, or an object {"tools": [...]}, of entries
@@ -19,8 +19,9 @@ A missing manifest adds nothing. A manifest that exists but cannot be used (unre
 duplicate entry, a path that is missing or not executable) is an error, never a silent skip. Like the preamble, the manifest
 of the working tree wins, and `source` (a lane task's preamble_from) is read when the working tree has none.
 
-The block holds the four STANDING lines every worker gets, the entries for the worker's role, and, when the task continues an
-earlier one, `Prior result: PATH; review report: PATH` (prior_line).
+The block ("# Project Tools") holds only the entries for the worker's role; with none it is empty. The standing rules every
+worker gets, manifest or not, are the worker contract (agent/contract/worker.md, rendered by lib/preamble.py). prior_line
+gives `Prior result: PATH; review report: PATH` for a task that continues an earlier one; lib/preamble.py delivers it.
 
     python3 agent_tools.py <workdir> [role [source]]    prints the block (nothing when there is no manifest)
 """
@@ -38,12 +39,6 @@ ENTRY_MAX = 150
 NAME = re.compile(r"[a-z][a-z0-9-]*\Z")
 TASK_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 FIELDS = ("name", "path", "roles", "use", "usage", "output")
-STANDING = (
-    "Do not re-request an unchanged range you already have; fetch more or refreshed context when you need it (after an edit, after a compaction).",
-    "Read a range with the Read tool (offset, limit) or safe_read, not sed -n. Quote paths with ( ) [ ] or spaces.",
-    "tp-agent request --kind skill|tool|context --what DESCRIPTION --reason REASON",
-    "tp-agent message TASK --text TEXT replies to a question from Main; tools/agent/test-run.sh WORKTREE -- CMD runs a check and records it.",
-)
 MAX_ANCESTORS = 10
 
 
@@ -190,20 +185,16 @@ def prior_line(state_dir, parent):
     return "; ".join(parts)
 
 
-def render(workdir, role="", source=None, known_roles=(), state_dir=None, parent=None):
-    """The Tools block for `role`, or "" when there is no manifest."""
+def render(workdir, role="", source=None, known_roles=()):
+    """The Project Tools block for `role`: its entries, or "" when there is no manifest or no entry for the role. Every entry
+    is validated whatever the role, so a broken manifest refuses for all roles."""
     path = manifest_path(workdir, source)
     if path is None:
         return ""
     entries = load_entries(path, set(known_roles))
-    lines = ["## Tools", "", *STANDING]
-    for entry in entries:
-        if role and role.lower() in entry["roles"]:
-            lines.append(f"- {entry['name']}: {entry['use']}: {entry['path']} {entry['usage']} -> {entry['output']}")
-    prior = prior_line(state_dir, parent)
-    if prior:
-        lines.append(prior)
-    return "\n".join(lines)
+    lines = [f"- {entry['name']}: {entry['use']}: {entry['path']} {entry['usage']} -> {entry['output']}"
+             for entry in entries if role and role.lower() in entry["roles"]]
+    return "\n".join(["# Project Tools", "", *lines]) if lines else ""
 
 
 if __name__ == "__main__":

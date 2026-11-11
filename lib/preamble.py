@@ -6,17 +6,25 @@ section naming a role tmux-pi does not have) is an error, never a silent skip, s
 instructions the repository meant it to have. The cap is checked on the whole file, so a refusal does not
 depend on which role is running.
 
-    python3 preamble.py <workdir> [role [source]] [--state-dir DIR --parent ID]
-        prints the text for the worker system prompt (nothing when there is none)
+    python3 preamble.py <workdir> [role [source]]
+        prints the repository's text (preamble and Project Tools block; nothing when there is none)
+    python3 preamble.py <workdir> [role [source]] --harness pi|claude [--state-dir DIR --parent ID]
+        prints the whole standing system text of a worker (system_text): the worker contract, then the repository's
+        preamble, then its Project Tools block, then the prior task line
 
 A lane's worktree is a fresh checkout and .tmux-pi/ is git-ignored, so it has no preamble of its own. `source` (a lane
 task's preamble_from, the repository's main working tree) is read when the working tree has no such file; a file in the
 working tree wins (a repository that tracks its preamble versions it with the branch).
 
 A repository that also has <workdir>/.tmux-pi/agent-tools.json (same fallback to `source`; see lib/agent_tools.py) gets a
-"Tools" block after the text above: the standing lines, the helper scripts listed for the worker's role and, when the caller
-passes --state-dir and --parent, the prior result and review report of the task being continued. The whole text, as rendered
+"Project Tools" block after the text above: the helper scripts listed for the worker's role. The whole text, as rendered
 for every role, must stay within MAX_BYTES too. With no such manifest the text is exactly what it was before the block existed.
+
+The worker contract (agent/contract/worker.md, first line `contract: worker vN`) is the one set of standing rules every
+worker gets on every route, manifest or not: scope, the read/search rule, permission prompts, report and RESULT_STATUS, how
+to reach Main. Its tool names are placeholders filled from HARNESS_TOOLS, the one per-harness table (tp-spawn and the tests
+read it here). Role files keep only role method. With --parent, the prior task's result and review report
+(lib/agent_tools.py prior_line) follow, manifest or not.
 """
 
 import re
@@ -28,6 +36,15 @@ RELATIVE = Path(".tmux-pi") / "worker-preamble.md"
 TOOLS_RELATIVE = Path(".tmux-pi") / "agent-tools.json"
 MAX_BYTES = 8000
 SECTION = re.compile(r"^##[ \t]+Role:[ \t]*(\S.*?)[ \t]*$", re.I)
+CONTRACT = ROOT / "agent" / "contract" / "worker.md"
+CONTRACT_VERSION = re.compile(r"contract: worker v([1-9][0-9]*)\Z")
+# The tool names each harness gives a worker for the read/search rule; the only place they are written.
+HARNESS_TOOLS = {
+    "claude": {"safe_grep": "mcp__tmux-pi-safe__safe_grep", "safe_read": "mcp__tmux-pi-safe__safe_read",
+               "read_tool": "the Read tool", "shell": "Bash"},
+    "pi": {"safe_grep": "safe_grep", "safe_read": "safe_read", "read_tool": "the read tool", "shell": "bash"},
+}
+PLACEHOLDER = re.compile(r"\{([a-z_]+)\}")
 
 
 def _present(path):
@@ -89,28 +106,67 @@ def _join(*parts):
     return "\n\n".join(p for p in parts if p)
 
 
-def load(workdir, role="", source=None, state_dir=None, parent=None):
+def _parts(workdir, role="", source=None):
+    """(preamble text, Project Tools block) for `role`; either may be ""."""
     text = _preamble_text(workdir, role, source)
     agent_tools = _agent_tools(workdir, source)
     if agent_tools is None or agent_tools.manifest_path(workdir, source) is None:
-        return text
+        return text, ""
     known = _known_roles()
-    # The cap must not depend on which role runs, so every role's text is checked (without the per-task prior-result line).
+    # The cap must not depend on which role runs, so every role's text is checked.
     for each in sorted(known):
         size = len(_join(_preamble_text(workdir, each, source), agent_tools.render(workdir, each, source, known)).encode("utf-8"))
         if size > MAX_BYTES:
             raise ValueError(f"the worker text for role '{each}' is {size} bytes with the tools block; the limit is {MAX_BYTES}. "
                              f"Shorten {agent_tools.RELATIVE} or the preamble")
-    text = _join(text, agent_tools.render(workdir, role, source, known, state_dir, parent))
-    if len(text.encode("utf-8")) > MAX_BYTES:
-        raise ValueError(f"the worker text is {len(text.encode('utf-8'))} bytes with the tools block; the limit is {MAX_BYTES}")
-    return text
+    return text, agent_tools.render(workdir, role, source, known)
+
+
+def load(workdir, role="", source=None):
+    """The repository's text for `role`: its preamble, then its Project Tools block."""
+    return _join(*_parts(workdir, role, source))
+
+
+def contract(harness, path=CONTRACT):
+    """The worker contract for `harness`, with its tool names filled in, under a `# Worker Contract` heading."""
+    if harness not in HARNESS_TOOLS:
+        raise ValueError(f"unknown harness '{harness}'; expected one of {', '.join(sorted(HARNESS_TOOLS))}")
+    try:
+        raw = Path(path).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        raise ValueError(f"cannot read the worker contract {path}: {error}")
+    lines = raw.strip().splitlines()
+    if not lines or not CONTRACT_VERSION.match(lines[0]):
+        raise ValueError(f"{path}: the first line must be 'contract: worker vN'")
+    values = dict(HARNESS_TOOLS[harness], tp_root=str(ROOT))
+    unknown = sorted(set(PLACEHOLDER.findall(raw)) - set(values))
+    if unknown:
+        raise ValueError(f"{path}: unknown placeholder(s) {', '.join(unknown)}")
+    return "# Worker Contract\n\n" + PLACEHOLDER.sub(lambda m: values[m.group(1)], "\n".join(lines))
+
+
+def _prior_line(state_dir, parent):
+    if not state_dir or not parent:
+        return ""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import agent_tools
+    return agent_tools.prior_line(state_dir, parent)
+
+
+def system_text(workdir, role="", source=None, harness="pi", state_dir=None, parent=None):
+    """A worker's standing system text: the contract, the repository's preamble, its Project Tools block, the prior task."""
+    text, tools = _parts(workdir, role, source)
+    prior = _prior_line(state_dir, parent)
+    return _join(contract(harness),
+                 "# Repository Instructions\n\n" + text if text else "",
+                 tools,
+                 "# Prior Task\n\n" + prior if prior else "")
 
 
 def _args(argv):
     positional, options, i = [], {}, 0
     while i < len(argv):
-        if argv[i] in ("--state-dir", "--parent"):
+        if argv[i] in ("--state-dir", "--parent", "--harness"):
             if i + 1 >= len(argv):
                 raise ValueError(f"{argv[i]} needs a value")
             options[argv[i][2:].replace("-", "_")] = argv[i + 1]
@@ -124,6 +180,12 @@ def _args(argv):
 if __name__ == "__main__":
     try:
         args, options = _args(sys.argv[1:])
-        sys.stdout.write(load(args[0], args[1] if len(args) > 1 else "", args[2] if len(args) > 2 else None, **options))
+        base = (args[0], args[1] if len(args) > 1 else "", args[2] if len(args) > 2 else None)
+        if "harness" in options:
+            sys.stdout.write(system_text(*base, **options))
+        elif options:
+            raise ValueError("--state-dir and --parent need --harness")
+        else:
+            sys.stdout.write(load(*base))
     except (ValueError, IndexError) as error:
         sys.exit(f"worker preamble: {error}")

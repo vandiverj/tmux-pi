@@ -1,6 +1,7 @@
 """pi safe_read / safe_grep (agent/extensions/safe.ts) and their sensitive.ts gate; runs the real tp-redact, no models."""
 import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -61,6 +62,24 @@ class PiSafeToolsTests(unittest.TestCase):
         for limit in ("MAX_FILE = 4_000_000", "MAX_CHARS = 200_000"):
             self.assertIn(limit, server)
             self.assertIn(limit, source)
+        # The descriptions say the same thing in the same words (the worker contract's read/search rule); only READ and SHELL,
+        # the harness's own tool names from lib/preamble.py HARNESS_TOOLS, differ.
+        sys.path.insert(0, str(ROOT / "lib"))
+        import preamble
+        def template(text, name):
+            match = re.search(r"const %s =\s*(.*?);\n" % name, text, re.S)
+            self.assertIsNotNone(match, name)
+            return re.sub(r"\s*\n\s*", " ", match.group(1))
+        for name in ("SAFE_READ_HELP", "SAFE_GREP_HELP"):
+            self.assertEqual(template(server, name), template(source, name), name)
+        for text, harness in ((server, "claude"), (source, "pi")):
+            tools = preamble.HARNESS_TOOLS[harness]
+            self.assertIn('const READ = "%s";' % tools["read_tool"], text)
+            self.assertIn('const SHELL = "%s";' % tools["shell"], text)
+        self.assertIn("description: SAFE_READ_HELP,", source)
+        self.assertIn("description: SAFE_READ_HELP + CLAUDE_ONLY,", server)   # the one declared harness-only sentence
+        for text in (server, source):
+            self.assertIn("description: SAFE_GREP_HELP,", text)
 
 
 if __name__ == "__main__":

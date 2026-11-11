@@ -246,7 +246,14 @@ class HandOverAndPreambleTests(RecoveryCase):
         run = subprocess.run([str(ROOT / "bin/tp-review"), "coder-direct0001"], env=self.env, text=True, capture_output=True, timeout=90)
         self.assertEqual(run.returncode, 0, run.stderr)
         [review] = self.state.glob("tasks/review-*")
-        self.assertIn("PREAMBLE-OF-THE-MAIN-TREE", (review / "system-prompt.md").read_text())
+        prompt = (review / "system-prompt.md").read_text()
+        self.assertIn("PREAMBLE-OF-THE-MAIN-TREE", prompt)
+        # A review of a lane step gets the worker contract for its harness first, once, and the reviewer's role method.
+        import preamble
+        harness = json.loads((review / "meta.json").read_text())["worker"]
+        self.assertTrue(prompt.startswith(preamble.contract(harness) + "\n\n# Repository Instructions\n\n"), prompt[:200])
+        self.assertEqual(prompt.count("contract: worker v"), 1)
+        self.assertEqual((review / "packet.md").read_text().count("# Worker Role\n\n# Code reviewer\n"), 1)
 
 
 class ReviewOverrideTests(RecoveryCase):

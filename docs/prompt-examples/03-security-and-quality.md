@@ -84,12 +84,12 @@ A test exists to fail when the behaviour it covers breaks. The number of tests i
 - **Exact expected values**, not `toBeDefined()`, truthiness or snapshot dumps.
 - **Test the edges the rule defines:** effective dates, empty sets, pending drafts, permission refusals, the
   business time zone's day boundary and both DST changes for anything dated.
-- **Find the existing test first.** Before writing a test, `git -C <wt> grep -l '<function, route or component>'
-  -- '*_test.ts' '*.test.ts' '*.test.tsx' '*.spec.ts'`. If a table, loop or `describe` covers it, add a row or case
+- **Find the existing test first.** Before writing a test, search the test files with `safe_grep` (pattern
+  `<function, route or component>`, path the test directory, glob `*.test.ts`). If a table, loop or `describe` covers it, add a row or case
   there. A new file only when none covers it (or the file is over 3,000 lines: then a sibling file named for the
   behaviour, importing the shared world helper). The report says "Existing test: file:line" or "None (searched:
   terms)" for each behaviour. Briefs never say "new file"; they name the test to extend.
-- **Grep for a helper before writing one** (`waitFor`, `later`, fake clock, date stub, world builder). An early
+- **Search (`safe_grep`) for a helper before writing one** (`waitFor`, `later`, fake clock, date stub, world builder). An early
   campaign wrote `later` four times.
 - **Lowest layer that proves it, once.** Table-driven cases for one rule. One DB per file, not per test.
 - **No fixed waits.** Never `setTimeout`, `sleep` or `waitForTimeout` to wait for something. Wait on the thing:

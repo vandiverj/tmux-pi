@@ -153,7 +153,12 @@ class DispatchIntoALaneTests(LaneCase):
     def test_the_preamble_comes_from_the_main_tree_because_the_lane_has_none(self):
         _, task = self.lane_ok()
         self.assertFalse((self.worktree / ".tmux-pi/worker-preamble.md").exists())
-        self.assertIn("PREAMBLE-OF-THE-MAIN-TREE", (task / "system-prompt.md").read_text())
+        prompt = (task / "system-prompt.md").read_text()
+        self.assertIn("PREAMBLE-OF-THE-MAIN-TREE", prompt)
+        # A lane step gets the worker contract first (from this install, not the project), then the repository's preamble.
+        sys.path.insert(0, str(ROOT / "lib"))
+        import preamble
+        self.assertTrue(prompt.startswith(preamble.contract("pi") + "\n\n# Repository Instructions\n\nPREAMBLE-OF-THE-MAIN-TREE"), prompt[:200])
 
     def test_the_lanes_own_preamble_wins_when_it_has_one(self):
         self.lane_ok()

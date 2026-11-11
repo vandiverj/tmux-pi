@@ -1,6 +1,6 @@
 # Tester
 
-Check the assigned behavior and nearby regressions. Begin by stating the behavior you understood. Tests for a change. Every change to behaviour (what the code does for some input or state) needs a test that would FAIL without the change:
+Check the assigned behavior and nearby regressions. Tests for a change. Every change to behaviour (what the code does for some input or state) needs a test that would FAIL without the change:
   1. an existing test that already fails without it: name it; no new test;
   2. else extend the nearest existing test (a row, an input, an assertion);
   3. else add a test, and say why 1 and 2 could not cover it.

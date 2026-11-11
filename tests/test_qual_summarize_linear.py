@@ -213,9 +213,9 @@ BUDGET = {
     "reverse in ( ), no path": 3.03,
     "compatibility forms": 3.13,
     "line of": 3.21,
-    "forward in ( ), 250000 failed line parts after a word": 4.38,
+    "forward in ( ), failed line parts after a word": 4.38,
     "bracket-with-hash lines": 5.18,
-    "forward in ( ), 200000 failed line parts after spaces": 5.7,
+    "forward in ( ), failed line parts after spaces": 5.7,
     "unmatched backtick runs in a claim": 5.85,
     "hash items one line": 8.2,
     "unknown-name items one line": 9.66,
@@ -229,7 +229,14 @@ DEPTH_BUDGET = 1.1  # steps per character, at both depths (the ratio of the two 
 class LinearTimeTests(unittest.TestCase):
     ANSWER = base.CheckerTests.ANSWER
     C = base.CheckerTests.C  # [src/cache.py:6]
-    MB = 1000000
+    # TQ1 Q2: the shapes were 1 MB each; every size is now a tenth of that. The count of steps per character is the same at both sizes (to
+    # three digits, for every shape, so the budgets below did not change), and a reader that walks the text for each of k candidates takes k
+    # times the steps: the four tests that failed on the quadratic reader of 8560cf6 at 1 MB fail on it at this size too, with the same
+    # message. "MB" below is the size of one input: 100,000 characters.
+    SCALE = 10
+    MB = 1000000 // SCALE
+    NEST = 16000 // SCALE  # nested pairs of one shape
+    RUNS = 120  # the longest backtick run (the runs 1 to RUNS add up to RUNS squared / 2 characters); 600 at 1 MB
     MEASURED = {}  # shape name -> steps per character of the last reading (for whoever sets the budgets)
 
     def reading(self, name, body, budget=None):
@@ -299,17 +306,20 @@ class LinearTimeTests(unittest.TestCase):
         self.megabyte({"short fact lines": "- x [y:1]\n", "bracket-with-hash lines": "[x#:1]\n", "bracket items, many lines": "- x [src/cache.py:6]\n"})
 
     # ---- round 14 (review-coder-b69bae86e7-032459 F1): nested pairs, read in linear time at any depth ----
-    def reverse_nest(self, opener, closer, k=16000, tail=".py"):
+    def reverse_nest(self, opener, closer, k=None, tail=".py"):
         """1 MB: k nested "line 1 of <opener>" (reverse order), one long word, tail, k closers. The k candidates share one tail."""
+        k = k or self.NEST
         lead = "line 1 of " + opener
         return lead * k + "x" * (self.MB - (len(lead) + len(closer)) * k - len(tail)) + tail + closer * k
 
-    def forward_nest(self, opener, closer, k=16000, tail=".py:6"):
+    def forward_nest(self, opener, closer, k=None, tail=".py:6"):
         """1 MB: k nested openers, one long word, tail (path and line part), k closers."""
+        k = k or self.NEST
         return opener * k + "x" * (self.MB - (len(opener) + len(closer)) * k - len(tail)) + tail + closer * k
 
-    def backtick_nest(self, lead, tail, depth=600):
+    def backtick_nest(self, lead, tail, depth=None):
         """1 MB: backtick runs of length 1 to depth (the only way backticks nest), each after lead, one long word, tail, the closers from depth to 1."""
+        depth = depth or self.RUNS
         opens = "".join(lead + "`" * i for i in range(1, depth + 1))
         closes = " ".join("`" * i for i in range(depth, 0, -1))
         return opens + "x" * (self.MB - len(opens) - len(closes) - len(tail)) + tail + closes
@@ -329,23 +339,23 @@ class LinearTimeTests(unittest.TestCase):
         self.megabyte({"forward in ( )": lambda: self.forward_nest("(", ")"), "forward in [ ]": lambda: self.forward_nest("[", "]"),
                        "forward in < >": lambda: self.forward_nest("<", ">"), "forward in backticks": lambda: self.backtick_nest("", ".py:6"),
                        "forward in ( ), no path": lambda: self.forward_nest("(", ")", tail=":6"),
-                       "forward in ( ), 250000 failed line parts after a word": lambda: "(" + "x" * 500000 + ":6" * 250000,
-                       "forward in ( ), 200000 failed line parts after spaces": lambda: "(" + " " * 500000 + "x" + ":6" * 200000 + ")"})
+                       "forward in ( ), failed line parts after a word": lambda: "(" + "x" * (self.MB // 2) + ":6" * (250000 // self.SCALE),
+                       "forward in ( ), failed line parts after spaces": lambda: "(" + " " * (self.MB // 2) + "x" + ":6" * (200000 // self.SCALE) + ")"})
 
     def test_rule_20_a_megabyte_of_mixed_nested_pairs_and_code_spans_is_read_in_linear_time(self):
         def padded(head, tail):
             return head + "x" * (self.MB - len(head) - len(tail)) + tail
-        self.megabyte({"reverse then forward": lambda: padded("line 1 of (" * 8000 + "(" * 8000, ".py:6" + ")" * 16000),
-                       "alternating bracket types": lambda: padded("line 1 of (line 1 of [" * 8000, ".py" + "])" * 8000),
-                       "forward and reverse alternating": lambda: padded("(line 1 of [" * 8000, ".py:6" + "])" * 8000),
+        self.megabyte({"reverse then forward": lambda: padded("line 1 of (" * (self.NEST // 2) + "(" * (self.NEST // 2), ".py:6" + ")" * self.NEST),
+                       "alternating bracket types": lambda: padded("line 1 of (line 1 of [" * (self.NEST // 2), ".py" + "])" * (self.NEST // 2)),
+                       "forward and reverse alternating": lambda: padded("(line 1 of [" * (self.NEST // 2), ".py:6" + "])" * (self.NEST // 2)),
                        # a claim: unmatched backtick runs of every length from 600 down to 2 each looked for a closer through all the runs after it
-                       "unmatched backtick runs in a claim": lambda: "- " + "".join("`" * i + "x" for i in range(600, 1, -1)) + "`x" * 400000 + " " + self.C})
+                       "unmatched backtick runs in a claim": lambda: "- " + "".join("`" * i + "x" for i in range(self.RUNS, 1, -1)) + "`x" * (400000 // self.SCALE) + " " + self.C})
 
     def test_rule_20_nesting_depth_costs_the_same_for_each_pair(self):
         """The reviewer's shape at the same 1 MB with 1000 pairs and with 16000: the steps are the same for each pair (a linear reader takes 15.9
         times as many for 16 times the pairs: each pair is a match of the forward grammar and two delimiters); the round-13 reader took 36 times
         the CPU. The bound is 20 times: 1.25 times the linear ratio and a thirteenth of the quadratic one."""
-        few, many = (self.reading("depth {}".format(k), self.reverse_nest("(", ")", k), budget=DEPTH_BUDGET) for k in (1000, 16000))
+        few, many = (self.reading("depth {}".format(k), self.reverse_nest("(", ")", k), budget=DEPTH_BUDGET) for k in (self.NEST // 16, self.NEST))
         self.assertLess(many, 20 * few, (few, many))
 
 

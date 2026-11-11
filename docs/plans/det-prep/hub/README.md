@@ -4,7 +4,7 @@ Owner request (verbatim): `owner-request.md`. Target: "I provide a goal, correct
 and receive current completion evidence without repeatedly reminding Main how to operate." Correct outcomes, fewer repeated
 reminders, reliable recovery and less supervision come first; token savings second. Built and evaluated on this Mac; the work Mac
 gets a handoff (HB9) and only validates environment differences, work-only integrations and real use.
-Queue rows: `../loop/ideas.md` H35-H42. Status: **HB1 audit done; HB0 interfaces drafted; lanes not started.**
+Queue rows: `../loop/ideas.md` H35-H42. Status: **HB1 audit done; HB0 interfaces drafted; lanes hub-correct (HB4a, `hb4/hb4a-brief.md`) and hub-episodes (HB8a, `hb8/hb8a-brief.md`) started 2026-11-11.**
 
 ## Baseline (HB1, read-only audit of main 6c8094f = 451a5e1 + origin's 5 gate commits)
 Reports: `audit/A-instructions.md` (launch routes, every read/search statement), `audit/B-control.md` (message, interrupt,

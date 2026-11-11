@@ -1096,6 +1096,11 @@ def lane_admit(base, plan, item):
 
 
 def dispatch(args, base):
+    with lanes.common_dir_once():  # the same directories are asked for their git directory many times in one dispatch
+        return _dispatch(args, base)
+
+
+def _dispatch(args, base):
     if not (ROLES / f"{args.role}.md").is_file():
         raise ValueError(f"unknown role: {args.role}")
     # Autonomy's recovery gate comes before anything is written: a refused dispatch creates no lane, branch, worktree or queue entry.

@@ -195,7 +195,7 @@ elif [[ ! -t 0 ]]; then
 else
   task=""
 fi
-[[ -n "${task//[[:space:]]/}" ]] || usage 1
+[[ "$task" =~ [^[:space:]] ]] || usage 1   # a regex test: ${task//[[:space:]]/} is quadratic in bash 3.2
 
 session="$(tp_session)"
 state_dir="$(tp_opt "$session" @tp_state_dir)"

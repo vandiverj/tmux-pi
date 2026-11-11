@@ -147,6 +147,18 @@ esac
         self.assertIn("--append-system-prompt", (task / "run.sh").read_text())
         self.assertNotIn("General rule.", (task / "packet.md").read_text())
 
+    def test_spawn_refuses_an_empty_or_whitespace_only_task_and_takes_a_long_one(self):
+        for task in ("", " ", "\t", "\n", "\r", " \t\r\n ", "\n\n  \t"):
+            with self.subTest(task=task):
+                spawned = subprocess.run([str(ROOT / "bin/tp-spawn"), "--worker", "pi", "--model", MODEL, "--workdir", str(self.project)],
+                                         env=self.env, input=task, text=True, capture_output=True)
+                self.assertEqual(spawned.returncode, 1, spawned.stderr)
+                self.assertIn("Usage: tp-spawn", spawned.stdout + spawned.stderr)
+        long_task = "word " * 20000   # 100 000 characters: the emptiness test must not be quadratic in the length
+        spawned = subprocess.run([str(ROOT / "bin/tp-spawn"), "--worker", "pi", "--model", MODEL, "--workdir", str(self.project), "--", long_task],
+                                 env=self.env, text=True, capture_output=True, timeout=60)
+        self.assertEqual(spawned.returncode, 0, spawned.stderr)
+
     def test_system_prompt_prefix_is_stable_across_tasks_and_roles(self):
         general = "General rule one.\n\nGeneral rule two."
         self.write_preamble(general + "\n\n## Role: coder\nCoder-only rule.\n\n## Role: tester\nTester-only rule.\n")

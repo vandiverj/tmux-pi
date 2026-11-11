@@ -263,19 +263,18 @@ class PreambleArgsTests(WorkerEnvCase):
 
     def test_the_preamble_gets_state_dir_and_parent(self):
         argv = self.spawn_probed("pa-1", "--parent", "parent-1")
-        self.assertIn("--state-dir " + str(self.state), argv)
+        self.assertIn("--harness claude --state-dir " + str(self.state), argv)
         self.assertIn("--parent parent-1", argv)
 
     def test_a_task_without_a_parent_passes_neither(self):
         argv = self.spawn_probed("pa-2")
+        self.assertTrue(argv.endswith(" --harness claude"), argv)   # the worker contract is rendered for the worker's harness
         self.assertNotIn("--state-dir", argv)
         self.assertNotIn("--parent", argv)
 
     def test_the_prior_task_line_reaches_the_worker_system_prompt(self):
-        """Real preamble.py and agent_tools.py: a repository with a tools manifest and a parent that has a result and a review
-        report names both in the system prompt a copy of which tp-spawn keeps."""
-        self.tools_manifest([{"name": "lane-info", "path": "$TP_ROOT/tools/agent/lane-info.sh", "roles": ["coder"],
-                              "use": "orient", "usage": "WORKTREE", "output": "branch"}])
+        """Real preamble.py and agent_tools.py: a parent that has a result and a review report names both in the system prompt a
+        copy of which tp-spawn keeps, with no tools manifest (before the worker contract the line needed one)."""
         parent, review = self.task("parent-1"), self.task("review-1")
         for folder in (parent, review):
             folder.mkdir(parents=True)

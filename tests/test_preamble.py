@@ -18,12 +18,6 @@ import preamble  # noqa: E402
 TOOL = {"name": "demo", "path": "$TP_ROOT/tools/agent/lane-info.sh", "roles": ["coder"], "use": "orient",
         "usage": "WORKTREE", "output": "a summary"}
 EXAMPLE = ROOT / "templates" / "agent-tools.example.json"
-STANDING_LINES = (
-    "Do not re-request an unchanged range you already have; fetch more or refreshed context when you need it (after an edit, after a compaction).",
-    "Read a range with the Read tool (offset, limit) or safe_read, not sed -n. Quote paths with ( ) [ ] or spaces.",
-    "tp-agent request --kind skill|tool|context --what DESCRIPTION --reason REASON",
-    "tp-agent message TASK --text TEXT replies to a question from Main; tools/agent/test-run.sh WORKTREE -- CMD runs a check and records it.",
-)
 
 
 class Base(unittest.TestCase):
@@ -58,7 +52,7 @@ class GoldenTests(Base):
                 self.assertEqual(preamble.load(self.work, role).encode(), expected)
 
     def test_coder_block_with_the_fixture_manifest_is_byte_identical(self):
-        # golden-coder-with-tools.txt holds the full Tools block (the four standing lines and the entries);
+        # golden-coder-with-tools.txt holds the full Project Tools block (the entries and nothing else);
         # $TP_ROOT stands for this checkout's path so the fixture does not depend on where the repo lives.
         self.preamble_file()
         self.manifest(json.loads((FIXTURES / "manifest.json").read_text()))
@@ -89,12 +83,16 @@ class GoldenTests(Base):
     def test_no_manifest_and_no_preamble_adds_nothing(self):
         self.assertEqual(preamble.load(self.work, "coder"), "")
 
-    def test_prior_task_arguments_add_nothing_without_a_manifest(self):
+    def test_the_prior_task_line_arrives_without_a_manifest_after_the_unchanged_preamble(self):
+        # Before the worker contract, a continued task got its prior result line only when the project had a tools manifest.
         self.preamble_file()
         state = self.tmp / "state"
         (state / "tasks" / "p1").mkdir(parents=True)
         (state / "tasks" / "p1" / "result.md").write_text("done")
-        self.assertEqual(preamble.load(self.work, "coder", None, str(state), "p1").encode(), (FIXTURES / "golden-coder.txt").read_bytes())
+        text = preamble.system_text(self.work, "coder", None, "pi", str(state), "p1")
+        golden = (FIXTURES / "golden-coder.txt").read_text()
+        self.assertEqual(text, preamble.contract("pi") + "\n\n# Repository Instructions\n\n" + golden
+                         + f"\n\n# Prior Task\n\nPrior result: {state / 'tasks' / 'p1' / 'result.md'}")
 
 
 class RenderTests(Base):
@@ -103,7 +101,7 @@ class RenderTests(Base):
         self.manifest(json.loads((FIXTURES / "manifest.json").read_text()))
         coder = preamble.load(self.work, "coder")
         golden = (FIXTURES / "golden-coder.txt").read_text()
-        self.assertTrue(coder.startswith(golden + "\n\n## Tools\n\n"))
+        self.assertTrue(coder.startswith(golden + "\n\n# Project Tools\n\n"))
         for name in ("lane-info", "pre-commit-gate", "web-jest"):
             self.assertIn(f"- {name}: ", coder)
         researcher = preamble.load(self.work, "researcher")
@@ -113,13 +111,13 @@ class RenderTests(Base):
         reviewer = preamble.load(self.work, "code-reviewer")
         self.assertNotIn("- lane-info", reviewer)
 
-    def test_every_role_gets_the_four_standing_lines_byte_for_byte(self):
+    def test_the_block_holds_only_the_roles_entries_and_a_role_with_none_gets_no_block(self):
+        # The standing lines the block used to carry are the worker contract now, delivered with or without a manifest.
         self.manifest([TOOL])
-        for role in ("coder", "researcher", "code-reviewer", ""):
+        for role, expected in (("coder", f"# Project Tools\n\n- demo: orient: {ROOT}/tools/agent/lane-info.sh WORKTREE -> a summary"),
+                               ("researcher", ""), ("code-reviewer", ""), ("", "")):
             with self.subTest(role=role):
-                text = preamble.load(self.work, role)
-                self.assertTrue(text.startswith("## Tools\n\n" + "\n".join(STANDING_LINES)))
-                self.assertNotIn("Read a file once", text)
+                self.assertEqual(preamble.load(self.work, role), expected)
 
     def test_the_example_manifest_loads_for_every_role_and_names_the_four_tools(self):
         self.manifest(json.loads(EXAMPLE.read_text()))
@@ -155,7 +153,7 @@ class RenderTests(Base):
     def test_manifest_without_a_preamble_file_still_renders(self):
         self.manifest([TOOL])
         text = preamble.load(self.work, "coder")
-        self.assertTrue(text.startswith("## Tools\n\n"))
+        self.assertTrue(text.startswith("# Project Tools\n\n"))
         self.assertIn("- demo: orient: ", text)
 
     def test_entry_line_has_the_resolved_path_usage_and_output(self):
@@ -307,11 +305,11 @@ class PriorTaskTests(Base):
         return directory
 
     def block(self, parent):
-        return preamble.load(self.work, "coder", None, str(self.state), parent)
+        return preamble.system_text(self.work, "coder", None, "pi", str(self.state), parent)
 
     def test_no_parent_means_no_prior_line(self):
         self.task("p1", {"id": "p1"}, result=True)
-        self.assertNotIn("Prior result", self.block(None))
+        self.assertNotIn("Prior", self.block(None))
         self.assertNotIn("Prior result", preamble.load(self.work, "coder"))
 
     def test_parent_with_a_result_and_a_review_report(self):
@@ -356,10 +354,45 @@ class PriorTaskTests(Base):
 
     def test_cli_passes_the_prior_task_through(self):
         p = self.task("p1", {}, result=True)
-        out = subprocess.run([sys.executable, str(ROOT / "lib" / "preamble.py"), str(self.work), "coder",
-                              "--state-dir", str(self.state), "--parent", "p1"], capture_output=True, text=True)
+        cli = [sys.executable, str(ROOT / "lib" / "preamble.py"), str(self.work), "coder", "--state-dir", str(self.state), "--parent", "p1"]
+        out = subprocess.run(cli + ["--harness", "claude"], capture_output=True, text=True)
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertIn(f"Prior result: {p / 'result.md'}", out.stdout)
+        self.assertTrue(out.stdout.startswith(preamble.contract("claude")))
+        self.assertTrue(out.stdout.endswith(f"# Prior Task\n\nPrior result: {p / 'result.md'}"))
+        out = subprocess.run(cli, capture_output=True, text=True)   # the prior line is part of the system text only
+        self.assertEqual((out.returncode, out.stdout), (1, ""))
+        self.assertIn("need --harness", out.stderr)
+
+
+class ContractTests(Base):
+    """agent/contract/worker.md: one versioned file, tool names filled per harness from HARNESS_TOOLS."""
+
+    def test_the_contract_is_short_versioned_and_names_only_its_harness_tools(self):
+        raw = preamble.CONTRACT.read_text()
+        self.assertLessEqual(len(raw.splitlines()), 20)
+        self.assertTrue(preamble.CONTRACT_VERSION.match(raw.splitlines()[0]))
+        for harness, tools in preamble.HARNESS_TOOLS.items():
+            with self.subTest(harness=harness):
+                text = preamble.contract(harness)
+                self.assertTrue(text.startswith("# Worker Contract\n\ncontract: worker v"))
+                self.assertNotRegex(text, r"\{[a-z_]+\}")
+                for name in tools.values():
+                    self.assertIn(name, text)
+                other = next(t for h, t in preamble.HARNESS_TOOLS.items() if h != harness)
+                self.assertNotIn(other["read_tool"], text)   # the other harness's names never leak in
+                self.assertNotIn(other["shell"] + " ", text)
+
+    def test_a_bad_contract_or_harness_is_refused(self):
+        for name, body, harness, message in (
+                ("no version", "rules\n", "pi", "first line"),
+                ("bad version", "contract: worker v0\n", "pi", "first line"),
+                ("unknown placeholder", "contract: worker v1\nuse {grep_tool}\n", "pi", "grep_tool"),
+                ("unknown harness", "contract: worker v1\n", "codex", "unknown harness")):
+            with self.subTest(row=name):
+                path = self.tmp / "worker.md"
+                path.write_text(body)
+                with self.assertRaisesRegex(ValueError, message):
+                    preamble.contract(harness, path)
 
 
 if __name__ == "__main__":

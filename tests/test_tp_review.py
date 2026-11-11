@@ -39,6 +39,9 @@ class TpReviewTests(unittest.TestCase):
         (cls.template / "lib").mkdir()
         shutil.copy(ROOT / "bin/tp-review", cls.template / "bin/tp-review")
         shutil.copy(ROOT / "lib/tp.sh", cls.template / "lib/tp.sh")
+        # The reviewer's role text rides in the packet (tp-spawn adds it), so tp-review reserves its size in the budget.
+        (cls.template / "agent/roles").mkdir(parents=True)
+        shutil.copy(ROOT / "agent/roles/code-reviewer.md", cls.template / "agent/roles/code-reviewer.md")
         # tp-review asks tp-agent's classifier whether the worker is paused (tp-agent shares lib/contract.py's pause rule).
         shutil.copy(ROOT / "bin/tp-agent", cls.template / "bin/tp-agent")
         shutil.copy(ROOT / "lib/contract.py", cls.template / "lib/contract.py")
@@ -283,8 +286,9 @@ echo review-1
             self.assertIn("name the family it belongs to", task)
             self.assertIn("end it with 'Family: <short-kebab-name>' on its own line, before its 'Closes by:' line, and use the name the earlier "
                           "finding used; a new finding may name a family too", task)
-            # Both providers have the redacted tools; a prompt on a bash search outside the worktree stalls an unattended reviewer.
-            self.assertIn("Read or search files outside the working tree with safe_read and safe_grep, never with rg or grep through bash", task)
+            # The read/search rule reaches the reviewer once, in the worker contract tp-spawn puts in its system prompt; the task does
+            # not repeat it (tests/test_orchestration.py checks the contract on the review route).
+            self.assertNotIn("safe_grep", task)
             self.assertNotIn("review round", task)  # a first review does not claim earlier rounds
             self.assertRegex(task, r"RESULT_STATUS: complete\|empty\|blocked\|incomplete on the second line")
         self.assertIn("report.md", research)
@@ -881,7 +885,7 @@ echo review-1
         """The reviewer's launch joined to the author's lifecycle: the stub spawner resolves the repository preamble for the
         --preamble-role and --workdir it is handed (the real lib/preamble.py), as tp-spawn does."""
         shutil.copy(ROOT / "lib/preamble.py", self.root / "lib/preamble.py")
-        shutil.copytree(ROOT / "agent/roles", self.root / "agent/roles")
+        shutil.copytree(ROOT / "agent/roles", self.root / "agent/roles", dirs_exist_ok=True)
         base = self.plan.parent
         self.stub("tp-spawn", f'''#!/usr/bin/env bash
 args=("$@"); workdir="" role=""

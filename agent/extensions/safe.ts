@@ -17,6 +17,21 @@ import { redactionSession } from "./lib/redaction.ts";
 const MAX_FILE = 4_000_000;
 const MAX_CHARS = 200_000;
 const ph = (name: string) => `<REDACTED:${name}>`;
+// The tool descriptions state the read/search rule of agent/contract/worker.md in the same words as claude/mcp/safe.mjs;
+// only READ and SHELL name this harness's tools (tests/test_pi_safe_tools.py compares the two templates).
+const READ = "the read tool";
+const SHELL = "bash";
+const SAFE_READ_HELP =
+	`Read a file with secrets replaced by ${ph("kind_n")} placeholders. Use this or ${READ} on an exact path; use this one for ` +
+	"files outside the working tree and files that may hold secrets (.env*, keys, credentials such as ~/.aws/credentials): it " +
+	`needs no permission prompt. Refuses a directory, a binary file or a file over ${MAX_FILE} bytes; output is clipped at ` +
+	`${MAX_CHARS} characters. Placeholders never reveal the value.`;
+const SAFE_GREP_HELP =
+	`Search file contents (regular expression) with secrets replaced by ${ph("kind_n")} placeholders. Use this to search, in the ` +
+	`working tree or outside it: it needs no permission prompt. Use grep or rg through ${SHELL} only on exact paths in the ` +
+	"working tree that are known not to be sensitive (no .env files, keys or credentials, nothing under agent/, config/ or claude/). Searches " +
+	"hidden files such as .env* (never .git; files ignored by .gitignore only with include_ignored); returns up to max_lines " +
+	"lines of path:line:text, each cut at 400 characters.";
 
 type Ran = { code: number; stdout: string };
 
@@ -62,10 +77,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "safe_read",
 		label: "Safe read",
-		description:
-			`Read a file with secrets replaced by ${ph("kind_n")} placeholders. Use this for files outside the working tree and for ` +
-			"credential files and env files the normal read tool asks about (production/staging env files, ~/.aws/credentials, keys); " +
-			"it needs no permission prompt. Placeholders never reveal the value.",
+		description: SAFE_READ_HELP,
 		parameters: Type.Object({
 			path: Type.String({ description: "File to read" }),
 			offset: Type.Optional(Type.Number({ description: "First line, 1-based (default 1)" })),
@@ -94,10 +106,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "safe_grep",
 		label: "Safe grep",
-		description:
-			`Search file contents (regular expression) with secrets replaced by ${ph("kind_n")} placeholders. Use this, not rg or grep ` +
-			"through bash, for files outside the working tree: it needs no permission prompt. Includes hidden files such as .env*. " +
-			"Returns path:line:text.",
+		description: SAFE_GREP_HELP,
 		parameters: Type.Object({
 			pattern: Type.String({ description: "Regular expression" }),
 			path: Type.Optional(Type.String({ description: "File or directory (default: working directory)" })),

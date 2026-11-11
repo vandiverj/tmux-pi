@@ -99,9 +99,9 @@ tmux-pi pane, prefix commands with `TP_STATE_DIR=<repo>/.tmux-pi/sessions/<sessi
 - Never `tp-agent message` a worker whose prompt is open: the message's Enter approves it. To deny, send
   `tmux send-keys -t <pane> Escape`, then message the safe alternative.
 - Most prompts come from shell forms. The brief rules prevent them: no heredocs or inline scripts, no shell
-  arrays or `$(...)`, scoped `git -C <wt> grep -n ... -- apps lib docs` instead of a repo-root `rg`, and
-  `safe_grep` / `safe_read` outside the worktree. Paste the `git -C <wt> grep` form into the brief: a repo-root
-  recursive search prompt once stopped a code reviewer (`code-reviewer-<task-id>`).
+  arrays or `$(...)`, and content searches through `safe_grep` (pattern, path), reads through `safe_read` or
+  the read tool on an exact path (a shell `grep`/`rg` only on exact, non-sensitive paths in the tree). The worker contract gives every worker this rule; a brief need not repeat it. A
+  repo-root recursive `rg` once stopped a code reviewer (`code-reviewer-<task-id>`) at a prompt.
 - A read-only worker started from the main checkout on a lane's diff (another worktree) hits sensitive-read prompts
   and is denied. Run that review or research as a lane step, or give it the diff as a file.
 - `tp-agent request` from a worker: answer with `tp-agent message ID '<answer>'`. Facts from `.env` files are

@@ -387,6 +387,15 @@ class ProcessEndTests(TmuxCase):
         self.assertEqual(os.fsencode(got), b"/tmp/pd1-\xff-state/evals")  # the bytes the OS would use for that path
         branch = os.fsdecode(b"feat-\xff-x")  # what argv holds for a branch git accepts
         self.assertEqual(os.fsencode(lanes.explicit_branch(branch)), b"feat-\xff-x")
+        # bin/tp-agent check_workdir: the workdir tp-spawn --check prints is the path the task runs in.
+        from importlib.machinery import SourceFileLoader
+        agent = SourceFileLoader("tp_agent_pd1_rt", str(ROOT / "bin/tp-agent")).load_module()
+        fake_root = self.root / "pd1-rt-root"
+        (fake_root / "bin").mkdir(parents=True)
+        (fake_root / "bin/tp-spawn").write_text("#!/bin/sh\nprintf '/tmp/pd1-\\377\\n'\n")
+        (fake_root / "bin/tp-spawn").chmod(0o755)
+        with mock.patch.object(agent, "ROOT", fake_root):
+            self.assertEqual(os.fsencode(agent.check_workdir("coder")), b"/tmp/pd1-\xff")
 
     # --- T3: reap ----------------------------------------------------------------------------
 

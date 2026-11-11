@@ -78,7 +78,6 @@ class TmuxCase(unittest.TestCase):
     server once for the class; after each test every session and window the test made is ended (the anchor stays), and the
     server is killed when the class ends. Such a class's tests must not depend on a fresh server."""
     shared_server = False
-    stable_root = False  # a shared-server class may ask for each test's root at `class_root/run` (same path every test; a lane snapshot needs it)
 
     @classmethod
     def setUpClass(cls):
@@ -106,14 +105,9 @@ class TmuxCase(unittest.TestCase):
             pass
 
     def setUp(self):
-        if self.shared_server and self.stable_root:
-            self.root = self.class_root / "run"
-            self.root.mkdir()
-            self.addCleanup(shutil.rmtree, self.root, True)
-        else:
-            temp = tempfile.TemporaryDirectory()
-            self.addCleanup(temp.cleanup)
-            self.root = Path(temp.name).resolve()
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name).resolve()
         self.lay_out_root()
         if self.shared_server:
             fake = self.fake

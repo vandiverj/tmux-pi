@@ -681,7 +681,7 @@ if [[ -n "$lane" ]]; then
     ${lane_replaces:+--replaces "$lane_replaces"} || exit 1
   lease_held=1
 fi
-# The task directory and its first three files are made in one python start (tp_write_many). A symlinked tasks/ or task directory
+# The task directory and its first four files are made in one python start (tp_write_many). A symlinked tasks/ or task directory
 # is refused, not entered. A required review marker, when there is one, goes in between the directory and the files, as before.
 skill_selection_json="$(jq . <<<"$skill_selection")"
 mkdir_args=(--mkdir "$state_dir/tasks" --mkdir "$task_dir")
@@ -698,9 +698,12 @@ fi
 # as the human-facing canonical record after meta.json exists.
 # Durable provenance: skill-selection.json holds only matching skill profiles and their body hashes.
 rc=0 owned=""
-owned="$({ printf '%s\n\0' "$task"; printf '%s\n\0' "$packet"; printf '%s\n\0' "$skill_selection_json"; } |
+# lmstudio-budget.count: the counter of the LM Studio request budget run.sh exports (0 requests used), so a budget Main passes
+# with --worker-env TP_LMSTUDIO_BUDGET=N has a counter to count in (lib/router.py refuses a missing one).
+owned="$({ printf '%s\n\0' "$task"; printf '%s\n\0' "$packet"; printf '%s\n\0' "$skill_selection_json"; printf '0\n\0'; } |
   tp_write_many --root "$state_dir" ${mkdir_args[@]+"${mkdir_args[@]}"} \
-    --file "$task_dir/request.md" --file "$task_dir/packet.md" --file "$task_dir/skill-selection.json")" || rc=$?
+    --file "$task_dir/request.md" --file "$task_dir/packet.md" --file "$task_dir/skill-selection.json" \
+    --file "$task_dir/lmstudio-budget.count")" || rc=$?
 # The directory is this run's to remove only when the writer said it made it after checking every directory above it (as
 # tp_owned_dir did). Never inferred from [ -d ] on the path: that is also true through a linked tasks/.
 if [[ $'\n'"$owned"$'\n' == *$'\n'"owned $task_dir"$'\n'* ]]; then made_task_dir=1; fi
@@ -776,7 +779,8 @@ run_sh="$(
   printf 'cd %q\n' "$workdir"
   # The reporters (pi extension, Claude hook) write state.json/result.md here.
   printf 'export TP_TASK_ID=%q TP_TASK_DIR=%q\n' "$id" "$task_dir"
-  # LM Studio request cap (lib/router.py local_open): 0 for every worker, its own counter file; --worker-env TP_LMSTUDIO_BUDGET=N (Main only) overrides.
+  # LM Studio request cap (lib/router.py local_open): 0 for every worker, its own counter file (written above, holding 0);
+  # --worker-env TP_LMSTUDIO_BUDGET=N (Main only) overrides the cap.
   printf 'export TP_LMSTUDIO_BUDGET=0 TP_LMSTUDIO_BUDGET_FILE=%q\n' "$task_dir/lmstudio-budget.count"
   for pair in ${worker_env[@]+"${worker_env[@]}"}; do printf 'export %s=%q\n' "${pair%%=*}" "${pair#*=}"; done
   # The dispatching main's identity (bin/tp-main) follows the spawner, never --worker-env, so the worker's own dispatches are

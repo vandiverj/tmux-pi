@@ -265,7 +265,32 @@ class RenderTests(unittest.TestCase):
         self.assertEqual(found, [{"claim": "f returns x", "cites": "a.py:3"}, {"claim": "g is a flag", "cites": "src/b.py:2-4"}])
 
 
+def live_fixture(root):
+    """Write big.py whose numbered text (prepare: `{n:>4}\t{line}` joined by newlines) is as large as whole lines allow under the
+    default budget, so the opt-in live test sends one full-size request. Returns its path name."""
+    lines, total = [], -1  # n lines have n - 1 joining newlines
+    while True:
+        line = "def f{0}(x): return x + {0}".format(len(lines))
+        size = len("{:>4}\t".format(len(lines) + 1)) + len(line) + 1
+        if total + size > ss.DEFAULT_BUDGET_CHARS:
+            break
+        lines.append(line)
+        total += size
+    (Path(root) / "big.py").write_text("\n".join(lines) + "\n")
+    return "big.py"
+
+
 class SummarizeTests(StubCase):
+    def test_the_live_fixture_prepares_within_the_default_budget_and_is_one_request(self):
+        """Offline check of LiveLmStudioTests' input: prepare accepts it at the default budget and summarize sends it once."""
+        with tempfile.TemporaryDirectory() as root:
+            name = live_fixture(root)
+            (prepared,) = ss.prepare(root, [name])
+            self.assertGreater(prepared["chars"], ss.DEFAULT_BUDGET_CHARS - 100)
+            self.stub.reply(json.dumps({"facts": []}))
+            _, record = ss.summarize(root, [name], "T", endpoint=self.stub.url, model="m", settings=SETTINGS)
+        self.assertEqual((record["chars"], len(self.stub.requests)), (prepared["chars"], 1))
+
     def test_record_and_text(self):
         with tempfile.TemporaryDirectory() as root:
             Path(root, "a.py").write_text("def f():\n    return 1\n")
@@ -406,20 +431,18 @@ class RunnerStructuredTests(StubCase):
 
 @unittest.skipUnless(os.environ.get("TP_LIVE_LMSTUDIO") == "1", "live LM Studio request: set TP_LIVE_LMSTUDIO=1 (budget 20, 300 s per request)")
 class LiveLmStudioTests(unittest.TestCase):
-    """One full-size (60k characters, the default limit) summarizer request to the real LM Studio, to determine the limit and wait
-    for the longer response. Opt-in; the budget is 20 requests, one at a time (tests/__init__.py)."""
+    """One full-size (prepared to just under 60k characters, the default limit) summarizer request to the real LM Studio, to
+    determine the limit and wait for the longer response. Opt-in; the budget is 20 requests, one at a time (tests/session_env.py)."""
     TIMEOUT = 300
 
     def test_full_size_request_returns_well_formed_facts(self):
         root = Path(tempfile.mkdtemp())
         self.addCleanup(__import__("shutil").rmtree, root, True)
-        lines = ["def f{n}(x):\n    return x + {n}\n".format(n=n) for n in range(4000)]
-        (root / "big.py").write_text("".join(lines)[:ss.DEFAULT_BUDGET_CHARS])
-        text, record = ss.summarize(root, ["big.py"], "what do the functions return", endpoint=ss.default_endpoint(ROOT),
+        text, record = ss.summarize(root, [live_fixture(root)], "what do the functions return", endpoint=ss.default_endpoint(ROOT),
                                     model=os.environ.get("TP_LIVE_LMSTUDIO_MODEL", "qwen/qwen3.6-35b-a3b"),
                                     settings=ss.load_settings(ROOT), timeout=self.TIMEOUT)
         self.assertIsInstance(text, str)
-        self.assertGreater(record["chars"], 50000)
+        self.assertGreater(record["chars"], ss.DEFAULT_BUDGET_CHARS - 100)
         self.assertGreaterEqual(record["kept"] + record["indexed"], 1)
 
 

@@ -10,10 +10,14 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "lib"))
+import router  # noqa: E402
 GOLDEN = ROOT / "tests" / "fixtures" / "trial_shadow" / "run.sh.golden"
 PACKET_GOLDEN = ROOT / "tests" / "fixtures" / "trial_shadow" / "packet_context.golden"
 
@@ -77,7 +81,7 @@ class SharedSpawnTests(SpawnMixin, unittest.TestCase):
         build_fixture(cls, cls.addClassCleanup)
         cls.nasty = "a b'c\"d $(touch {m}) `touch {m}` ; touch {m} \\ *".format(m=cls.base / "ran")
         jobs = {
-            "listed": (("--worker-env", "TP_TRIAL_ID=sh-a-1", "--worker-env", "TP_DOCS_TOOLS=1"), None),
+            "listed": (("--worker-env", "TP_TRIAL_ID=sh-a-1", "--worker-env", "TP_DOCS_TOOLS=1", "--worker-env", "TP_LMSTUDIO_BUDGET=3"), None),
             "nasty": (("--worker-env", "TP_DOCS_TOOLS=" + cls.nasty), None),
             "equals": (("--worker-env", "TP_TRIAL_ID=a=b", "--worker-env", "TP_DOCS_TOOLS="), None),
             "gold-1": ((), None),
@@ -111,6 +115,15 @@ class SharedSpawnTests(SpawnMixin, unittest.TestCase):
         self.assertIn("export TP_DOCS_TOOLS=1\n", text)
         self.assertLess(text.index("export TP_TASK_ID"), text.index("export TP_TRIAL_ID"))
         self.assertLess(text.index("export TP_TRIAL_ID"), text.index("tp-claude"))  # set before the worker starts
+        # Main's LM Studio budget replaces the worker's 0, and the counter tp-spawn wrote lets the guard count in it
+        exports = "\n".join(line for line in text.splitlines() if line.startswith("export TP_LMSTUDIO_BUDGET"))
+        read = subprocess.run(["bash", "-c", exports + '\nprintf "%s\\n%s" "$TP_LMSTUDIO_BUDGET" "$TP_LMSTUDIO_BUDGET_FILE"'],
+                              text=True, capture_output=True, timeout=20)
+        budget, counter = read.stdout.split("\n")
+        self.assertEqual((budget, counter, Path(counter).read_text()), ("3", str(self.task("listed") / "lmstudio-budget.count"), "0\n"))
+        with mock.patch.dict(os.environ, {"TP_LMSTUDIO_BUDGET": budget, "TP_LMSTUDIO_BUDGET_FILE": counter}):
+            os.close(router._take_budget())  # one request counted, as local_open does before it sends
+        self.assertEqual(Path(counter).read_text(), "1")
 
     def test_values_are_quoted_so_the_shell_reads_them_back_as_text_and_runs_nothing(self):
         run = self.runs["nasty"]
@@ -136,6 +149,7 @@ class SharedSpawnTests(SpawnMixin, unittest.TestCase):
         for value, name in ((str(self.task("gold-1")), "@TASK_DIR@"), (str(self.state), "@STATE@"), (str(self.project), "@WORKDIR@"), (str(ROOT), "@ROOT@")):
             text = text.replace(value, name)
         self.assertEqual(text, GOLDEN.read_text())
+        self.assertEqual((self.task("gold-1") / "lmstudio-budget.count").read_text(), "0\n")  # the counter of the exported budget
         self.assertNotIn("TP_TRIAL_ID", text)
         self.assertNotIn("TP_DOCS_TOOLS", text)
 

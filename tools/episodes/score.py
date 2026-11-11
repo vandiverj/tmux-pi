@@ -41,10 +41,18 @@ One owner for each record fact (round 9); every reader calls it:
     read, and one it names that is absent is lost. A record outside every record directory has an unknown producer.
   - before_result(record, moment): a record backs a result or a claim only when it ended by it (record end <= result.md
     mtime, full precision; the worker's whole-second stamp when result.md was rewritten outside it, then a record ending in
-    that second is undecided).
+    that second is undecided). result_moment reads the observation's raw stamp (`_stamp`), never the poll clamp (`_t`):
+    a clamp only widens the undecided span (HB8b K3).
   - Run.request_ids(): request ids are enumerated only through the tracked reader of the requests/ files and the task and
     session event journals: one of them not ok makes the measure unknown.
   - record_pointers(text): the pointer path is the rest of the `record:` line (spaces included), or a JSON `record` field.
+
+Derived values carry their sources (HB8b): Run.derive(label, compute) is the one tracking function. It returns the value
+and a Rec whose deps are every record compute() read; Run.use(rec) flags every record in rec.closure() that is not ok. The
+request ids (request_ids: attached to each task's requests/ record and, for ids naming no task, to the task dirs) and the
+record-pointer inventory (record_pointer_paths: a dependency of Main's, every task's and the unknown-producer test-run
+records) go through it, so a measure is unknown, naming the source, whenever any source in its closure is missing or
+unreadable: a lost transcript that could have named a lost record, a lost journal that could have named a request.
 """
 import argparse
 import hashlib
@@ -86,6 +94,7 @@ def _unknown(reason, **extra):
 # status is not ok is unknown, with the reasons: the reader records each read in the scopes open at the time (Run.track), so
 # what a value depends on is what its code read, never a hand-kept table.
 OK, MISSING, EMPTY, UNREADABLE, UNDATED = "ok", "missing", "empty", "unreadable", "undated"
+FLAGGED = "flagged"         # a problem a reader flagged without a record (Run.flag) inside a derivation (Run.derive)
 NEVER = datetime.max.replace(tzinfo=timezone.utc)
 RECORD_LINE = re.compile(r"(?m)^record: (/[^\r\n]*?\.json)[ \t\r]*$")   # test-run.sh's `record: PATH` (rule 5: spaces kept)
 OUTSIDE = "ran outside test-run.sh"
@@ -123,30 +132,47 @@ def before_result(record, moment):
 
 def result_moment(run, task):
     """(lo, hi) when the task's result was written, or None. result.md's mtime (full precision) when it lies in the
-    second of the worker's whole-second stamp of its last stop with the result; else that stamp's whole second."""
-    when = run.result_held_time(task["id"])
-    if when is None:
+    second of the raw stamp of the worker's last stop with the result (HB8b K3: the raw stamp, never the poll clamp);
+    else that stamp's whole second, widened (never moved) to the clamp when the clamp is later."""
+    obs = run.result_held(task["id"])
+    if obs is None:
         return None
+    stamp = obs.get("_stamp") or obs["_at"]
+    clamp = obs.get("_t") or stamp
     written = task["result_written"]
-    if written is not None and when <= written < when + STAMP:
+    if written is not None and stamp <= written < stamp + STAMP:
         return written, written
-    return when, when + STAMP - timedelta(microseconds=1)
+    return stamp, max(stamp + STAMP - timedelta(microseconds=1), clamp)
 
 
 
 class Rec:
     """One record as read: label, status (ok, missing, empty: empty although the log shows it should hold something,
-    unreadable, undated), value and why."""
-    __slots__ = ("label", "status", "value", "why")
+    unreadable, undated), value and why. deps (HB8b): the records a derived record was read from (Run.derive); reading it
+    reads them, so one of them not ok makes its reader unknown."""
+    __slots__ = ("label", "status", "value", "why", "deps")
 
-    def __init__(self, label, status=OK, value=None, why=None):
-        self.label, self.status, self.value, self.why = label, status, value, why
+    def __init__(self, label, status=OK, value=None, why=None, deps=()):
+        self.label, self.status, self.value, self.why, self.deps = label, status, value, why, tuple(deps)
 
     @property
     def ok(self):
         return self.status == OK
 
+    def closure(self):
+        """This record and every record it was derived from, transitively (each once)."""
+        out, stack = [], [self]
+        while stack:
+            rec = stack.pop()
+            if any(rec is seen for seen in out):
+                continue
+            out.append(rec)
+            stack.extend(reversed(rec.deps))
+        return out
+
     def problem(self):
+        if self.status == FLAGGED:
+            return self.label
         return "%s %s%s" % (self.label, self.status, " (%s)" % self.why if self.why else "")
 
 
@@ -172,7 +198,7 @@ class Run:
     def __init__(self, run_dir):
         self.dir = Path(run_dir).resolve()
         self._scopes = []
-        self._cache = {}
+        self._reads = []            # the open derivations' source lists (derive)
         self.recs = []
         rec = self.dir / "run"
         self.record = el.read_json(rec / "run.json") or {}
@@ -209,7 +235,6 @@ class Run:
         # journal holds session events (a correction recorded), so its presence says nothing about task journals.
         self._events_written = bool(tasks_dir and tasks_dir.is_dir() and any(tasks_dir.glob("*/events.jsonl")))
         self._requests_written = bool(tasks_dir and tasks_dir.is_dir() and any(p.is_dir() for p in tasks_dir.glob("*/requests")))
-        self._request_recs = {}
         self._load_tasks()
         self._load_main_runs()
         status, events, why = el.read_jsonl_status(self.state_dir / "events.jsonl") if self.state_dir else (MISSING, None, "no state dir")
@@ -230,15 +255,39 @@ class Run:
         return rec
 
     def use(self, rec):
-        """The record's value; a status that is not ok goes into every open scope."""
-        if rec.status != OK:
-            self.flag(rec.problem())
+        """The record's value; the problem of every record in its closure (itself and what it was derived from) that is
+        not ok goes into every open scope, and the record is a source of every open derivation (derive)."""
+        for reads in self._reads:
+            reads.append(rec)
+        for source in rec.closure():
+            if source.status != OK:
+                self._flag(source.problem())
         return rec.value
 
     def flag(self, text):
+        """A problem with no record of its own: in a derivation it becomes one of the derived record's sources."""
+        for reads in self._reads:
+            reads.append(Rec(text, FLAGGED))
+        self._flag(text)
+
+    def _flag(self, text):
         for scope in self._scopes:
             if text not in scope:
                 scope.append(text)
+
+    def derive(self, label, compute):
+        """(value, Rec): the one tracking function (HB8b). compute() is run with every record it reads collected; the
+        returned Rec (status ok, value the result) has those records as its deps, so a reader of the derived value
+        depends on every source it was derived from. Nothing is flagged in the caller's scopes here: the caller uses the
+        Rec (or attaches it to the record its readers read)."""
+        reads = []
+        self._reads.append(reads)
+        try:
+            with self.track(isolated=True):
+                value = compute()
+        finally:
+            self._reads.pop()       # derivations nest: the innermost closes first
+        return value, Rec(label, OK, value, deps=reads)
 
     @contextmanager
     def track(self, isolated=False):
@@ -250,17 +299,6 @@ class Run:
             yield scope
         finally:
             self._scopes = saved
-
-    def cached(self, name, compute):
-        """compute() once; every later call reports the problems of the reads it made, as if it read them again."""
-        if name not in self._cache:
-            with self.track(isolated=True) as scope:
-                value = compute()
-            self._cache[name] = (value, list(scope))
-        value, problems = self._cache[name]
-        for problem in problems:
-            self.flag(problem)
-        return value
 
     # ---- loading -------------------------------------------------------------------------------------------------------
     def _load_episode(self, path):
@@ -306,10 +344,13 @@ class Run:
                 # The runner polls; the worker's own stamp (whole seconds, never later than the change) dates the change
                 # when it is close to the observation, so Main reacting between change and poll is not read as waiting.
                 # Never earlier than the poll that still saw the previous state.
+                # HB8b K3: _stamp keeps the raw time (the worker's stamp, else the poll) apart from that clamp (_t): a
+                # clamp orders states between polls; it never moves the stamp before_result compares (result_moment).
                 own = el.parse_time(entry.get("updated"))
                 at = entry["_at"]
                 t = own if own and at and timedelta(0) <= at - own <= timedelta(seconds=5) else at
                 prev = seen_before.get(entry.get("task"))
+                entry["_stamp"] = t
                 entry["_t"] = max(t, prev) if t and prev else t
                 if at:
                     seen_before[entry.get("task")] = at
@@ -451,47 +492,73 @@ class Run:
             why = ("unreadable: %s" % ", ".join(bad_requests)) if bad_requests else "the log saw it at a prompt" if st != OK else None
         values["requests"] = requests or []
         sources["requests"] = (self.add(Rec("requests/ of %s" % tid, st, requests, why)),)
-        self._request_recs[tid] = sources["requests"][0]
         values["review_of"] = el._text(task_dir / "review-of")
         return Task(self, values, sources)
 
-    def request_ids(self):
-        """({task id: ids in its requests/ files}, {task id or None: ids the request.* events (ref) name}): the one reader of
-        request ids (round 9 rule 4). Every source is read through the tracked accessors (each task's requests/ and
-        events.jsonl, the session's events.jsonl), so a measure that counts requests depends on every journal that could
-        name one: a journal that is not ok makes it unknown. Transcript text is never read for ids."""
-        held, named = {}, defaultdict(set)
-        for task in self._tasks:
-            held[task["id"]] = {r.get("id") or r.get("request_id") for r in task["requests"] or [] if isinstance(r, dict)}
-            for e in task["events"] or []:
+    def request_ids(self, task_id=None, strays_only=False):
+        """(held, named, Rec): the one reader of request ids (round 9 rule 4), through the one tracking function (derive,
+        HB8b). held: {task id: ids in its requests/ files}; named: {task id or None: ids the request.* events (ref) name}.
+        task_id: only what that task's completeness reads (its requests/ and events.jsonl, the session journal's events for
+        it); strays_only: only the session journal's events naming no task or a task with no dir. Every task's requests/
+        is read only when such stray events exist (their ids are looked for in every task's files). The Rec's deps are the
+        sources read; the caller's scopes get their problems here, so a count of requests depends on every journal that
+        could name one. Transcript text is never read for ids."""
+        def compute():
+            tasks = self.tasks
+            known = {t["id"] for t in tasks}
+            named = defaultdict(set)
+            for e in self.session_events or []:
                 if isinstance(e, dict) and str(e.get("kind", "")).startswith("request.") and e.get("ref"):
-                    named[task["id"]].add(str(e["ref"]))
-        for e in self.session_events or []:
-            if isinstance(e, dict) and str(e.get("kind", "")).startswith("request.") and e.get("ref"):
-                named[e.get("task")].add(str(e["ref"]))
-        return held, named
+                    named[e.get("task")].add(str(e["ref"]))
+            strays = {k for k in named if k is None or k not in known}
+            held = {}
+            for task in tasks:
+                mine = not strays_only and task_id in (None, task["id"])
+                if mine or strays:
+                    held[task["id"]] = {r.get("id") or r.get("request_id") for r in task["requests"] or [] if isinstance(r, dict)}
+                if mine:
+                    for e in task["events"] or []:
+                        if isinstance(e, dict) and str(e.get("kind", "")).startswith("request.") and e.get("ref"):
+                            named[task["id"]].add(str(e["ref"]))
+            if strays_only or task_id is not None:
+                named = {k: v for k, v in named.items() if k in strays or (not strays_only and k == task_id)}
+            return held, dict(named)
+        label = "request ids" + (" named for no task" if strays_only else " of %s" % task_id if task_id else "")
+        (held, named), rec = self.derive(label, compute)
+        self.use(rec)
+        return held, named, rec
 
     def _check_request_ids(self):
         """Every request id the run's records name is read (round 5 rule 7): an id an event names with no readable
-        requests/ file is a lost record: that task's requests/ is missing (a session event naming no task makes every
-        task's requests/ missing: which task lost it is unknown)."""
+        requests/ file is a lost record: that task's request ids are missing (a session event naming no task makes every
+        task's missing: which task lost it is unknown). HB8b: each task's request completeness is derived (request_ids)
+        and attached to its requests/ record, so every reader of its requests depends on the journals that could name
+        one; the stray ids (a task with no dir) are a fact about the task dirs, attached to them."""
         if not self.state_dir:
             return
-        held, named = self.request_ids()
-        everywhere = set().union(*held.values()) if held else set()
-        for tid, ids in named.items():
-            lost = sorted(i for i in ids if i not in (everywhere if tid is None or tid not in held else held[tid]))
-            if not lost:
-                continue
-            targets = [tid] if tid in self._request_recs else [] if tid is not None else list(self._request_recs)
-            for target in targets:
-                rec = self._request_recs[target]
-                if rec.status == OK:
-                    rec.status = MISSING
-                    rec.why = "request id(s) %s named by an event have no readable requests/ file" % ", ".join(lost[:3])
-            if not targets and self._tasks_rec.status == OK:
-                self._tasks_rec.status, self._tasks_rec.why = MISSING, "request id(s) %s named for %s have no task's file" % (
-                    ", ".join(lost[:3]), tid or "no task")
+
+        def lost_of(held, named, tid):
+            everywhere = set().union(*held.values()) if held else set()
+            return sorted(i for i in named.get(tid, ()) if i not in (everywhere if tid is None or tid not in held else held[tid]))
+
+        derived = []
+        for task in self._tasks:              # every derivation first: none reads another's result (order free)
+            tid = task["id"]
+            held, named, rec = self.request_ids(tid)
+            lost = sorted(set(lost_of(held, named, tid)) | set(lost_of(held, named, None)))
+            if lost:
+                rec.status = MISSING
+                rec.why = "request id(s) %s named by an event have no readable requests/ file" % ", ".join(lost[:3])
+            derived.append((task, self.add(rec)))
+        held, named, strays = self.request_ids(strays_only=True)
+        # Ids named for a task with no dir, or for no task when there is none: no task's requests/ can hold them.
+        phantom = sorted((k or "no task", i) for k in named if k is not None or not self._tasks for i in lost_of(held, named, k))
+        for task, rec in derived:
+            task._sources["requests"] += (rec,)
+        self._tasks_rec.deps += (strays,)
+        if phantom and self._tasks_rec.status == OK:
+            self._tasks_rec.status, self._tasks_rec.why = MISSING, "request id(s) %s named for %s have no task's file" % (
+                ", ".join(i for _k, i in phantom[:3]), phantom[0][0])
 
     def _load_messages(self, task):
         """messages.jsonl (round 8 rule 4: the journal is the record of the messages sent to the task, never Main's Bash
@@ -519,10 +586,7 @@ class Run:
         elif Path(listed).is_dir():
             files = sorted(Path(listed).glob("test-run-*.json"))
         task_by_id = {t["id"]: t for t in self._tasks}
-        named = set()
-        for entries in [self._main or []] + [dict.get(t, "transcript") or [] for t in self._tasks]:
-            for e in entries:
-                named.update(os.path.realpath(p) for p in record_pointers(e.get("result_text")))
+        named, pointers = self.record_pointer_paths()
         held = {os.path.realpath(r["path"]) for t in self._tasks for r in dict.get(t, "test_runs") or []}
         unowned = []
         seen = set()
@@ -557,9 +621,24 @@ class Run:
                 runs.append(r)
         if bad:
             status, why = UNREADABLE, "; ".join(bad)
-        self._main_runs_rec = self.add(Rec("Main test-runs", status, runs, why))
+        # HB8b: the record inventory is derived from the transcripts the pointers were read from: every test-run record
+        # source depends on them (a lost transcript could have named a lost record in any record directory).
+        self._main_runs_rec = self.add(Rec("Main test-runs", status, runs, why, deps=(pointers,)))
         self._unowned_rec = self.add(Rec("test-run records of unknown producer", unowned[0][0] if unowned else OK, None,
-                                         "; ".join(w for _s, w in unowned[:3]) or None))
+                                         "; ".join(w for _s, w in unowned[:3]) or None, deps=(pointers,)))
+        for task in self._tasks:
+            task._sources["test_runs"][0].deps += (pointers,)
+
+    def record_pointer_paths(self):
+        """({real path}, Rec): every record a tool result names (record_pointers), from Main's transcripts and every task's
+        transcript: the one enumerator of pointers, through the one tracking function (derive, HB8b). The Rec's deps are
+        the transcripts (and the task dirs) read: one not ok makes every reader of the record inventory unknown."""
+        def compute():
+            texts = [e.get("result_text") for e in self.main or []]
+            for task in self.tasks:
+                texts += [e.get("result_text") for e in task["transcript"] or []]
+            return {os.path.realpath(p) for text in texts for p in record_pointers(text)}
+        return self.derive("record pointers in tool results", compute)
 
     # ---- record manifest (a report; scoring never reads it) ------------------------------------------------------------
     def _manifest(self):
@@ -676,20 +755,19 @@ class Run:
                 seen, result = True, obs.get("result")
         return seen, result
 
-    def result_time(self, task_id):
-        """When the task's result was first observed (worker-stamped), else None."""
-        return next((o.get("_t") or o["_at"] for o in self.obs(task_id) if o.get("result")), None)
-
-    def result_held_time(self, task_id):
-        """When the worker last stopped (left working/tool/permission) holding a result (worker-stamped), else the first
-        observed result. A worker that wrote result.md, took a message and wrote it again claims what result.md now holds."""
-        stops, last = [], None
+    def result_held(self, task_id):
+        """The observation of the worker's last stop (left working/tool/permission) holding a result, else its first
+        observed result, else None. A worker that wrote result.md, took a message and wrote it again claims what
+        result.md now holds. Its `_stamp` is the raw time, its `_t` the poll clamp (result_moment reads both)."""
+        stops, last, first = [], None, None
         for obs in self.obs(task_id):
             key = (obs.get("state"), obs.get("result"))
+            if obs.get("result") and first is None:
+                first = obs
             if key != last and obs.get("result") and obs.get("state") not in BUSY_STATES + ("permission",):
-                stops.append(obs.get("_t") or obs["_at"])
+                stops.append(obs)
             last = key
-        return stops[-1] if stops else self.result_time(task_id)
+        return stops[-1] if stops else first
 
     def missed_kind(self, *kinds):
         return {sid: p for sid, p in self.missed.items() if p["kind"] in kinds}
@@ -1073,7 +1151,7 @@ def _evaluate_check(run, check):
         if not run.requests_written():
             return None, "no requests/ records (HB4 not in this build)"
         run.tasks
-        held, _named = run.request_ids()      # rule 4: every requests/ and event journal it reads is a dependency
+        held, _named, _rec = run.request_ids()    # rule 4: every requests/ and event journal it reads is a dependency
         ids = set().union(*held.values()) if held else set()
         return len(ids) >= int(check.get("count", 2)), "%d distinct request id(s)" % len(ids)
     if kind == "no_duplicate_messages":

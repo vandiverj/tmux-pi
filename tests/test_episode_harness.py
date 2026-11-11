@@ -442,8 +442,11 @@ class VerificationTests(ScorerCase):
         r = self.records()
         r.task("coder-1", created=0, transcript=None)
         m = r.score()["measures"]["verification"]
-        # Repeats are a count of records (none: 0); what the final tree's state is cannot be known without the final check.
-        self.assertEqual((m["value"], m["final_tree_state"]), (0, "unknown"))
+        # Repeats are a count of records (none: 0), but HB8b K1: the record inventory is read from every transcript's
+        # pointers, so with coder-1's transcript lost the count is at least 0, unknown; the final tree's state cannot be
+        # known without the final check.
+        self.assertEqual((m["value"], m["at_least"], m["partial"]["final_tree_state"]), (None, 0, "unknown"))
+        self.assertIn("transcript of coder-1 missing", m["unknown"])
         r.main_runs_dir = False                      # Main's records cannot be read: the count is unknown, not 0
         self.assertIsNone(r.score()["measures"]["verification"]["value"])
 
@@ -1036,7 +1039,8 @@ class TreeIdentityTests(ScorerCase):
         self.assertEqual(r.score()["measures"]["verification"]["stale"], 1)
 
     def test_unknown_when_a_stream_is_missing(self):
-        """Repeats count records (round 8 rule 2): a lost transcript does not change them. The final-tree state needs every
+        """Repeats count records (round 8 rule 2), and the record inventory is read from every transcript's pointers (HB8b
+        K1): a lost transcript leaves the count at least what the records show, unknown. The final-tree state needs every
         Bash stream: with one lost, a run outside test-run.sh cannot be ruled out."""
         r = self.records()
         r.final = {"exit": 0, "tree": "t1"}
@@ -1044,8 +1048,8 @@ class TreeIdentityTests(ScorerCase):
         r.main_run(2, 0.5, {"label": "npm test", "tree": "t0", "exit": 0})
         r.task("coder-1", transcript=None)
         m = r.score()["measures"]["verification"]
-        self.assertEqual((m["value"], m["final_tree_state"]), (1, "unknown"))
-        self.assertIn("transcript of coder-1 missing", m["final_tree_unknown"])
+        self.assertEqual((m["value"], m["at_least"], m["partial"]["final_tree_state"]), (None, 1, "unknown"))
+        self.assertIn("transcript of coder-1 missing", m["unknown"])
 
 
 class PauseClaimTests(ScorerCase):
@@ -1496,6 +1500,18 @@ class ClaimTimeTests(ScorerCase):
             stamp = (T0 + timedelta(seconds=written)).timestamp()
             os.utime(result_md, (stamp, stamp))
             self.assertEqual(score.score(r.root)["measures"]["verification"]["stale"], stale, written)
+        # HB8b K3 (review F3, fail-before on decee7a): a poll clamp never moves the worker's stamp. A poll at 9.3 saw the
+        # result while still working, the stop was seen at 9.4 with stamp 9; result.md written at 9.2. The stop's clamped
+        # time (9.3) is not the stamp: the result is at 9.2, so a final-tree pass ending at 9.25 is after it (stale 1).
+        r.log = [o for o in r.log if not (o.get("task") == "coder-1" and o.get("state") == "waiting")]
+        r.observe(9.3, "coder-1", "working", result="complete", stamp=9)
+        r.observe(9.4, "coder-1", "waiting", result="complete", stamp=9)
+        for end, stale in ((9.15, 0), (9.2, 0), (9.25, 1)):
+            r.tasks["coder-1"]["test_runs"][1] = (8, end - 8, {"cmd": ["npm", "test"], "tree": "t1", "exit": 0})
+            r.write()
+            stamp = (T0 + timedelta(seconds=9.2)).timestamp()
+            os.utime(result_md, (stamp, stamp))
+            self.assertEqual(score.score(r.root)["measures"]["verification"]["stale"], stale, end)
 
     def test_rewritten_result_is_judged_when_the_worker_last_stopped_with_it(self):
         """Fake E2 (pass): the worker wrote a result, took a message and wrote result.md again. The claim is the result.md
@@ -1880,8 +1896,18 @@ class RoundFiveTests(ScorerCase):
         # shows the build writes them: the count reads every journal, so it stays unknown, never a known smaller count.
         r.task("coder-2", created=1, events=[{"at": at(2), "kind": "state", "ref": None}])
         r.observe(1, "coder-2", "working")
+        # HB8b K2 (review F2, fail-before on decee7a): request completeness carries its journals to every reader. A message
+        # sent to coder-1 while it worked reads coder-1's requests/; with the journal naming req-b lost, messages-into-prompt
+        # stays unknown, never 0.
+        r.tasks["coder-1"]["messages"] = [(1.5, "New direction")]
         r.write()
+        into = score.score(r.root)["measures"]["into_prompt"]
+        self.assertIsNone(into["value"])
+        self.assertIn("req-b", into["unknown"])
         (r.state / "tasks/coder-1/events.jsonl").unlink()
+        into = score.score(r.root)["measures"]["into_prompt"]
+        self.assertIsNone(into["value"])
+        self.assertIn("events.jsonl of coder-1 missing", into["unknown"])
         ok, detail = score.evaluate_check(score.Run(r.root), dict({"id": "c", "measure": "evidence"}, **check))
         self.assertIsNone(ok)
         self.assertIn("events.jsonl of coder-1 missing", detail)
@@ -2031,6 +2057,21 @@ class RecordsOnlyTests(ScorerCase):
         s = r.score()
         self.assertIn("producer is unknown", s["manifest"]["test-run records of unknown producer"])
         self.assertIsNone(s["measures"]["verification"]["value"])
+        # HB8b K1 (review F1, fail-before on decee7a): the record inventory depends on the transcripts it was read from. A
+        # reviewer's pointer to a lost record in Main's directory leaves verification unknown; with that transcript lost
+        # too, the pointer is gone but the inventory is still unknown (never verified with 0 repeats).
+        lost = record.parent / "test-run-lost.json"
+        r.tasks["reviewer-1"]["transcript"] = [("tool", 1, "Read", {"file_path": "main.log"}, 0, 3, "record: %s\n" % lost)]
+        r.write()
+        for transcript, cause in ((True, "is absent"), (False, "transcript of reviewer-1 missing")):
+            if not transcript:
+                (r.state / "tasks/reviewer-1/transcript.jsonl").unlink()
+            v = score.score(r.root)["measures"]["verification"]
+            self.assertEqual((v["value"], v["final_tree_verified"]), (None, None), transcript)
+            self.assertIn(cause, v["unknown"], transcript)
+            ok, detail = score.evaluate_check(score.Run(r.root), dict({"id": "c", "measure": "evidence"}, **check))
+            self.assertIsNone(ok, transcript)
+            self.assertIn(cause, detail, transcript)
         # run.json with no main_test_runs: Main's records cannot be read.
         r.tasks["reviewer-1"]["transcript"] = [("user", 0, "Do the task.")]
         r.main_runs_dir = False

@@ -723,7 +723,7 @@ class LmStudioBudgetTests(unittest.TestCase):
         self.hold[0] = True
         self.addCleanup(self.hold.__setitem__, 0, False)
         self.addCleanup(self.release.set)
-        procs, out = {}, {"A": [], "B": []}
+        procs, out, pumps = {}, {"A": [], "B": []}, []
 
         def start(name):
             procs[name] = subprocess.Popen([sys.executable, "-c", code], env=env, stdout=subprocess.PIPE, text=True)
@@ -733,7 +733,8 @@ class LmStudioBudgetTests(unittest.TestCase):
             def pump(name=name):
                 for line in procs[name].stdout:
                     self.events.put((name, line.strip()))
-            threading.Thread(target=pump, daemon=True).start()
+            pumps.append(threading.Thread(target=pump, daemon=True))
+            pumps[-1].start()
 
         def next_event():
             event = self.events.get(timeout=30)  # a bound on a hang, not a wait for time to pass
@@ -750,6 +751,9 @@ class LmStudioBudgetTests(unittest.TestCase):
         self.release.set()
         for p in procs.values():
             p.wait(timeout=30)
+        for t in pumps:  # EOF on each child's stdout: every line it printed is in the queue before counting
+            t.join(timeout=30)
+            self.assertFalse(t.is_alive(), "a stdout reader did not reach EOF")
         while not self.events.empty():
             next_event()
         lines = [line for name in out for line in out[name] if line != "waiting"]

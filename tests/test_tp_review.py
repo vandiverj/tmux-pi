@@ -145,6 +145,11 @@ echo review-1
             self.assertEqual(r.returncode, 1)
             self.assertIn("approv", r.stderr)
             self.assertFalse((self.plan.parent / "route.args").exists())  # refused before any plan
+        for loc in ("en_US.UTF-8", "C"):   # an approval in a legacy encoding is a quote, not blank (old test: nonblank)
+            with self.subTest(invalid_utf8_approval=loc):
+                r = subprocess.run([str(self.root / "bin/tp-review"), "--same-provider", "--approved-by-user", "\udcc8\udcf1", "w1"], text=True,
+                                   errors="replace", capture_output=True, env={**self.env, "LC_ALL": loc})
+                self.assertNotIn("needs --approved-by-user", r.stderr)
         quote = "use claude, gpt is out of credits"
         self.set_plan(reviewer={"worker": "claude", "model": "claude-sonnet-5-5", "thinking": "high",
                                 "independence": "same_provider_user_approved", "approved_by_user": quote})

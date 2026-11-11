@@ -195,7 +195,7 @@ elif [[ ! -t 0 ]]; then
 else
   task=""
 fi
-[[ "$task" =~ [^[:space:]] ]] || usage 1   # a regex test: ${task//[[:space:]]/} is quadratic in bash 3.2
+! [[ "$task" =~ ^[[:space:]]*$ ]] || usage 1   # linear; ${task//[[:space:]]/} is quadratic in bash 3.2. Not =~ [^[:space:]]: that calls invalid UTF-8 bytes blank
 
 session="$(tp_session)"
 state_dir="$(tp_opt "$session" @tp_state_dir)"

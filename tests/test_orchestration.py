@@ -154,6 +154,14 @@ esac
                                          env=self.env, input=task, text=True, capture_output=True)
                 self.assertEqual(spawned.returncode, 1, spawned.stderr)
                 self.assertIn("Usage: tp-spawn", spawned.stdout + spawned.stderr)
+        # bytes that are not valid UTF-8 are text, not blank for the emptiness test (the old ${task//[[:space:]]/} test said nonblank):
+        # CP1251 "Ispravi oshibku", a lone continuation byte, and whitespace around 0xff
+        for task in (b"\xc8\xf1\xef\xf0\xe0\xe2\xfc", b"\x80", b" \xe2\x80 ", b"\n\xff\n"):
+            for loc in ("en_US.UTF-8", "C"):
+                with self.subTest(task=task, locale=loc):
+                    spawned = subprocess.run([str(ROOT / "bin/tp-spawn"), "--worker", "pi", "--model", MODEL, "--workdir", str(self.project)],
+                                             env={**self.env, "LC_ALL": loc}, input=task, capture_output=True)
+                    self.assertNotIn(b"Usage: tp-spawn", spawned.stdout + spawned.stderr)   # (later steps may still reject non-UTF-8 text)
         long_task = "word " * 20000   # 100 000 characters: the emptiness test must not be quadratic in the length
         spawned = subprocess.run([str(ROOT / "bin/tp-spawn"), "--worker", "pi", "--model", MODEL, "--workdir", str(self.project), "--", long_task],
                                  env=self.env, text=True, capture_output=True, timeout=60)

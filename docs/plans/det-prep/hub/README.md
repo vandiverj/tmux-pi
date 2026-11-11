@@ -150,3 +150,7 @@ simulated. **Evidence:** `hub/handoff/`.
 
 ## Independent assessment (2026-11-10)
 The Fable assessment is mapped in `../assessment/README.md`. It confirms the HUB order. Its additions went into HB2, HB4b, HB5, HB6 and HB9 as notes on H35, H37, H38, H39 and H42; its new items are H43-H55. H48 (labelling one campaign's interventions) should run before HB7 is scoped.
+
+**Target Main (owner, 2026-11-10):** "lets only worry about claude main for now and bring pi main up once we have the processes all
+working". HUB items are built and judged on Claude Code Main. Pi-only parts (the pi watchdog in row 6a, pi handler parity) are
+follow-ups after the processes work, not blockers.

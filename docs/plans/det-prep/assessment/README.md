@@ -46,7 +46,8 @@ HUB order (`../hub/README.md`); new rows are queued behind it unless marked othe
 | Watch: native agent teams | No row | Keep files and records as the contract |
 
 ## Questions for the owner (from the assessment's list, still open)
-1. Which Main is the target: Claude only, or Claude and pi at parity? This decides HB4b/HB6 work on the pi side.
+1. ~~Which Main is the target?~~ **Answered 2026-11-10:** "lets only worry about claude main for now and bring pi main up once we
+   have the processes all working". HB4b/HB6 and H53 target Claude Main; pi Main parity is a later follow-up, not a blocker.
 2. Where is the hostile bar required? The assessment proposes trust, redaction and sensitive-read code only (H43).
 3. May session metadata (event files, decision snapshots, never repository content) leave the work Mac? H47 and the HB9 tuning loop
    depend on it.

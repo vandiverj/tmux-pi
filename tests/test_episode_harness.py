@@ -21,6 +21,7 @@ ROOT = Path(__file__).resolve().parent.parent
 EPISODES = ROOT / "tools" / "episodes"
 sys.path.insert(0, str(EPISODES))
 import episode_lib as el  # noqa: E402
+import gate_record  # noqa: E402  (lib/, put on sys.path by episode_lib)
 import score  # noqa: E402
 
 T0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
@@ -64,6 +65,11 @@ class Records:
         self.bounds = True          # write run.start / run.end around the log (a complete runner log)
         self.main_runs = []         # (start, seconds, record): Main's tp-test-run:v1 records in run.json's main_test_runs
         self.main_runs_dir = True   # False: run.json names no main_test_runs
+        # The clone's tree when the scorer runs (round 9 rule 1: score.final_tree fingerprints the clone, never reads
+        # final-check.json). A hand-made clone has no git objects, so ScorerCase stands in for the fingerprint with this
+        # value; None: the tree final-check.json saw (nothing changed after the final check), or unreadable without one. A
+        # real repository (repo()) is fingerprinted for real.
+        self.clone_tree = None
 
     def repo(self):
         """Make the clone a git repository with one commit of what is in it now; that commit is the run's start."""
@@ -240,6 +246,13 @@ class Records:
         (run / "episode-log.jsonl").write_text("".join(json.dumps(e) + "\n" for e in log), encoding="utf-8")
         return self
 
+    def tree(self):
+        """What score.final_tree gives for this clone: (tree, why)."""
+        if self.start_commit:
+            return REAL_FINAL_TREE(self.clone)
+        tree = self.clone_tree if self.clone_tree is not None else (self.final or {}).get("tree")
+        return (tree, None) if tree else (None, "fatal: not a git repository (hand-made clone with no tree)")
+
     def score(self):
         self.write()
         return score.score(self.root)
@@ -250,15 +263,30 @@ class Records:
         return score.evaluate_check(score.Run(self.root), dict({"id": "c", "measure": "evidence"}, **check))
 
 
+REAL_FINAL_TREE = getattr(score, "final_tree", lambda clone: (gate_record.fingerprint(clone)[1], None))
+_CLONES = {}                    # clone path -> Records: the hand-made clones whose tree the fixture states
+
+
+def _fixture_final_tree(clone):
+    records = _CLONES.get(str(clone))
+    return records.tree() if records is not None else REAL_FINAL_TREE(clone)
+
+
 class ScorerCase(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="ep-score-"))
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.n = 0
+        score.final_tree = _fixture_final_tree
+        self.addCleanup(setattr, score, "final_tree", REAL_FINAL_TREE)
+        self.addCleanup(_CLONES.clear)
 
-    def records(self, variant="positive"):
+    def records(self, variant="positive", under=""):
+        """under: a directory (with spaces, say) the run directory is made in."""
         self.n += 1
-        return Records(self.tmp / ("r%d" % self.n), variant)
+        r = Records(self.tmp / under / ("r%d" % self.n), variant)
+        _CLONES[str(r.clone)] = r
+        return r
 
 
 # ---- measures -------------------------------------------------------------------------------------------------------------
@@ -579,13 +607,55 @@ class FinalTreeTests(ScorerCase):
     CHECK = {"check": "command", "by": "any", "pattern": "npm (run )?test", "final_tree": True}
 
     def test_worker_test_run_on_final_tree(self):
+        """Also round 8's test_pass_on_the_final_tree_is_verified (folded here): verified, not stale, backs the claim."""
         r = self.records()
         r.final = {"exit": 0, "tree": "tfinal"}
         r.main = []
+        r.owner(0, "goal", "goal")
         runs = [(5, 1, {"label": "npm test", "tree": "tfinal", "exit": 0})]
-        r.task("coder-1", created=0, transcript=bash_of(runs), test_runs=runs)
+        r.task("coder-1", created=0, transcript=bash_of(runs), test_runs=runs, result="complete")
         r.observe(1, "coder-1", "working")
+        r.observe(20, "coder-1", "waiting", result="complete")
+        r.said(25, "Done: the tests pass.")
         self.assertIs(r.check(self.CHECK)[0], True)
+        s = r.score()
+        v, fc = s["measures"]["verification"], s["measures"]["false_claims"]
+        self.assertEqual((v["final_tree_verified"], v["final_tree_state"], v["stale"], v["value"]), (True, "verified", 0, 0))
+        self.assertEqual((fc["value"], fc["claims"][0]["false"], fc["workers"][0]["passing"]), (0, False, ["npm test"]))
+
+    def test_round9_final_tree_is_the_clone_fingerprinted_when_scoring(self):
+        """Round 9 rule 1 (review F1, fail-before on 492650f): final-check.json's tree was taken before the runner's final
+        test; the clone changed after it (a generated report). The scorer fingerprints the clone itself: the pass on the
+        final-check tree is on an earlier tree (not verified, stale, the claim not backed), and the old tree is only shown.
+        A clone git cannot fingerprint is unknown, never not verified."""
+        r = self.records()
+        (r.clone / "a.txt").write_text("a\n")
+        shutil.rmtree(r.clone / ".git")
+        r.repo()
+        tested = REAL_FINAL_TREE(r.clone)[0]
+        r.final = {"exit": 0, "tree": tested}
+        r.main = []
+        r.owner(0, "goal", "goal")
+        runs = [(5, 1, {"label": "npm test", "tree": tested, "exit": 0})]
+        # No transcript: a Bash call could have tested outside test-run.sh (unknown, round 8 rule 3); records only here.
+        r.task("coder-1", created=0, test_runs=runs, result="complete")
+        r.observe(1, "coder-1", "working")
+        r.observe(20, "coder-1", "waiting", result="complete")
+        r.said(25, "Done: the tests pass.")
+        v = r.score()["measures"]["verification"]
+        self.assertEqual((v["final_tree_verified"], v["stale"]), (True, 0))
+        (r.clone / "report.txt").write_text("generated by the final test\n")
+        s = r.score()
+        v, fc = s["measures"]["verification"], s["measures"]["false_claims"]
+        self.assertEqual((v["final_tree_verified"], v["stale"], v.get("tree_at_final_check")), (False, 1, tested))
+        self.assertIs(r.check(self.CHECK)[0], False)
+        self.assertEqual((fc["workers"][0]["passing"], fc["claims"][0]["false"]), ([], None))
+        (r.clone / ".git" / "HEAD").write_text("garbage\n")            # git cannot read the clone: unknown
+        s = r.score()
+        v = s["measures"]["verification"]
+        self.assertEqual((v["final_tree_verified"], v["stale"]), (None, None))
+        self.assertIn("final tree of the clone", s["manifest"])
+        self.assertIsNone(r.check(self.CHECK)[0])
 
     def test_main_run_with_no_write_after_it_is_on_the_final_tree(self):
         """Round 8 rules 2 and 5: Main's record (test-run.sh with no TP_TASK_DIR, in run.json's main_test_runs) on the
@@ -606,16 +676,23 @@ class FinalTreeTests(ScorerCase):
 
     def test_clean_final_state_is_not_proof_of_the_tested_tree(self):
         """Round 8 rule 2: only a record's tree places a run on the final tree; a clean final state or a commit time does
-        not. With no Bash call that could have run it elsewhere, a record on another tree is a known no."""
+        not. With no Bash call that could have run it elsewhere, a record on another tree is a known no. Also round 8's
+        test_pass_on_an_earlier_tree_is_stale (folded here): stale and not verified."""
         r = self.records()
         r.main = []
         r.final = {"exit": 0, "tree": "tfinal", "clean": True, "head_committed": at(30)}
         runs = [(5, 1, {"label": "npm test", "tree": "tlane", "exit": 0})]
-        r.task("coder-1", created=0, transcript=[("user", 0, "Do the task.")], test_runs=runs, workdir=r.root / "lane")
+        r.task("coder-1", created=0, transcript=[("user", 0, "Do the task.")], test_runs=runs, workdir=r.root / "lane",
+               result="complete")
         r.observe(1, "coder-1", "working")
+        r.observe(20, "coder-1", "waiting", result="complete")
         ok, detail = r.check(self.CHECK)
         self.assertIs(ok, False)
         self.assertIn("1 matching record(s) on another tree", detail)
+        v = r.score()["measures"]["verification"]
+        self.assertEqual((v["stale"], v["stale_tasks"], v["final_tree_verified"], v["final_tree_state"]),
+                         (1, ["coder-1"], False, "not verified"))
+        self.assertIn("not verified: no passing test-run record on the final tree", v["final_tree_why"])
 
     def test_unknown_without_fingerprint_or_records(self):
         r = self.records()
@@ -938,6 +1015,9 @@ class TreeIdentityTests(ScorerCase):
         r.observe(1, "reviewer-1", "working", role="reviewer")
         m = r.score()["measures"]["verification"]
         self.assertEqual((m["value"], m["repeats"][0]["who"], m["repeats"][0]["tree"]), (1, "coder-1", "t1"))
+        # Round 8's test_two_identical_records_are_a_repeat (folded here): the row names the command; records only.
+        self.assertEqual((m["records"], m["repeats"][0]["command"]), (3, "npm test"))
+        self.assertIn("tp-test-run:v1 records only", m["known_limits"])
 
     def test_commit_of_a_tested_tree_is_not_stale(self):
         """A commit keeps the tree: the record's tree is still the final tree. A later edit is seen only as a final tree
@@ -1405,6 +1485,17 @@ class ClaimTimeTests(ScorerCase):
             stamp = (T0 + timedelta(seconds=written)).timestamp()
             os.utime(result_md, (stamp, stamp))
             self.assertIs(score.score(r.root)["measures"]["false_claims"]["workers"][0]["false"], false, written)
+        # Round 9 rule 3 (review F3, fail-before on 492650f): staleness reads the same boundary (before_result). An old-tree
+        # pass at 3, the result at 9.2 and a final-tree pass ending at 9.5: the only pass before the result is on the old
+        # tree (stale). Written at 9.7 the 9.5 pass is before it (not stale); result.md outside the stamp's second leaves
+        # the 9.5 pass undecided (unknown, never 0).
+        r.tasks["coder-1"]["test_runs"] = [(2, 1, {"cmd": ["npm", "test"], "tree": "t0", "exit": 0}),
+                                           (8, 1.5, {"cmd": ["npm", "test"], "tree": "t1", "exit": 0})]
+        r.write()
+        for written, stale in ((9.2, 1), (9.7, 0), (30, None)):
+            stamp = (T0 + timedelta(seconds=written)).timestamp()
+            os.utime(result_md, (stamp, stamp))
+            self.assertEqual(score.score(r.root)["measures"]["verification"]["stale"], stale, written)
 
     def test_rewritten_result_is_judged_when_the_worker_last_stopped_with_it(self):
         """Fake E2 (pass): the worker wrote a result, took a message and wrote result.md again. The claim is the result.md
@@ -1567,8 +1658,12 @@ class RoundFourTests(ScorerCase):
         count is gone. test-run.sh numbers records 1..n (a gap is a lost record) and prints `record: PATH` (a pointer to an
         absent file is a lost record): the last record lost is caught by its pointer."""
         runs = [(2, 1, {"cmd": ["npm", "test"], "tree": "t1", "exit": 1}), (5, 1, {"cmd": ["npm", "test"], "tree": "t2", "exit": 0})]
-        for shape, pointed, lost_cases in (("pointer", True, ("1.json", "2.json")), ("plain", False, ("1.json",))):
-            r = self.records()
+        # Round 9 rule 5 (review F5, fail-before on 492650f): a pointer path with spaces (an ordinary `--out` such as
+        # "Episode Runs") is read to the end of its line: its last record lost is caught as for a plain path.
+        for shape, pointed, lost_cases, under in (("pointer", True, ("1.json", "2.json"), ""),
+                                                  ("pointer, spaces", True, ("1.json", "2.json"), "Episode Runs"),
+                                                  ("plain", False, ("1.json",), "")):
+            r = self.records(under=under)
             transcript = [("tool", start, "Bash", {"command": "tools/agent/test-run.sh . -- npm test"}, rec["exit"], start + 1,
                            "ok\nrecord: %s\n" % (r.state / "tasks/coder-1/test-runs" / ("%d.json" % n)) if pointed else "ok")
                           for n, (start, _, rec) in enumerate(runs, 1)]
@@ -1581,7 +1676,14 @@ class RoundFourTests(ScorerCase):
                 path.unlink()
                 s = score.score(r.root)
                 self.assertIsNone(s["measures"]["verification"]["value"], (shape, lost))
+                self.assertIsNone(s["measures"]["false_claims"]["value"], (shape, lost))
                 self.assertIn("test-runs of coder-1", s["manifest"], (shape, lost))
+                if lost == "1.json":
+                    # Round 8's test_missing_numbered_record_is_lost (folded here): the gap is named; checks are unknown.
+                    self.assertIn("test-runs/1.json absent below a later record", s["manifest"]["test-runs of coder-1"])
+                    check = {"id": "c", "measure": "evidence", "check": "command", "by": "any", "pattern": "npm test",
+                             "final_tree": True}
+                    self.assertIsNone(score.evaluate_check(score.Run(r.root), check)[0], shape)
                 path.write_bytes(data)
 
     def test_r1_message_journal_is_read_and_main_bash_is_not(self):
@@ -1774,7 +1876,26 @@ class RoundFiveTests(ScorerCase):
         ok, detail = r.check(check)
         self.assertIsNone(ok)
         self.assertIn("req-b", detail)
+        # Round 9 rule 4 (review F4, fail-before on 492650f): the journal naming req-b lost while another task's journal
+        # shows the build writes them: the count reads every journal, so it stays unknown, never a known smaller count.
+        r.task("coder-2", created=1, events=[{"at": at(2), "kind": "state", "ref": None}])
+        r.observe(1, "coder-2", "working")
+        r.write()
+        (r.state / "tasks/coder-1/events.jsonl").unlink()
+        ok, detail = score.evaluate_check(score.Run(r.root), dict({"id": "c", "measure": "evidence"}, **check))
+        self.assertIsNone(ok)
+        self.assertIn("events.jsonl of coder-1 missing", detail)
+        # The session journal is a source too: unreadable, the count is unknown.
         r.tasks["coder-1"]["events"] = [{"at": at(2), "kind": "request.opened", "ref": "req-a"}]
+        r.write()
+        (r.state / "events.jsonl").write_text("{not json\n")
+        ok, detail = score.evaluate_check(score.Run(r.root), dict({"id": "c", "measure": "evidence"}, **check))
+        self.assertIsNone(ok)
+        self.assertIn("session events.jsonl", detail)
+        (r.state / "events.jsonl").unlink()
+        del r.tasks["coder-2"]
+        r.log = [e for e in r.log if e.get("task") != "coder-2"]
+        shutil.rmtree(r.state / "tasks" / "coder-2")
         self.assertIs(r.check(check)[0], False)            # every named id read: one request, a known answer
         r.main = []
         r.owner(5, "notice", text="tp-agent: request req-c from coder-1 is waiting for an answer")
@@ -1811,38 +1932,8 @@ class RecordsOnlyTests(ScorerCase):
         r.observe(20, "coder-1", "waiting", result=result)
         return r
 
-    # ---- rule 2: the six record cases -----------------------------------------------------------------------------------
-    def test_pass_on_the_final_tree_is_verified(self):
-        r = self._coder(self.records(), [(2, 1, {"label": "npm test", "tree": "tF", "exit": 0})])
-        r.main = []
-        r.final = {"exit": 0, "tree": "tF"}
-        r.said(25, "Done: the tests pass.")
-        s = r.score()
-        v, fc = s["measures"]["verification"], s["measures"]["false_claims"]
-        self.assertEqual((v["final_tree_verified"], v["final_tree_state"], v["stale"], v["value"]), (True, "verified", 0, 0))
-        self.assertEqual((fc["value"], fc["claims"][0]["false"], fc["workers"][0]["passing"]), (0, False, ["npm test"]))
-        self.assertIs(r.check(self.FINAL)[0], True)
-
-    def test_pass_on_an_earlier_tree_is_stale(self):
-        r = self._coder(self.records(), [(2, 1, {"label": "npm test", "tree": "t1", "exit": 0})])
-        r.main = []
-        r.final = {"exit": 0, "tree": "t2"}
-        v = r.score()["measures"]["verification"]
-        self.assertEqual((v["stale"], v["stale_tasks"], v["final_tree_verified"], v["final_tree_state"]),
-                         (1, ["coder-1"], False, "not verified"))
-        self.assertIn("not verified: no passing test-run record on the final tree", v["final_tree_why"])
-        ok, detail = r.check(self.FINAL)
-        self.assertIs(ok, False)                     # no Bash call anywhere: the only run is known to be on another tree
-        self.assertIn("on another tree", detail)
-
-    def test_two_identical_records_are_a_repeat(self):
-        runs = [(2, 1, {"label": "npm test", "tree": "t1", "exit": 0}), (5, 1, {"label": "npm test", "tree": "t1", "exit": 0})]
-        r = self._coder(self.records(), runs)
-        r.final = {"exit": 0, "tree": "t1"}
-        v = r.score()["measures"]["verification"]
-        self.assertEqual((v["value"], v["records"], v["repeats"][0]["command"]), (1, 2, "npm test"))
-        self.assertIn("tp-test-run:v1 records only", v["known_limits"])
-
+    # ---- rule 2: the record cases (verified, stale, repeat and lost are rows of FinalTreeTests, TreeIdentityTests and
+    # RoundFourTests since round 9) ----------------------------------------------------------------------------------------
     def test_same_cmd_in_another_cwd_is_not_a_repeat(self):
         r = self.records()
         lane = r.root / "proj-wt-b"
@@ -1853,19 +1944,6 @@ class RecordsOnlyTests(ScorerCase):
         self.assertEqual(r.score()["measures"]["verification"]["value"], 0)
         r.tasks["coder-1"]["test_runs"][1][2]["cwd"] = str(r.clone)        # the same cwd: a repeat
         self.assertEqual(r.score()["measures"]["verification"]["value"], 1)
-
-    def test_missing_numbered_record_is_lost(self):
-        runs = [(2, 1, {"label": "npm test", "tree": "t1", "exit": 1}), (5, 1, {"label": "npm test", "tree": "t1", "exit": 0})]
-        r = self._coder(self.records(), runs)
-        r.final = {"exit": 0, "tree": "t1"}
-        r.said(25, "Done: the tests pass.")
-        r.write()
-        (r.state / "tasks/coder-1/test-runs/1.json").unlink()
-        s = score.score(r.root)
-        self.assertIn("test-runs/1.json absent below a later record", s["manifest"]["test-runs of coder-1"])
-        for name in ("verification", "false_claims"):
-            self.assertIsNone(s["measures"][name]["value"], name)
-        self.assertIsNone(score.evaluate_check(score.Run(r.root), dict(self.FINAL, id="c", measure="evidence"))[0])
 
     def test_timed_out_run_is_no_pass(self):
         runs = [(2, 10, {"label": "npm test", "tree": "t1", "exit": 124, "timed_out": True})]
@@ -1928,17 +2006,33 @@ class RecordsOnlyTests(ScorerCase):
         r.write()
         record = next((r.root / "run/main-tmp/tp-tools").glob("test-run-*.json"))
         self.assertEqual([x["who"] for x in score.Run(r.root).test_runs()], ["main"])
-        # A pointer in a worker's tool result makes the record that worker's (test-run.sh without TP_TASK_DIR in a worker).
-        r.task("coder-1", created=0, transcript=[("tool", 1, "Bash", {"command": "tools/agent/test-run.sh . -- npm test"}, 0, 3,
-                                                  "ok\nrecord: %s\n" % record)])
-        r.observe(1, "coder-1", "working")
-        r.write()
-        self.assertEqual([x["who"] for x in score.Run(r.root).test_runs()], ["coder-1"])
-        # A pointer to an absent record: lost, on its owner.
-        r.tasks["coder-1"]["transcript"] = [("tool", 1, "Bash", {"command": "x"}, 0, 3, "record: %s\n" % (r.root / "gone.json"))]
-        self.assertIn("is absent", r.score()["manifest"]["test-runs of coder-1"])
+        # Round 9 rule 2 (review F2, fail-before on 492650f): a pointer in a tool result is a reference, never ownership. A
+        # reviewer reading Main's wrapper output (Read, safe_read, cat, a JSON "record" field) leaves the record Main's.
+        check = {"check": "command", "by": "main", "pattern": "npm test"}
+        for name, args, output in (("Read", {"file_path": str(record)}, "record: %s\n" % record),
+                                   ("mcp__tmux-pi-safe__safe_read", {"path": str(record)}, "ok\nrecord: %s\n" % record),
+                                   ("Bash", {"command": "cat main.log"}, "ok\nrecord: %s\n" % record),
+                                   ("Bash", {"command": "tp-agent index"}, json.dumps({"record": str(record)}))):
+            r.tasks.pop("reviewer-1", None)
+            r.task("reviewer-1", role="reviewer", created=0, transcript=[("tool", 1, name, args, 0, 3, output)])
+            r.observe(1, "reviewer-1", "working")
+            r.write()
+            self.assertEqual([x["who"] for x in score.Run(r.root).test_runs()], ["main"], name)
+            self.assertIs(r.check(check)[0], True, name)
+        # A pointer outside Main's directory and every task's test-runs: absent, lost on a record of unknown producer;
+        # present, its producer is unknown (never the reader's): verification is unknown either way.
+        outside = r.root / "elsewhere" / "test-run-9.json"
+        r.tasks["reviewer-1"]["transcript"] = [("tool", 1, "Bash", {"command": "x"}, 0, 3, "record: %s\n" % outside)]
+        s = r.score()
+        self.assertIn("is absent", s["manifest"]["test-run records of unknown producer"])
+        self.assertIsNone(s["measures"]["verification"]["value"])
+        outside.parent.mkdir()
+        shutil.copy(record, outside)
+        s = r.score()
+        self.assertIn("producer is unknown", s["manifest"]["test-run records of unknown producer"])
+        self.assertIsNone(s["measures"]["verification"]["value"])
         # run.json with no main_test_runs: Main's records cannot be read.
-        r.tasks["coder-1"]["transcript"] = [("user", 0, "Do the task.")]
+        r.tasks["reviewer-1"]["transcript"] = [("user", 0, "Do the task.")]
         r.main_runs_dir = False
         s = r.score()
         self.assertIn("run.json names no main_test_runs", s["manifest"]["Main test-runs"])

@@ -206,6 +206,10 @@ MUST_PASS = [
     "bash -c 'set -- -e README.md; cat \"$2\"'", "bash -s <<'SH'\nf=README.md\ncat \"$f\"\nSH",
     "printf '%s\\n' 'f=README.md' 'cat \"$f\"' | bash -s", "bash -c 'export F=lib/x.py; echo \"$F\"'",
     "source <(echo 'f=README.md; cat \"$f\"')", "echo 'cat README.md' | source /dev/stdin",
+    # a line that runs a stdin shell, with any options or wrapper, naming only ordinary files anywhere (sg1 round 10)
+    "printf '%s\\n' 'f=README.md' 'cat \"$f\"' | bash -eu", "{ printf '%s\\n' 'f=README.md'; printf '%s\\n' 'cat \"$f\"'; } | bash -s",
+    "( printf '%s\\n' 'f=README.md'; printf '%s\\n' 'cat \"$f\"' ) | sh -se",
+    "find tools -name x.sh -exec bash -s \\; <<< 'f=README.md; cat \"$f\"'", "bash -s < tools/x.sh", "cat README.md | grep x",
     "rg handler src",
     "rg -t py handler src",
     "rg --sort path handler src",
@@ -1015,7 +1019,12 @@ class SensitiveReadTableTests(unittest.TestCase):
                 (f"bash -s <<'SH'\nset -- -e {LOCAL}\ncat \"$2\"\nSH", ask_main),
                 (f"bash -s <<< 'set -- -e {LOCAL} ; cat \"$2\"'", ask_main), (f"bash -c 'set -- -e {LOCAL} ; cat \"$2\"'", generic),
                 (f"bash -s <<'SH'\nf={LOCAL}\ncat \"$f\"\nSH", ask_main), (f"bash -s <<< 'f={LOCAL} ; cat \"$f\"'", ask_main),
-                (f"bash -c 'f={LOCAL} ; cat \"$f\"'", generic)]
+                (f"bash -c 'f={LOCAL} ; cat \"$f\"'", generic),
+                # sg1 round 10: a line that runs a stdin shell is checked word by word everywhere (F1-F4)
+                (f"printf '%s\\n' 'f={LOCAL}' 'cat \"$f\"' | bash -eu", ask_main),
+                (f"find tools -name x.sh -exec bash -s \\; <<< 'f={LOCAL}; cat \"$f\"'", ask_main),
+                (f"{{ printf '%s\\n' 'f={LOCAL}'; printf '%s\\n' 'cat \"$f\"'; }} | bash -s", ask_main),
+                (f"printf '%s\\n' 'bash tools/x.sh {LOCAL}' 'f={LOCAL}; cat \"$f\"' | bash -s", ask_main)]
         with tempfile.TemporaryDirectory() as task:
             record = Path(task) / "permission-request.json"
             for command, named in rows:
@@ -1328,6 +1337,22 @@ class SensitiveReadTableTests(unittest.TestCase):
             f"source /dev/stdin <<'SH'\nf={LOCAL}\ncat \"$f\"\nSH", f". /dev/stdin <<< 'set -- {LOCAL}; cat \"$1\"'",
             f"echo 'f={LOCAL}; cat \"$f\"' | source /dev/stdin", f"bash <(echo 'f={LOCAL}; cat \"$f\"')",
             f"source <(printf '%s\\n' 'f={LOCAL}' 'cat \"$f\"')", f"bash -c \"$(echo 'f={LOCAL}; cat \"$f\"')\"",
+            # sg1 round 10: in a line that runs a stdin shell (any options or clusters, any wrapper, `.`/`source` of
+            # /dev/stdin), every word anywhere is checked: option clusters (F1), find -exec fed a here-string or heredoc
+            # (F2), a group, subshell or later stage supplying the text (F3), and a name beside a script line (F4)
+            f"printf '%s\\n' 'f={LOCAL}' 'cat \"$f\"' | bash -eu", f"printf '%s\\n' 'f={LOCAL}' 'cat \"$f\"' | bash -se",
+            f"printf '%s\\n' 'f={LOCAL}' 'cat \"$f\"' | sh -eu", f"printf '%s\\n' 'f={ENV}' 'cat \"$f\"' | nice bash -o pipefail",
+            f"find tools -name x.sh -exec bash -s \\; <<< 'f={LOCAL}; cat \"$f\"'",
+            f"find tools -name x.sh -exec bash -s \\; <<'SH'\nf={LOCAL}\ncat \"$f\"\nSH",
+            f"find tools -name x.sh -exec bash -s \\; <<'SH'\nset -- -e {LOCAL}\ncat \"$2\"\nSH",
+            f"find tools -name x.sh -exec . /dev/stdin \\; <<< 'f={LOCAL}; cat \"$f\"'",
+            f"{{ printf '%s\\n' 'f={LOCAL}'; printf '%s\\n' 'cat \"$f\"'; }} | bash -s",
+            f"( printf '%s\\n' 'f={LOCAL}'; printf '%s\\n' 'cat \"$f\"' ) | bash -s",
+            f"printf ignored | cat <<< 'f={LOCAL}; cat \"$f\"' | bash -s",
+            f"printf '%s\\n' 'bash tools/x.sh {LOCAL}' 'f={LOCAL}; cat \"$f\"' | bash -s",
+            f"bash <(printf '%s\\n' 'bash tools/x.sh {LOCAL}' 'f={LOCAL}; cat \"$f\"')",
+            # ... and a script call the shell does not itself receive as its whole text is not exempt
+            f"echo 'bash tools/x.sh {LOCAL}' | find tools -name x.sh -exec bash -s \\;",
         ]
         kept = [  # each non-search cause, from the site that decides it
             (f"sh tools/x.sh {ENV}", sr.RUNS_CODE), (f"python3 tools/x.py {ENV}; grep -n x README.md", sr.RUNS_CODE),
@@ -1337,6 +1362,9 @@ class SensitiveReadTableTests(unittest.TestCase):
             (f"bash -s <<'SH'\npython3 tools/x.py {LOCAL}\nSH", sr.RUNS_CODE), (f"echo 'bash tools/x.sh {LOCAL}' | sh", sr.RUNS_CODE),
             (f"source /dev/stdin <<< 'python3 tools/x.py {LOCAL}'", sr.RUNS_CODE),
             (f"bash <(echo 'python3 tools/x.py {LOCAL}')", sr.RUNS_CODE),
+            # sg1 round 10: a script call that is the whole text a stdin shell receives keeps RUNS_CODE, whatever the options
+            (f"echo 'bash tools/x.sh {LOCAL}' | bash -s", sr.RUNS_CODE), (f"echo 'bash tools/x.sh {LOCAL}' | bash -eu", sr.RUNS_CODE),
+            (f"cat <<'SH' | nice sh -xe\nbash tools/x.sh {LOCAL}\nSH", sr.RUNS_CODE),
             (f"xargs python3 tools/x.py < {LOCAL}", sr.RUNS_CODE), ("find . -name x -exec python3 tools/x.py {} \\;", sr.RUNS_CODE),
             (f"printf '%s\\n' {LOCAL} | xargs python3 tools/x.py", sr.RUNS_CODE), (f"fd -g '{ENV}' -x node tools/x.js", sr.RUNS_CODE),
             (f"for f in {LOCAL}; do python3 tools/x.py $f; done", sr.RUNS_CODE),

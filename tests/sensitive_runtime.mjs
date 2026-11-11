@@ -242,6 +242,17 @@ assert.equal((await diff(repo))?.block, true, 'diff touching config/local.json m
     ["bash -s <<'SH'\nf=config/local.json\ncat \"$f\"\nSH", ASK_MAIN],
     ["bash -s <<< 'f=config/local.json ; cat \"$f\"'", ASK_MAIN],
     ["bash -c 'f=config/local.json ; cat \"$f\"'", /^(?!.* with path ).*Search with safe_grep and read with safe_read/],
+    // sg1 round 10: a line that runs a stdin shell is checked word by word everywhere: option clusters (F1), find -exec fed
+    // text (F2), a group, subshell or later stage supplying it (F3), a name beside a script line (F4)
+    ["printf '%s\\n' 'f=config/local.json' 'cat \"$f\"' | bash -eu", ASK_MAIN],
+    ["printf '%s\\n' 'f=config/local.json' 'cat \"$f\"' | sh -eu", ASK_MAIN],
+    ["find tools -name x.sh -exec bash -s \\; <<< 'f=config/local.json; cat \"$f\"'", ASK_MAIN],
+    ["find tools -name x.sh -exec bash -s \\; <<'SH'\nset -- -e config/local.json\ncat \"$2\"\nSH", ASK_MAIN],
+    ["{ printf '%s\\n' 'f=config/local.json'; printf '%s\\n' 'cat \"$f\"'; } | bash -s", ASK_MAIN],
+    ["( printf '%s\\n' 'f=config/local.json'; printf '%s\\n' 'cat \"$f\"' ) | bash -s", ASK_MAIN],
+    ["printf ignored | cat <<< 'f=config/local.json; cat \"$f\"' | bash -s", ASK_MAIN],
+    ["printf '%s\\n' 'bash tools/x.sh config/local.json' 'f=config/local.json; cat \"$f\"' | bash -s", ASK_MAIN],
+    ["bash <(printf '%s\\n' 'bash tools/x.sh config/local.json' 'f=config/local.json; cat \"$f\"')", ASK_MAIN],
   ];
   for (const [command, named] of rows) {
     prompts.length = 0;
@@ -273,7 +284,9 @@ assert.equal((await diff(repo))?.block, true, 'diff touching config/local.json m
   // non-search cause from the classifier's closed list, as do an encoding and a remote command.
   for (const command of ["python3 tools/x.py .env", "bash -c 'python3 tools/x.py config/local.json'",
                          "printf '%s\\n' config/local.json | xargs git diff --", 'base64 .env', 'ssh host cat .env',
-                         'python3 tools/check.py -c dev config/local.json']) {  // round 6 F4: the script's own -c
+                         'python3 tools/check.py -c dev config/local.json',  // round 6 F4: the script's own -c
+                         // sg1 round 10: a script call that is the whole text a stdin shell receives, whatever its options
+                         "echo 'bash tools/x.sh config/local.json' | bash -s", "echo 'bash tools/x.sh config/local.json' | bash -eu"]) {
     prompts.length = 0;
     const other = await hw.tool_call(call('bash', { command }), ui);
     assert.equal(prompts.length, 1, `a worker prompt the safe tools cannot replace was refused: ${command}`);

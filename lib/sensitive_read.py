@@ -2221,7 +2221,185 @@ def _printed_source_hit(first, base, depth):
     prog, args = _program(first["words"])
     texts = (list(args) if prog in _PRINTERS else []) + list(first["strings"]) + [
         "".join(holder) for holder, _ in first["heredocs"]]
-    return _first(_shell_hit(text, base, depth + 1, source=True) for text in texts if isinstance(text, str) and text)
+    # every text is judged: one with a cause (a script line) never exempts a later one (sg1 round 10 F4)
+    return _all_hits(_shell_hit(text, base, depth + 1, source=True) for text in texts if isinstance(text, str) and text)
+
+
+def _all_hits(hits):
+    """The first hit, with no cause when any hit has none: no first-hit stop (as _commands_hit aggregates)."""
+    found = None
+    for hit in hits:
+        if hit:
+            found = found or hit
+            if _cause(hit) is None:
+                return _because(None, found)
+    return found
+
+
+# A LINE THAT RUNS A STDIN SHELL (sg1 round 10). Enumerating how text reaches a shell that reads code from stdin does not
+# converge (option clusters, wrappers' stdin, groups, later stages), so the decision fails closed: in a line that runs one,
+# every word anywhere in the line is checked for a sensitive name, and a hit has no cause. The one exemption is per
+# occurrence: a name that is an operand of a project script call that is the whole text the shell receives
+# (_whole_script_text). Lines without a stdin shell keep their decisions.
+_LINE_DEPTH = 8
+_LINE_PIECES = 20000
+_STDIN_SOURCES = (".", "source")
+
+
+def _runs_stdin_source(prog, args, base):
+    """Whether `prog args` is a shell (any options, `-s` or not; `-c` excluded: its line is judged as source) or
+    `.`/`source` that is not shown to run a script file (_code_run): /dev/stdin, /dev/fd/N, a process substitution, no
+    operand, or options the parse does not know. Not shown is a stdin shell."""
+    if prog in _SHELLS:
+        return _dash_c_at(args) is None and _code_run(prog, args, base)[0] != _SCRIPT
+    return prog in _STDIN_SOURCES and _code_run(prog, args, base)[0] != _SCRIPT
+
+
+def _has_stdin_shell(command, base, depth=0):
+    """Whether any command of the line, of its substitutions, or of a `-c` line in it runs a stdin shell, directly, through
+    xargs, or anywhere in the tail of a wrapper, `find -exec` or `fd -x` (every word of the tail tried as the program, as the
+    floor does: command_wrappers.bag). A wrapper whose command cannot be found counts when its tail names a shell."""
+    if depth > _LINE_DEPTH:
+        return False
+    for cmd in _commands(command):
+        if not isinstance(cmd, dict):
+            continue
+        if any(_has_stdin_shell(sub, base, depth + 1) for sub in cmd["subs"]):
+            return True
+        words = cmd["words"]
+        prog, args = _runs(words) if _program(words)[0] == "xargs" else _program(words)
+        candidates = [(prog, list(args))]
+        wrapped = command_wrappers.starts_with_wrapper(words, _ASSIGN, _KEYWORDS)
+        tail = wrapped[1] if wrapped else list(args) if prog in ("find", "fd", "fdfind", "xargs", _OPAQUE) else None
+        if tail is not None:
+            entries, _ = command_wrappers.bag(tail)
+            # A bare `.` in a tail is most often a path (`find . -name x`), so it counts only when it sources /dev/stdin or
+            # /dev/fd/N; `source` and the shells count as named.
+            candidates += [(name, [w for w in rest if w != command_wrappers.SEP]) for name, rest in entries
+                           if name in _SHELLS or name == "source"
+                           or name == "." and rest[:1] and isinstance(rest[0], str)
+                           and (rest[0] == "/dev/stdin" or rest[0].startswith("/dev/fd/"))]
+        for name, rest in candidates:
+            if name == _OPAQUE and any(posixpath.basename(w).lower() in _SHELLS for w in rest if isinstance(w, str)):
+                return True
+            if name in _SHELLS and _dash_c_at(rest) is not None:
+                if _has_stdin_shell(rest[_dash_c_at(rest)], base, depth + 1):
+                    return True
+            elif _runs_stdin_source(name, rest, base):
+                return True
+    return False
+
+
+def _printed_text(cmd):
+    """The one text a command prints as is (`echo TEXT`, `printf TEXT` with no format, `printf '%s\\n' TEXT`, `cat <<<
+    TEXT`, `cat <<'EOF'` TEXT with nothing expanded), or None."""
+    prog, args = _program(cmd["words"])
+    if cmd["words"][:1] != [prog] or cmd["subs"] or cmd["inputs"]:
+        return None
+    if prog == "cat" and not args:
+        bodies = list(cmd["strings"]) + ["".join(holder) for holder, expands in cmd["heredocs"]
+                                         if not expands or not re.search(r"[$`]", "".join(holder))]
+        return bodies[0] if len(bodies) == 1 == len(cmd["strings"]) + len(cmd["heredocs"]) else None
+    if cmd["strings"] or cmd["heredocs"]:
+        return None
+    if prog == "echo" and len(args) == 1 and not args[0].startswith("-"):
+        return args[0]
+    if prog == "printf" and len(args) == 1 and not re.search(r"[%\\]", args[0]):
+        return args[0]
+    if prog == "printf" and len(args) == 2 and args[0] in ("%s\\n", "%s\n", "%s"):
+        return args[1]
+    return None
+
+
+def _whole_script_text(command, base):
+    """(TEXT, words) when the stdin shell of the line receives exactly one TEXT, and TEXT is exactly one project script call
+    (`bash tools/x.sh FILE`, `python3 tools/x.py FILE`: _code_run shows a script file): `echo TEXT | SHELL`, `SHELL <<< TEXT`,
+    `SHELL <<EOF` TEXT, `SHELL <(echo TEXT)`. `words` are the call's words that are not the script's operands: they are still
+    checked. Any other line shape: None, and every occurrence is checked (sg1 round 10)."""
+    items = _commands(command)
+    shapes = [x if isinstance(x, str) else "c" for x in items]
+    text = None
+    if shapes == ["c", "c"] and items[0]["feeds"] and items[1]["piped"]:
+        shell, text = items[1], _printed_text(items[0])
+        received = not (shell["strings"] or shell["heredocs"] or shell["inputs"])
+    elif shapes == ["c"]:
+        shell = items[0]
+        bodies = list(shell["strings"]) + ["".join(holder) for holder, expands in shell["heredocs"]]
+        quiet = all(not expands or not re.search(r"[$`]", "".join(holder)) for holder, expands in shell["heredocs"])
+        text = bodies[0] if len(bodies) == 1 else None
+        received = quiet and not shell["inputs"]
+    elif shapes == ["c", "(", "c", ")"] and len(_INPUT_SUB.findall(command)) == 1:
+        shell, text = items[0], _printed_text(items[2])
+        received = not (shell["strings"] or shell["heredocs"] or shell["inputs"])
+    else:
+        return None
+    if not isinstance(text, str) or not received or shell["subs"]:
+        return None
+    prog, args = _program(shell["words"])
+    if not _runs_stdin_source(prog, args, base):
+        return None
+    calls = _commands(text)
+    if len(calls) != 1 or not isinstance(calls[0], dict):
+        return None
+    call = calls[0]
+    if call["subs"] or call["strings"] or call["heredocs"] or call["inputs"]:
+        return None
+    sub, sub_args = _program(call["words"])
+    if sub not in _SHELLS and sub not in _INTERPRETERS:
+        return None
+    form, _, rest = _code_run(sub, sub_args, base)
+    if form != _SCRIPT:
+        return None
+    return text, call["words"][:len(call["words"]) - len(rest)] + call["outputs"]
+
+
+def _line_pieces(text, out, exempt=None, depth=0):
+    """Every word of `text` (quotes removed), each piece of it split at blanks and shell operators, and the same for the
+    text inside every word, substitution and here-document body, to any depth: process substitutions and groups are words
+    of the line too. The `exempt` text, once, adds only its checked words. False when the line is too deep or too large."""
+    if depth > _LINE_DEPTH:
+        return False
+    for token in _tokens(text):
+        if token[0] == "op":
+            continue
+        inner = ["".join(token[1])] if token[0] == "heredoc" else [token[1]]
+        if token[0] == "word":
+            inner += token[2]  # its substitutions
+        for word in inner:
+            if not isinstance(word, str) or not word:
+                continue
+            if exempt and exempt[0] is not None and word == exempt[0]:
+                out.extend(exempt[1])
+                exempt[0] = None  # the exemption is for that one occurrence
+                continue
+            out.append(word)
+            out.extend(piece for piece in _SOURCE_SPLIT.split(word) if piece and piece != word)
+            if len(out) > _LINE_PIECES:
+                return False
+            # the word read as shell text once more (quotes, escapes, `$'...'`), unless that reads it as itself
+            if (token[0] == "heredoc" or [t[:2] for t in _tokens(word)] != [("word", word)]) and not _line_pieces(
+                    word, out, None, depth + 1):
+                return False
+    return True
+
+
+def _stdin_line_hit(command, base=""):
+    """The first sensitive name anywhere in a line that runs a stdin shell (_has_stdin_shell), with no cause; None for any
+    other line. When every name is a whole script text's operand (_whole_script_text), that script call's own hit."""
+    if not _has_stdin_shell(command, base):
+        return None
+    whole = _whole_script_text(command, base)
+    pieces = []
+    if not _line_pieces(command, pieces, list(whole) if whole else None):
+        return "stdin shell line", "the line is too deep or too large to check"
+    hit = _words_hit(pieces, base)
+    if hit:
+        _prompts_now()
+        return _because(None, hit)
+    # Every name was the operand of the whole text's script call: that call is judged as itself (its RUNS_CODE comes from
+    # the round-6 sites), whatever the receiving shell's options, so `echo 'bash tools/x.sh NAME' | bash -eu` is kept as
+    # `| bash -s` is.
+    return _shell_hit(whole[0], base) if whole else None
 
 
 def _process_source_hit(body, base, depth):
@@ -2860,7 +3038,13 @@ def classify(tool, params, cwd=None, trust=None):
             hit = _tool_hit(tool, params)
         elif tool in _SHELL_TOOLS:
             command = str(params.get("command") or "")
-            hit = _shell_hit(command.replace("\\", "/") if tool.lower() == "powershell" else command)
+            command = command.replace("\\", "/") if tool.lower() == "powershell" else command
+            hit = _shell_hit(command)
+            line = _stdin_line_hit(command)  # a line that runs a stdin shell fails closed (sg1 round 10)
+            if line and _cause(line) is None:
+                hit = _because(None, hit or line)
+            elif line and not hit:  # its names are only a whole script text's operands
+                hit = line
     except Exception:  # a guard that cannot parse the call must not wave it through
         hit = "unparsed tool call", "the call could not be analysed"
     finally:

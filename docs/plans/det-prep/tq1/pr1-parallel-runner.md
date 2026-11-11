@@ -47,3 +47,13 @@ with the runner (`--jobs` default) and once serially, both on the same `git writ
 pi start; nothing to 127.0.0.1:1234 or any network; private tmux `-L` sockets only; never `kill-server` without `-L`. Do not
 edit config/. Search with safe_grep, read with Read/safe_read; never read claude/mcp.json, .env*, auth files or config/local.json.
 Commit nothing. No background shells. `RESULT_STATUS: complete` as the last line.
+
+## Amendment (Main, answering the worker's request of 15:44Z)
+- **Extend the runner that exists; do not add a second one.** `tests/run_parallel.py` (with `tests/run_bounded.py`) is the one
+  runner; Main missed it when writing this brief. Keep its path and its CLI (README cites `tests/run_parallel.py -j2`). Bring it up
+  to rules 1-6: the id-set check against the loader, the scrubbed env and per-child `TMUX_TMPDIR`/`TMPDIR`, the unittest-format
+  totals, longest-first scheduling, a higher `MAX_JOBS`/default chosen from measurement on this 18-core Mac (state the numbers),
+  and review each existing `SERIAL` entry against rule 5 (keep only with a measured reason). Extend `RunParallelTests` in
+  `tests/test_run_bounded.py` for the Tests section instead of a new module; `tools/test/` is not used.
+- **Docs: do not edit them in this lane.** README.md, docs/project-map.md and docs/plans/det-prep/README.md belong to other lanes;
+  put the proposed one-sentence changes in your report and Main applies them after merge.

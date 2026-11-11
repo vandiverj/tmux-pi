@@ -1,8 +1,8 @@
-# Agent tools: shared helper scripts and the "Tools" block
+# Agent tools: shared helper scripts and the "Project Tools" block
 
 Workers repeat the same setup routines in every task: orient in the lane, run the pre-commit checks, run web jest. This
 repository ships plain scripts for them (`tools/agent/`: `lane-info`, `pre-commit-gate`, `web-jest`, `test-run`), and a project lists the ones its workers should use in
-`<project>/.tmux-pi/agent-tools.json`. `lib/preamble.py` renders that list as a "Tools" block in the worker's standing
+`<project>/.tmux-pi/agent-tools.json`. `lib/preamble.py` renders that list as a "Project Tools" block in the worker's standing
 instructions, filtered by the worker's role. Nothing here goes into a tracked path of the project: the scripts live in
 this repository and take the worktree as an argument, and `.tmux-pi/` is git-excluded in the project.
 
@@ -79,7 +79,7 @@ names)`.
 
 ## Start a project
 
-A project with no `.tmux-pi/agent-tools.json` gives its workers no Tools block at all. To start one, copy the example and
+A project with no `.tmux-pi/agent-tools.json` gives its workers no Project Tools block at all. To start one, copy the example and
 trim it:
 
 ```
@@ -120,7 +120,7 @@ All fields are required; unknown fields are an error.
 
 Rules:
 
-- **No manifest: nothing changes.** The worker text is byte-identical to what it was before the block existed (golden test).
+- **No manifest: no block.** The repository text is byte-identical to the preamble alone (golden test).
 - **A manifest that cannot be used is an error, never a silent skip**: unreadable, not UTF-8, not JSON, a bad or duplicate
   entry, or a `path` that is missing or not executable. Every entry's path is checked whatever the worker's role, so a
   broken manifest is refused the same way for all roles.
@@ -129,25 +129,33 @@ Rules:
 ## What the block contains
 
 ```
-## Tools
+# Project Tools
 
-Do not re-request an unchanged range you already have; fetch more or refreshed context when you need it (after an edit, after a compaction).
-Read a range with the Read tool (offset, limit) or safe_read, not sed -n. Quote paths with ( ) [ ] or spaces.
-tp-agent request --kind skill|tool|context --what DESCRIPTION --reason REASON
-tp-agent message TASK --text TEXT replies to a question from Main; tools/agent/test-run.sh WORKTREE -- CMD runs a check and records it.
 - web-jest: run web jest tests: /…/tmux-pi/tools/agent/web-jest.sh WORKTREE [--repeat N] TEST_PATH... -> per-file counts; last line exit=N log=PATH
-Prior result: /…/tasks/coder-1/result.md; review report: /…/tasks/review-1/report.md
 ```
 
-1. The four standing lines (every worker, whenever a manifest exists; not filtered by role): do not re-request an
-   unchanged range (fetch refreshed context after an edit or a compaction); read a range with the Read tool or `safe_read`,
-   not `sed -n`, and quote paths with `( ) [ ]` or spaces; how to `tp-agent request` a skill, tool or context; and
-   `tp-agent message TASK --text TEXT` to reply to a question from Main plus `tools/agent/test-run.sh` to run and record a check.
-2. One line per entry listed for the worker's role.
-3. `Prior result: PATH; review report: PATH` only when the task continues an earlier one: the parent's `result.md`, and
-   `report.md` of the newest review in the parent's `meta.json` (`reviews`, or `review`), or of its nearest retry ancestor.
-   A file that does not exist is not named. This needs the caller to pass `--state-dir DIR --parent ID`
-   (`python3 lib/preamble.py WORKDIR ROLE SOURCE --state-dir DIR --parent ID`).
+One line per entry listed for the worker's role, and nothing else; with no entry for the role there is no block. The
+standing rules every worker needs (scope, the read/search rule, permission prompts, report and RESULT_STATUS,
+`tp-agent request`, `tools/agent/test-run.sh`) are not here: they are the worker contract, `agent/contract/worker.md`,
+which every worker gets on every route, manifest or not.
+
+Known portability limit: `safe_grep` uses `rg` and skips `.git` and gitignored files; on a machine without `rg` its
+fallback grep does not exclude `.git` or gitignored files.
+
+## The worker's system prompt
+
+`python3 lib/preamble.py WORKDIR ROLE SOURCE --harness pi|claude [--state-dir DIR --parent ID]` prints what tp-spawn
+puts in the worker's system prompt, in this order:
+
+1. `# Worker Contract`: `agent/contract/worker.md` (first line `contract: worker vN`, at most 20 lines), with its tool
+   names filled from `HARNESS_TOOLS` in `lib/preamble.py` for the harness.
+2. `# Repository Instructions`: the project's `worker-preamble.md` and the role's section, when there is one.
+3. `# Project Tools`: the block above, when the manifest lists an entry for the role.
+4. `# Prior Task`: `Prior result: PATH; review report: PATH` only when the task continues an earlier one (`--parent`):
+   the parent's `result.md`, and `report.md` of the newest review in the parent's `meta.json` (`reviews`, or `review`),
+   or of its nearest retry ancestor. A file that does not exist is not named. Manifest or not.
+
+tp-spawn then adds the machine's prompt for the model (`config/local.json` `prompts`), if any.
 
 ## Airtera
 

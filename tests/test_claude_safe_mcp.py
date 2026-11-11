@@ -60,6 +60,14 @@ class SafeMcpTests(unittest.TestCase):
         self.assertTrue(tools["reveal"]["_meta"]["anthropic/requiresUserInteraction"])
         self.assertNotIn("_meta", tools["safe_read"])
         self.assertNotIn("_meta", tools["safe_grep"])
+        # The rendered descriptions carry the worker contract's rule with this harness's names (tests/test_pi_safe_tools.py
+        # checks the template is the pi extension's too).
+        self.assertIn("Use this or the Read tool on an exact path", tools["safe_read"]["description"])
+        # The same rule as the contract's (agent/contract/worker.md): a shell grep or rg only on exact, non-sensitive paths.
+        self.assertIn("Use grep or rg through Bash only on exact paths in the working tree that are known not to be sensitive "
+                      "(no .env files, keys or credentials, nothing under agent/, config/ or claude/)", tools["safe_grep"]["description"])
+        self.assertNotIn("every content search", tools["safe_grep"]["description"])
+        self.assertIn("over 4000000 bytes", tools["safe_read"]["description"])
 
     def test_safe_read_returns_placeholders_for_a_file_the_normal_read_refuses(self):
         (text, error), = self.rpc(("safe_read", {"path": str(self.prod)}))

@@ -13,7 +13,8 @@ import sys
 ROOT = Path(__file__).resolve().parent.parent
 MODEL = "openai/gpt-6.1-sol"
 WAITING = '{"state":"waiting"}'
-_SAFE_SEARCH_RULE = ("# Searching and Reading Files\n\nSearch file contents with {grep} (pattern, path). Read a file with {read} or "
+# SG1's read/search rule, word for word; it reaches every worker inside the worker contract (agent/contract/worker.md).
+_SAFE_SEARCH_RULE = ("Search file contents with {grep} (pattern, path). Read a file with {read} or "
                      "{tool} on an exact path. Use grep, rg, cat, head, tail or sed -n through {shell} only on exact paths in "
                      "the working tree that are known not to be sensitive (no .env files, keys or credentials, nothing under "
                      "agent/, config/ or claude/): in a worker task a shell search or read that may reach a sensitive file is "
@@ -24,7 +25,9 @@ SAFE_SEARCH_RULE_CLAUDE = _SAFE_SEARCH_RULE.format(grep="mcp__tmux-pi-safe__safe
 sys.path.insert(0, str(ROOT / "lib"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from fake_tools import fake_tmux  # noqa: E402
+import preamble  # noqa: E402
 from sensitive_read import classify, hook_response
+CONTRACT = {harness: preamble.contract(harness) for harness in ("pi", "claude")}
 from session_env import isolate_session, outside_session  # noqa: E402
 
 
@@ -98,7 +101,9 @@ esac
         task = self.task_dir(item)
         packet = self.packet(item)
         self.assertIn("# Coder", packet)
-        self.assertIn("RESULT_STATUS", packet)
+        # The RESULT_STATUS rule is the contract's, in the system prompt; the pi packet does not repeat it.
+        self.assertIn("RESULT_STATUS: complete|empty|blocked|incomplete", self.system_prompt(item))
+        self.assertNotIn("RESULT_STATUS", packet)
         self.assertEqual(json.loads((task / "meta.json").read_text())["deliverable"], "Report paths and checks")
         self.settle(item, "RESULT_STATUS: complete\nVerified one path.\n")
         collected = self.cli("collect", item["id"])
@@ -148,13 +153,12 @@ esac
         a = self.system_prompt(self.dispatch(role="coder", task="Fix the parser"))
         b = self.system_prompt(self.dispatch(role="tester", task="Check the importer", tests="full"))
         c = self.system_prompt(self.dispatch(role="researcher", task="Survey options"))
-        head = "# Repository Instructions\n\n" + general
+        head = CONTRACT["pi"] + "\n\n# Repository Instructions\n\n" + general   # the contract first, then the repository's text
         for prompt in (a, b, c):
             self.assertTrue(prompt.startswith(head), prompt)
-        self.assertTrue(a.startswith(head + "\n\nCoder-only rule."))
-        self.assertTrue(b.startswith(head + "\n\nTester-only rule."))
-        self.assertEqual(c, head + "\n\n" + SAFE_SEARCH_RULE_PI)  # no role section: the standing search rule follows the general part
-        self.assertTrue(a.endswith("Coder-only rule.\n\n" + SAFE_SEARCH_RULE_PI), a)
+        self.assertEqual(a, head + "\n\nCoder-only rule.")
+        self.assertEqual(b, head + "\n\nTester-only rule.")
+        self.assertEqual(c, head)  # no role section
         # nothing per task inside the prompt
         for prompt in (a, b, c):
             for word in ("Fix the parser", "Check the importer", "coder-", "tester-", "researcher-", str(self.project), "20"):
@@ -172,8 +176,12 @@ esac
         self.assertIn("Global rule.", text)
         self.assertIn("Reviewer-only rule.", text)
         self.assertNotIn("Coder-only rule.", text)
-        self.assertNotIn("# Worker Role", (reviews[0] / "packet.md").read_text().split("# Context")[0])  # the preamble role does not load role instructions
-        self.assertNotIn("Global rule.", (reviews[0] / "packet.md").read_text().split("# Context")[0])
+        head = (reviews[0] / "packet.md").read_text().split("# Context")[0]
+        # The reviewer gets its role's method (agent/roles/code-reviewer.md) like any role, while meta.json records no role:
+        # the autonomy gate admits a review start only without one (lib/autonomy.py).
+        self.assertEqual(head.count("# Worker Role\n\n# Code reviewer\n"), 1)
+        self.assertNotIn("role", json.loads((reviews[0] / "meta.json").read_text()))
+        self.assertNotIn("Global rule.", head)
 
     def test_dispatch_without_workdir_validates_the_main_pane_workdir(self):
         fake = self.root / "bin2"
@@ -450,29 +458,81 @@ esac
                                       "route_info", "deliverable", "parent", "after", "context", "notes", "tests",
                                       "queue_reason"})
 
-    def test_missing_preamble_adds_only_the_search_rule(self):
+    def test_missing_preamble_adds_only_the_worker_contract(self):
         item = self.dispatch()
         self.assertNotIn("Repository Instructions", self.packet(item))
-        # Every worker gets the standing search rule, with or without a preamble or a tools manifest, through the system prompt.
-        self.assertEqual(self.system_prompt(item), SAFE_SEARCH_RULE_PI)
+        # Every worker gets the contract, with or without a preamble or a tools manifest, through the system prompt.
+        self.assertEqual(self.system_prompt(item), CONTRACT["pi"])
         self.assertIn("--append-system-prompt", (self.task_dir(item) / "run.sh").read_text())
-        self.assertNotIn("Searching and Reading Files", self.packet(item))
+        self.assertNotIn("contract: worker", self.packet(item))
 
-    def test_search_rule_names_each_harness_tools(self):
-        for worker, model, rule in (("pi", MODEL, SAFE_SEARCH_RULE_PI), ("claude", "sonnet", SAFE_SEARCH_RULE_CLAUDE)):
-            with self.subTest(worker):
-                spawned = subprocess.run([str(ROOT / "bin/tp-spawn"), "--worker", worker, "--model", model, "--workdir",
-                                          str(self.project), "--", "t"], env=self.env, text=True, capture_output=True)
-                self.assertEqual(spawned.returncode, 0, spawned.stderr)
-                prompt = self.system_prompt(self.state / "tasks" / spawned.stdout.strip())
-                self.assertTrue(prompt.startswith(rule), prompt)
-                self.assertNotIn("grep -rn", prompt)
-        self.assertNotIn("mcp__", SAFE_SEARCH_RULE_PI)
+    def test_every_route_delivers_the_contract_once_with_its_harness_tools(self):
+        # The delivery table (HB2a). Each row is a launch route that reaches a distinct tp-spawn input: dispatch (--role),
+        # retry and a retry of a retry (--parent: the prior-task block), review (--preamble-role, no role in meta), a direct
+        # claude start with a manifest. The routes not driven here (lane step, -k contract task, investigate, trial, bench)
+        # pass the same tp-spawn path; test_no_launcher_starts_a_harness_without_tp_spawn guards that.
+        (self.state / "agent-tools.json").write_text(json.dumps([
+            {"name": "demo", "path": "$TP_ROOT/tools/agent/lane-info.sh", "roles": ["coder", "code-reviewer"], "use": "orient",
+             "usage": "WORKTREE", "output": "a summary"}]))
+        first = self.dispatch()
+        self.settle(first, "RESULT_STATUS: complete\nDone.\n")
+        second = self.retry(first)
+        self.settle(second, "RESULT_STATUS: complete\nDone.\n")
+        third = self.retry(second)
+        self.settle(third, "RESULT_STATUS: complete\nDone.\n")
+        review = self.raw("review", third["id"], "--force")
+        self.assertEqual(review.returncode, 0, review.stderr)
+        reviewer = next(d for d in (self.state / "tasks").iterdir() if (d / "review-of").exists())
+        (self.state / "agent-tools.json").unlink()
+        spawned = subprocess.run([str(ROOT / "bin/tp-spawn"), "--worker", "claude", "--model", "sonnet", "--workdir", str(self.project),
+                                  "--preamble-role", "code-reviewer", "--", "t"], env=self.env, text=True, capture_output=True)
+        self.assertEqual(spawned.returncode, 0, spawned.stderr)
+        rows = (("dispatch", self.task_dir(first), "pi", "# Coder", True, False),
+                ("retry", self.task_dir(second), "pi", "# Coder", True, True),
+                ("retry of a retry", self.task_dir(third), "pi", "# Coder", True, True),
+                ("review", reviewer, json.loads((reviewer / "meta.json").read_text())["worker"], "# Code reviewer", True, False),
+                ("claude, no manifest", self.state / "tasks" / spawned.stdout.strip(), "claude", "# Code reviewer", False, False))
+        for name, task, harness, role, tools, prior in rows:
+            with self.subTest(row=name):
+                prompt, packet = self.system_prompt(task), (task / "packet.md").read_text().split("# Context")[0]
+                self.assertTrue(prompt.startswith(CONTRACT[harness]), f"{name}: the prompt does not open with the {harness} contract")
+                self.assertEqual((prompt + packet).count("contract: worker v1"), 1, f"{name}: the contract is not there once")
+                self.assertIn(SAFE_SEARCH_RULE_PI if harness == "pi" else SAFE_SEARCH_RULE_CLAUDE, prompt, name)
+                self.assertNotRegex(prompt + packet, r"grep -rn|\brg -|\brg\b.*recursive", name)
+                # Each directive is given once: the packet states the report path as a fact and leaves the rules (where the
+                # report goes, the RESULT_STATUS line) to the contract.
+                self.assertEqual(packet.count("report.md"), 1, f"{name}: the report path is stated once")
+                for directive in ("Put durable findings", "write it to", "end every final reply"):
+                    self.assertNotIn(directive, packet, f"{name}: {directive!r} repeats the contract")
+                self.assertEqual(prompt.count("RESULT_STATUS: complete|empty|blocked|incomplete"), 1, name)
+                if name != "review":   # a review task places the line (after its verdict), as the contract allows
+                    self.assertNotIn("RESULT_STATUS: complete|empty|blocked|incomplete", packet, name)
+                self.assertEqual(packet.count("# Worker Role\n\n" + role + "\n"), 1, f"{name}: role text")
+                self.assertEqual(packet.count("\n# Return\n"), 1, f"{name}: Return block")
+                self.assertEqual("# Project Tools\n\n- demo: " in prompt, tools, f"{name}: Project Tools block")
+                self.assertEqual("# Prior Task\n\nPrior result: " in prompt, prior, f"{name}: prior task block")
+        self.assertIn(str(self.task_dir(second) / "result.md"), self.system_prompt(self.task_dir(third)))   # the nearest parent
 
-    def test_coder_role_searches_through_safe_grep(self):
-        text = (ROOT / "agent/roles/coder.md").read_text()
-        self.assertNotIn("grep -rn", text)
-        self.assertIn("safe_grep", text)
+    def test_no_launcher_starts_a_harness_without_tp_spawn(self):
+        # Every route reaches the contract only through bin/tp-spawn; a launcher that ran a harness itself would skip it.
+        known = {"bin/tp-spawn": "every worker", "bin/tp-main": "Main itself (HB2 step b)",
+                 "bin/tp-claude-bootstrap": "the owner's folder-trust start", "tools/qual/summarize_meaning.py": "a text summary, no task",
+                 "tools/qual/summarize_run.py": "a text summary, no task",
+                 "agent/extensions/assistant.ts": "ask_local, a read-only helper with its own prompt and no task (HB2 step b)"}
+        forms = [form for h in ("tp-pi", "tp-claude") for form in (f'bin/{h}"', f'"bin" / "{h}"', f'bin("{h}")')]
+        files = [p for d in ("bin", "lib", "tools/qual", "tools/agent", "agent/extensions", "claude/mcp")
+                 for p in (ROOT / d).iterdir() if p.is_file() and (d in ("bin", "tools/qual", "tools/agent") or p.suffix in (".py", ".ts", ".mjs"))]
+        starters = sorted(str(p.relative_to(ROOT)) for p in files
+                          if any(form in line for line in p.read_text(errors="replace").splitlines()
+                                 if not line.lstrip().startswith("#") for form in forms))
+        self.assertEqual(sorted(set(starters) - set(known)), [], "a launcher starts a harness without tp-spawn")
+
+    def test_role_files_hold_method_and_name_no_harness_tool(self):
+        # Tool names come from lib/preamble.py HARNESS_TOOLS through the contract; a role names none.
+        for role in (ROOT / "agent/roles").glob("*.md"):
+            text = role.read_text()
+            for word in ("grep -rn", "safe_grep", "safe_read", "mcp__", "RESULT_STATUS", "tp-agent request"):
+                self.assertNotIn(word, text, f"{role.name}: {word}")
 
     def test_unusable_preamble_refuses_at_dispatch_and_spawn(self):
         for label, content in (("oversize", "x" * 8001), ("unknown role", "## Role: wizard\nHi\n"),

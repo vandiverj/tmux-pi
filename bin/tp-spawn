@@ -64,15 +64,16 @@
 #   --worker-env KEY=VAL     export KEY=VAL in the worker's run.sh (the worker's window does not inherit the caller's
 #                            environment); repeatable. Only TP_DOCS_TOOLS, TP_TRIAL_ID and LANE_BASE are accepted, once each, and a value
 #                            has no line break. Without the flag run.sh is exactly what it was before the flag existed
-#   --preamble-role <role>   pick the preamble section of this role without loading the role's
-#                            instructions (tp-review passes the reviewer's); default is --role
+#   --preamble-role <role>   deliver this role's preamble section and its agent/roles text (# Worker Role) without making it
+#                            the task's role in meta.json (tp-review passes the reviewer's); default is --role
 #   --review-of <task>       this start is the independent review of that finished task (tp-review passes it, with --preamble-role
 #                            code-reviewer and the author's lane tags). Only while autonomy is on and recovery is pending does it
 #                            matter: lib/autonomy.py then admits no other start, and this one only when the task exists in this
 #                            run with a reply and a settled state and the call has no --role or --deliverable
 #
-# If <workdir>/.tmux-pi/worker-preamble.md exists, its text (and the section for the
-# worker's role) is appended to the worker's system prompt (not the packet; a copy is kept as system-prompt.md in the task dir); see lib/preamble.py. An unusable file refuses.
+# Every worker's system prompt starts with the worker contract (agent/contract/worker.md, tool names for the harness). If
+# <workdir>/.tmux-pi/worker-preamble.md exists, its text (and the section for the worker's role) follows it (not the packet; a
+# copy is kept as system-prompt.md in the task dir); see lib/preamble.py. An unusable file refuses.
 #
 # The worker's first message is packet.md: the task, then the selected files and
 # notes. Workers load no context files (AGENTS.md, CLAUDE.md), so the packet is
@@ -427,7 +428,7 @@ read_context() {
 }
 
 if [[ "$check" == 1 ]]; then
-  python3 "$ROOT/lib/preamble.py" "$workdir" "${preamble_role:-$role}" "$preamble_from" >/dev/null || exit 1
+  python3 "$ROOT/lib/preamble.py" "$workdir" "${preamble_role:-$role}" "$preamble_from" --harness "$worker" >/dev/null || exit 1
   screen_contexts
   for spec in ${contexts[@]+"${contexts[@]}"}; do read_context "$spec" || true; done
   printf '%s\n' "$workdir"
@@ -528,24 +529,26 @@ if [[ -n "$tests" ]]; then
   esac
   packet+=$'\n'
 fi
-# The repository preamble goes to the worker's system prompt, not the packet (see below), so it sits ahead of
-# everything per-task and its bytes stay the same across tasks. Validated here, before anything is created.
-# With a parent task, lib/preamble.py adds the prior task's result and review line to the Tools block (see lib/agent_tools.py).
-preamble_args=()
+# The worker contract and the repository preamble go to the worker's system prompt, not the packet (see below), so they sit
+# ahead of everything per-task and their bytes stay the same across tasks. Validated here, before anything is created.
+# With a parent task, lib/preamble.py adds the prior task's result and review line as a last block (see lib/agent_tools.py).
+preamble_args=(--harness "$worker")
 if [[ -n "$parent" ]]; then
-  preamble_args=(--state-dir "$state_dir" --parent "$parent")
+  preamble_args+=(--state-dir "$state_dir" --parent "$parent")
 fi
-preamble="$(python3 "$ROOT/lib/preamble.py" "$workdir" "${preamble_role:-$role}" "$preamble_from" ${preamble_args[@]+"${preamble_args[@]}"})" || exit 1
+preamble="$(python3 "$ROOT/lib/preamble.py" "$workdir" "${preamble_role:-$role}" "$preamble_from" "${preamble_args[@]}")" || exit 1
 packet+=$'\n\n# Local Task Artifacts\n\n'
 if [[ "$worker" == claude ]]; then  # claude/plugins/tmux-pi/hooks/report.sh keeps a report by its RESULT_STATUS line
-  packet+="Task directory: $task_dir. Put durable findings in this directory and return their paths. The directory is local and not part of the project source tree. If you write a report, write it to $task_dir/report.md: your final reply is saved as result.md, and a later reply replaces it only when it holds a RESULT_STATUS line, so end every final reply with one, whoever asked for it. A reply without one, and each result.md that is replaced, is kept under $task_dir/results/. report.md is kept and the main agent is shown its path and size."
+  packet+="Task directory: $task_dir (local, not part of the project source tree); the report path is $task_dir/report.md, which is kept and shown to the main agent with its size. Your final reply is saved as result.md; a later reply replaces it only when it holds a RESULT_STATUS line, and a reply without one, like each result.md that is replaced, is kept under $task_dir/results/."
 else
-  packet+="Task directory: $task_dir. Put durable findings in this directory and return their paths. The directory is local and not part of the project source tree. If you write a report, write it to $task_dir/report.md: your final reply is saved as result.md and replaces any earlier result.md, but report.md is kept and the main agent is shown its path and size."
+  packet+="Task directory: $task_dir (local, not part of the project source tree); the report path is $task_dir/report.md, which is kept and shown to the main agent with its size. Your final reply is saved as result.md and replaces any earlier result.md."
 fi
 packet+=$'\n'
-if [[ -n "$role" ]]; then
+# The role's method; a review (tp-review) names its role with --preamble-role only, so meta.json records no role for it.
+role_text="${role:-$preamble_role}"
+if [[ -n "$role_text" && -f "$ROOT/agent/roles/$role_text.md" ]]; then
   packet+=$'\n\n# Worker Role\n\n'
-  packet+="$(cat "$ROOT/agent/roles/$role.md")"
+  packet+="$(cat "$ROOT/agent/roles/$role_text.md")"
   packet+=$'\n'
 fi
 if [[ -n "$deliverable" ]]; then
@@ -554,9 +557,7 @@ if [[ -n "$deliverable" ]]; then
   packet+=$'\n'
 fi
 packet+=$'\n\n# Return\n\n'
-packet+="Begin with one short sentence stating the assignment you understood, unless the task specifies the exact first lines of the reply (then follow it). In your final reply state RESULT_STATUS: complete|empty|blocked|incomplete, then summarize evidence, artifact paths, verification, and remaining uncertainty. Do not claim completion without evidence. Do not leave background shells or log watchers running after your final reply: each one that finishes starts another turn, and its short reply can bury your report."
-packet+=$'\n\n'
-packet+="If you need a task-relevant skill, tool, or context that is unavailable, use tp-agent request --kind skill|tool|context --what DESCRIPTION --reason REASON. The main agent can answer through the task message channel. A request does not itself grant access."
+packet+="Begin with one short sentence stating the assignment you understood, unless the task specifies the exact first lines of the reply (then follow it). In your final reply summarize evidence, artifact paths, verification, and remaining uncertainty. Do not leave background shells or log watchers running after your final reply: each one that finishes starts another turn, and its short reply can bury your report."
 packet+=$'\n\n'
 packet+="If you see a test fail that you believe is not caused by your change, do not edit or skip the test. Report it in a block that starts with a line FAILING_TESTS: then, for each test, lines '- test: NAME', '  command: THE EXACT COMMAND', '  unmodified_base: yes, with the evidence, or not checked' (yes only if you reproduced the failure on an unmodified checkout in this run). The main agent sends an investigator; your belief that the failure predates your change is not taken as the answer. When no test fails that you do not own, leave the block out entirely; do not write FAILING_TESTS: none."
 # Classify only the main-owned worker task, never conversation/context documents.
@@ -736,21 +737,11 @@ else
   esac
 fi
 # Standing instructions go in the system prompt, which both harnesses accept as --append-system-prompt (one
-# flag, one value, so no harness has to merge repeats). Order is fixed and holds nothing per task, so a prompt
-# cache can reuse it: the repository's general preamble, then the worker's role section, then the machine's
-# instruction for this model (config/local.json "prompts", for a mistake the model is known to make).
-system_prompt=""
-if [[ -n "$preamble" ]]; then
-  system_prompt="# Repository Instructions"$'\n\n'"$preamble"
-fi
-# Every worker, with or without a preamble or tools manifest: search and read through the safe tools. A shell search or read
-# that would ask for a sensitive read is refused in a worker task (lib/sensitive_read.py safe_route), so it would only fail.
-if [[ "$worker" == pi ]]; then
-  safe_grep=safe_grep safe_read=safe_read read_tool="the read tool" shell=bash
-else
-  safe_grep=mcp__tmux-pi-safe__safe_grep safe_read=mcp__tmux-pi-safe__safe_read read_tool="the Read tool" shell=Bash
-fi
-system_prompt+="${system_prompt:+$'\n\n'}# Searching and Reading Files"$'\n\n'"Search file contents with $safe_grep (pattern, path). Read a file with $safe_read or $read_tool on an exact path. Use grep, rg, cat, head, tail or sed -n through $shell only on exact paths in the working tree that are known not to be sensitive (no .env files, keys or credentials, nothing under agent/, config/ or claude/): in a worker task a shell search or read that may reach a sensitive file is refused."
+# flag, one value, so no harness has to merge repeats). Order is fixed, so a prompt cache can reuse its head: the worker
+# contract for this harness (every route, every worker), the repository's preamble and role section, its Project Tools
+# block, the prior task line (a continued task only), then the machine's instruction for this model (config/local.json
+# "prompts", for a mistake the model is known to make). lib/preamble.py system_text renders all but the last.
+system_prompt="$preamble"
 if [[ -n "$model" ]]; then
   prompt="$(python3 - "$ROOT" "$model" <<'EOF'
 import sys

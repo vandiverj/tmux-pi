@@ -17,6 +17,24 @@ const MAX_FILE = 4_000_000;
 const MAX_CHARS = 200_000;
 const PLACEHOLDER = /^<REDACTED:[a-z0-9_]+>$/;
 const ph = (name) => `<REDACTED:${name}>`;
+// The tool descriptions state the read/search rule of agent/contract/worker.md in the same words as
+// agent/extensions/safe.ts; only READ and SHELL name this harness's tools (tests/test_pi_safe_tools.py compares the two
+// templates). CLAUDE_ONLY is the one harness-only sentence: pi has no hook that restores placeholders in a write.
+const READ = "the Read tool";
+const SHELL = "Bash";
+const SAFE_READ_HELP =
+  `Read a file with secrets replaced by ${ph("kind_n")} placeholders. Use this or ${READ} on an exact path; use this one for ` +
+  "files outside the working tree and files that may hold secrets (.env*, keys, credentials such as ~/.aws/credentials): it " +
+  `needs no permission prompt. Refuses a directory, a binary file or a file over ${MAX_FILE} bytes; output is clipped at ` +
+  `${MAX_CHARS} characters. Placeholders never reveal the value.`;
+const SAFE_GREP_HELP =
+  `Search file contents (regular expression) with secrets replaced by ${ph("kind_n")} placeholders. Use this to search, in the ` +
+  `working tree or outside it: it needs no permission prompt. Use grep or rg through ${SHELL} only on exact paths in the ` +
+  "working tree that are known not to be sensitive (no .env files, keys or credentials, nothing under agent/, config/ or claude/). Searches " +
+  "hidden files such as .env* (never .git; files ignored by .gitignore only with include_ignored); returns up to max_lines " +
+  "lines of path:line:text, each cut at 400 characters.";
+const CLAUDE_ONLY =
+  " Placeholders can be used in commands and in Write content or Edit new_string for the same file (never in Edit old_string).";
 
 const run = (cmd, args, input) =>
   new Promise((done) => {
@@ -49,10 +67,7 @@ const unchanged = (name, real) => {
 
 const TOOLS = {
   safe_read: {
-    description:
-      `Read a file with secrets replaced by ${ph("kind_n")} placeholders. Use this for credential files and env files that the ` +
-      "normal Read tool refuses (production/staging env files, ~/.aws/credentials, keys). Placeholders can be used in commands " +
-      "and in Write content or Edit new_string for the same file (never in Edit old_string); they never reveal the value.",
+    description: SAFE_READ_HELP + CLAUDE_ONLY,
     schema: {
       type: "object", required: ["path"],
       properties: { path: str("File to read"), offset: { type: "number", description: "First line, 1-based (default 1)" }, limit: { type: "number", description: "Max lines (default 2000)" } },
@@ -76,9 +91,7 @@ const TOOLS = {
     },
   },
   safe_grep: {
-    description:
-      `Search file contents (regular expression) with secrets replaced by ${ph("kind_n")} placeholders. Includes hidden files such ` +
-      "as .env*, so it can search what the normal Grep refuses. Returns path:line:text.",
+    description: SAFE_GREP_HELP,
     schema: {
       type: "object", required: ["pattern"],
       properties: {

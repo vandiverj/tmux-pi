@@ -39,12 +39,14 @@ SESSION_VARS = ("TMUX", "TMUX_PANE", "TP_TASK_ID", "TP_TASK_DIR", "TP_MAIN_ID", 
 FILE = "G3_SMOKE.md"
 # The permission prompt: one Bash command whose ask is decided by code (lib/redact_hook.py in redaction "on"; lib/sensitive_read.py in
 # "shadow" and "off"), not by the model. It is harmless when accepted, by construction and whatever exists on disk or in the environment:
-# it runs only the no-op builtin `:` and `exit`. `:` opens nothing and prints nothing; the two operands are only text for the hooks to
-# match (a dotenv-shaped name, and a secret-shaped variable name in single quotes, so the shell does not even expand it). The `exit` keeps
-# the redaction hook from wrapping the command, which is what makes it ask. Built from pieces so this file names no credential.
+# it runs only the builtins `test -e`, `:` and `exit`. `test -e` only checks that a dotenv-shaped name exists (it opens nothing and prints
+# nothing); `:` gets a secret-shaped variable name in single quotes, so the shell does not even expand it. The `exit` keeps the redaction
+# hook from wrapping the command, which is what makes it ask in "on". It asks a worker too (sg1): checking that a file exists names the file
+# without reading it (sensitive_read.NAMES_ONLY), so it is not refused as a shell read, as `: ./.env...` alone is. Built from pieces so
+# this file names no credential.
 ABSENT = "." + "env." + "g3-smoke-absent"
 SECRET_VAR = "G3_SMOKE_" + "API_" + "TOKEN"
-PROMPT_COMMAND = f": ./{ABSENT} '${SECRET_VAR}'; exit 3"
+PROMPT_COMMAND = f"test -e ./{ABSENT}; : '${SECRET_VAR}'; exit 3"
 STEP_ID = "s1"
 # No branch name or worktree path is written in this file: the integration branch (the run's scratch branch), the lane branch prefix and the
 # worktree pattern are the repository's own lane config (<repo>/.tmux-pi/lanes.json, defaults when absent), computed by the lane tools' own
@@ -525,7 +527,7 @@ class Smoke:
                 f"newline. Change nothing else, do not commit, and finish with RESULT_STATUS: complete.")
         self.facts["task"] = task
         first_task = (f"Before anything else, run exactly this one Bash command, unchanged, once: {PROMPT_COMMAND}\n"
-                      f"(it is a no-op that opens no file and prints nothing; its only effect is that the owner may be asked to confirm it, and if "
+                      f"(it only checks whether a file exists, opens no file and prints nothing; its only effect is that the owner may be asked to confirm it, and if "
                       f"the owner declines, stop and wait for instructions). Then: {task}")
         try:
             item = self.agent_json("dispatch", "--role", "coder", "--lane", self.name, "--step", STEP_ID, "--repo", self.repo,

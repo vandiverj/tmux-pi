@@ -152,7 +152,9 @@ class DeclineOrderTest(Base):
 
 
 class HookTriggerTest(Base):
-    """F1: the prompt trigger asks in every redaction mode a worker can run in, decided by the real hooks, and reads nothing."""
+    """F1: the prompt trigger asks in every redaction mode a worker can run in, decided by the real hooks, and reads nothing. Under sg1 a
+    worker's shell read of a sensitive name is refused, not asked; the trigger names the file only in an existence check (NAMES_ONLY), so
+    it still asks, and the refusal of the older trigger is checked beside it."""
 
     @classmethod
     def setUpClass(cls):
@@ -183,6 +185,10 @@ class HookTriggerTest(Base):
     def decide(self, hook, event):
         """The decision of one real hook entry point for one event: (permissionDecision or None). `redact`: lib/redact_hook.handle (what
         bin/tp-redact --claude-hook runs); `sensitive`: bin/tp-sensitive-read main() with the arguments hooks/sensitive-read.sh passes."""
+        return self.output(hook, event).get("permissionDecision")
+
+    def output(self, hook, event):
+        """The hookSpecificOutput of that hook for that event ({} when it prints none)."""
         if hook == "redact":
             output = self.redact_hook.handle(event)
         else:
@@ -191,14 +197,14 @@ class HookTriggerTest(Base):
                     mock.patch.object(sys, "stdin", io.StringIO(json.dumps(event))), contextlib.redirect_stdout(out):
                 self.sensitive.main()
             output = json.loads(out.getvalue()) if out.getvalue().strip() else None
-        return ((output or {}).get("hookSpecificOutput") or {}).get("permissionDecision")
+        return (output or {}).get("hookSpecificOutput") or {}
 
     def request(self):
         return json.loads((self.task / "permission-request.json").read_text())
 
-    def test_the_trigger_is_only_noop_builtins_with_operands(self):
-        """Harmless by construction: it parses to exactly `:` (with the two operands) and `exit 3`, joined by `;`. No other command, no
-        redirection, no substitution, no pipe or list operator."""
+    def test_the_trigger_is_only_harmless_builtins_with_operands(self):
+        """Harmless by construction: it parses to exactly `test -e <file>`, `:` (with the variable name) and `exit 3`, joined by `;`. No
+        other command, no redirection, no substitution, no pipe or list operator."""
         lex = shlex.shlex(g3.PROMPT_COMMAND, posix=True, punctuation_chars=True)
         lex.whitespace_split = True
         tokens = list(lex)
@@ -211,9 +217,10 @@ class HookTriggerTest(Base):
             else:
                 current.append(token)
         commands.append(current)
-        self.assertEqual([c[0] for c in commands], [":", "exit"], tokens)
-        self.assertEqual(commands[0][1:], [f"./{g3.ABSENT}", f"${g3.SECRET_VAR}"], "the operands are only text for the hooks to match")
-        self.assertEqual(commands[1], ["exit", "3"])
+        self.assertEqual([c[0] for c in commands], ["test", ":", "exit"], tokens)
+        self.assertEqual(commands[0][1:], ["-e", f"./{g3.ABSENT}"], "only an existence check of the dotenv-shaped name")
+        self.assertEqual(commands[1][1:], [f"${g3.SECRET_VAR}"], "the variable name is only text for the hooks to match")
+        self.assertEqual(commands[2], ["exit", "3"])
         self.assertNotIn("`", g3.PROMPT_COMMAND)
         self.assertNotIn("$(", g3.PROMPT_COMMAND)
         self.assertIn(f"'${g3.SECRET_VAR}'", g3.PROMPT_COMMAND, "single quoted: the shell does not even expand it")
@@ -242,7 +249,11 @@ class HookTriggerTest(Base):
             self.assertTrue(any("redact.sh" in c for c in commands), (event, commands))
 
     def test_the_trigger_asks_in_every_mode_then_is_denied(self):
-        for mode, asker, quiet in (("on", "redact", "sensitive"), ("shadow", "sensitive", "redact"), ("off", "sensitive", "redact")):
+        """The trigger asks a worker in every mode. The trigger before sg1 (`: ./<dotenv name>`, a shell call naming the file with no
+        non-search cause) is refused to a worker in every mode instead: deny, the reason names the safe tools, the record says `refused`
+        (no open question: the task does not need input, and a turn leaves it as it is), nothing ran. Main is still asked."""
+        modes = (("on", "redact", "sensitive"), ("shadow", "sensitive", "redact"), ("off", "sensitive", "redact"))
+        for mode, asker, quiet in modes:
             with self.subTest(mode=mode), mock.patch.dict(os.environ, self.env(mode)):
                 if (self.task / "permission-request.json").exists():
                     (self.task / "permission-request.json").unlink()
@@ -254,6 +265,29 @@ class HookTriggerTest(Base):
                 self.decide(asker, self.event("PermissionDenied"))      # the owner declined the dialog
                 self.assertEqual(self.request()["status"], "denied")
                 self.assertFalse((self.repo / g3.ABSENT).exists())
+        shell_read = {**self.event("PreToolUse"), "tool_input": {"command": f": ./{g3.ABSENT} '${g3.SECRET_VAR}'; exit 3"}}
+        for mode, asker, quiet in modes:
+            with self.subTest(mode=mode, refused="worker"), mock.patch.dict(os.environ, self.env(mode)):
+                (self.task / "permission-request.json").unlink(missing_ok=True)
+                out = self.output(asker, shell_read)
+                self.assertEqual(out.get("permissionDecision"), "deny")
+                self.assertIn("refuses this shell read in a worker task", out["permissionDecisionReason"])
+                self.assertIn("mcp__tmux-pi-safe__safe_read", out["permissionDecisionReason"], "the reason names the safe tool")
+                self.assertIsNone(self.decide(quiet, shell_read), "the other hook defers in this mode")
+                refused = self.request()
+                self.assertEqual((refused["status"], refused["call"]), ("refused", "toolu_g3hook"))
+                self.assertNotEqual(self.life(), "needs_input", "a refusal is not a question for the owner")
+                before = (self.task / "permission-request.json").read_bytes()
+                for ending in ("UserPromptSubmit", "Stop"):
+                    self.assertIsNone(self.decide("redact", self.turn(ending)))
+                    self.assertEqual((self.task / "permission-request.json").read_bytes(), before, f"{ending} leaves a refusal as it is")
+                self.assertFalse((self.repo / g3.ABSENT).exists())
+            with self.subTest(mode=mode, refused="main"), mock.patch.dict(os.environ, self.env(mode)):
+                for name in ("TP_TASK_DIR", "TP_TASK_ID"):
+                    os.environ.pop(name)
+                (self.task / "permission-request.json").unlink(missing_ok=True)
+                self.assertEqual(self.decide(asker, shell_read), "ask", "Main is still asked")
+                self.assertFalse((self.task / "permission-request.json").exists())
 
     def test_the_worker_hears_a_new_turn_in_both_hooks(self):
         """One hook settles a declined dialog in every mode: redact.sh, registered on UserPromptSubmit, Stop and SubagentStop. sensitive-read.sh is not

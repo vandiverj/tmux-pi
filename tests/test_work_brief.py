@@ -162,7 +162,7 @@ class AttackTable(Base):
         lines = text.split("\n")
         self.assertLessEqual(len(lines), work_brief.MAX_LINES, text)
         self.assertTrue(any(line.startswith("CONFLICT: ") for line in lines), text)
-        self.assertIn("more: tp-agent work records --status active", text)  # more rules than the brief shows
+        self.assertIn("more: " + work_brief.MORE["rules"], text)  # more rules than the brief shows
         for life in ("superseded", "withdrawn"):
             self.assertNotIn(f"| {life} |", text)
         self.assertEqual((counts["cells"], counts["shown"]), (110, 26))  # 4 writers x 5 scopes x 5 lifecycles + 2 old forms x 5 lifecycles
@@ -544,9 +544,9 @@ class Realistic(Base):
         index = {"active": rows, "paused": [], "unstatused": [], "pending": [], "lanes": lanes}
         with mock.patch.dict(os.environ, {"TP_WORK_DIR": self.env["TP_WORK_DIR"]}):
             text, _ = work_brief.build(self.state, str(project), False, index)
-        inputs = {"tp-agent work records --status active": rules + [pending] + provisional,
-                  "tp-agent list": [r["id"] for r in rows] + list(lanes),
-                  "tp-agent work decisions": decisions}
+        inputs = {work_brief.MORE["rules"]: rules + [pending] + provisional,
+                  work_brief.MORE["work"]: [r["id"] for r in rows] + list(lanes),
+                  work_brief.MORE["decisions"]: decisions}
         wholes = [f"project:{project.name}", ws, f"tp-agent work show {ws}", *(f"{name} working 2" for name in lanes),
                   *(f"- {r['id']} coder working" for r in rows), *rules]
         return text, inputs, wholes, rules[14:]
@@ -579,6 +579,9 @@ class Realistic(Base):
                     missing = [v for v in values if not re.search(re.escape(v) + r"(?![0-9])", text)]
                     more = [int(m.group(1)) for m in (re.fullmatch(r"- \+(\d+) more: " + re.escape(command), line) for line in lines) if m]
                     self.assertEqual(more, [len(missing)] if missing else [], f"{length}: {command}: missing {missing}\n{text}")
+                    if missing and command.startswith("tp-agent work "):  # the remedy, run, gives back every one it stands for
+                        got = str(self.ok(*command.split()[1:]))
+                        self.assertEqual([v for v in missing if not re.search(re.escape(v) + r"(?![0-9])", got)], [], f"{length}: {command}")
 
 
 if __name__ == "__main__":

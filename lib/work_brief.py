@@ -26,7 +26,8 @@ import work_index
 
 MAX_LINES = 60
 LINE_CHARS = 240
-MORE = {"rules": "tp-agent work records --status active", "work": "tp-agent list", "decisions": "tp-agent work decisions"}
+MORE = {"rules": "tp-agent work records",  # every status the rules section counts (active, pending, provisional) comes back
+         "work": "tp-agent list", "decisions": "tp-agent work decisions"}
 MAIN_SCOPES = ("global", "project", "workspace")
 NO_WORKSPACE = "no workspace attached: `tp-agent work new TITLE --repo {project} --objective TEXT && tp-agent work attach ID`"  # a Whole
 _CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")

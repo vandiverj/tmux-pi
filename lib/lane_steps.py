@@ -521,11 +521,70 @@ def _without_authorization(record, step):
 FINDING_LEAD = re.compile(r"^[ \t]{0,3}(?:(?:[-*+]|\d{1,3}[.)])[ \t]+)?(?P<heading>#{1,6}[ \t]+)?(?P<em>(?:\*\*|__|\*|_)[ \t]*)?\[?"
                           r"F(?P<n>\d{1,4})(?![A-Za-z0-9'’]|_[A-Za-z0-9])(?P<rest>.*)$")
 BARE_LEAD_REST = re.compile(r"^\]?(?:[ \t]*$|[ \t]*[—–]|[ \t]+(?:-|\*\*|__|\[|\())")
-# Any Markdown (ATX) heading, `#` to `######`, empty or not: it ends the section of the finding above it.
-ANY_HEADING = re.compile(r"^[ \t]{0,3}#{1,6}(?:[ \t]|$)")
-# A line that starts a bold lead paragraph (`**Owed before close:** ...`, `__Cause__`), or a thematic break (`---`, `***`, `___`):
-# it ends the section too (fail closed), unless it is itself a `Closes by:` or `Family:` label line (`**Closes by:** code`).
-SECTION_BREAK = re.compile(r"^[ \t]{0,3}(?:(?P<b>\*\*|__)[^ \t].*?(?P=b)|(?:-[ \t]*){3,}$|(?:\*[ \t]*){3,}$|(?:_[ \t]*){3,}$)")
+# The kinds of line in a finding's section (section_kinds). A label line: the whole stripped line is a label, optionally led by a `**`
+# or `__` wrap (`Closes by: code`, `**Closes by:** code`, `__Family:__ x`).
+LABEL_WRAP = re.compile(r"^(?:\*\*|__)[ \t]*")
+# Read on the stripped line: an ATX heading and a thematic break end a section (and interrupt a list item or quote); a list item (any
+# marker) and a `>` quote are contained.
+HEADING_OR_BREAK = re.compile(r"^(?:#{1,6}(?:[ \t]|$)|(?:-[ \t]*){3,}$|(?:\*[ \t]*){3,}$|(?:_[ \t]*){3,}$)")
+LIST_ITEM = re.compile(r"^(?:[-+*]|\d{1,9}[.)])(?:[ \t]|$)")
+LABELS = (("closes", review_verdict.CLOSES_BY), ("family", review_verdict.FAMILY))
+
+
+def label_line(line):
+    """(kind, value) when the whole stripped `line` is a `Closes by:` or `Family:` label, wrap allowed ('closes'|'family'), else None."""
+    rest = LABEL_WRAP.sub("", line.strip(), count=1)
+    for kind, pattern in LABELS:
+        match = pattern.match(rest)
+        if match:
+            return kind, (match.group(1) or match.group(2)).lower()
+    return None
+
+
+def _indent(line):
+    wide = line.expandtabs(4)
+    return len(wide) - len(wide.lstrip())
+
+
+def section_kinds(visible, leads):
+    """Per line of a reply (`visible` from family_sweep.visible_lines, None inside fenced code; `leads` the indexes of counted finding
+    leads), what it is to the finding section it is in:
+      'lead'       a counted finding lead: it starts a section;
+      'boundary'   an ATX heading, a thematic break, or a line led by `**`/`__` that is not a label line and not inside a list item
+                   or quote: it ends the section, and a label on it belongs to no finding;
+      'contained'  a list item (any marker, any indent) and its continuation lines, a `>` quote and its continuation lines, fenced
+                   code (the whole fence), a line indented 4+ columns: it stays in the section and never carries a label;
+      'label'      a label line: it belongs to the section;
+      'prose'      any other line: it stays in the section, and a label ending it counts for the section.
+    A continuation line is Markdown's lazy one (a non-blank line straight after a line of the item or quote, unless a heading or
+    thematic break interrupts it), or, for a list, a line indented 2+ columns after a blank line. A blank line ends a quote; a line
+    indented under 2 columns after a blank line ends a list. Fenced code and an indented line allow no lazy continuation, so a label
+    line right after them counts for the open section (a known limit)."""
+    kinds, block, lazy = [], None, False  # block: None, 'list' or 'quote'; lazy: the line before is text of that block
+    for index, shown in enumerate(visible):
+        stripped = "" if shown is None else shown.strip()
+        if index in leads:
+            kind, block, lazy = "lead", None, False
+        elif shown is None:
+            kind, lazy = "contained", False
+        elif not stripped:
+            kind, lazy = "prose", False
+            block = None if block == "quote" else block
+        elif _indent(shown) >= 4:
+            kind, lazy = "contained", block is not None
+        elif HEADING_OR_BREAK.match(stripped):
+            kind, block, lazy = "boundary", None, False
+        elif stripped.startswith(">"):
+            kind, block, lazy = "contained", "quote", True
+        elif LIST_ITEM.match(stripped):
+            kind, block, lazy = "contained", "list", True
+        elif block == "list" and _indent(shown) >= 2 or block is not None and lazy:
+            kind, lazy = "contained", True
+        else:
+            block, lazy = None, False
+            kind = "label" if label_line(shown) else "boundary" if stripped.startswith(("**", "__")) else "prose"
+        kinds.append(kind)
+    return kinds
 
 
 def finding_lead(line):
@@ -545,11 +604,14 @@ def stop_review(text):
 
     An approval counts as one only when assess finds it complete. In a REQUEST_CHANGES reply the findings are counted, not taken
     from the quoting splitter (family_sweep.findings stops at a Coverage or Verification heading): every line of the whole reply
-    that starts one (finding_lead) is a finding, wherever it is. A finding's section starts at its lead line and ends before the
-    next line that is any Markdown heading (ANY_HEADING, outside fenced code), a bold lead paragraph or thematic break
-    (SECTION_BREAK, unless the line is itself a label) or another finding's lead (a counted bold lead starts one), or at the end. The
-    `Closes by:` and `Family:` labels (review_verdict's label patterns, read on the lines family_sweep.visible_lines shows: outside
-    fenced code and comments, not quoted, not in a `>` quote) belong only to the section they are in. Each section must hold exactly
+    that starts one (finding_lead) is a finding, wherever it is. A finding's section starts at its lead line; every later line, up to
+    the next counted lead, is one kind (section_kinds): a label line (the whole stripped line is a `Closes by:` or `Family:` label,
+    `**`/`__` wrap allowed) belongs to the section; a boundary line (an ATX heading, a thematic break, a line led by `**` or `__`
+    that is not a label line and not inside a list item or quote) ends it, and a label on it belongs to no finding; a contained
+    line (a list item and its continuation lines, a `>` quote, fenced code, a line indented 4+ columns) stays in it and never
+    carries a label; any other line is prose, stays in it, and a label ending it counts for the section. Labels are review_verdict's
+    patterns, read on the lines family_sweep.visible_lines shows (comments blanked), never after an open backtick or double quote.
+    A label line straight after fenced code or an indented line counts for the open section (a known limit). Each section must hold exactly
     one `Closes by:` and at most one `Family:`, and one that closes by code must name its family. A label outside every section
     belongs to no finding: a `Closes by:` other than code there is an owed item (an "Owed before close" list) and is passed over; a
     `Closes by: code` or a `Family:` there is a finding with no lead line, which cannot be counted, and refuses. Refused too: a reply
@@ -580,20 +642,25 @@ def _counted_findings(text):
     if twice:
         raise ValueError(f"two findings have the id {', '.join(twice)} (lines {', '.join(str(i + 1) for i, ident in leads.items() if ident in twice)})")
     owner, sections = None, {index: {"closes": [], "family": []} for index in leads}
+    kinds = section_kinds(visible, leads)
     for index in range(1, len(raw)):
-        shown = visible[index]
-        if index in leads:
+        shown, kind_of_line = visible[index], kinds[index]
+        if kind_of_line == "lead":
             owner = index
-        elif shown is not None and (ANY_HEADING.match(shown) or SECTION_BREAK.match(shown) and not any(
-                pattern.search(shown.rstrip()) for pattern in (review_verdict.CLOSES_BY, review_verdict.FAMILY))):
+        elif kind_of_line == "boundary":
             owner = None
-        if shown is None or shown.lstrip().startswith(">"):
-            continue
-        for kind, pattern in (("closes", review_verdict.CLOSES_BY), ("family", review_verdict.FAMILY)):
-            match = pattern.search(shown.rstrip())
-            if not match or review_verdict._quoted(shown[:match.start()]):
-                continue
-            value, line = (match.group(1) or match.group(2)).lower(), index + 1
+        if kind_of_line == "contained" or shown is None:
+            continue  # a list, quote, fenced code or indented line never carries a label for any finding (nor a lead inside a fence)
+        if kind_of_line == "label":
+            labels = [label_line(shown)]
+        else:  # a lead, prose or boundary line: a label ending it, not inside a backtick or double quote
+            labels = []
+            for kind, pattern in LABELS:
+                match = pattern.search(shown.rstrip())
+                if match and not review_verdict._quoted(shown[:match.start()]):
+                    labels.append((kind, (match.group(1) or match.group(2)).lower()))
+        for kind, value in labels:
+            line = index + 1
             if owner is not None:
                 sections[owner][kind].append((value, line))
             elif kind == "family" or value == "code":

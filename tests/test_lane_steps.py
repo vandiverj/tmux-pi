@@ -1118,6 +1118,9 @@ class StopRuleTests(StepCase):
             path.write_text("F1 F3\n")
             return path.unlink
 
+        def f7_then(owed):  # the last finding in a new family with no Closes by:, then `owed` before the Owed heading
+            return LAST.replace("a third stale read.\nFamily: stale-cache\nCloses by: code\n", f"a third stale read.\nFamily: new-security\n\n{owed}\n")
+
         def another_review(text=None, life="settled"):  # a second review of the closed tree, newer than the closing one
             _, task = self.review(case["retry"], text, life=life)
             return lambda: shutil.rmtree(task)
@@ -1146,8 +1149,20 @@ class StopRuleTests(StepCase):
                 "a third stale read.\nFamily: stale-cache\nCloses by: code\n",
                 "a third stale read.\nFamily: new-security\n\n**Owed before close:** Main owes the log of the full run.\nCloses by: check\n")),
              {}, "finding F7 (line 8) has no Closes by: line", REFUSES),
+            # round 4: after a lead, a heading, a thematic break or a `**`/`__` line that is not a label ends the section, and a label on
+            # it or after it is no finding's; a list item, a quote, fenced code or an indented line and their continuation lines stay in
+            # the section and never carry a label. The review's two cases (a bold list lead with its lazy `Closes by:` line; a label
+            # ending a bold paragraph), then a quote and its lazy line, a label inside fenced code, a label ending an indented line
+            *((f"last code finding with no Closes by: above {name}", lambda owed=owed: rewrite(closing, f7_then(owed)), {},
+               "finding F7 (line 8) has no Closes by: line", REFUSES) for name, owed in (
+                ("a bold list lead", "- **rerun log:** Main owes the log of the full run.\nCloses by: check"),
+                ("a bold paragraph ending in a label", "**Owed before close:** Main owes the log of the full run. Closes by: check"),
+                ("a quote", "> Main owes the log of the full run.\nCloses by: check"),
+                ("fenced code", "```text\nmain owes the log. Closes by: check\n```"),
+                ("an indented line", "    Main owes the log of the full run. Closes by: check"))),
+            # the second is a label line in a `__` wrap (round 4: a label line may be wrapped in `**` or `__`)
             ("two Closes by: in one finding", lambda: rewrite(closing, LAST.replace("another stale read.\nFamily: stale-cache\nCloses by: code\n",
-                                                                     "another stale read.\nFamily: stale-cache\nCloses by: code\nCloses by: check\n")),
+                                                                     "another stale read.\nFamily: stale-cache\nCloses by: code\n__Closes by:__ check\n")),
              {}, "finding F3 (line 3) has 2 Closes by: lines", REFUSES),
             ("two Family: in one finding", lambda: rewrite(closing, LAST.replace("another stale read.\nFamily: stale-cache\n",
                                                                   "another stale read.\nFamily: stale-cache\nFamily: stale-cache\n")),

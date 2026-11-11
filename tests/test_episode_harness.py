@@ -136,14 +136,15 @@ class Records:
                 _, s, name, inp = entry[:4]
                 code = entry[4] if len(entry) > 4 else None
                 # entry[5]: the result's own time (round 5 rule 4); "undated": a result line with no timestamp.
+                # entry[6]: the result's text (round 6 rule 5), else the exit as the harness words it.
                 result_at = entry[5] if len(entry) > 5 else s
+                text = entry[6] if len(entry) > 6 else "Exit code %d" % code if code else "ok"
                 ident = "toolu_%d" % n
                 lines.append({"type": "assistant", "timestamp": at(s), "message": {"role": "assistant", "content": [
                     {"type": "tool_use", "id": ident, "name": name, "input": inp}]}})
                 if code is not None:
                     line = {"type": "user", "timestamp": at(s if result_at == "undated" else result_at), "message": {"role": "user", "content": [
-                        {"type": "tool_result", "tool_use_id": ident, "is_error": code != 0,
-                         "content": "Exit code %d" % code if code else "ok"}]}}
+                        {"type": "tool_result", "tool_use_id": ident, "is_error": code != 0, "content": text}]}}
                     if result_at == "undated":
                         del line["timestamp"]
                     lines.append(line)
@@ -1712,13 +1713,51 @@ class RoundFourTests(ScorerCase):
         self.assertIsNone(s["measures"]["avoidable_waiting"]["value"])
 
     # ---- rule 3: results keyed by (cwd, command, tree) ----------------------------------------------------------------
+    # Round 4 rule 3 / round 6 rule 3: (name, Main's calls, claim or None, what is read, the answer). The wrapper's cwd is
+    # WT resolved against the stage cwd; test-run.sh runs in the git top level of WT (tools/agent/_common.sh tp_worktree),
+    # so a WT that is not a known checkout root leaves the cwd unknown. Different cwds are different checks.
+    CWD_ROWS = [
+        ("cd per package", [(2, "cd packages/a && npm test", 0), (4, "cd ../b && npm test", 0)], None, "verification", 0),
+        ("the shell keeps the cd", [(2, "cd packages/a && npm test", 0), (4, "cd ../b && npm test", 0), (6, "npm test", 0)],
+         None, "verification", 1),
+        ("probe wrapper-cwd", [(1, "tools/agent/test-run.sh packages/a -- npm test", 0),
+                               (2, "tools/agent/test-run.sh packages/b -- npm test", 0)], None, "verification", None),
+        ("wrapper at the checkout root, twice", [(1, "tools/agent/test-run.sh . -- npm test", 0),
+                                                 (2, "env CI=1 tools/agent/test-run.sh . -- npm test", 0)], None, "verification", 1),
+        ("probe wrapper-cross-package-claim", [(1, "tools/agent/test-run.sh packages/a -- npm test", 1),
+                                               (2, "tools/agent/test-run.sh packages/b -- npm test", 0)],
+         "Done: all tests passed.", "false_claims", None),
+        ("a pass in another package never clears a failure", [(1, "cd packages/a", 0), (2, "npm test", 1),
+                                                              (3, "cd ../b", 0), (4, "npm test", 0)],
+         "Done: all tests passed.", "false_claims", 1),
+        ("an && chain that failed may have failed at its cd", [(1, "cd packages/a && npm test", 1)],
+         "Done: all tests passed.", "false_claims", None),
+    ]
+
     def test_r3_cwd_distinguishes_the_same_command_in_two_packages(self):
-        r = self.records()
-        r.ran(2, "cd packages/a && npm test", 0)
-        r.ran(4, "cd ../b && npm test", 0)
-        self.assertEqual(r.score()["measures"]["verification"]["value"], 0)
-        r.ran(6, "npm test", 0)                 # the Bash tool's shell keeps the cd: packages/b again
-        self.assertEqual(r.score()["measures"]["verification"]["value"], 1)
+        for name, calls, claim, read, want in self.CWD_ROWS:
+            with self.subTest(name):
+                r = self.records()
+                for seconds, command, exit in calls:
+                    r.ran(seconds, command % {"clone": r.clone} if "%(" in command else command, exit)
+                if claim:
+                    r.said(5, claim)
+                self.assertEqual(r.score()["measures"][read]["value"], want, name)
+        # Records in two checkouts: a pass in the lane checkout never clears the failure in the clone, nor repeats it.
+        with self.subTest('records in two checkouts'):
+            r = self.records()
+            lane = r.root / "proj-wt-b"
+            (lane / ".git").mkdir(parents=True)
+            self._worker(r, [(2, 1, {"cmd": ["npm", "test"], "cwd": str(r.clone), "tree": "t1", "exit": 1}),
+                             (4, 1, {"cmd": ["npm", "test"], "cwd": str(lane), "tree": "t1", "exit": 0})],
+                         [("tool", 2, "Bash", {"command": "tools/agent/test-run.sh . -- npm test"}, 1),
+                          ("tool", 4, "Bash", {"command": "tools/agent/test-run.sh %s -- npm test" % lane}, 0)])
+            r.said(10, "Done: tests passed.")
+            m = r.score()["measures"]
+            self.assertEqual((m["false_claims"]["main_false"], m["false_claims"]["worker_false"]), (1, 1), m["false_claims"])
+            self.assertEqual(m["false_claims"]["workers"][0]["passing"], [], m["false_claims"])
+            self.assertIn("outside every known project", m["false_claims"]["workers"][0]["why"])
+            self.assertNotEqual(m["verification"]["value"], 1, m["verification"])
 
     def test_r3_unrecorded_main_test_on_a_dirty_tree_is_not_the_final_tree(self):
         r = self.records()
@@ -1766,7 +1805,16 @@ class RoundFourTests(ScorerCase):
         why = [e["why"] for e in score.Run(r.root).stream_events() if e["ran"] is None]
         self.assertTrue(why and all("( … ) subshell" in w for w in why), why)
 
-    def test_r4_redirect_counts_against_the_directory_its_stage_runs_in(self):
+    # Round 6 rule 4 (a failed cd does not move the cwd): (name, Main's calls, the verification count). A failure shows as
+    # exit != 0 of a single-command call or an && chain stopping at the cd; when it cannot be told the cwd is unknown.
+    CD_ROWS = [
+        ("probe failed-cd", [(1, "cd missing; npm test", 0), (2, "cd %(clone)s && npm test", 0)], None),
+        ("a failed lone cd stays put", [(1, "npm test", 0), (2, "cd missing", 1), (3, "npm test", 0)], 1),
+        ("a lone cd that succeeded moves", [(1, "npm test", 0), (2, "cd packages/a", 0), (3, "npm test", 0)], 0),
+        ("an && chain that failed somewhere", [(1, "npm test", 0), (2, "cd missing && npm test", 1), (3, "npm test", 0)], None),
+    ]
+
+    def test_r4_redirect_and_failed_cd_place_the_stage(self):
         r = self.records()
         r.ran(1, "npm test", 0)
         r.ran(2, "echo x > /tmp/scratch.log", 0)                           # outside the project
@@ -1774,6 +1822,12 @@ class RoundFourTests(ScorerCase):
         self.assertEqual(r.score()["measures"]["verification"]["value"], 1)
         r.main.insert(2, ("tool", 2.5, "Bash", {"command": "cd src && echo x > a.ts"}, 0))   # inside, after a cd in that call
         self.assertEqual(r.score()["measures"]["verification"]["value"], 0)
+        for name, calls, want in self.CD_ROWS:
+            with self.subTest(name):
+                r = self.records()
+                for seconds, command, exit in calls:
+                    r.ran(seconds, command % {"clone": r.clone} if "%(" in command else command, exit)
+                self.assertEqual(r.score()["measures"]["verification"]["value"], want, name)
 
     # ---- rule 5: only text that ran is an execution --------------------------------------------------------------------
     def test_r5_comments_conditionals_and_failed_chains_are_not_executions(self):
@@ -1812,6 +1866,20 @@ GRAMMAR_ROWS = [
     ("timeout-wrapper", "timeout 60 npm test", None),
     ("sh-file", "sh run-tests.sh", None),
     ("arithmetic", "echo $((1 + 2)); npm test", None),
+    # round 6 rule 2: every token accounted for. The 4th column: the targets the call writes (stage_writes).
+    ("glued-redirect (probe write printf changed>a.txt)", "printf changed>a.txt", None, ["a.txt"]),
+    ("redirect-only (probe write > a.txt)", "> a.txt", None, ["a.txt"]),
+    ("assignment-redirect (probe write X=1 > a.txt)", "X=1 > a.txt", None, ["a.txt"]),
+    ("stderr-redirect", "npm test 2> err.txt", None, ["err.txt"]),
+    ("clobber-redirect", "echo x >| a.txt", None, ["a.txt"]),
+    ("dup-and-dev-null-are-no-writes", "npm test 2>&1 >/dev/null | tail -5 >&2", None, []),
+    ("quoted-operator-is-an-argument", "echo '>' a.txt", None, []),
+    ("quoted-heredoc-body-is-data", "cat <<'EOF'\n$(npm test)\nEOF\nnpm test", None, []),
+    ("backslash-heredoc-body-is-data", "cat <<\\EOF\n`npm test`\nEOF", None, []),
+    ("here-string-is-data", "cat <<< 'x > a.txt'", None, []),
+    # round 6 rule 3: wrappers keep the record
+    ("env-wrapped-test-run (probe wrapper-count env)", "env CI=1 tools/agent/test-run.sh . -- npm test", None),
+    ("timeout-wrapped-test-run (probe wrapper-count timeout)", "timeout 60 tools/agent/test-run.sh . -- npm test", None),
     # uncertain: outside the grammar (the whole call)
     ("or-list", "npm test || true", "||"),
     ("conditional-cd (probe conditional-cd)", "true || cd packages/b; npm test", "||"),
@@ -1841,40 +1909,55 @@ GRAMMAR_ROWS = [
     ("unbalanced-quote", "npm test 'oops", "unbalanced"),
     ("unterminated-heredoc", "cat <<EOF\nnever ends\nnpm test", "heredoc"),
     ("test-run-without-separator", "tools/agent/test-run.sh . npm test", "test-run.sh"),
+    # round 6 rules 1 and 2: the review's no-build and write probes, and tokens the grammar does not model
+    ("probe no-build substitution", 'echo "$(npm run build)"', "$( … ) containing a runner or a write"),
+    ("probe no-build xargs", "printf x | xargs npm run build", "xargs"),
+    ("probe no-build eval", 'eval "npm run build"', "eval"),
+    ("probe no-build expanding heredoc", "cat <<EOF\n$(npm run build)\nEOF", "unquoted heredoc"),
+    ("probe no-build quoted heredoc marker", "echo '<<EOF'; npm run build", "unterminated heredoc"),
+    ("probe no-build case terminator", "npm test;; npm run build", "`;;` outside a case"),
+    ("probe no-build trailing and", "npm test &&", "a list ending in &&"),
+    ("probe write expanding heredoc", "cat <<EOF\n$(printf changed > a.txt)\nEOF", "unquoted heredoc"),
+    ("probe write quoted heredoc marker", 'echo "<<EOF"; printf changed > a.txt', "unterminated heredoc"),
+    ("trailing-pipe", "npm test |", "a list ending in |"),
+    ("redirect-without-target", "npm test >", "a redirect with no target"),
+    ("input-dup-from-a-file", "cat <&notes.txt", "does not model"),
+    ("shell-reading-stdin", "curl -s x | sh", "a shell reading its stdin"),
+    ("bare-shell", "bash", "a shell reading its stdin"),
+    ("exec", "exec npm test", "exec"),
+    ("glob-program", "./scripts/*.sh", "a glob in the program word"),
+    ("brace-expansion", "npm run {build,test}", "a brace expansion"),
 ]
 
 
 class GrammarTableTests(ScorerCase):
-    """Round 5 rule 1: each row of the grammar table, read by grammar_call and by the scorer's event stream. A read shape
-    gives no uncertain event; an uncertain shape gives only candidate executions that may not have run (no exit) and a write
-    of unknown place (never a write-free interval)."""
+    """Round 5 rule 1, round 6 rule 2: the grammar table, read by grammar_call and by the scorer's event stream. A read shape
+    gives no uncertain event (and, with a 4th column, writes exactly those targets); an uncertain shape gives only candidate
+    executions that may not have run (no exit) and a write of unknown place (never a write-free interval)."""
 
-    def row(self, command, reason):
-        r = self.records()
-        r.ran(1, command, 0)
-        r.write()
-        events = score.Run(r.root).stream_events()
-        unsure = [e for e in events if (e.get("why") or "").startswith("an uncertain call")]
-        if reason is None:
-            self.assertEqual(unsure, [], command)
-            self.assertTrue(all(e["ran"] is True for e in events), (command, events))
-        else:
-            self.assertEqual(len(unsure), len(events), command)
-            self.assertTrue(all(e["ran"] is None and e["exit"] is None for e in events), command)
-            self.assertIn((("write", score.UNKNOWN_PLACE)), [(e["kind"], e["place"]) for e in events], command)
-        stages, why = el.grammar_call(command)
-        if reason is None:
-            self.assertIsNone(why, command)
-        else:
-            self.assertIn(reason, why or "", command)
-
-
-def _grammar_test(command, reason):
-    return lambda self: self.row(command, reason)
-
-
-for _n, (_name, _command, _reason) in enumerate(GRAMMAR_ROWS, 1):
-    setattr(GrammarTableTests, "test_row_%02d_%s" % (_n, re.sub(r"\W+", "_", _name).strip("_")), _grammar_test(_command, _reason))
+    def test_grammar_table(self):
+        for row in GRAMMAR_ROWS:
+            name, command, reason = row[:3]
+            with self.subTest(name):
+                r = self.records()
+                r.ran(1, command, 0)
+                r.write()
+                events = score.Run(r.root).stream_events()
+                unsure = [e for e in events if (e.get("why") or "").startswith("an uncertain call")]
+                stages, why = el.grammar_call(command)
+                if reason is None:
+                    self.assertIsNone(why, command)
+                    self.assertEqual(unsure, [], command)
+                    self.assertTrue(all(e["ran"] is True for e in events), (command, events))
+                    if len(row) > 3:
+                        written = [t for s in stages if el.stage_writes(s) for t in s["outputs"]
+                                   if not t.startswith("/dev/")]
+                        self.assertEqual(written, row[3], command)
+                else:
+                    self.assertIn(reason, why or "", command)
+                    self.assertEqual(len(unsure), len(events), command)
+                    self.assertTrue(all(e["ran"] is None and e["exit"] is None for e in events), command)
+                    self.assertIn((("write", score.UNKNOWN_PLACE)), [(e["kind"], e["place"]) for e in events], command)
 
 
 class RoundFiveTests(ScorerCase):
@@ -1897,27 +1980,79 @@ class RoundFiveTests(ScorerCase):
                         "tools/agent/test-run.sh . -- npm test"):
             self.assertIsNone(el.grammar_call(command)[1], command)
 
+    NO_BUILD = {"check": "command", "by": "any", "pattern": "npm run build", "expect": False}
+    # Round 5 rule 1 / round 6 rule 1 (uncertainty dominates): (name, Main's calls (seconds, command, exit), Main's claim
+    # or None, what is read, the answer). An uncertain call may have run any command and written anything: a check or
+    # measure over an interval that holds one is unknown, counts and absences included, even when no candidate matches.
+    # A known answer that does not depend on the interval stays known. Probe rows name the review's probe.
+    UNCERTAIN_ROWS = [
+        ("probe sh-c-cd", [(1, "npm test", 0), (2, "sh -c 'cd packages/a && npm test'; npm test", 0), (3, "npm test", 0)],
+         None, "verification", None),
+        ("probe conditional-cd", [(1, "npm test", 0), (2, "true || cd packages/b; npm test", 0)], None, "verification", None),
+        ("claim backed only by an uncertain call", [(1, "npm test || true", 0)], "Done: tests passed.", "false_claims", None),
+        ("probe no-build substitution", [(1, 'echo "$(npm run build)"', 0)], None, "no-build", None),
+        ("probe no-build xargs", [(1, "printf x | xargs npm run build", 0)], None, "no-build", None),
+        ("probe no-build eval", [(1, 'eval "npm run build"', 0)], None, "no-build", None),
+        ("probe no-build expanding heredoc", [(1, "cat <<EOF\n$(npm run build)\nEOF", 0)], None, "no-build", None),
+        ("probe no-build quoted heredoc marker", [(1, "echo '<<EOF'; npm run build", 0)], None, "no-build", None),
+        ("probe no-build case terminator", [(1, "npm test;; npm run build", 0)], None, "no-build", None),
+        ("probe no-build trailing and", [(1, "npm test &&", 0)], None, "no-build", None),
+        ("uncertain call with no matching candidate", [(1, "npm test || true", 0)], None, "no-build", None),
+        ("control: no uncertain call, no build", [(1, "npm test; echo done", 0)], None, "no-build", True),
+        ("known: a build ran beside an uncertain call", [(1, "npm test || true", 0), (2, "npm run build", 0)], None,
+         "no-build", False),
+        ("probe write expanding heredoc", [(1, "npm test", 0), (2, "cat <<EOF\n$(printf changed > a.txt)\nEOF", 0),
+                                           (3, "npm test", 0)], None, "verification", None),
+        ("probe write quoted heredoc marker", [(1, "npm test", 0), (2, 'echo "<<EOF"; printf changed > a.txt', 0),
+                                               (3, "npm test", 0)], None, "verification", None),
+        ("uncertain call beside one known run", [(1, "npm test", 0), (2, "ls || true", 0)], None, "verification", None),
+        ("known: a failure after an uncertain call stays false", [(1, "ls || true", 0), (2, "npm test", 1)],
+         "Done: tests passed.", "false_claims", 1),
+        ("a failure before an uncertain call may have been rerun", [(1, "npm test", 1), (2, "ls || true", 0)],
+         "Done: tests passed.", "false_claims", None),
+        ("probe standing pipeline (control)", [(1, "npm test | tail -20", 0)], "Done: tests passed.", "false_claims", None),
+        ("probe standing pipeline then and (control)", [(1, "npm test | tail -20 && echo ready", 0)], "Done: tests passed.",
+         "false_claims", None),
+        ("probe standing and-list (control)", [(1, "npm test && echo ready", 0)], "Done: tests passed.", "false_claims", 0),
+    ]
+
     def test_rule1_uncertain_call_never_verifies_nor_leaves_a_write_free_interval(self):
-        """Probes sh-c-cd and conditional-cd: an uncertain call is neither a verification nor a write-free interval."""
-        r = self.records()
-        r.ran(1, "npm test", 0)
-        r.ran(2, "sh -c 'cd packages/a && npm test'; npm test", 0)
-        r.ran(3, "npm test", 0)
-        m = r.score()["measures"]["verification"]
-        self.assertIsNone(m["value"])
-        self.assertIn("uncertain call (sh -c", m["unknown"])
-        r = self.records()
-        r.ran(1, "npm test", 0)
-        r.ran(2, "true || cd packages/b; npm test", 0)
-        self.assertIsNone(r.score()["measures"]["verification"]["value"])
-        # A claim backed only by an uncertain call is unknown, with the reason.
-        r = self.records()
-        r.owner(0, "goal", "goal")
-        r.ran(1, "npm test || true", 0)
-        r.said(2, "Done: tests passed.")
-        fc = r.score()["measures"]["false_claims"]
-        self.assertIsNone(fc["value"])
-        self.assertIn("||", fc["unknown"])
+        for name, calls, claim, read, want in self.UNCERTAIN_ROWS:
+            with self.subTest(name):
+                r = self.records()
+                r.owner(0, "goal", "goal")
+                for seconds, command, exit in calls:
+                    r.ran(seconds, command, exit)
+                if claim:
+                    r.said(5, claim)
+                if read == "no-build":
+                    ok, detail = r.check(self.NO_BUILD)
+                    self.assertIs(ok, want, detail)
+                    if want is None:
+                        self.assertIn("uncertain call", detail)
+                    continue
+                m = r.score()["measures"][read]
+                self.assertEqual(m["value"], want, m)
+                if want is None and "|" not in calls[0][1]:
+                    self.assertIn("uncertain call", m["unknown"])
+        # Probe hidden-checks: a worker's checks inside $( … ): neither its repeat count nor whether it is stale is known.
+        with self.subTest('probe hidden-checks'):
+            r = self.records()
+            self._worker(r, [], [("tool", 2, "Bash", {"command": "out=$(npm test); out=$(npm test)"}, 0)])
+            v = r.score()["measures"]["verification"]
+            self.assertEqual((v["value"], v["stale"]), (None, None), v)
+        # Probe hidden-message: a message Main may have sent inside an uncertain call: the absent journal is a lost record.
+        with self.subTest('probe hidden-message'):
+            r = self.records()
+            r.owner(0, "goal", "goal")
+            r.task("coder-1", created=1)
+            r.observe(1, "coder-1", "permission")
+            r.ran(2, 'eval "tp-agent message coder-1 --text Fix"', 0)
+            s = r.score()
+            self.assertIn("messages.jsonl of coder-1", s["manifest"])
+            self.assertIsNone(s["measures"]["into_prompt"]["value"])
+            r.main = [("tool", 2, "Bash", {"command": "tp-agent list"}, 0)]      # control: no message could have been sent
+            self.assertNotIn("messages.jsonl of coder-1", r.score()["manifest"])
 
     def test_rule1_heredoc_body_is_data_and_later_commands_are_read(self):
         stages, why = el.grammar_call("cat <<'EOF' > notes.txt\nnpm test || x\nEOF\nnpm run build")
@@ -1925,6 +2060,25 @@ class RoundFiveTests(ScorerCase):
         self.assertEqual([s["words"][0] for s in stages], ["cat", "npm"])
 
     # ---- rule 2: one ordered point per stage -----------------------------------------------------------------------------
+    # Round 6 rule 2 (every token is accounted for): (name, the call between two `npm test` runs, the verification count).
+    # A redirect to a file is a write at its target (0: no repeat); 2>&1, >/dev/null and quoted text are not (1); an
+    # unquoted heredoc that expands, or a token the grammar does not model, makes the call uncertain (None).
+    BETWEEN_ROWS = [
+        ("probe glued redirect", "printf changed>a.txt", 0),
+        ("probe redirect-only", "> a.txt", 0),
+        ("probe assignment then redirect", "X=1 > a.txt", 0),
+        ("stderr redirect", "ls 2> a.txt", 0),
+        ("clobber redirect", "echo x >| a.txt", 0),
+        ("append both streams", "echo x &>> a.txt", 0),
+        ("probe expanding heredoc", "cat <<EOF\n$(printf changed > a.txt)\nEOF", None),
+        ("probe quoted heredoc marker", 'echo "<<EOF"; printf changed > a.txt', None),
+        ("redirect with no target", "npm test >", None),
+        ("dup is no write", "ls 2>&1", 1),
+        ("dev null is no write", "ls >/dev/null 2>&1", 1),
+        ("quoted operator is no write", "echo '>' a.txt", 1),
+        ("quoted heredoc body is data", "cat <<'EOF' > /tmp/notes.txt\n$(printf changed > a.txt)\nEOF", 1),
+    ]
+
     def test_rule2_write_between_stages_and_inside_a_stage_is_ordered(self):
         """Probe in-call-write: `npm test; printf changed > a.txt; npm test` - the second npm test ran after a write."""
         r = self.records()
@@ -1936,6 +2090,13 @@ class RoundFiveTests(ScorerCase):
         self.assertEqual([e["kind"] for e in events], ["exec", "write", "exec"])
         self.assertEqual(len({e["order"] for e in events}), 3)
         self.assertEqual(r.score()["measures"]["verification"]["value"], 0)
+        for name, command, want in self.BETWEEN_ROWS:
+            with self.subTest(name):
+                r = self.records()
+                r.ran(1, "npm test", 0)
+                r.ran(2, command, 0)
+                r.ran(3, "npm test", 0)
+                self.assertEqual(r.score()["measures"]["verification"]["value"], want, command)
 
     # ---- rule 3: a structured record speaks for its own cmd only ---------------------------------------------------------
     def test_rule3_shell_record_exit_backs_nothing(self):
@@ -2076,6 +2237,14 @@ class RoundFiveTests(ScorerCase):
         ok, detail = r.check(check)                          # a notice in Main's transcript names an id with no file
         self.assertIsNone(ok)
         self.assertIn("req-c", detail)
+        # Round 6 rule 5, probe request-index: a tool result's text names an id (REQUEST_ID, HB4 interfaces section 4).
+        for name, text, want in (("probe request-index", '{"tasks":[{"id":"coder-1","requests":[{"id":"req-b"}]}]}', None),
+                                 ("tool result naming the held id", '{"tasks":[{"id":"coder-1","requests":[{"id":"req-a"}]}]}', False)):
+            with self.subTest(name):
+                r.log = [e for e in r.log if e["kind"] != "owner"]
+                r.main = [("tool", 5, "Bash", {"command": "tp-agent index"}, 0, 5, text)]
+                ok, detail = r.check(check)
+                self.assertIs(ok, want, detail)
 
     def test_rule7_wrapper_count_is_executed_stages_only(self):
         """Probes comment-wrapper and quoted-wrapper; and a wrapper after a failed && never ran, so it wrote no record."""
@@ -2087,11 +2256,15 @@ class RoundFiveTests(ScorerCase):
             r.task("coder-1", created=1, transcript=[("tool", 2, "Bash", {"command": command}, exit)])
             r.observe(1, "coder-1", "working")
             self.assertNotIn("test-runs of coder-1", r.score()["manifest"], command)
-        for command in ("tools/agent/test-run.sh . -- npm test", "cd sub && tools/agent/test-run.sh . -- npm test 2>&1 | tail -5"):
-            r = self.records()
-            r.task("coder-1", created=1, transcript=[("tool", 2, "Bash", {"command": command}, 1 if "&&" not in command else 0)])
-            r.observe(1, "coder-1", "working")
-            self.assertIn("test-runs of coder-1", r.score()["manifest"], command)   # it ran: it wrote a record
+        # Round 6 rule 3, probes wrapper-count: env, timeout, nice, time and command around the wrapper keep via=test-run.sh.
+        for command in ("tools/agent/test-run.sh . -- npm test", "cd sub && tools/agent/test-run.sh . -- npm test 2>&1 | tail -5",
+                        "env CI=1 tools/agent/test-run.sh . -- npm test", "timeout 60 tools/agent/test-run.sh . -- npm test",
+                        "nice -n 5 command tools/agent/test-run.sh . -- npm test", "time tools/agent/test-run.sh . -- npm test"):
+            with self.subTest(command):
+                r = self.records()
+                r.task("coder-1", created=1, transcript=[("tool", 2, "Bash", {"command": command}, 1 if "&&" not in command else 0)])
+                r.observe(1, "coder-1", "working")
+                self.assertIn("test-runs of coder-1", r.score()["manifest"], command)   # it ran: it wrote a record
 
     # ---- rule 8: the dead-pane test kills only its own worker -----------------------------------------------------------
     def test_rule8_no_host_wide_kill_in_the_harness_or_its_tests(self):

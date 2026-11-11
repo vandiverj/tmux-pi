@@ -439,6 +439,8 @@ def transcript_from(lines):
         entry = by_id.get(call_id)
         if entry is None:
             return
+        # Round 6 rule 5: the result's text is kept; a request id it names (an index, `tp-agent request`) is read.
+        entry["result_text"] = _result_text(content)
         if not is_error:
             entry["exit"] = 0
         else:
@@ -588,34 +590,120 @@ def _operands(program, words):
     return operands, recursive, files
 
 
-REDIRECT = re.compile(r"^\d*(<|>>|>|&>|&>>)(&?\d*-?)?(.*)$")
+class Word(str):
+    """A shell word with its quotes removed (round 6 rule 2). op: a redirect operator with its fd prefix (`2>`, `>>`,
+    `&>`, `<<`), never a quoted word. bare: the word's unquoted characters (a glob or a brace expansion is only there)."""
+    op = False
+    bare = ""
+
+
+REDIRECT_OPS = ("&>>", "&>", "<<<", "<<-", "<<", ">>", ">|", ">&", "<&", "<>", ">", "<")
+
+
+def _tokens(text):
+    """The words of one simple command's text, quote-aware, with every redirect operator its own Word (op True): `changed>a.txt`
+    is `changed`, `>`, `a.txt`; `2>&1` is `2>&`, `1`; a quoted `'>'` is a plain word. Digits directly before an operator
+    are its fd only when they make the whole word so far, unquoted. ValueError on an unbalanced quote."""
+    out, buf, bare, quoted, i, n = [], [], [], False, 0, len(text)
+
+    def flush():
+        if buf or quoted:
+            word = Word("".join(buf))
+            word.bare = "".join(bare)
+            out.append(word)
+
+    while i < n:
+        c = text[i]
+        if c in " \t\n":
+            flush()
+            buf, bare, quoted = [], [], False
+            i += 1
+        elif c == "'":
+            end = text.find("'", i + 1)
+            if end < 0:
+                raise ValueError("unbalanced quotes")
+            buf.append(text[i + 1:end])
+            quoted, i = True, end + 1
+        elif c == '"':
+            j = i + 1
+            while j < n and text[j] != '"':
+                if text[j] == "\\" and j + 1 < n and text[j + 1] in '"\\$`\n':
+                    buf.append(text[j + 1] if text[j + 1] != "\n" else "")
+                    j += 2
+                    continue
+                buf.append(text[j])
+                j += 1
+            if j >= n:
+                raise ValueError("unbalanced quotes")
+            quoted, i = True, j + 1
+        elif c == "\\":
+            if i + 1 < n and text[i + 1] != "\n":
+                buf.append(text[i + 1])
+                quoted = True
+            i += 2
+        elif c in "<>" or text.startswith("&>", i):
+            op = next(o for o in REDIRECT_OPS if text.startswith(o, i))
+            so_far = "".join(buf)
+            fd = so_far if buf and not quoted and so_far.isdigit() else ""
+            if not fd:
+                flush()
+            buf, bare, quoted = [], [], False
+            word = Word(fd + op)
+            word.op = True
+            out.append(word)
+            i += len(op)
+        else:
+            buf.append(c)
+            bare.append(c)
+            i += 1
+    flush()
+    return out
+
+
+def _redirect_scan(words):
+    """(words without redirections, input targets, output targets, [reasons the call is uncertain]) of one simple command
+    (round 6 rule 2). `< f` reads f; `> f`, `>> f`, `>| f`, `&> f`, `&>> f`, `>& f` and `<> f` write f (a target under
+    /dev, such as /dev/null, is no write: stage_writes); `2>&1`, `>&2` and `>&-` duplicate or close a descriptor; a heredoc
+    delimiter and a here-string word are data. An operator with no word after it, or `<&` to a file, is outside the grammar.
+    A list of plain strings (a record's argv) holds no operator: its `>` is an argument."""
+    kept, inputs, outputs, reasons, i = [], [], [], [], 0
+    while i < len(words):
+        word = words[i]
+        if not getattr(word, "op", False):
+            kept.append(word)
+            i += 1
+            continue
+        op = word.lstrip("0123456789")
+        target = words[i + 1] if i + 1 < len(words) and not getattr(words[i + 1], "op", False) else None
+        i += 1 if target is None else 2
+        if target is None:
+            reasons.append("a redirect with no target (%s)" % word)
+        elif op in ("<<", "<<-", "<<<"):
+            continue
+        elif op in (">&", "<&") and re.match(r"^(\d+|-)$", target):
+            continue
+        elif op == "<&":
+            reasons.append("a redirect the grammar does not model (%s%s)" % (word, target))
+        elif op == "<":
+            inputs.append(target)
+        else:
+            outputs.append(target)
+            if op == "<>":
+                inputs.append(target)
+    return kept, inputs, outputs, reasons
 
 
 def _redirects(words):
-    """(words without redirections, input-redirect targets, output-redirect targets). `< f` / `<f` is a read of f;
-    `> f`, `>> f`, `&>f` write f; `2>&1` is neither."""
-    kept, inputs, outputs, index = [], [], [], 0
-    while index < len(words):
-        match = REDIRECT.match(words[index])
-        if not match:
-            kept.append(words[index])
-            index += 1
-            continue
-        target = match.group(3)
-        if not target and not match.group(2) and index + 1 < len(words):
-            index += 1
-            target = words[index]
-        if target and not (match.group(2) or "").startswith("&"):
-            (inputs if match.group(1) == "<" else outputs).append(target)
-        index += 1
-    return kept, inputs, outputs
+    """(words without redirections, input-redirect targets, output-redirect targets): _redirect_scan without its reasons."""
+    return _redirect_scan(words)[:3]
 
 
 # ---- shell command lines: stages, executions, writes (round 3 rule 4) -------------------------------------------------------
 def _segments(command):
     """[(text, separator before it)] of a command line split on ; newline && || | & outside quotes. The & of `2>&1` and
     `&>` is a redirection, not a separator. A `#` that starts a word outside quotes starts a comment, which runs to the end
-    of the line and is dropped (round 4 rule 5: a comment is never an execution); `;;` (a case arm's end) is one separator."""
+    of the line and is dropped (round 4 rule 5: a comment is never an execution); `;;` (a case arm's end) is one separator,
+    given as `;;` (outside a case it is outside the grammar)."""
     out, buf, quote, i, before = [], [], None, 0, None
     while i < len(command):
         c = command[i]
@@ -640,14 +728,14 @@ def _segments(command):
             continue
         elif c in ";\n":
             sep = ";;" if c == ";" and nxt == ";" else ";"
-        elif c == "|":
+        elif c == "|" and not (buf and buf[-1] == ">"):          # `>|` is a redirect, not a pipe
             sep = "||" if nxt == "|" else "|"
         elif c == "&" and not (buf and buf[-1] in "<>") and nxt != ">":
             sep = "&&" if nxt == "&" else "&"
         if sep:
             out.append(("".join(buf), before))
             buf = []
-            before = ";" if sep == ";;" else sep
+            before = sep
             i += len(sep)
             continue
         buf.append(c)
@@ -658,21 +746,29 @@ def _segments(command):
 
 def _words(text):
     try:
-        return shlex.split(text, posix=True)
+        return _tokens(text)
     except ValueError:
         return text.split()
 
 
-ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\+?=")
 SHELLS = ("sh", "bash", "zsh", "dash")
 SHELL_KEYWORDS = ("for", "while", "until", "if", "then", "do", "else", "elif", "case", "function", "done", "fi")
 OPAQUE_PROGRAMS = ("xargs", "eval", "source", ".", "parallel")     # run text the scorer does not parse
 
 
 def _unwrap(words):
-    """(words of the program that really runs, nested command text for `sh -c TEXT` or None). Strips env assignments and
-    `env`/`timeout`/`nice`/`time`/`command`/`exec`/`nohup`/`npx`, and `tools/agent/test-run.sh WORKTREE [--label N] --`."""
-    words = list(words)
+    """(words of the program that really runs, nested command text for `sh -c TEXT` or None): _unwrap_chain without its
+    wrappers."""
+    return _unwrap_chain(words)[:2]
+
+
+def _unwrap_chain(words):
+    """(words of the program that really runs, nested command text for `sh -c TEXT` or None, [(wrapper, worktree)]).
+    Strips env assignments and `env`/`timeout`/`nice`/`time`/`command`/`exec`/`nohup`/`npx`, and `tools/agent/test-run.sh
+    WORKTREE [--timeout S] [--label N] --`, in any combination (round 6 rule 3: `env CI=1 timeout 60 test-run.sh . -- CMD`
+    is a test-run.sh call). Each stripped wrapper is listed in order; test-run.sh's entry carries its WORKTREE operand."""
+    words, wrappers = list(words), []
     while words:
         while words and ASSIGN.match(words[0]):
             words = words[1:]
@@ -697,12 +793,15 @@ def _unwrap(words):
             while words and words[0].startswith("-"):
                 words = words[1:]
         elif program == "test-run.sh":
+            wrappers.append((program, words[1] if len(words) > 1 and words[1] != "--" else None))
             words = words[words.index("--") + 1:] if "--" in words else []
+            continue
         elif program in SHELLS and len(words) > 2 and words[1].startswith("-") and "c" in words[1]:
-            return [], words[2]
+            return [], words[2], wrappers
         else:
             break
-    return words, None
+        wrappers.append((program, None))
+    return words, None, wrappers
 
 
 def shell_stages(command, _piped=False):
@@ -715,7 +814,7 @@ def shell_stages(command, _piped=False):
     if isinstance(command, (list, tuple)):
         parts = [(list(command), None)]
     elif isinstance(command, str):
-        parts = [(_words(text), sep) for text, sep in _segments(strip_heredocs(command)[0])]
+        parts = [(_words(text), ";" if sep == ";;" else sep) for text, sep in _segments(strip_heredocs(command)[0])]
     else:
         return []
     out = []
@@ -914,37 +1013,55 @@ def record_command(record):
 GRAMMAR = """A Bash call is read only if, after comment stripping (and heredoc bodies removed), it is a list of simple
 commands joined by newline, `;` or `&&`. Each command is optional env assignments, a word list and optional redirects,
 optionally followed by a pipeline (`|`) whose first stage is the command; every pipeline stage is itself a simple command.
-The wrappers env, timeout, nice, time, command, exec, nohup, npx and `tools/agent/test-run.sh WORKTREE [--timeout S]
-[--label N] --` are stripped from a command (the test-run.sh call itself is counted). `cd DIR` as its own command (not in a
-pipeline) changes the cwd of the following commands of that call only when it ran (stage_runs: certain). Anything else makes
-the WHOLE call uncertain: `||`, background `&`, if/case/loops/select/functions/`!`/`[[`, `( … )`, `{ … }`, process
-substitution, `sh -c`/`bash -c`/`eval`/`source`/`.`, `$( … )` or backticks containing a runner or a write, xargs/parallel/
-`find -exec` running a runner, a write or a shell (or `find -delete`), a program word that is a variable, pushd/popd, cd in a
-pipeline, unbalanced quotes or parentheses. An uncertain call never counts as a verification or a write-free interval: every
-execution in it may not have run (no exit), it may have written anything (a write of unknown place that may have run), and
-when it holds a cd the cwd after it is unknown."""
+Words are split quote-aware and every redirect operator is its own token (`changed>a.txt` writes a.txt). A redirect to a
+file (`>`, `>>`, `>|`, `&>`, `&>>`, `>& f`, `<>`, `2> f`, a bare `> f`, `X=1 > f`) is a write at its target, resolved
+against the stage's cwd; `2>&1`, `>&2`, `>&-` and a target under /dev (`>/dev/null`) are not writes; `< f` is a read; a
+heredoc delimiter and a `<<<` word are data. A heredoc body is data only when its delimiter is quoted (`<<'EOF'`, `<<\EOF`)
+or it holds no `$` or backtick. The wrappers env, timeout, nice, time, command, nohup, npx and `tools/agent/test-run.sh
+WORKTREE [--timeout S] [--label N] --` are stripped from a command in any combination; a test-run.sh call under any of
+them is counted and runs in its WORKTREE. `cd DIR` as its own command (not in a pipeline) changes the cwd of the following
+commands of that call only when it ran and its exit is known to be 0: a known nonzero exit leaves the cwd where it was,
+an unknown exit leaves it unknown. Anything else makes the WHOLE call uncertain: `||`, background `&`, `;;` outside a
+case, a list ending in `&&` or `|`, if/case/loops/select/functions/`!`/`[[`, `( … )`, `{ … }`, process substitution,
+`sh -c`/`bash -c`/`eval`/`source`/`.`/`exec`, a shell reading its stdin (`bash`, `sh -s`, `… | sh`), `$( … )` or
+backticks containing a runner or a write, an unquoted heredoc body holding `$` or a backtick, xargs/parallel/`find -exec`
+running a runner, a write or a shell (or `find -delete`), a program word that is a variable or a glob, a brace expansion,
+a redirect with no target or `<&` to a file, pushd/popd, cd in a pipeline, unbalanced quotes or parentheses. An uncertain
+call may have run any command and written anything: every execution in it may not have run (no exit), it holds a write
+of unknown place that may have run, and when it holds a cd the cwd after it is unknown; a check or measure over an
+interval that holds one is unknown (score.py, round 6 rule 1). Known limit: a program outside the writer list (stage_writes)
+is taken not to write."""
 GRAMMAR_KEYWORDS = ("if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done", "case", "esac", "select",
                     "function", "!", "[[", "]]", "in", "coproc")
 SUB = "$__SUB"                     # a $( … ) or backtick substitution, replaced before the call is split
 
 
-HEREDOC_OP = re.compile(r"(?<!<)<<(-?)[ \t]*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\2")
+HEREDOC_OP = re.compile(r"(?<!<)<<(-?)[ \t]*(\\?)(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\3")
 
 
 def strip_heredocs(text):
-    """(text without heredoc bodies, unterminated). Each `<<WORD` (`<<-WORD`, quoted WORD) takes the following lines up to a
-    line that is WORD (tabs stripped for <<-); the command line and everything after the delimiter stay. lib/routines'
-    HEREDOC drops the rest of the call from `<<` on, commands after the heredoc included, so it is not used here."""
-    out, pending = [], []
+    """(text without heredoc bodies, unterminated): _heredocs without its expanding flag."""
+    return _heredocs(text)[:2]
+
+
+def _heredocs(text):
+    """(text without heredoc bodies, unterminated, expanding). Each `<<WORD` (`<<-WORD`, quoted `'WORD'`/`"WORD"`/`\WORD`)
+    takes the following lines up to a line that is WORD (tabs stripped for <<-); the command line and everything after the
+    delimiter stay. expanding (round 6 rule 2): an unquoted delimiter's body holds `$` or a backtick, so the shell expands
+    it and a `$( … )` in it runs; a quoted delimiter's body is data. lib/routines' HEREDOC drops the rest of the call from
+    `<<` on, commands after the heredoc included, so it is not used here."""
+    out, pending, expanding = [], [], False
     for line in text.split("\n"):
         if pending:
-            dash, word = pending[0]
+            dash, word, quoted = pending[0]
             if (line.lstrip("\t") if dash else line) == word:
                 pending.pop(0)
+            elif not quoted and ("$" in line or "`" in line):
+                expanding = True
             continue
         out.append(line)
-        pending.extend((m.group(1), m.group(3)) for m in HEREDOC_OP.finditer(line))
-    return "\n".join(out), bool(pending)
+        pending.extend((m.group(1), m.group(4), bool(m.group(2) or m.group(3))) for m in HEREDOC_OP.finditer(line))
+    return "\n".join(out), bool(pending), expanding
 
 
 def _close_paren(text, start):
@@ -1072,26 +1189,42 @@ def _runs_something(words):
 
 
 def _grammar_stage(words, sep, next_sep):
-    """(stage or None, reason or None) for one simple command of a call inside the grammar."""
+    """(stage or None, reason or None) for one simple command of a call inside the grammar. A stage of only assignments
+    and redirects (`> a.txt`, `X=1 > a.txt`) runs `:` with those redirects: its output target is a write (round 6 rule 2)."""
     if words[0] in GRAMMAR_KEYWORDS:
         return None, "if/case/loop/function/`!`/`[[` (%s)" % words[0]
-    kept, inputs, outputs = _redirects(words)
-    bare = list(kept)
-    while bare and ASSIGN.match(bare[0]):
-        bare = bare[1:]
-    via = "test-run.sh" if bare and os.path.basename(bare[0]) == "test-run.sh" else None
-    inner, nested = _unwrap(kept)
+    kept, inputs, outputs, bad = _redirect_scan(words)
+    if bad:
+        return None, "; ".join(bad)
+    unquoted = " ".join(getattr(w, "bare", "") for w in kept)
+    if re.search(r"\{[^{}\s]*(,|\.\.)[^{}\s]*\}", unquoted):
+        return None, "a brace expansion"
+    inner, nested, wrappers = _unwrap_chain(kept)
+    names = [name for name, _wt in wrappers]
+    # Round 6 rule 3: test-run.sh under env/timeout/nice/time/command is still a test-run.sh call, run in its WORKTREE.
+    via = "test-run.sh" if "test-run.sh" in names else None
+    worktree = next((wt for name, wt in wrappers if name == "test-run.sh"), None)
     if nested is not None:
         return None, "sh -c"
+    if "exec" in names:
+        return None, "exec"
     if not inner:
-        return (None, "test-run.sh with no `--` command") if via else (None, None)     # assignments only: nothing runs
+        if via:
+            return None, "test-run.sh with no `--` command"
+        if not (inputs or outputs):
+            return None, None                                   # assignments only: nothing runs
+        inner = [":"]
     program, args = os.path.basename(inner[0]), inner[1:]
     if "$" in inner[0]:
         return None, "a program word that is a variable"
+    if any(ch in getattr(inner[0], "bare", "") for ch in "*?["):
+        return None, "a glob in the program word"
     if program in ("eval", "source", "."):
         return None, program
     if program in SHELLS and any(re.match(r"^-[a-zA-Z]*c", a) for a in args if a.startswith("-") and not a.startswith("--")):
         return None, "sh -c"
+    if program in SHELLS and (all(a.startswith("-") for a in args) or "-s" in args):
+        return None, "a shell reading its stdin"
     if program in ("xargs", "parallel") and _runs_something(_program_args(args, ("-n", "-I", "-L", "-P", "-d", "-E", "-s", "-j"))):
         return None, "%s running a runner, a write or a shell" % program
     if program == "find":
@@ -1106,15 +1239,15 @@ def _grammar_stage(words, sep, next_sep):
         return None, "cd in a pipeline"
     text = " ".join([program] + args)
     return {"words": [program] + args, "inputs": inputs, "outputs": outputs, "piped": sep == "|", "sep": sep, "cond": False,
-            "cd": (args[0] if args else "~") if program == "cd" else None, "sub": 0, "via": via,
+            "cd": (args[0] if args else "~") if program == "cd" else None, "sub": 0, "via": via, "wt": worktree,
             "opaque": SUB in text or any("$" in w for w in args + inputs) or program in OPAQUE_PROGRAMS}, None
 
 
 def grammar_call(command):
-    """(stages, reason) for one Bash call (round 5 rule 1). reason None: the call is inside the grammar (GRAMMAR) and
-    stages are its simple commands in order (sep: None ; && |). reason text: the whole call is uncertain; stages are then
-    shell_stages' best-effort parse, candidates only (each may not have run). A list of words (a record's cmd) is one
-    simple command."""
+    """(stages, reason) for one Bash call (round 5 rule 1, round 6 rule 2). reason None: the call is inside the grammar
+    (GRAMMAR) and stages are its simple commands in order (sep: None ; && |). reason text: the whole call is uncertain;
+    stages are then shell_stages' best-effort parse, candidates only (each may not have run). A list of words (a record's
+    cmd) is one simple command."""
     if isinstance(command, (list, tuple)):
         words = [str(w) for w in command]
         if not words:
@@ -1123,23 +1256,25 @@ def grammar_call(command):
         return ([stage] if stage else [], None) if why is None else (shell_stages(words), why)
     if not isinstance(command, str):
         return [], None
-    text, unterminated = strip_heredocs(command)
+    text, unterminated, expanding = _heredocs(command)
     flat, subs, reasons = _structure(text)
     if unterminated:
         reasons.append("an unterminated heredoc")
+    if expanding:
+        reasons.append("an unquoted heredoc whose body holds $ or a backtick")
     for inner in subs:
         inner_stages, inner_why = grammar_call(inner)
         if inner_why or any(check_identity(s["words"]) or stage_writes(s) for s in inner_stages):
             reasons.append("$( … ) containing a runner or a write")
     stages, segments, pending = [], _segments(flat) if not reasons else [], None
     for k, (text, sep) in enumerate(segments):
-        if sep in ("||", "&"):
-            reasons.append("||" if sep == "||" else "background &")
+        if sep in ("||", "&", ";;"):
+            reasons.append({"||": "||", "&": "background &", ";;": "`;;` outside a case"}[sep])
             continue
         if pending and sep in (";", None):
             sep, pending = pending, None              # `a &&\n b`: the line break after && or | continues the list
         try:
-            words = shlex.split(text, posix=True)
+            words = _tokens(text)
         except ValueError:
             reasons.append("unbalanced quotes")
             continue
@@ -1152,6 +1287,8 @@ def grammar_call(command):
             reasons.append(why)
         elif stage:
             stages.append(stage)
+    if pending:
+        reasons.append("a list ending in %s" % pending)
     if reasons:
         seen = []
         for r in reasons:

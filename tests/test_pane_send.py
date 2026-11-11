@@ -235,6 +235,16 @@ class PaneSendTests(unittest.TestCase):
                 pane, log, raw = self.server.worker(mode)
                 self.assertEqual(pane_send.send(pane, TEXT, task_dir=self.task, **FAST), expected)
                 self.assertEqual(self.server.typed(raw, TEXT), 1)
+        # PD1: a screen with malformed bytes (0xa0, lone 0xff, truncated 0xc3) beside a valid prompt probe still reads right.
+        stubs = self.task / "pd1-stubs"
+        stubs.mkdir()
+        for name, junk in (("0xa0", r"a \240 b"), ("lone 0xff", r"\377"), ("truncated multibyte", r"caf\303")):
+            with self.subTest(malformed=name):
+                (stubs / "tmux").write_text(f"#!/bin/sh\nprintf '%b\\n' '{junk}' 'prompt> {TEXT}'\n")
+                (stubs / "tmux").chmod(0o755)
+                with unittest.mock.patch.dict(os.environ, {"PATH": f"{stubs}{os.pathsep}{os.environ['PATH']}"}):
+                    self.assertTrue(pane_send.pane_has_text("%0", TEXT))
+                    self.assertFalse(pane_send.pane_has_text("%0", "something never shown"))
         pane, log, raw = self.server.worker("normal")
         self.assertEqual(pane_send.send(pane, TEXT, **FAST), {"submitted": True, "attempts": 1})  # no task dir
         # The stated limit (MS2): the pane check sees only the end, so a long message whose start was lost reads as submitted.

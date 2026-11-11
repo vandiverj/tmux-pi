@@ -57,7 +57,7 @@ def _no_server(stderr):
 def pane_table():
     """{pane id: (alive, pid)} for every tmux pane; {} when no tmux server is running. An unreadable table, or any row of it
     that does not parse, refuses: a guess could end the wrong process or let a second writer start."""
-    run = subprocess.run(["tmux", "list-panes", "-a", "-F", "#{pane_id} #{pane_dead} #{pane_pid}"], text=True, capture_output=True)
+    run = subprocess.run(["tmux", "list-panes", "-a", "-F", "#{pane_id} #{pane_dead} #{pane_pid}"], text=True, errors="replace", capture_output=True)
     if run.returncode and _no_server(run.stderr):
         return {}  # no server means no live pane: nothing can be alive in one
     if run.returncode:
@@ -97,7 +97,7 @@ def effective_role(role, task_id):
 
 def _commands():
     """[(pid, command)] of every running (not zombie) process; an unreadable table refuses."""
-    run = subprocess.run(["ps", "-ww", "-ax", "-o", "pid=,stat=,command="], text=True, capture_output=True)
+    run = subprocess.run(["ps", "-ww", "-ax", "-o", "pid=,stat=,command="], text=True, errors="surrogateescape", capture_output=True)
     if run.returncode:
         raise RuntimeError(f"cannot read the process table: {run.stderr.strip() or 'ps failed'}")
     rows = []
@@ -321,7 +321,7 @@ def end_or_refuse(path):
 
 def _ps():
     """{pid: (pgid, stat, start)} for every process; an unreadable table refuses."""
-    run = subprocess.run(["ps", "-ax", "-o", "pid=,pgid=,stat=,lstart="], text=True, capture_output=True)
+    run = subprocess.run(["ps", "-ax", "-o", "pid=,pgid=,stat=,lstart="], text=True, errors="surrogateescape", capture_output=True)
     if run.returncode:
         raise RuntimeError(f"cannot read the process table: {run.stderr.strip() or 'ps failed'}")
     rows = {}
@@ -430,7 +430,7 @@ def finish_stop(path, pane):
     path = Path(path)
     rec = read_record(path)
     if pane and pane in pane_table():
-        run = subprocess.run(["tmux", "kill-pane", "-t", pane], text=True, capture_output=True)
+        run = subprocess.run(["tmux", "kill-pane", "-t", pane], text=True, errors="replace", capture_output=True)
         if run.returncode and pane in pane_table():
             raise RuntimeError(f"cannot kill pane {pane}: {run.stderr.strip() or 'tmux failed'}")
     if rec is None:

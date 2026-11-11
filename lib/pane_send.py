@@ -171,7 +171,7 @@ def pane_has_text(pane, text):
     probe = _squash(text)[-PROBE_CHARS:]
     if not probe:
         return False
-    shot = _tmux("capture-pane", "-p", "-t", pane, capture_output=True, text=True).stdout
+    shot = _tmux("capture-pane", "-p", "-t", pane, capture_output=True, text=True, errors="replace").stdout
     lines = [line for line in shot.splitlines() if line.strip()]
     return probe in _squash("".join(lines[-PANE_LINES:]))
 

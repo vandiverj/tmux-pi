@@ -117,7 +117,7 @@ def env_for(state, name, base=None, extra=None):
 
 
 def _tmux(args, env=None, check=True):
-    run = subprocess.run(["tmux"] + list(args), text=True, capture_output=True, env=env, timeout=TMUX_TIMEOUT)
+    run = subprocess.run(["tmux"] + list(args), text=True, errors="surrogateescape", capture_output=True, env=env, timeout=TMUX_TIMEOUT)
     if check and run.returncode:
         raise SessionError("tmux {} failed: {}".format(args[0], (run.stderr or run.stdout).strip() or "exit {}".format(run.returncode)))
     return run
@@ -233,7 +233,7 @@ def process_start(pid):
     process runs. A pid that is reused has another start time."""
     if not isinstance(pid, int) or isinstance(pid, bool) or pid < 1:
         return None
-    run = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], text=True, capture_output=True, timeout=TMUX_TIMEOUT)
+    run = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], text=True, errors="replace", capture_output=True, timeout=TMUX_TIMEOUT)
     start = " ".join(run.stdout.split())
     return start if run.returncode == 0 and start else None
 
@@ -306,7 +306,7 @@ def start_tp(argv, env, cwd=None, timeout=None, check=None, detach=None):
     args = [str(a) for a in argv]
     if detach is not None:
         return subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=detach, stderr=subprocess.STDOUT, start_new_session=True, cwd=cwd, env=env)
-    return subprocess.run(args, text=True, capture_output=True, timeout=timeout, env=env, cwd=cwd)
+    return subprocess.run(args, text=True, errors="surrogateescape", capture_output=True, timeout=timeout, env=env, cwd=cwd)
 
 
 def local_active(state, env=None):

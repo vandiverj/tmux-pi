@@ -426,7 +426,7 @@ def refresh_record(state_dir, task_id):
     so a caller reports this rather than failing."""
     root = Path(__file__).resolve().parent.parent
     try:
-        run = subprocess.run([str(root / "bin" / "tp-contract"), "status", task_id], capture_output=True, text=True, timeout=60,
+        run = subprocess.run([str(root / "bin" / "tp-contract"), "status", task_id], capture_output=True, text=True, errors="replace", timeout=60,
                              env=dict(os.environ, TP_STATE_DIR=str(state_dir)))
     except (OSError, subprocess.SubprocessError) as error:
         return "task.md of {} was not refreshed: {}".format(task_id, error)

@@ -341,6 +341,62 @@ class ProcessEndTests(TmuxCase):
                     with self.assertRaisesRegex(RuntimeError, "cannot read tmux panes"):
                         worker_process.pane_table()
 
+    def test_a_process_table_row_that_is_not_utf8_does_not_hide_the_task_row_or_raise(self):
+        """PD1: another process's command line may hold any bytes; the table is still read and the task's row still matches."""
+        sys.path.insert(0, str(ROOT / "lib"))
+        import worker_process
+        task_dir = "/tmp/pd1-state/tasks/t1"
+        stubs = self.root / "pd1-stubs"
+        stubs.mkdir()
+        cases = {  # the foreign row, as printf octal escapes
+            "0xa0 byte": r"900 S foo \240 bar",
+            "lone 0xff": r"901 S \377",
+            "truncated multibyte": r"902 S caf\303",
+            "0xa0 inside the task path row": r"903 S bash /tmp/pd1-state/tasks/t1/run.sh \240",
+        }
+        for name, foreign in cases.items():
+            with self.subTest(name):
+                (stubs / "ps").write_text(
+                    "#!/bin/sh\n"
+                    "case \"$*\" in\n"
+                    f"*command=*) printf '%b\\n' '{foreign}' '100 S bash {task_dir}/run.sh' '101 Z defunct';;\n"
+                    "*) printf '%b\\n' '100 5 S Mon Jan  1 00:00:00 2026' '902 5 S Mon \\240 1';;\n"
+                    "esac\n")
+                (stubs / "ps").chmod(0o755)
+                with mock.patch.dict(os.environ, {"PATH": f"{stubs}{os.pathsep}{os.environ['PATH']}"}):
+                    rows = worker_process._commands()
+                    self.assertIn((100, f"bash {task_dir}/run.sh"), rows)
+                    self.assertIn(100, worker_process.task_processes(task_dir))
+                    self.assertNotIn(101, [pid for pid, _ in rows])
+                    self.assertEqual(worker_process._ps()[100][1:], ("S", "Mon Jan 1 00:00:00 2026"))
+        self.assertIn(903, worker_process.task_processes(task_dir, [(903, "bash /tmp/pd1-state/tasks/t1/run.sh \udca0")]))
+
+    def test_values_read_back_from_foreign_output_round_trip_their_bytes(self):
+        """PD1 (lossy-os-identity): a value that is later a path or a branch name keeps its bytes (surrogateescape, never replace)."""
+        sys.path.insert(0, str(ROOT / "lib"))
+        import lanes
+        import routing_evals
+        stubs = self.root / "pd1-rt-stubs"
+        stubs.mkdir()
+        (stubs / "tmux").write_text("#!/bin/sh\nprintf '/tmp/pd1-\\377-state\\n'\n")
+        (stubs / "tmux").chmod(0o755)
+        env = {"PATH": f"{stubs}{os.pathsep}{os.environ['PATH']}", "TMUX": "x,1,0"}
+        with mock.patch.dict(os.environ, env):
+            os.environ.pop("TP_STATE_DIR", None)
+            got = routing_evals.eval_dir()
+        self.assertEqual(os.fsencode(got), b"/tmp/pd1-\xff-state/evals")  # the bytes the OS would use for that path
+        branch = os.fsdecode(b"feat-\xff-x")  # what argv holds for a branch git accepts
+        self.assertEqual(os.fsencode(lanes.explicit_branch(branch)), b"feat-\xff-x")
+        # bin/tp-agent check_workdir: the workdir tp-spawn --check prints is the path the task runs in.
+        from importlib.machinery import SourceFileLoader
+        agent = SourceFileLoader("tp_agent_pd1_rt", str(ROOT / "bin/tp-agent")).load_module()
+        fake_root = self.root / "pd1-rt-root"
+        (fake_root / "bin").mkdir(parents=True)
+        (fake_root / "bin/tp-spawn").write_text("#!/bin/sh\nprintf '/tmp/pd1-\\377\\n'\n")
+        (fake_root / "bin/tp-spawn").chmod(0o755)
+        with mock.patch.object(agent, "ROOT", fake_root):
+            self.assertEqual(os.fsencode(agent.check_workdir("coder")), b"/tmp/pd1-\xff")
+
     # --- T3: reap ----------------------------------------------------------------------------
 
     def test_reap_lists_without_yes_and_ends_only_finished_tasks_with_it(self):

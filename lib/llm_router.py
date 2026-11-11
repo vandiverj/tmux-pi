@@ -131,7 +131,7 @@ def call(entry, effort, system, user, timeout, runner=subprocess.run, config=Non
         if entry.get("transport", "cli") == "direct_chat":
             text, thinking = _chat_call(entry, system, user, timeout, config, opener)
         else:
-            done = runner(command(entry, effort, system, user), capture_output=True, text=True, timeout=timeout,
+            done = runner(command(entry, effort, system, user), capture_output=True, text=True, errors="replace", timeout=timeout,
                           cwd=tempfile.gettempdir(), stdin=subprocess.DEVNULL, env=_environment(entry))
             if done.returncode != 0:
                 raise RuntimeError("exit {}: {}".format(done.returncode, (done.stderr or done.stdout).strip()[:200]))

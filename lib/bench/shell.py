@@ -54,7 +54,7 @@ class Shell:
     def execute(self, argv, env=None, cwd=None, timeout=None):
         """Start the process; never raises for a nonzero exit, a missing program or a timeout."""
         try:
-            done = subprocess.run([str(a) for a in argv], env=self.environment(env), cwd=cwd, text=True,
+            done = subprocess.run([str(a) for a in argv], env=self.environment(env), cwd=cwd, text=True, errors="replace",
                                   capture_output=True, timeout=timeout)
         except subprocess.TimeoutExpired as error:
             return Result(TIMED_OUT, error.stdout or "", error.stderr or "")

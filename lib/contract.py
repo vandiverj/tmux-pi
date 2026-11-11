@@ -790,7 +790,7 @@ def state_dir(runner=subprocess.run):
         cmd = ["tmux", "display-message", "-p", "#{@tp_state_dir}"]
     else:
         cmd = ["tmux", "show-options", "-qv", "-t", "={}:".format(os.environ.get("TP_SESSION", "tmux-pi")), "@tp_state_dir"]
-    out = runner(cmd, capture_output=True, text=True).stdout.strip()
+    out = runner(cmd, capture_output=True, text=True, errors="surrogateescape").stdout.strip()
     if not out:
         raise ContractError("no tmux-pi session (start one with: agent)")
     return out

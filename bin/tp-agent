@@ -82,10 +82,10 @@ def state_dir():
         return Path(explicit).resolve()
     if os.getenv("TMUX"):
         target = ["-t", os.environ["TMUX_PANE"]] if os.getenv("TMUX_PANE") else []
-        session = subprocess.check_output(["tmux", "display-message", "-p", *target, "#S"], text=True).strip()
+        session = subprocess.check_output(["tmux", "display-message", "-p", *target, "#S"], text=True, errors="surrogateescape").strip()
     else:
         session = os.getenv("TP_SESSION", "tmux-pi")
-    value = subprocess.check_output(["tmux", "show-options", "-qv", "-t", f"={session}:", "@tp_state_dir"], text=True).strip()
+    value = subprocess.check_output(["tmux", "show-options", "-qv", "-t", f"={session}:", "@tp_state_dir"], text=True, errors="surrogateescape").strip()
     if not value:
         raise ValueError("no tmux-pi state directory; start a workspace with tp")
     return Path(value)
@@ -723,7 +723,7 @@ def launch(base, item):
     if item.get("main"):
         spawn_env["TP_MAIN_ID"] = item["main"]
     try:
-        run = subprocess.run(args, text=True, capture_output=True, env=spawn_env)
+        run = subprocess.run(args, text=True, errors="replace", capture_output=True, env=spawn_env)
     finally:
         if facts_file:
             Path(facts_file.name).unlink(missing_ok=True)
@@ -757,7 +757,7 @@ def check_workdir(role, workdir=None, contexts=(), lane=None):
     for spec in contexts:
         command += ["--context", spec]
     command += ["--", "check"]
-    run = subprocess.run(command, text=True, capture_output=True)
+    run = subprocess.run(command, text=True, errors="surrogateescape", capture_output=True)
     if run.returncode:
         raise ValueError(run.stderr.strip() or "tp-spawn could not check the workdir")
     effective = run.stdout.strip()
@@ -1224,7 +1224,7 @@ def review(base, args):
         command += ["--same-provider", "--approved-by-user", args.approved_by_user]
     elif args.approved_by_user is not None:
         raise ValueError("--approved-by-user applies only with --same-provider")
-    run = subprocess.run(command + [args.id], text=True, capture_output=True, env={**os.environ, "TP_STATE_DIR": str(base)})
+    run = subprocess.run(command + [args.id], text=True, errors="surrogateescape", capture_output=True, env={**os.environ, "TP_STATE_DIR": str(base)})
     if run.returncode == 3:
         return {"id": args.id, "review": None, "status": "not_needed", "reason": run.stderr.strip()}
     if run.returncode:
@@ -1703,7 +1703,7 @@ def _main(argv):
                 value = {"notice": notice, **value}  # first key, so a reader sees it at once
                 print(notice, file=sys.stderr)
         elif args.command == "stop":
-            run = subprocess.run([str(ROOT / "bin/tp-kill"), args.id], text=True, capture_output=True)
+            run = subprocess.run([str(ROOT / "bin/tp-kill"), args.id], text=True, errors="replace", capture_output=True)
             if run.returncode:
                 raise RuntimeError(run.stderr.strip())
             value = {"id": args.id, "status": "stopped"}

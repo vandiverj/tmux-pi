@@ -122,7 +122,7 @@ def _git_raw(worktree, *args, env=None, data=None) -> bytes:
 
 
 def _git(worktree, *args, env=None) -> str:
-    out = subprocess.run(["git", "-C", str(worktree), *args], env=env, capture_output=True, text=True)
+    out = subprocess.run(["git", "-C", str(worktree), *args], env=env, capture_output=True, text=True, errors="surrogateescape")
     if out.returncode != 0:
         raise RuntimeError("git %s failed in %s: %s" % (" ".join(args), worktree, out.stderr.strip()))
     return out.stdout.strip()
@@ -134,7 +134,7 @@ def fingerprint(worktree) -> Tuple[str, str]:
     Real index flags are never inherited. On failure retry empty-index add -A/write-tree. head is "" without a commit.
     """
     head = subprocess.run(["git", "-C", str(worktree), "rev-parse", "--verify", "--quiet", "HEAD"],
-                          capture_output=True, text=True).stdout.strip()
+                          capture_output=True, text=True, errors="surrogateescape").stdout.strip()
     scratch = tempfile.mkdtemp(prefix="tp-fp.")
     try:
         env = dict(os.environ, GIT_INDEX_FILE=os.path.join(scratch, "index"))

@@ -26,6 +26,30 @@ tp-agent find TERMS                                # search workspaces, notes, e
 A new session finds attached and nearby work in the injected task index without being told; open decisions appear as counts
 and ids, never as question text (`tp-agent work decisions` shows the text).
 
+#### Decision records and the working brief (HB3a)
+
+Every `work decide` line and every answered `work decision add|answer` entry is a **record** with a kind (`preference`,
+`design`, `task-intent`, `obligation`, `correction`; `--kind`, default design), a scope (`global`, `project:/abs/path`,
+`workspace` (default), `lane:NAME`, `task:ID`, `role:NAME`; `--scope`), provenance (`by` owner, main or worker; the owner's exact
+`quote`; `at`; `source`) and a status. Only `--by owner` (or `user`) with a non-empty `--quote` is `active`; anything else is
+`provisional` until `tp-agent work decision confirm ID --quote "..."`. A worker process (`TP_TASK_ID` or `TP_TASK_DIR` set) is
+recorded as `worker` and is refused, never downgraded, when it asks to write or confirm as the owner. `--supersedes ID` marks the
+old record `superseded` with pointers both ways, only within the same scope; a provisional replacement of an active record waits
+for the owner's confirm. `work decision withdraw ID` withdraws a record (an active one needs the owner's `--quote`).
+`tp-agent work records [--status S] [--json]` lists them all. The fields are stored as a trailing `<!-- record: {...} -->` on a
+`Decisions` line and as a `Record:` field on an entry. Old lines and entries without them read as kind design, scope workspace,
+and `active` only when answered `--by user` with a quote (else `provisional`; an old `Decisions` line has no provenance, so it
+is provisional, id `<ws>/L<n>` by position).
+
+`tp-agent brief` prints Main's working brief (at most 60 lines, from records only, no model call): the workspace's outcome
+(`Objective`) and `Acceptance` (`work set ID --acceptance`), the active records in scope (global, the session's project, the
+attached workspace), conflicts between active records answering the same question, provisional ids, active work from the task
+index, open decision ids, named empty slots for obligations (HB5) and the launch record (HB2), the last evidence and checkpoint,
+and pointers. A part older than the newest compaction is marked STALE. Claude Main's SessionStart hook (startup, resume,
+compact) runs `brief --attach`, which first attaches the newest active workspace whose `repos` hold the project (never creating
+one; with none, the first line says how to make one), and injects the brief; after a compaction the task index text follows it.
+The PreCompact hook attaches the same way before it checkpoints, and logs why when no checkpoint is written.
+
 #### Checkpoints and recovery
 
 A **checkpoint** is a validated copy of a workspace's judgement state: the objective head, every `Decisions` line, every open

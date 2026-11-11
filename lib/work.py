@@ -25,8 +25,8 @@ WORKSPACE_STATUS = ("active", "paused", "done", "archived")
 NOTE_STATUS = ("draft", "active", "superseded", "archived")
 PRIORITIES = ("high", "normal", "low")
 DECISION_STATUS = ("open", "answered", "withdrawn")
-SECTIONS = ("Objective", "Scope", "Decisions", "Open decisions", "Blockers / questions", "Next actions", "Links", "Progress", "Sessions")
-FIELDS = ("Question", "Background", "Options", "Recommended", "Affects", "Resolution", "By", "At", "Quote", "Withdrawn")
+SECTIONS = ("Objective", "Scope", "Acceptance", "Decisions", "Open decisions", "Blockers / questions", "Next actions", "Links", "Progress", "Sessions")
+FIELDS = ("Question", "Background", "Options", "Recommended", "Affects", "Resolution", "By", "At", "Quote", "Withdrawn", "Record")
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,47}$")
 DECISION_RE = re.compile(r"^([a-z0-9][a-z0-9-]*)/D(\d+)$")
 HEADING_RE = re.compile(r"^### (\S+/D\d+)\s*·\s*(\S+)\s*·\s*(\S+)(?:\s*·\s*(blocking))?\s*$")
@@ -640,3 +640,200 @@ def open_decisions(include_closed=False, skipped=None):
         rows += found
     rows.sort(key=lambda r: (not r["blocking"], PRIORITY_RANK.get(r["priority"], 9), r["workspace_updated"], r["id"]))
     return rows
+
+
+# -------------------------------------------------------------------- records
+# HB3 (docs/plans/det-prep/hub/interfaces.md section 5): every decision is a record with kind, scope, provenance, status and
+# supersession. Two places hold them, both inside a workspace file:
+#   - a `Decisions` line (`work decide`): `- DATE TEXT [Source: S] <!-- record: {JSON} -->`; the JSON trailer is written on every
+#     new line, and a line without one (written before HB3, or by hand) is read by `line_record` with the old-line mapping below;
+#   - an `Open decisions` entry (`work decision add|answer`): the `Record:` field holds the same JSON (kind, scope, and once it is
+#     answered or confirmed its provenance and status); an entry without one is read from its By, Quote and status fields.
+# Old-line mapping (no fields): kind `design`, scope `workspace`, status `active` only when the entry was answered `--by user` with
+# a non-empty quote, else `provisional`; a withdrawn entry is `withdrawn`; an entry still open is a question, not a record in force.
+# Ids: `<ws>/R<n>` for a new line, `<ws>/L<k>` for an old line (k = its place among the section's non-empty lines; lines are only
+# ever appended, so k is stable), `<ws>/D<n>` for an entry.
+
+RECORD_KINDS = ("preference", "design", "task-intent", "obligation", "correction")
+RECORD_STATUS = ("active", "provisional", "superseded", "withdrawn")
+RECORD_BY = ("owner", "main", "worker")
+SCOPE_RE = re.compile(r"^(global|workspace|project:/\S.*|lane:[A-Za-z0-9._-]+|task:[A-Za-z0-9._-]+|role:[A-Za-z0-9._-]+)$")
+TRAILER_RE = re.compile(r"\s*<!-- record: (\{.*\}) -->\s*$")
+RECORD_ID_RE = re.compile(r"^([a-z0-9][a-z0-9-]*)/([DRL])(\d+)$")
+LINE_RE = re.compile(r"^\s*[-*]\s+(?:(\d{4}-\d\d-\d\d)\s+)?(.*?)(?:\s+Source:\s*(.*))?$")
+
+
+def in_worker(env=None):
+    """A worker or reviewer process: tp-spawn exports TP_TASK_ID and TP_TASK_DIR to every task (either one, even empty, counts)."""
+    env = os.environ if env is None else env
+    return "TP_TASK_ID" in env or "TP_TASK_DIR" in env
+
+
+def record_status(by, quote):
+    """Only the owner, with their exact words, makes a record active; anything else waits for the owner (`decision confirm`)."""
+    return "active" if by == "owner" and str(quote or "").strip() else "provisional"
+
+
+def normal_by(value):
+    """The provenance `by` of a command's --by: user/owner -> owner, agent/main -> main, worker -> worker; empty -> None."""
+    return {"user": "owner", "owner": "owner", "agent": "main", "main": "main", "worker": "worker"}.get(str(value or "").strip())
+
+
+def check_scope(scope):
+    """The scope as stored: `project:PATH` is made absolute and resolved; anything outside the closed list is refused."""
+    scope = str(scope or "workspace").strip()
+    if scope.startswith("project:") and len(scope) > len("project:"):
+        scope = "project:" + str(Path(scope[len("project:"):]).expanduser().resolve())
+    if not SCOPE_RE.fullmatch(scope):
+        raise WorkError(f"invalid scope {scope!r}: global | project:<repo path> | workspace | lane:<name> | task:<id> | role:<role>")
+    return scope
+
+
+def scope_key(record):
+    """Two records are in the same scope when these keys are equal: `workspace` means the workspace the record lives in."""
+    return f"workspace:{record['workspace']}" if record["scope"] == "workspace" else record["scope"]
+
+
+def record_json(value):
+    """The JSON of a trailer or a `Record:` field: one line, and no `<` or `>` so it can never close the comment around it."""
+    return json.dumps(value, ensure_ascii=False, sort_keys=True).replace("<", "\\u003c").replace(">", "\\u003e")
+
+
+def _loads(text):
+    try:
+        value = json.loads(text)
+    except ValueError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _record(ws, ident, form, fields, text, fallback):
+    """One record from stored `fields` (a trailer or a Record field, possibly None) laid over the `fallback` of its old form."""
+    fields = fields or {}
+    prov = fields.get("provenance") if isinstance(fields.get("provenance"), dict) else {}
+    by = prov.get("by", fallback["by"]) if fields else fallback["by"]
+    value = {
+        "id": ident, "workspace": ws, "form": form if fields else form + ":old", "text": text,
+        "kind": fields.get("kind") if fields.get("kind") in RECORD_KINDS else fallback["kind"],
+        "scope": fields.get("scope") if isinstance(fields.get("scope"), str) and SCOPE_RE.fullmatch(fields["scope"]) else "workspace",
+        "provenance": {"by": by if by in RECORD_BY else None, "quote": prov.get("quote", fallback["quote"]) or None,
+                       "at": prov.get("at", fallback["at"]) or None, "source": prov.get("source", fallback["source"]) or None},
+        "status": fields.get("status") if fields.get("status") in RECORD_STATUS else fallback["status"],
+        "supersedes": fields.get("supersedes") or None, "superseded_by": fields.get("superseded_by") or None,
+        "question": str(fields.get("question") or fallback.get("question") or "").strip() or None,
+        "withdrawn": fields.get("withdrawn") or None,
+    }
+    return value
+
+
+def line_records(doc):
+    """The records of a workspace's `Decisions` section, in order. A line with a trailer is read from it; one without is an old
+    line: kind design, scope workspace, provenance unknown (by null), status provisional (nothing on it says the owner made it)."""
+    out, position = [], 0
+    for line in (get_section(doc.body, "Decisions") or "").split("\n"):
+        if not line.strip():
+            continue
+        position += 1
+        trailer = TRAILER_RE.search(line)
+        fields = _loads(trailer.group(1)) if trailer else None
+        visible = line[:trailer.start()] if trailer else line
+        match = LINE_RE.match(visible)
+        stamp, text, source = (match.groups() if match else (None, visible.strip(), None))
+        ident = fields.get("id") if fields and isinstance(fields.get("id"), str) and RECORD_ID_RE.match(fields["id"]) else f"{doc.id}/L{position}"
+        fallback = {"by": None, "quote": None, "at": stamp, "source": source, "kind": "design", "status": "provisional"}
+        record = _record(doc.id, ident, "line", fields, (text or "").strip(), fallback)
+        record["position"] = position
+        out.append(record)
+    return out
+
+
+def entry_record(doc_id, entry):
+    """The record of an `Open decisions` entry. Without a `Record:` field: answered `--by user` with a quote -> active (by owner);
+    answered otherwise -> provisional; withdrawn -> withdrawn; still open -> status None (a question, never in force)."""
+    fields = _loads(entry.get("record") or "") if entry.get("record") else None
+    if entry["status"] == "withdrawn":
+        status = "withdrawn"
+    elif entry["status"] == "answered":
+        status = record_status(normal_by(entry.get("by")), entry.get("quote"))
+    else:
+        status = None
+    fallback = {"by": normal_by(entry.get("by")), "quote": entry.get("quote"), "at": entry.get("at"), "source": None,
+                "kind": "design", "status": status, "question": entry.get("question")}
+    record = _record(doc_id, entry["id"], "entry", fields, entry.get("resolution") or "", fallback)
+    if entry["status"] == "withdrawn":
+        record["status"] = "withdrawn"  # a withdrawal is the entry's own state, whatever the Record field last said
+    elif entry["status"] == "open" and record["status"] not in ("superseded",):
+        record["status"] = None
+    record["entry_status"] = entry["status"]
+    record["question"] = record["question"] or (entry.get("question") or "").strip() or None
+    return record
+
+
+def records_of(doc):
+    """Every record of one workspace: its Decisions lines, then its Open decisions entries."""
+    return [*line_records(doc), *(entry_record(doc.id, e) for e in decisions_of(doc))]
+
+
+def all_records(skipped=None):
+    """The records of every non-archived workspace; a workspace that cannot be parsed is skipped and named in `skipped`."""
+    out = []
+    for doc in iter_docs("workspace", skipped=skipped):
+        try:
+            out += records_of(doc)
+        except Exception:  # noqa: BLE001 - per-document isolation
+            note_skipped(skipped, doc.path)
+    return out
+
+
+def find_record(ident):
+    """(workspace Doc, record) for `<ws>/D<n>`, `<ws>/R<n>` or `<ws>/L<k>` in a non-archived workspace."""
+    match = RECORD_ID_RE.match(ident or "")
+    if not match:
+        raise WorkError(f"invalid record id {ident!r}; expected <workspace-id>/D<n>, /R<n> or /L<n>")
+    doc = load("workspace", match.group(1), include_archived=False)
+    for record in records_of(doc):
+        if record["id"] == ident:
+            return doc, record
+    raise WorkError(f"unknown record: {ident}")
+
+
+def next_line_number(doc):
+    numbers = [int(RECORD_ID_RE.match(r["id"]).group(3)) for r in line_records(doc) if RECORD_ID_RE.match(r["id"]).group(2) == "R"]
+    return max(numbers + [0]) + 1
+
+
+def stored_fields(record):
+    """What a trailer or a `Record:` field keeps: the interfaces.md section 5 shape, nulls left out."""
+    prov = {k: v for k, v in record["provenance"].items() if v}
+    value = {"id": record["id"], "kind": record["kind"], "scope": record["scope"], "provenance": prov, "status": record["status"]}
+    for key in ("supersedes", "superseded_by", "question", "withdrawn"):
+        if record.get(key):
+            value[key] = record[key]
+    return value
+
+
+def put_record(doc, record):
+    """Write `record` back into `doc` (not saved): a line gets its trailer (an old line gains one, keeping its id), an entry gets
+    its `Record:` field."""
+    if record["form"].startswith("line"):
+        lines = (get_section(doc.body, "Decisions") or "").split("\n")
+        position = 0
+        for i, line in enumerate(lines):
+            if not line.strip():
+                continue
+            position += 1
+            if position == record["position"]:
+                trailer = TRAILER_RE.search(line)
+                visible = line[:trailer.start()] if trailer else line.rstrip()
+                lines[i] = f"{visible} <!-- record: {record_json(stored_fields(record))} -->"
+                doc.body = set_section(doc.body, "Decisions", "\n".join(lines))
+                return
+        raise WorkError(f"record {record['id']} is no longer in the Decisions section")
+    entries = decisions_of(doc)
+    for entry in entries:
+        if entry["id"] == record["id"]:
+            entry["record"] = record_json({k: v for k, v in stored_fields(record).items() if k != "id"})
+            entry["_dirty"] = True
+            put_decisions(doc, entries)
+            return
+    raise WorkError(f"record {record['id']} is no longer in Open decisions")

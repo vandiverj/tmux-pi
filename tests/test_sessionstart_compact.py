@@ -63,8 +63,13 @@ class Delivers(Base):
         answer = json.loads(run.stdout)
         self.assertEqual(list(answer), ["hookSpecificOutput"])
         self.assertEqual(answer["hookSpecificOutput"]["hookEventName"], "SessionStart")
-        text = answer["hookSpecificOutput"]["additionalContext"]
+        whole = answer["hookSpecificOutput"]["additionalContext"]
         self.assertEqual(set(answer["hookSpecificOutput"]), {"hookEventName", "additionalContext"})
+        # HB3a: the working brief first, then (after a compaction only) the index text, which register.tsx does not re-inject.
+        brief, _, text = whole.partition("\n\n" + index_text.HEADER)
+        text = index_text.HEADER + text
+        self.assertTrue(brief.startswith("working brief (tp-agent brief"), brief)
+        self.assertIn('workspace loader "Loader" (attached;', brief)
         self.assertTrue(text.startswith(index_text.HEADER + "\nobjective: ship the loader\n"))
         self.assertIn("- loader ", text)
         # The marker was set before the index was read, so the text says so (the first pending event is the attach).
@@ -73,7 +78,7 @@ class Delivers(Base):
         self.assertEqual(text + "\n", self.tp("index", "--no-write", "--text"))
         self.assertEqual(text, index_text.render(json.loads(self.tp("index", "--no-write"))))
         # The script prints tp-agent's finished hook output unchanged.
-        self.assertEqual(run.stdout, self.tp("index", "--no-write", "--hook-json"))
+        self.assertEqual(run.stdout, self.tp("brief", "--attach", "--hook-json", "--source", "compact"))
 
     def test_controls_and_lone_surrogates_reach_the_main_as_the_renderers_give_them(self):
         (self.state / "session-objective.md").write_bytes(b"a\x00b\x1bc\n")
@@ -85,7 +90,9 @@ class Delivers(Base):
         text = json.loads(run.stdout)["hookSpecificOutput"]["additionalContext"]
         self.assertIn("\nobjective: abc\n", text)
         self.assertIn("coder-1 co\ufffdder", text)
-        self.assertEqual(text, index_text.render(json.loads(self.tp("index", "--no-write"))))
+        self.assertTrue(text.endswith("\n\n" + index_text.render(json.loads(self.tp("index", "--no-write")))))
+        self.assertNotIn("\x00", text)
+        self.assertNotIn("\x1b", text)
 
     def test_the_text_carries_rows_of_the_session(self):
         task = self.state / "tasks" / "coder-1"
@@ -105,24 +112,42 @@ class Delivers(Base):
         self.assertTrue(json.loads(self.tp("work", "compacted", "--reason", "x"))["pending"])
 
     def test_the_gate_is_the_modules(self):
-        for env in ({"TP_TASK_DIR": str(self.tmp)}, {"TP_TASK_DIR": ""}, {"TP_MODE": "legacy"}, {"TP_MODE": None}, {"TP_ROOT": None}, {"TP_MAIN_HARNESS": "pi"},
-                    {"TP_MAIN_HARNESS": ""}):  # set but empty is not claude, as autonomy.env_problem reads it
-            with self.subTest(env=env):
-                run = self.run_hook(**env)
+        self.tp("work", "new", "Loader", "--id", "loader", "--repo", str(self.tmp))
+        # A worker or reviewer (TP_TASK_ID and/or TP_TASK_DIR set, even empty) gets nothing at any source and attaches nothing.
+        workers = [{"TP_TASK_DIR": str(self.tmp)}, {"TP_TASK_DIR": ""}, {"TP_TASK_ID": "coder-1"}, {"TP_TASK_ID": ""},
+                   {"TP_TASK_ID": "reviewer-1", "TP_TASK_DIR": str(self.tmp)}]
+        for i, env in enumerate((*workers, {"TP_MODE": "legacy"}, {"TP_MODE": None}, {"TP_ROOT": None}, {"TP_MAIN_HARNESS": "pi"},
+                                 {"TP_MAIN_HARNESS": ""})):  # set but empty is not claude, as autonomy.env_problem reads it
+            source = ("startup", "resume", "compact")[i % 3]  # every source meets a worker row; one hook run per row
+            with self.subTest(env=env, source=source):
+                run = self.run_hook(json.dumps({"source": source}), TP_WORKDIR=str(self.tmp), **env)
                 self.assertEqual((run.returncode, run.stdout, run.stderr), (0, "", ""))
                 self.assertFalse(self.pending())
+                self.assertFalse((self.state / "session-work.json").exists())
         # TP_MAIN_HARNESS=claude (what autonomy.env_problem demands) and unset (tp-claude does not export it) both deliver.
         self.assertIn("hookSpecificOutput", self.run_hook(TP_MAIN_HARNESS="claude").stdout)
         self.assertIn("hookSpecificOutput", self.run_hook().stdout)
 
-    def test_only_a_compaction_delivers(self):
-        for source in ("startup", "resume", "clear"):
+    def test_startup_and_resume_get_the_brief_alone_compact_gets_brief_and_index_clear_gets_nothing(self):
+        # register.tsx appends the index at an interactive startup, so startup/resume carry the brief only (nothing twice); they do
+        # not arm recovery (no compaction happened).
+        for source in ("startup", "resume"):
+            with self.subTest(source=source):
+                run = self.run_hook(json.dumps({"hook_event_name": "SessionStart", "source": source}))
+                text = json.loads(run.stdout)["hookSpecificOutput"]["additionalContext"]
+                self.assertTrue(text.startswith("no workspace attached: `tp-agent work new "), text)
+                self.assertNotIn(index_text.HEADER, text)
+                self.assertFalse(self.pending())
+        for source in ("clear", "other"):
             with self.subTest(source=source):
                 run = self.run_hook(json.dumps({"hook_event_name": "SessionStart", "source": source}))
                 self.assertEqual((run.returncode, run.stdout), (0, ""))
         self.assertFalse(self.pending())
-        for stdin in ("", "not json"):  # the matcher already selected compact: no source named is not a reason to stay silent
-            self.assertIn("hookSpecificOutput", self.run_hook(stdin).stdout)
+        for stdin in ("", "not json"):  # no source named reads as compact (as before): brief + index
+            with self.subTest(stdin=stdin):
+                text = json.loads(self.run_hook(stdin).stdout)["hookSpecificOutput"]["additionalContext"]
+                self.assertIn("\n\n" + index_text.HEADER, text)
+        self.assertTrue(self.pending())
 
 
 class FailsOpen(Base):
@@ -144,51 +169,65 @@ class FailsOpen(Base):
         path = self.state / LOG
         return path.read_text() if path.exists() else ""
 
-    def test_a_failing_tp_agent_prints_nothing_and_leaves_a_note(self):
+    def notice(self, run):
+        self.assertEqual((run.returncode, run.stderr), (0, ""))
+        return json.loads(run.stdout)["hookSpecificOutput"]["additionalContext"]
+
+    def test_a_failing_tp_agent_injects_only_the_unavailable_notice_and_leaves_a_note(self):
         hook = self.fake_root('echo "boom: store unreadable" >&2\nexit 1\n')
         run = self.run_hook(hook=hook)
-        self.assertEqual((run.returncode, run.stdout, run.stderr), (0, "", ""))
+        self.assertEqual(self.notice(run), "working brief unavailable: tp-agent brief failed (exit 1): boom: store unreadable")
         lines = self.log().splitlines()
-        self.assertEqual(len(lines), 2)
+        self.assertEqual(len(lines), 3)
         self.assertIn("work compacted failed", lines[0])
-        self.assertIn("index --hook-json failed (exit 1), nothing injected: boom: store unreadable", lines[1])
+        self.assertIn("brief --hook-json failed (exit 1): boom: store unreadable", lines[1])
+        self.assertIn("index --hook-json failed too, nothing injected but the notice: boom: store unreadable", lines[2])
         self.assertRegex(lines[1], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ sessionstart-compact: ")
         self.assertEqual(stat.S_IMODE((self.state / LOG).stat().st_mode), 0o600)
 
-    def test_an_empty_index_is_not_injected(self):
+    def test_an_empty_brief_is_not_injected(self):
         hook = self.fake_root("exit 0\n")
-        run = self.run_hook(hook=hook)
-        self.assertEqual((run.returncode, run.stdout), (0, ""))
-        self.assertIn("index --hook-json failed (exit 0), nothing injected", self.log())
+        self.assertEqual(self.notice(self.run_hook(hook=hook)), "working brief unavailable: tp-agent brief failed (exit 0)")
+        self.assertIn("brief --hook-json failed (exit 0)", self.log())
 
-    def test_a_failed_marker_does_not_stop_the_index(self):
-        hook = self.fake_root('[[ "$1" == work ]] && { echo "no state" >&2; exit 1; }\necho \'{"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": "the index text"}}\'\n')
+    def test_a_failed_brief_after_a_compaction_still_delivers_the_index(self):
+        hook = self.fake_root('[[ "$1" == brief ]] && { echo "store locked" >&2; exit 2; }\n'
+                              'echo \'{"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": "the index text"}}\'\n')
+        self.assertEqual(self.notice(self.run_hook(hook=hook)), "working brief unavailable: tp-agent brief failed (exit 2): store locked\n\nthe index text")
+        # At startup/resume register.tsx brings the index, so the notice stands alone.
+        run = self.run_hook(json.dumps({"source": "startup"}), hook=hook)
+        self.assertEqual(self.notice(run), "working brief unavailable: tp-agent brief failed (exit 2): store locked")
+
+    def test_a_failed_marker_does_not_stop_the_brief(self):
+        hook = self.fake_root('[[ "$1" == work ]] && { echo "no state" >&2; exit 1; }\necho \'{"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": "the brief text"}}\'\n')
         run = self.run_hook(hook=hook)
-        self.assertEqual(json.loads(run.stdout)["hookSpecificOutput"]["additionalContext"], "the index text")
-        self.assertIn("work compacted failed (the index is still read): no state", self.log())
+        self.assertEqual(json.loads(run.stdout)["hookSpecificOutput"]["additionalContext"], "the brief text")
+        self.assertIn("work compacted failed (the brief is still read): no state", self.log())
 
     def test_the_output_is_printed_byte_for_byte_never_through_a_shell_variable(self):
         # A shell variable would drop the NUL and the trailing newlines; the file the script prints keeps them.
-        hook = self.fake_root("[[ \"$1\" == index ]] && printf 'x\\000y\\n\\n\\n'\nexit 0\n")
+        hook = self.fake_root("[[ \"$1\" == brief ]] && printf 'x\\000y\\n\\n\\n'\nexit 0\n")
         run = subprocess.run([str(hook)], input=COMPACT.encode(), env=self.env, capture_output=True, timeout=60)
         self.assertEqual((run.returncode, run.stdout, run.stderr), (0, b"x\x00y\n\n\n", b""))
 
     def test_the_hook_asks_for_the_finished_hook_output(self):
-        hook = self.fake_root('[[ "$1" == index ]] && echo "$*" >&2 && exit 3\nexit 0\n')
+        hook = self.fake_root('[[ "$1" == brief ]] && echo "$*" >&2 && exit 3\nexit 0\n')
         self.run_hook(hook=hook)
-        self.assertIn("nothing injected: index --no-write --hook-json", self.log())
+        self.assertIn("brief --hook-json failed (exit 3): brief --attach --hook-json --source compact", self.log())
+        self.run_hook(json.dumps({"source": "resume"}), hook=hook)
+        self.assertIn("brief --attach --hook-json --source resume", self.log())
 
     def test_the_note_never_follows_a_symlink(self):
         victim = self.tmp / "victim.txt"
         victim.write_text("keep")
         (self.state / LOG).symlink_to(victim)
         run = self.run_hook(hook=self.fake_root("exit 1\n"))
-        self.assertEqual((run.returncode, run.stdout), (0, ""))
+        self.assertEqual(self.notice(run), "working brief unavailable: tp-agent brief failed (exit 1)")
         self.assertEqual(victim.read_text(), "keep")
 
     def test_no_state_directory_is_still_a_quiet_exit(self):
         run = self.run_hook(hook=self.fake_root("exit 1\n"), TP_STATE_DIR=str(self.tmp / "gone"))
-        self.assertEqual((run.returncode, run.stdout, run.stderr), (0, "", ""))
+        self.assertEqual(self.notice(run), "working brief unavailable: tp-agent brief failed (exit 1)")
 
     def test_the_real_script_with_an_unreadable_work_store_still_exits_zero(self):
         (self.tmp / "work").write_text("a file where the store should be")
@@ -198,11 +237,11 @@ class FailsOpen(Base):
 
 
 class Registered(unittest.TestCase):
-    def test_hooks_json_runs_it_for_a_compaction_only_with_a_short_timeout(self):
+    def test_hooks_json_runs_it_at_startup_resume_and_compaction_with_a_short_timeout(self):
         hooks = json.loads((PLUGIN / "hooks" / "hooks.json").read_text())["hooks"]["SessionStart"]
         mine = [g for g in hooks if any("sessionstart-compact.sh" in h["command"] for h in g["hooks"])]
         self.assertEqual(len(mine), 1)
-        self.assertEqual(mine[0]["matcher"], "compact")
+        self.assertEqual(mine[0]["matcher"], "startup|resume|compact")  # not clear: a cleared session starts over on purpose
         self.assertEqual(mine[0]["hooks"], [{"type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/sessionstart-compact.sh\"", "timeout": 15}])
         self.assertTrue(os.access(HOOK, os.X_OK))
         # report.sh still sees every SessionStart.

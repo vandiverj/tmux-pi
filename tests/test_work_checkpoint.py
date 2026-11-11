@@ -1036,6 +1036,27 @@ class HookScript(Base):
         self.assertEqual(run.returncode, 0)
         self.assertTrue(self.marker()["pending"])
         self.assertFalse((self.store / "checkpoints").exists())
+        # HB3a: why no checkpoint was written is kept in the run's hook-precompact.log.
+        self.assertRegex((self.state / "hook-precompact.log").read_text(),
+                         r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ precompact: no checkpoint written \(exit 1\): .*ghost")
+
+    def test_with_nothing_attached_it_attaches_the_newest_matching_workspace_and_checkpoints_it(self):
+        # HB3a: the newest active workspace whose repos hold the project is attached first, so the compaction is checkpointed.
+        project = self.tmp / "repo"
+        project.mkdir()
+        self.cli("work", "new", "Old", "--id", "old", "--repo", str(project))
+        self.cli("work", "new", "New", "--id", "new", "--repo", str(project))
+        run = self.run_hook(TP_MODE="orchestrator", TP_WORKDIR=str(project))
+        self.assertEqual((run.returncode, run.stdout, run.stderr), (0, "", ""))
+        self.assertEqual(json.loads((self.state / "session-work.json").read_text())["attached"], ["new"])
+        self.assertEqual(cp.latest("new")["valid"][1]["trigger"], "precompact")
+        self.assertFalse((self.state / "hook-precompact.log").exists())
+        # With no matching workspace nothing is created or attached, and the log says why there is no checkpoint.
+        (self.state / "session-work.json").unlink()
+        self.run_hook(TP_MODE="orchestrator", TP_WORKDIR=str(self.tmp / "elsewhere"))
+        self.assertFalse((self.state / "session-work.json").exists())
+        self.assertEqual(sorted(p.stem for p in (self.store / "workspaces").glob("*.md")), ["new", "old"])
+        self.assertIn("no workspace is attached to this session; no checkpoint written", (self.state / "hook-precompact.log").read_text())
 
     def test_it_never_fails_the_compaction(self):
         self.cli("work", "new", "Demo", "--id", "demo")
@@ -1050,7 +1071,8 @@ class HookScript(Base):
     def test_workers_and_other_sessions_are_left_alone(self):
         self.cli("work", "new", "Demo", "--id", "demo")
         self.attach("demo")
-        for env in ({}, {"TP_MODE": "worker"}, {"TP_MODE": "orchestrator", "TP_TASK_DIR": str(self.tmp)}):
+        for env in ({}, {"TP_MODE": "worker"}, {"TP_MODE": "orchestrator", "TP_TASK_DIR": str(self.tmp)},
+                    {"TP_MODE": "orchestrator", "TP_TASK_ID": "reviewer-1"}):  # HB3a: a worker/reviewer with TP_TASK_ID only
             run = self.run_hook(**env)
             self.assertEqual((run.returncode, run.stdout, run.stderr), (0, "", ""))
         self.assertIsNone(self.marker())
@@ -1224,6 +1246,8 @@ LEAVES = {
     "decision list": ("read", ["decision", "list"]), "promote": ("other", ["promote", "demo"]), "decisions": ("read", ["decisions"]),
     "checkpoint": ("read", ["checkpoint"]), "recover": ("read", ["recover"]), "compacted": ("read", ["compacted"]),
     "recovered": ("read", ["recovered", "--evidence", "checked"]),
+    # HB3a: the owner's confirm changes the record's workspace; `records` only reads.
+    "decision confirm": ("workspace", ["decision", "confirm", "demo/R1", "--quote", "yes"]), "records": ("read", ["records"]),
 }
 
 

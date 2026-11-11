@@ -42,29 +42,46 @@ class OtherLanePathsTests(LaneCase):
     def packet(self, task):
         return (task / "packet.md").read_text()
 
-    def test_a_dispatch_lists_the_other_open_lane_its_branch_its_last_closed_step_and_the_overlapping_path(self):
-        self.make_beta(closed_step="L1")
-        _, task = self.lane_ok()
-        packet = self.packet(task)
-        self.assertIn(SECTION, packet)
-        section = packet.split(SECTION, 1)[1]
-        for word in ("beta", "lane/beta", "L1", "lib/x.py", SENTENCE):
-            self.assertIn(word, section)
+    def test_a_dispatch_lists_the_other_open_lane_and_says_when_it_has_closed_no_step(self):
+        rows = (("a dispatch lists the other open lane, its branch, its last closed step and the overlapping path", "L1",
+                 ("beta", "lane/beta", "L1", "lib/x.py", SENTENCE)),
+                ("a lane with no closed step says so", None, ("no step closed yet",)))
+        for number, (name, closed_step, words) in enumerate(rows):
+            with self.subTest(name):
+                if number:
+                    self.reset_fixture()  # each row dispatches from an empty state
+                self.make_beta(closed_step=closed_step)
+                _, task = self.lane_ok()
+                packet = self.packet(task)
+                self.assertIn(SECTION, packet)
+                section = packet.split(SECTION, 1)[1]
+                for word in words:
+                    self.assertIn(word, section)
 
-    def test_a_lane_with_no_closed_step_says_so(self):
-        self.make_beta()
-        _, task = self.lane_ok()
-        self.assertIn("no step closed yet", self.packet(task).split(SECTION, 1)[1])
+    def test_no_section_unless_an_open_lane_owns_an_overlapping_path(self):
+        def no_overlap():
+            self.make_beta(edit="docs/d.md")  # beta changes only what alpha (lib) does not touch
 
-    def test_no_overlap_no_section(self):
-        self.make_beta(edit="docs/d.md")  # beta changes only what alpha (lib) does not touch
-        _, task = self.lane_ok()
-        self.assertNotIn(SECTION, self.packet(task))
-        self.assertNotIn("Do not edit these paths", self.packet(task))
+        def alone():
+            pass  # a dispatch into the lane alone
 
-    def test_a_dispatch_into_the_lane_alone_has_no_section(self):
-        _, task = self.lane_ok()
-        self.assertNotIn(SECTION, self.packet(task))
+        def not_open():
+            self.make_beta()
+            common = Path(git(self.repo, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+            record = lanes.read_lane(common, "beta")
+            with lanes.lane_lock(common):
+                lanes.write_lane(common, dict(record, state="abandoned"))
+
+        rows = (("no overlap, no section", no_overlap), ("a dispatch into the lane alone has no section", alone),
+                ("a lane that is not open is not listed", not_open))
+        for number, (name, prepare) in enumerate(rows):
+            with self.subTest(name):
+                if number:
+                    self.reset_fixture()  # each row dispatches from an empty state
+                prepare()
+                _, task = self.lane_ok()
+                self.assertNotIn(SECTION, self.packet(task))
+                self.assertNotIn("Do not edit these paths", self.packet(task))
 
     def test_a_later_task_in_the_existing_lane_and_a_retry_of_it_have_the_section(self):
         _, first = self.lane_ok()
@@ -77,15 +94,6 @@ class OtherLanePathsTests(LaneCase):
         run = self.raw("retry", second.name, "--reason", "again", "--worker", "pi", "--model", MODEL)
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertIn("lib/x.py", self.packet(self.state / "tasks" / json.loads(run.stdout)["id"]).split(SECTION, 1)[1])
-
-    def test_a_lane_that_is_not_open_is_not_listed(self):
-        self.make_beta()
-        common = Path(git(self.repo, "rev-parse", "--path-format=absolute", "--git-common-dir"))
-        record = lanes.read_lane(common, "beta")
-        with lanes.lane_lock(common):
-            lanes.write_lane(common, dict(record, state="abandoned"))
-        _, task = self.lane_ok()
-        self.assertNotIn(SECTION, self.packet(task))
 
     def test_a_record_that_cannot_be_read_is_left_out_and_does_not_refuse(self):
         self.make_beta()
@@ -106,14 +114,18 @@ class OtherLanePathsTests(LaneCase):
         self.assertNotIn("more", text)
         self.assertEqual(lane_commands.other_lanes_section([]), "")
 
-    def test_an_ordinary_path_is_shown_as_a_json_string_in_a_code_span(self):
-        self.assertIn('`"lib/x.py"`', self.section("lib/x.py"))
-
-    def test_a_path_with_a_backtick_is_named_in_a_span_it_cannot_close(self):
-        text = self.section("lib/a.py", "lib/`important.py", "lib/x``y.py")
-        self.assertIn('`` "lib/`important.py" ``', text)  # CommonMark: a longer fence, padded with a space each side
-        self.assertIn('``` "lib/x``y.py" ```', text)
-        self.assertIn('`"lib/a.py"`', text)
+    def test_a_path_is_shown_as_a_json_string_in_a_span_it_cannot_close(self):
+        rows = (("an ordinary path is shown as a json string in a code span", ("lib/x.py",), ['`"lib/x.py"`']),
+                ("a path with a backtick is named in a span it cannot close", ("lib/a.py", "lib/`important.py", "lib/x``y.py"),
+                 ['`` "lib/`important.py" ``',  # CommonMark: a longer fence, padded with a space each side
+                  '``` "lib/x``y.py" ```', '`"lib/a.py"`']),
+                ("a backslash n and a real newline are shown differently", ("lib/a\\nb.py", "lib/a\nb.py"), [r'`"lib/a\\nb.py"`', r'`"lib/a\nb.py"`']),
+                ("leading and trailing spaces stay visible inside the quotes", (" lib/x.py ",), ['`" lib/x.py "`']))
+        for name, paths, shown in rows:
+            with self.subTest(name):
+                text = self.section(*paths)
+                for expected in shown:
+                    self.assertIn(expected, text)
 
     def test_a_path_with_a_control_character_is_named_escaped_on_one_line(self):
         text = self.section("lib/a\nb.py", "lib/t\tab.py", "lib/e\x1b[0m.py")
@@ -122,14 +134,6 @@ class OtherLanePathsTests(LaneCase):
         body = text.split("\n\n", 1)[0]
         self.assertEqual(len(body.splitlines()), 1)
         self.assertFalse(any(ord(c) < 32 and c != "\n" for c in text))
-
-    def test_a_backslash_n_and_a_real_newline_are_shown_differently(self):
-        text = self.section("lib/a\\nb.py", "lib/a\nb.py")
-        self.assertIn(r'`"lib/a\\nb.py"`', text)
-        self.assertIn(r'`"lib/a\nb.py"`', text)
-
-    def test_leading_and_trailing_spaces_stay_visible_inside_the_quotes(self):
-        self.assertIn('`" lib/x.py "`', self.section(" lib/x.py "))
 
     def test_a_non_ascii_path_is_shown_escaped_on_one_line(self):
         text = self.section("lib/é.py")

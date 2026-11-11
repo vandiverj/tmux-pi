@@ -102,15 +102,6 @@ class CreateTests(Scratch):
         self.assertEqual((record["branch"], record["worktree"]), ("x/alpha", str(self.parent / "proj-lane-alpha")))
         self.assertEqual(record["defaulted"], [])
 
-    def test_a_malformed_repository_config_refuses_before_anything_is_made(self):
-        (self.repo / ".tmux-pi").mkdir()
-        (self.repo / ".tmux-pi/lanes.json").write_text(json.dumps({"worktree_pattern": "{repo}-wt"}))
-        before = self.snapshot()
-        with self.assertRaises(ValueError) as caught:
-            self.create()
-        self.assertIn("worktree_pattern", str(caught.exception))
-        self.assertEqual(self.snapshot(), before)
-
     def test_base_can_be_a_branch_or_a_commit(self):
         first = git(self.repo, "rev-parse", "HEAD")
         (self.repo / "b.txt").write_text("b\n")
@@ -170,16 +161,45 @@ class CreateTests(Scratch):
 
 
 class RefusalAndRollbackTests(Scratch):
-    def test_an_existing_path_is_never_reused_or_touched(self):
-        path = self.parent / "proj-wt-alpha"
-        path.mkdir()
-        (path / "keep.txt").write_text("mine\n")
-        before = self.snapshot()
-        with self.assertRaises(ValueError) as caught:
-            self.create()
-        self.assertIn("already exists", str(caught.exception))
-        self.assertEqual((path / "keep.txt").read_text(), "mine\n")
-        self.assertEqual(self.snapshot(), before)
+    def test_a_refusal_names_why_and_makes_nothing(self):
+        """Rows: a setup, the arguments of the refused create, the fragment the refusal names, and a check after it. The snapshot
+        of every row is taken after its setup, and each row starts from a fresh repository (setUp again)."""
+        def malformed_config():
+            (self.repo / ".tmux-pi").mkdir()
+            (self.repo / ".tmux-pi/lanes.json").write_text(json.dumps({"worktree_pattern": "{repo}-wt"}))
+
+        def existing_path():
+            path = self.parent / "proj-wt-alpha"
+            path.mkdir()
+            (path / "keep.txt").write_text("mine\n")
+
+        def active_limit():
+            self.create("one")
+            self.create("two")
+
+        def corrupt_record():
+            self.create("one")
+            (Path(self.common) / "tmux-pi/lanes/one/lane.json").write_text("{")
+
+        def keep_is_untouched():
+            self.assertEqual((self.parent / "proj-wt-alpha/keep.txt").read_text(), "mine\n")
+
+        rows = (("a malformed repository config refuses before anything is made", malformed_config, {}, "worktree_pattern", None),
+                ("an existing path is never reused or touched", existing_path, {}, "already exists", keep_is_untouched),
+                ("the active lane limit refuses before anything is made", active_limit, {"name": "three"}, "limit 2", None),
+                ("a corrupt record blocks creation naming the file", corrupt_record, {"name": "two"}, "one/lane.json", None))
+        for number, (name, setup, kw, fragment, after) in enumerate(rows):
+            with self.subTest(name):
+                if number:
+                    self.setUp()
+                setup()
+                before = self.snapshot()
+                with self.assertRaises(ValueError) as caught:
+                    self.create(**kw)
+                self.assertIn(fragment, str(caught.exception))
+                if after:
+                    after()
+                self.assertEqual(self.snapshot(), before)
 
     def test_an_existing_branch_or_a_conflicting_branch_is_not_adopted(self):
         git(self.repo, "branch", "lane/alpha")
@@ -193,30 +213,12 @@ class RefusalAndRollbackTests(Scratch):
         self.assertEqual(git(self.repo, "rev-parse", "lane/alpha"), tip)
         self.assertEqual(self.snapshot(), before)
 
-    def test_the_active_lane_limit_refuses_before_anything_is_made(self):
-        self.create("one")
-        self.create("two")
-        before = self.snapshot()
-        with self.assertRaises(ValueError) as caught:
-            self.create("three")
-        self.assertIn("limit 2", str(caught.exception))
-        self.assertEqual(self.snapshot(), before)
-
     def test_an_existing_record_of_the_same_name_refuses_and_is_untouched(self):
         self.create()
         text = (Path(self.common) / "tmux-pi/lanes/alpha/lane.json").read_text()
         with self.assertRaises(ValueError):
             self.create()
         self.assertEqual((Path(self.common) / "tmux-pi/lanes/alpha/lane.json").read_text(), text)
-
-    def test_a_corrupt_record_blocks_creation_naming_the_file(self):
-        self.create("one")
-        (Path(self.common) / "tmux-pi/lanes/one/lane.json").write_text("{")
-        before = self.snapshot()
-        with self.assertRaises(ValueError) as caught:
-            self.create("two")
-        self.assertIn("one/lane.json", str(caught.exception))
-        self.assertEqual(self.snapshot(), before)
 
     def test_a_record_write_failure_leaves_no_branch_worktree_or_record(self):
         before = self.snapshot()
@@ -472,16 +474,16 @@ class CommandTests(Scratch):
         self.assertEqual([r["name"] for r in json.loads(self.run_agent("lanes", "two").stdout)], ["two"])
 
     def test_a_refusal_is_a_tp_agent_error_with_exit_1_and_nothing_made(self):
-        run = self.run_agent("lane", "create", "Bad", "--domain", "d", "--touches", "lib")
-        self.assertEqual(run.returncode, 1)
-        self.assertTrue(run.stderr.startswith("tp-agent: invalid lane name"), run.stderr)
-        self.assertEqual(run.stdout, "")
-        self.assertEqual(git(self.repo, "worktree", "list").count("\n"), 0)
-
-    def test_a_directory_that_is_not_a_repository_refuses(self):
-        run = self.run_agent("lanes", cwd=self.parent)
-        self.assertEqual(run.returncode, 1)
-        self.assertIn("tp-agent:", run.stderr)
+        rows = (("a refusal is a tp-agent error", ("lane", "create", "Bad", "--domain", "d", "--touches", "lib"), None,
+                 lambda stderr: stderr.startswith("tp-agent: invalid lane name")),
+                ("a directory that is not a repository refuses", ("lanes",), self.parent, lambda stderr: "tp-agent:" in stderr))
+        for name, args, cwd, says in rows:
+            with self.subTest(name):
+                run = self.run_agent(*args, cwd=cwd)
+                self.assertEqual(run.returncode, 1)
+                self.assertTrue(says(run.stderr), run.stderr)
+                self.assertEqual(run.stdout, "")
+                self.assertEqual(git(self.repo, "worktree", "list").count("\n"), 0)
 
     def test_the_cli_flag_sets_the_branch(self):
         run = self.run_agent("lane", "create", "alpha", "--domain", "d", "--touches", "lib/a", "--repo", str(self.repo),

@@ -42,6 +42,13 @@ ORACLE_ITEM = re.compile(r"[^\s,:\[\]]+:[0-9]+(?:-[0-9]+)?\Z")
 ORACLE_TAIL = re.compile(r"\[([^\[\]]*)\]\Z")
 ORACLE_FULL_EVERY = 32  # every 32nd case is also checked inside the whole reference reply (about 6x the cost of the line alone)
 CHARACTERS = list(base.ASCII_PUNCTUATION) + base.NON_ASCII
+# TQ1 Q2: the characters family ran over all 36 chores (about 1456 cases each, in each of nine delimiters). A case depends on the chore through
+# the cited file the line is written around (its directories, its name and extension, the other files the answer cites) and through the reference
+# reply that every 32nd case is also checked inside. These ten chores hold every distinct kind of cited file of the 36 and the largest of each
+# other part: no extension (bin/tp-spawn), one directory, two, four; a name with "_" and an upper-case name; four cited files; the longest
+# reference (12 lines). The other 26 repeat one of these kinds with another file name; the generated cases of the other families still run over all 36.
+CHARACTERS_CHORES = ("real-spawn-lanes-py", "use-lrucache", "steps-watch", "diff-settings", "real-reporter-states", "real-lane-file-writers",
+                     "real-plan-s2-additions", "use-load-settings", "exports-worker", "real-lane-lock-users")
 
 
 def oracle_pairs(w):
@@ -386,17 +393,19 @@ class OracleCases:
         as a fact line."""
         cases = full = 0
         stats = {}
-        for chore in self.chores:
+        chores = [chore for chore in self.chores if chore["id"] in CHARACTERS_CHORES]
+        self.assertEqual(len(chores), len(CHARACTERS_CHORES))
+        for chore in chores:
             n, f, bad = oracle_mismatches(self.answers[chore["id"]], delimiter, "characters", limit=5, stats=stats)
             self.assertEqual(bad, [], chore["id"])
             cases, full = cases + n, full + f
         self.product_condition(stats, cases, delimiter, "characters")
-        bare = sum(1 for chore in self.chores if "." not in oracle_target(self.answers[chore["id"]]).rpartition("/")[2])
-        self.assertEqual(stats["changed"], self.CHANGED_BY_RULES_29_30[delimiter] * len(self.chores) + self.CHANGED_EXTRA_WITHOUT_EXTENSION.get(delimiter, 0) * bare,
+        bare = sum(1 for chore in chores if "." not in oracle_target(self.answers[chore["id"]]).rpartition("/")[2])
+        self.assertEqual(stats["changed"], self.CHANGED_BY_RULES_29_30[delimiter] * len(chores) + self.CHANGED_EXTRA_WITHOUT_EXTENSION.get(delimiter, 0) * bare,
                          "cases read differently from the round-12 reading: " + delimiter)
         per_chore = len(CHARACTERS) * len(ORACLE_PLACES) * (len(ORACLE_BEFORE) * 2 + 1)
-        self.assertEqual(cases, len(self.chores) * per_chore)
-        self.assertEqual(full, len(self.chores) * (per_chore // ORACLE_FULL_EVERY))
+        self.assertEqual(cases, len(chores) * per_chore)
+        self.assertEqual(full, len(chores) * (per_chore // ORACLE_FULL_EVERY))
         if os.environ.get("QUAL_ATTACK_COUNTS"):
             print("path oracle {:<14} cases {} (whole-reply checks {}) on python {}".format(delimiter, cases, full, sys.version.split()[0]), file=sys.stderr)
 

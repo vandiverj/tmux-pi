@@ -145,6 +145,14 @@ class World(unittest.TestCase):
 class _Rerun:
     """Runs every test of a test_sensitive_read.py class with a resolver (or an explicit `trust=None`) behind classify."""
     mode = "unrelated"
+    # TQ1 Q2: the two expensive rows of test_sensitive_read run whole once (the plain run of the class) and one row each here. The oversized inputs
+    # reach the record lookup only through sensitive_read._lift_name -> Resolver._lookup, keyed by the path's tree, the same for every input (see
+    # BASE.OVERSIZED_REPRESENTATIVE). The worker-hook test starts bin/tp-sensitive-read without --trusted, so it builds no resolver and the record of
+    # this rerun cannot reach it at all (bin/tp-sensitive-read, `if not args.trusted`): one row each shows the mock leaves its answer alone.
+    oversized = [BASE.OVERSIZED_REPRESENTATIVE]
+
+    def hook_rows(self, rows):
+        return list(rows)[:1]
 
     def setUp(self):
         super().setUp()

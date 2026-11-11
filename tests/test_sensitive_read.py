@@ -778,14 +778,23 @@ SYMLINKED = [
     ("", "rg key code", False),
 ]
 
-# Inputs far larger than any real command: (command, prompts)
+# Inputs far larger than any real command: (command, prompts). TQ1 Q2: each was 150k-500k characters (the oversized test took 10 s a run, 63 s
+# under coverage, and again in each rerun of test_sensitive_trust). No limit in the classifier needs that size: the only size limits it has are
+# the brace list's 64 alternatives (_brace_expand: a longer list is judged as a glob), the nesting depth 4 of a shell command, and Python's own
+# recursion limit of 1000 (the nesting row stays at 1500 levels: it costs nothing and is above both). The other rows are linear or quadratic
+# in size with no limit to cross, so each is 10,000 to 20,000 characters: the same code paths, 10 to 200 times fewer characters.
 OVERSIZED = [
     ("$(" * 1500 + "echo ok" + ")" * 1500, True),
-    ("cat {" + ",".join(["a"] * 250000) + "}", False),
-    ("cat " + "*" * 200000, False),
-    ("cat " + "./" * 150000 + AUTH, True),
-    ("echo " + "$(echo x)" * 5000, False),
+    ("cat {" + ",".join(["a"] * 65) + "}", False),  # 65 alternatives: one more than _brace_expand lists
+    ("cat " + "*" * 10000, False),
+    ("cat " + "./" * 10000 + AUTH, True),
+    ("echo " + "$(echo x)" * 500, False),
 ]
+# The one row the reruns of test_sensitive_trust check. A record is asked about only through _lift_name (sensitive_read.py, "def _lift_name"), which
+# returns at its first test (`_weak_only(plain)`) before Resolver._lookup (trust_lift.py) for any name that is not weak, and the lookup is keyed by the
+# tree a path lies in, never by the command's length or shape. None of these rows names a weak name; this one names a strong one (auth.json), the
+# case where a wrongly applied record would change the answer, so it is the one a rerun checks.
+OVERSIZED_REPRESENTATIVE = OVERSIZED[3]
 
 
 def bash(command, cwd=CWD):
@@ -793,6 +802,12 @@ def bash(command, cwd=CWD):
 
 
 class SensitiveReadTableTests(unittest.TestCase):
+    oversized = OVERSIZED
+
+    def hook_rows(self, rows):
+        """The rows of the worker-hook test that this run checks. All of them here; test_sensitive_trust's reruns check one."""
+        return rows
+
     def test_benign_commands_pass(self):
         for command in MUST_PASS + KNOWN_LIMITS:
             with self.subTest(command=command):
@@ -916,7 +931,7 @@ class SensitiveReadTableTests(unittest.TestCase):
         self.assertFalse(classify("Grep", {**LINES, "pattern": "key", "path": "code"}, str(top))["sensitive"])
 
     def test_oversized_input_is_judged_without_failing(self):
-        for command, prompts in OVERSIZED:
+        for command, prompts in self.oversized:
             with self.subTest(command=command[:24], size=len(command)):
                 result = bash(command)
                 self.assertEqual(result["sensitive"], prompts)
@@ -1042,7 +1057,7 @@ class SensitiveReadTableTests(unittest.TestCase):
                 ("cd conf*; printf '%s\\n' 'f=local.json' 'cat \"$f\"' | bash -eu", ask_main)]
         with tempfile.TemporaryDirectory() as task:
             record = Path(task) / "permission-request.json"
-            for command, named in rows:
+            for command, named in self.hook_rows(rows):
                 with self.subTest(command=command):
                     decision, reason = run(command, task)
                     self.assertEqual(decision, "deny")
@@ -1064,11 +1079,11 @@ class SensitiveReadTableTests(unittest.TestCase):
             self.assertIsNone(run("grep -n x README.md", task))
             # sg1 round 3: a shell wrapper around a non-search, and xargs git diff (a patch, not a search), keep their ask.
             # Round 4: each has a non-search cause the classifier gives (test_search_read_cause), as do these.
-            for command in (f"python3 tools/x.py {ENV}", f"python3 tools/x.py {ENV}; grep -n x README.md",
+            for command in self.hook_rows((f"python3 tools/x.py {ENV}", f"python3 tools/x.py {ENV}; grep -n x README.md",
                             f"bash -c 'python3 tools/x.py {ENV}'", "bash -c 'git diff -- config/'",
                             f"printf '%s\\n' {LOCAL} | xargs git diff --", f"base64 {ENV}", f"ssh host cat {ENV}",
                             # sg1 round 12: a project script's arguments are not a stdin shell
-                            f"python3 tools/run.py -- bash -eu {LOCAL}"):
+                            f"python3 tools/run.py -- bash -eu {LOCAL}")):
                 with self.subTest(command=command):  # the ask is the program's, not the harmless search's
                     decision, reason = run(command, task)
                     self.assertEqual(decision, "ask")

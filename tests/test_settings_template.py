@@ -21,6 +21,10 @@ class SettingsTemplateTests(unittest.TestCase):
         (self.base / "agent").mkdir()
         shutil.copy(ROOT / "bin/tp-pi", self.base / "bin/tp-pi")
         shutil.copy(ROOT / "agent/settings.example.json", self.base / "agent/settings.example.json")
+        # tp-pi reads the router config on every start (the local provider alias check); no config/local.json here.
+        (self.base / "lib").symlink_to(ROOT / "lib")
+        (self.base / "config").mkdir()
+        (self.base / "config/router.json").symlink_to(ROOT / "config/router.json")
         fake = self.base / "fake"
         fake.mkdir()
         (fake / "pi").write_text("#!/bin/sh\nexit 0\n")

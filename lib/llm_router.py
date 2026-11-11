@@ -48,10 +48,13 @@ def _environment(entry):
     return env
 
 
-def command(entry, effort, system, user):
+def command(entry, effort, system, user, config=None):
+    """The router CLI's argv. A pi router is launched with this machine's provider alias (lib/router.py launch_model);
+    the attempt records keep the shared id."""
     if entry["worker"] == "claude":
         return ["claude", *CLAUDE_FLAGS, "--model", entry["model"], "--effort", effort, "--system-prompt", system, user]
-    return ["pi", *PI_FLAGS, "--system-prompt", system, "--model", entry["model"], "--thinking", effort, user]
+    return ["pi", *PI_FLAGS, "--system-prompt", system, "--model", router.launch_model(entry["model"], config),
+            "--thinking", effort, user]
 
 
 def _claude_reply(out):
@@ -131,7 +134,7 @@ def call(entry, effort, system, user, timeout, runner=subprocess.run, config=Non
         if entry.get("transport", "cli") == "direct_chat":
             text, thinking = _chat_call(entry, system, user, timeout, config, opener)
         else:
-            done = runner(command(entry, effort, system, user), capture_output=True, text=True, errors="replace", timeout=timeout,
+            done = runner(command(entry, effort, system, user, config), capture_output=True, text=True, errors="replace", timeout=timeout,
                           cwd=tempfile.gettempdir(), stdin=subprocess.DEVNULL, env=_environment(entry))
             if done.returncode != 0:
                 raise RuntimeError("exit {}: {}".format(done.returncode, (done.stderr or done.stdout).strip()[:200]))

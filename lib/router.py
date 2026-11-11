@@ -107,7 +107,69 @@ def _target(value, config):
     return validate_decision(value, config)
 
 
-LOCAL_KEYS = {"routes", "escalation", "mlx", "rules", "prompts", "followup", "packet_files", "redaction", "summarize_structured"}
+LOCAL_KEYS = {"routes", "escalation", "mlx", "rules", "prompts", "followup", "packet_files", "redaction", "summarize_structured",
+              "provider_aliases"}
+# A pi provider name as used before the "/" of a provider/model id: lowercase letters, digits, ".", "_" and "-".
+PROVIDER_NAME = re.compile(r"[a-z0-9][a-z0-9._-]*")
+
+
+class ProviderAliasError(RouterError):
+    """A bad local provider_aliases: every route that would start pi refuses with this text."""
+
+
+def check_provider_aliases(aliases):
+    """Validate local "provider_aliases": shared provider prefix -> the pi provider this machine launches it with.
+
+    Both sides are provider names; no alias names itself, no alias target is itself aliased (no chains), so one
+    rewrite is final, and no two shared names share a target, so the pi reporter (agent/extensions/reporter.ts, given the
+    map in TP_PROVIDER_ALIASES by bin/tp-pi) can record every launched name under its one shared name. Returns the mapping."""
+    if not isinstance(aliases, dict):
+        raise ProviderAliasError("provider_aliases must map a shared provider name to this machine's pi provider name")
+    for shared, launched in aliases.items():
+        if not isinstance(launched, str) or not PROVIDER_NAME.fullmatch(shared) or not PROVIDER_NAME.fullmatch(launched):
+            raise ProviderAliasError("provider_aliases {!r}: names must be provider names (lowercase letters, digits, '.', '_', '-')"
+                              .format(shared))
+        if shared == launched:
+            raise ProviderAliasError("provider_aliases {!r} aliases itself".format(shared))
+        if launched in aliases:
+            raise ProviderAliasError("provider_aliases {!r} -> {!r} is a chain: {!r} is aliased too".format(shared, launched, launched))
+    targets = {}
+    for shared, launched in aliases.items():
+        if launched in targets:
+            raise ProviderAliasError("provider_aliases {!r} and {!r} both launch as {!r}: records could not name the shared provider"
+                                     .format(targets[launched], shared, launched))
+        targets[launched] = shared
+    return aliases
+
+
+def launch_model(model, config):
+    """The model id to hand to pi on this machine: provider/model with the provider rewritten by the local
+    provider_aliases (config as load_config returns it; None or no aliases leaves the id as it is). The shared id
+    (roster, catalog, routes, records, review checks) is never rewritten; only the pi launch uses this."""
+    aliases = ((config or {}).get("local") or {}).get("provider_aliases") or {}
+    provider, slash, rest = (model or "").partition("/")
+    if slash and provider in aliases:
+        return aliases[provider] + "/" + rest
+    return model
+
+
+def launch_argv(argv, config):
+    """argv for pi with every --model value (--model X or --model=X) launched under this machine's provider alias; an
+    already-local name is left alone. The one rewrite shared by bin/tp-pi (so tp-spawn, tp-main, the qualification runners
+    and ask_local all pass through it)."""
+    out, i = [], 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--":  # the rest is the task text, not options
+            out += argv[i:]
+            break
+        if arg == "--model" and i + 1 < len(argv):
+            out += [arg, launch_model(argv[i + 1], config)]
+            i += 2
+            continue
+        out.append("--model=" + launch_model(arg[8:], config) if arg.startswith("--model=") else arg)
+        i += 1
+    return out
 
 
 def load_local(path, config):
@@ -223,6 +285,8 @@ def load_local(path, config):
         budget = structured.get("budget_chars", 1000)
         if isinstance(budget, bool) or not isinstance(budget, int) or not 1000 <= budget <= 2000000:
             raise RouterError("summarize_structured budget_chars must be an integer from 1000 to 2000000")
+    if "provider_aliases" in local:
+        check_provider_aliases(local["provider_aliases"])
     return local
 
 

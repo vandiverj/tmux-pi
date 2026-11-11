@@ -5,6 +5,14 @@ combination or as a check on another tool than alone. Advisory only. Status: **q
 cache (`~/.npm/_npx/e6d07818f0a04ee4`); nothing to install. Run with `FALLOW_TELEMETRY=off DO_NOT_TRACK=1`, on a scratch clone
 (it can write `.fallow/` into the tree it scans).
 
+
+**Retargeted (owner, 2026-11-10).** These tools are for tmux-pi to check the project its agents work on (battle-soccer here,
+work projects on the work Mac), not tmux-pi itself. The tmux-pi cases below only show the tool installs, runs and reports; the
+cases that decide adoption come from a target project (battle-soccer first: TS/React, Vite, 21 modules, 48 commits), run on a
+scratch clone. The reviewer is the gate, not the only place: score the tool at each stage (task start, after an edit, coder
+before finish, review, lane close), run from a hook where possible, skipped with a note when the tool is not installed, never
+a crash or a block. Stage map: the code-quality eval's "Where the checks run".
+
 ## Main's first look (scratch clone of main 1c689ec, 2026-11-10)
 - `fallow health --hotspots --format json`: 23 TS/JS files ranked by churn x complexity in 0.35 s. Top: `register.tsx` 65.2,
   `dispatcher.ts` 59.5, `runtime.js` 54.6. `subagents.ts` (43.4) and `subagents.mjs` (36.6) are both hotspots, and they are

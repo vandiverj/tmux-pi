@@ -4,6 +4,14 @@ Owner, 2026-11-10: when a reviewer finds a defect that may recur in other module
 historically changed alongside the affected file, with the number of shared commits and a few representative commit ids so
 the reviewer can check why they changed together. Advisory only: the owner decides on adoption. Status: **queued**.
 
+
+**Retargeted (owner, 2026-11-10).** These tools are for tmux-pi to check the project its agents work on (battle-soccer here,
+work projects on the work Mac), not tmux-pi itself. The tmux-pi cases below only show the tool installs, runs and reports; the
+cases that decide adoption come from a target project (battle-soccer first: TS/React, Vite, 21 modules, 48 commits), run on a
+scratch clone. The reviewer is the gate, not the only place: score the tool at each stage (task start, after an edit, coder
+before finish, review, lane close), run from a hook where possible, skipped with a note when the tool is not installed, never
+a crash or a block. Stage map: the code-quality eval's "Where the checks run".
+
 ## Expected gain
 Affected files surface earlier, including sibling implementations that share a business rule but have different names or code
 structure, which text search and ast-grep (H13) miss by construction.

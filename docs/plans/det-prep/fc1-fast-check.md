@@ -5,6 +5,14 @@ checks the existing implementations and the proposed shared one behave the same 
 return any minimized counterexample and its replay seed to the reviewer. Advisory only: the owner decides whether to combine
 code or keep separate behavior. Status: **queued**.
 
+
+**Retargeted (owner, 2026-11-10).** These tools are for tmux-pi to check the project its agents work on (battle-soccer here,
+work projects on the work Mac), not tmux-pi itself. The tmux-pi cases below only show the tool installs, runs and reports; the
+cases that decide adoption come from a target project (battle-soccer first: TS/React, Vite, 21 modules, 48 commits), run on a
+scratch clone. The reviewer is the gate, not the only place: score the tool at each stage (task start, after an edit, coder
+before finish, review, lane close), run from a hook where possible, skipped with a note when the tool is not installed, never
+a crash or a block. Stage map: the code-quality eval's "Where the checks run".
+
 ## Expected gain
 Subtle behavior differences are caught before a consolidation is approved, and the owner gets a concrete counterexample when
 deciding.

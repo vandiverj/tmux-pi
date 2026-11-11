@@ -495,26 +495,90 @@ class Realistic(Base):
         self.assertIn("review-5 of coder-a", line)
         self.assertIn("evidence it was given: none attached", line)
 
-    def test_every_structural_value_made_long_comes_out_whole(self):
-        """Round 5: ids, lane names, 20 lanes, long workspace ids and titles, a long project path: nothing structural is clipped."""
-        ws = "w" * 46
-        project = self.tmp / ("p" * 100) / ("r" * 100)
+    # Round 6: one campaign fills every section; its structural values at three lengths. `boundary` puts list lines at 239/240/241
+    # characters with label and separators: lane 00 with its label is 241 (so it goes below), lanes 01-03 are 239, lanes 04-06 are
+    # 241 (so 06 starts the next line), 06-08 are 240; in `short` the first lanes line is exactly 240.
+    LENGTHS = {"short": dict(ws=("hub", "hub-other"), project="ordinary-project-with-a-long-descriptive-directory-name",
+                             lanes=[35] * 20, task=lambda n: f"coder-{n}"),
+               "boundary": dict(ws=("b" * 44 + "-hub", "b" * 42 + "-other"), project="p" * 200,
+                                lanes=[224, 67, 68, 68, 68, 68, 69, 67, 68] + [35] * 11,
+                                task=lambda n: f"coder-{n}-" + "t" * (215 + n % 3)),  # task rows of 239, 240, 241 characters
+               "overlong": dict(ws=("o" * 44 + "-hub", "o" * 42 + "-other"), project="p" * 250, lanes=[250] * 20,
+                                task=lambda n: f"coder-{n}-" + "t" * 250)}
+
+    def campaign(self, length):
+        """Build the brief for the full campaign at `length` in a store and run of its own. (text, inputs by section, wholes)."""
+        spec = self.LENGTHS[length]
+        root = self.tmp / length
+        project = root / spec["project"]
         project.mkdir(parents=True)
-        self.ok("work", "new", "T" * 200, "--id", ws, "--repo", str(project), "--objective", "o" * 400)
-        for i in range(3):
-            self.ok("work", "decide", ws, f"rule {i} " + "x" * 300, "--kind", "preference", "--scope", "global", *OWNER, "q" * 200)
-        self.ok("work", "decide", ws, "a main guess", "--by", "main")
-        lanes = {f"lane-{i:02d}-" + "n" * 24: {"by_status": {"working": 2, "settled": i}} for i in range(20)}
-        rows = [{"id": f"coder-{'i' * 60}-{n}", "role": "coder", "status": "working", "lane": "lane-00-" + "n" * 24, "lane_step": "S" * 20}
-                for n in range(4)]
+        self.state = root / "state"
+        (self.state / "tasks").mkdir(parents=True)
+        self.env = {**self.env, "TP_WORK_DIR": str(root / "work"), "TP_STATE_DIR": str(self.state), "TP_WORKDIR": str(project)}
+        ws, other = spec["ws"]
+        for ident in (other, ws):
+            self.ok("work", "new", "T" * 200, "--id", ident, "--repo", str(project), "--objective", "o" * 400)
+        rules = []
+        for i in range(20):  # 4 conflict pairs (0-7), global rules, then project-scoped ones (written a day later, so shown first)
+            scope = f"project:{project}" if i >= 14 else "global"
+            question = ["--question", f"question {i // 2}?"] if i < 8 else []
+            with mock.patch.object(work, "now", return_value="2026-01-02T00:00:00Z" if i >= 14 else "2026-01-01T00:00:00Z"):
+                rules.append(self.ok("work", "decide", ws, f"rule {i} " + "x" * 300, "--kind", "preference", "--scope", scope, *question,
+                                     *OWNER, "q" * 200)["record"]["id"])
+        real = work.Doc.save
+        with mock.patch.object(work.Doc, "save", lambda doc: (_ for _ in ()).throw(OSError(28, "disk full")) if doc.id == ws else real(doc)):
+            self.call("work", "decide", other, "replacement", "--scope", "global", "--supersedes", rules[8], *OWNER, "yes")
+        pending = f"{other}/R1"
+        provisional = [self.ok("work", "decide", ws, f"guess {i}", "--by", "main")["record"]["id"] for i in range(3)]
+        decisions = [self.ok("work", "decision", "add", ws, "--question", f"open {i}?", *(["--blocking"] if i % 2 else []))["id"]
+                     for i in range(8)]
+        self.ok("work", "attach", ws)
+        self.assertIn("checkpoint written: ", self.ok("work", "checkpoint", "--auto", "--trigger", "precompact"))
+        author = self.task("coder-a", "coder", "settled", "done\nRESULT_STATUS: complete\n")
+        (author / "main-evidence").mkdir()
+        (author / "main-evidence" / "evidence.md").write_text("e")
+        self.task("review-1", "reviewer", "settled", self.REVIEW.format(verdict="APPROVED"), review_of="coder-a",
+                  packet="# Evidence supplied by Main: evidence.md\n", at=1_800_000_000)
+        lanes = {f"lane-{i:02d}-" + "n" * (size - 8): {"by_status": {"working": 2}} for i, size in enumerate(spec["lanes"])}
+        rows = [{"id": spec["task"](n), "role": "coder", "status": "working"} for n in range(10)]
         index = {"active": rows, "paused": [], "unstatused": [], "pending": [], "lanes": lanes}
         with mock.patch.dict(os.environ, {"TP_WORK_DIR": self.env["TP_WORK_DIR"]}):
-            text, _ = work_brief.build(self.state, str(project), True, index)
-        wholes = [ws, f"tp-agent work show {ws}"]
-        wholes += [f"{name} settled {e['by_status']['settled']}, working 2" for name, e in lanes.items()]
-        wholes += [f"- {r['id']} coder working lane {r['lane']}/{r['lane_step']}" for r in rows]
-        wholes += [f"{ws}/R{n}" for n in (1, 2, 3)]
-        assert_structure_whole(self, text, wholes)
+            text, _ = work_brief.build(self.state, str(project), False, index)
+        inputs = {"tp-agent work records --status active": rules + [pending] + provisional,
+                  "tp-agent list": [r["id"] for r in rows] + list(lanes),
+                  "tp-agent work decisions": decisions}
+        wholes = [f"project:{project.name}", ws, f"tp-agent work show {ws}", *(f"{name} working 2" for name in lanes),
+                  *(f"- {r['id']} coder working" for r in rows), *rules]
+        return text, inputs, wholes, rules[14:]
+
+    def test_a_full_campaign_keeps_every_section_and_every_structural_value_at_three_lengths(self):
+        """Every section filled at once. At most MAX_LINES; the checkpoint, approved review and pointers are always there; a line is
+        at most LINE_CHARS unless it is exactly one whole value; every id, lane name, project name and command that went in is in the
+        output whole, or its section ends with `+N more: COMMAND` whose N counts exactly the ones it left out."""
+        import re
+        base = dict(self.env)
+        for length in self.LENGTHS:
+            self.env = dict(base)
+            text, inputs, wholes, project_rules = self.campaign(length)
+            lines = text.split("\n")
+            with self.subTest(length=length, check="sections"):  # each check on its own: one failing does not hide the others
+                self.assertLessEqual(len(lines), work_brief.MAX_LINES, text)
+                for head in ("last checkpoint [", "last approved review [", "pointers:"):
+                    self.assertTrue(any(line.startswith(head) for line in lines), f"{length}: {head} missing\n{text}")
+            with self.subTest(length=length, check="names whole"):  # the project name whole, or every rule naming it is left out
+                if not all(r not in text for r in project_rules):
+                    self.assertIn(wholes[0], text)
+                for value in wholes[1:3]:  # the workspace id and its command
+                    self.assertIn(value, text)
+            with self.subTest(length=length, check="line bound"):
+                for line in lines:
+                    if len(line) > work_brief.LINE_CHARS:
+                        self.assertIn(line.strip(), wholes, f"{length}: an overlong line that is not one whole value: {line[:100]!r}")
+            for command, values in inputs.items():
+                with self.subTest(length=length, check=command):
+                    missing = [v for v in values if not re.search(re.escape(v) + r"(?![0-9])", text)]
+                    more = [int(m.group(1)) for m in (re.fullmatch(r"- \+(\d+) more: " + re.escape(command), line) for line in lines) if m]
+                    self.assertEqual(more, [len(missing)] if missing else [], f"{length}: {command}: missing {missing}\n{text}")
 
 
 if __name__ == "__main__":

@@ -1,10 +1,13 @@
-"""`tp-agent brief` (HB3a): Main's working brief, built from records only (no model call), at most about 60 lines.
+"""`tp-agent brief` (HB3a): Main's working brief, built from records only (no model call), at most 60 lines.
 
 Parts (docs/plans/det-prep/hub/interfaces.md section 5): the workspace and its outcome and acceptance; the active records whose
 scope covers this Main (global, project:<repo> holding the session's project, and workspace for an attached workspace); the active
 work from the session's task records (tasks, reviews with their verdict, lanes); the open decisions (ids only, never question text,
 as the index); obligations (HB5) and the launch record (HB2) as named empty slots until those records exist; the last approved
 review and the evidence it was given; pointers. Each part states its record time, and a part older than the newest compaction is marked stale.
+
+Size: at most MAX_LINES lines, by section budgets (`assemble`), never by a cut of the whole text. The fixed parts are never cut; the
+rules, work and decisions sections share the lines left, and one over its budget keeps its first lines and ends `+N more: COMMAND`.
 
 With `attach`, a session with no attached workspace attaches the newest active workspace whose `repos` covers the project (the
 others that match are listed); with none, the first line says so and how to make one. Nothing is ever created. The text that
@@ -23,9 +26,7 @@ import work_index
 
 MAX_LINES = 60
 LINE_CHARS = 240
-RULES_SHOWN = 20
-TASKS_SHOWN = 10
-DECISIONS_SHOWN = 8
+MORE = {"rules": "tp-agent work records --status active", "work": "tp-agent list", "decisions": "tp-agent work decisions"}
 MAIN_SCOPES = ("global", "project", "workspace")
 NO_WORKSPACE = "no workspace attached: `tp-agent work new TITLE --repo {project} --objective TEXT && tp-agent work attach ID`"  # a Whole
 _CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
@@ -215,6 +216,31 @@ class Brief:
 
     def __init__(self, compaction):
         self.lines, self.compaction = [], compaction
+        self.units = []  # [(first line index, keys)]: the pieces a section budget keeps or drops whole (see fit)
+
+    def unit(self, *keys):
+        """Start a piece of the section: the lines added from here to the next `unit` are kept or dropped together. `keys` name what
+        it shows (record, task, lane, decision ids) so a cut can say how many are left out."""
+        self.units.append((len(self.lines), set(keys)))
+
+    def fit(self, budget, command):
+        """The section in at most `budget` lines (at least 1): all of it when it fits; else its first pieces and one last line
+        `- +N more: COMMAND`, N = the keys that no kept piece shows, COMMAND (whole) prints all of them."""
+        if len(self.lines) <= budget:
+            return list(self.lines)
+        bounds = [start for start, _ in self.units] + [len(self.lines)]
+        pieces = [(self.lines[:bounds[0]], set())] + [(self.lines[a:b], keys) for (a, keys), b in zip(self.units, bounds[1:])]
+        kept, shown, every, full = [], set(), set(), False
+        for lines, keys in pieces:
+            every |= keys
+            if not full and len(kept) + len(lines) <= budget - 1:
+                kept += lines
+                shown |= keys
+            else:
+                full = True  # a section keeps its FIRST lines: nothing after the first piece that does not fit
+        more = Brief(None)
+        more.line(f"- +{len(every - shown)} more: ", Whole(command))
+        return kept + more.lines
 
     def stale(self, when):
         """STALE when the part's own time is before the newest compaction; a part with no time cannot be called fresh."""
@@ -270,22 +296,29 @@ class Brief:
         """One indented line that is a single command: whole."""
         self.lines.append("  " + Whole(text))
 
-    def add_list(self, label, items, sep=", ", below=False):
-        """`label` (prose) then whole `items` packed onto as many lines as they need: an item is never split or dropped; one longer
-        than LINE_CHARS has a line of its own. Continuation lines are indented."""
-        current = _clip(label, LINE_CHARS)
-        if below:
-            self.lines.append(current)
-            current = ""
-        fresh = False  # whether `current` already holds an item
-        for item in map(str, items):
-            joined = current + (sep.rstrip() + " " if fresh else " ") + item if current else "  " + item
-            if fresh and len(joined) > LINE_CHARS:
-                self.lines.append(current + sep.rstrip())
-                current, fresh = "  " + item, True
+    def add_list(self, label, items, sep=", ", below=False, keys=None):
+        """`label` (prose) then whole `items` packed onto as many lines as they need: an item is never split or dropped. The length
+        check counts everything on the line (label, indentation, separators) before an item joins it; an item that does not fit
+        starts the next line (indented), and one that alone is longer than LINE_CHARS is that line, whole. The separator goes only
+        between items on one line; a line end separates the rest. `keys`: what each item shows, for the section's units (default the
+        item itself): the label with the first line of items is one unit, each further line its own."""
+        items = list(map(str, items))
+        rows = [[_clip(label), []]] + ([["", []]] if below else [])  # [text, keys of the items on it]
+        for item, key in zip(items, items if keys is None else keys):
+            text, on = rows[-1]
+            joined = (text + (sep if on else " ") + item) if text else "  " + item
+            if text and len(joined) > LINE_CHARS:
+                rows.append(["  " + item, [key]])
             else:
-                current, fresh = joined, True
-        self.lines.append(current)
+                rows[-1] = [joined, on + [key]]
+        self.unit()
+        before = False  # whether the unit so far already holds items
+        for text, on in (r for r in rows if r[0]):
+            if before:
+                self.unit()
+            self.units[-1][1].update(on)
+            before = before or bool(on)
+            self.lines.append(text)
 
 
 def build(state_dir, workdir=None, attach=False, index=None):
@@ -296,11 +329,11 @@ def build(state_dir, workdir=None, attach=False, index=None):
     problem = store_problem()
     if problem:  # not "none recorded": the store is there and cannot be read, so nothing below could say what is recorded
         root = work.store_root()
-        brief = Brief(last_compaction(state_dir))
-        brief.line("working brief unavailable: work store ", Whole(root), " unusable: ", problem)
-        _work(brief, index() if callable(index) else index)
-        brief.add_whole("pointers (the work store must be fixed first):", "tp-agent work show ID | tp-agent work records | tp-agent list")
-        return "\n".join(brief.lines), {"attached": [], "auto_attached": None, "matching": [], "store_problem": problem}
+        head, tail, sections = Brief(last_compaction(state_dir)), Brief(None), {"work": Brief(last_compaction(state_dir))}
+        head.line("working brief unavailable: work store ", Whole(root), " unusable: ", problem)
+        _work(sections["work"], index() if callable(index) else index)
+        tail.add_whole("pointers (the work store must be fixed first):", "tp-agent work show ID | tp-agent work records | tp-agent list")
+        return "\n".join(assemble(head, sections, tail)), {"attached": [], "auto_attached": None, "matching": [], "store_problem": problem}
     skipped, notes = [], []
     attached = list(dict.fromkeys(work_index.attached_ids(state_dir))) if state_dir else []
     try:
@@ -347,20 +380,41 @@ def build(state_dir, workdir=None, attach=False, index=None):
         brief.head("acceptance", _when(doc.meta.get("acceptance_at")),
                    *([_clip(acceptance, 10 ** 6)] if acceptance else ["not recorded (", Whole(f"tp-agent work set {ws_id} --acceptance TEXT"), ")"]),
                    unknown=bool(acceptance))
-    _rules(brief, project, attached, skipped)
-    _work(brief, index() if callable(index) else index)
-    _decisions(brief, docs)
-    brief.add("obligations (HB5): no obligation records exist yet")
-    brief.add("launch record (HB2): no launch record exists yet")
-    _evidence_part(brief, state_dir, attached)
+    sections = {name: Brief(brief.compaction) for name in MORE}
+    _rules(sections["rules"], project, attached, skipped)
+    _work(sections["work"], index() if callable(index) else index)
+    _decisions(sections["decisions"], docs)
+    tail = Brief(brief.compaction)
+    tail.add("obligations (HB5): no obligation records exist yet")
+    tail.add("launch record (HB2): no launch record exists yet")
+    _evidence_part(tail, state_dir, attached)
     if work.skipped_count(skipped):
-        brief.add(work.skipped_line(skipped))
+        tail.add(work.skipped_line(skipped))
     ws = attached[0] if attached else "ID"
-    brief.add_whole("pointers:", f"tp-agent work show {ws} | tp-agent work records | tp-agent work decisions | tp-agent work recover | tp-agent list")
-    lines = brief.lines
-    if len(lines) > MAX_LINES:
-        lines = lines[:MAX_LINES - 1] + [f"(+{len(lines) - MAX_LINES + 1} lines cut; tp-agent brief prints the same)"]
-    return "\n".join(lines), {"attached": attached, "auto_attached": auto, "matching": [w.id for w in found]}
+    tail.add_whole("pointers:", f"tp-agent work show {ws} | tp-agent work records | tp-agent work decisions | tp-agent work recover | tp-agent list")
+    return "\n".join(assemble(brief, sections, tail)), {"attached": attached, "auto_attached": auto, "matching": [w.id for w in found]}
+
+
+def budgets(left, needs):
+    """{section: lines}. The lines left under MAX_LINES after the fixed ones: each section first gets what it needs up to a third of
+    them; the lines no section used then go to the others in order (rules, work, decisions). A section with lines gets at least 1 (its
+    `+N more` line), set aside before the spare lines are shared."""
+    left = max(left, 0)
+    give = {name: max(min(need, left // 3), 1 if need else 0) for name, need in needs.items()}
+    spare = left - sum(give.values())
+    for name, need in needs.items():
+        extra = max(min(need - give[name], spare), 0)
+        give[name] += extra
+        spare -= extra
+    return give
+
+
+def assemble(head, sections, tail):
+    """The brief's lines: `head` and `tail` whole (header, workspace, outcome, acceptance, placeholders, evidence, checkpoint,
+    skipped, pointers: never cut), each variable section in its budget (Brief.fit). No global cut: the total is at most MAX_LINES
+    unless the fixed lines alone leave fewer than one line per section that has any."""
+    given = budgets(MAX_LINES - len(head.lines) - len(tail.lines), {name: len(b.lines) for name, b in sections.items()})
+    return head.lines + [line for name, b in sections.items() for line in b.fit(given[name], MORE[name])] + tail.lines
 
 
 def _rules(brief, project, attached, skipped):
@@ -372,27 +426,27 @@ def _rules(brief, project, attached, skipped):
     shown, conflicts = in_force(records, project, attached)
     newest = max((_when(r["provenance"]["at"]) for r in shown if _when(r["provenance"]["at"])), default=None)
     brief.head("rules in force (active, owner-confirmed; global, project, workspace)", newest, "" if shown else "none recorded")
-    for r in shown[:RULES_SHOWN]:
+    for group in conflicts:  # above the other rule lines: a budget cut keeps them first
+        brief.add_list("CONFLICT: these are active in one scope and answer the same question; ask the owner which stands "
+                        "(`work decide ... --supersedes ID --by owner --quote ...`):", [r["id"] for r in group], below=True)
+    for r in shown:
         quote = r["provenance"]["quote"] or ""
         at = _when(r["provenance"]["at"])
         tail = Whole(f" ({r['id']}, {_stamp(at)}{', STALE' if brief.stale(at) else ''})")  # whole: only the prose before it is clipped
-        brief.line(f"- [{r['kind']} ", _clip(_scope_label(r['scope']), 40), "] ", _clip(r["text"], 120), " — owner: \"", _clip(quote, 60), "\"", tail)
-    if len(shown) > RULES_SHOWN:
-        brief.line(f"- +{len(shown) - RULES_SHOWN} more: ", Whole("tp-agent work records --status active"))
-    for group in conflicts:
-        brief.add_list("CONFLICT: these are active in one scope and answer the same question; ask the owner which stands "
-                        "(`work decide ... --supersedes ID --by owner --quote ...`):", [r["id"] for r in group], below=True)
+        brief.unit(r["id"])
+        brief.line(f"- [{r['kind']} ", Whole(_scope_label(r['scope'])), "] ", _clip(r["text"], 120), " — owner: \"", _clip(quote, 60), "\"", tail)
     for new, old in uncommitted(records, project, attached):
+        brief.unit(new["id"], old["id"])
         brief.line("pending: ", Whole(new["id"]), " replaces ", Whole(old["id"]), ", not yet committed (", Whole(old["id"]),
                    " stays in force); finish with:")
         brief.add_value(f"tp-agent work decision confirm {new['id']} --quote \"their exact words\"")
     waiting = [r["id"] for r in records if r["status"] == "provisional" and covers(r, project, attached)]
     if waiting:
-        brief.add_list("provisional (not in force until the owner confirms; tp-agent work decision confirm ID --quote ...):",
-                       waiting[:8] + ([f"+{len(waiting) - 8}"] if len(waiting) > 8 else []), below=True)
+        brief.add_list("provisional (not in force until the owner confirms; tp-agent work decision confirm ID --quote ...):", waiting, below=True)
 
 
 def _scope_label(scope):
+    """The scope as Main reads it: `project:<directory name>` (a name, so a Whole: never clipped), else the scope itself."""
     return "project:" + Path(scope[len("project:"):]).name if scope.startswith("project:") else scope
 
 
@@ -406,16 +460,15 @@ def _work(brief, index):
     rows = [*index.get("active", []), *index.get("paused", []), *index.get("unstatused", []), *index.get("pending", [])]
     newest = max((_when(r.get("updated")) for r in rows if _when(r.get("updated"))), default=None)
     brief.head("active work (session task records)", newest, "" if rows else "no active, paused or unreviewed tasks")
-    for r in rows[:TASKS_SHOWN]:
+    for r in rows:
         extra = "".join(f" {k}: {r[k]}" for k in ("verdict", "result_status") if r.get(k))
         lane = f" lane {r['lane']}/{r['lane_step']}" if r.get("lane") else ""
+        brief.unit(f"task {r.get('id')}")
         brief.line(Whole(f"- {r.get('id')} {r.get('role')} {r.get('status')}{extra}{lane}"))
-    if len(rows) > TASKS_SHOWN:
-        brief.line(f"- +{len(rows) - TASKS_SHOWN} more: ", Whole("tp-agent list"))
-    lanes = index.get("lanes") or {}
+    lanes = sorted((index.get("lanes") or {}).items())
     if lanes:
-        brief.add_list("lanes:", [f"{name} " + ", ".join(f"{k} {v}" for k, v in sorted(e.get("by_status", {}).items()))
-                                  for name, e in sorted(lanes.items())], sep="; ")
+        brief.add_list("lanes:", [f"{name} " + ", ".join(f"{k} {v}" for k, v in sorted(e.get("by_status", {}).items())) for name, e in lanes],
+                       sep="; ", keys=[f"lane {name}" for name, _ in lanes])
 
 
 def _entry_time(entry):
@@ -442,11 +495,10 @@ def _decisions(brief, docs):
     known = [when for _, when in rows if when]
     brief.head("open decisions", max(known, default=None), *(["none"] if not rows else [Whole("tp-agent work decisions"), " shows each question"]),
                unknown=bool(rows) and not known)
-    for e, when in rows[:DECISIONS_SHOWN]:
+    for e, when in rows:
+        brief.unit(e["id"])
         brief.line(Whole(f"- {e['id']} [{e['priority']}{' blocking' if e['blocking'] else ''}] "
                          f"{_stamp(when) if when else 'time unknown'}{brief.stale(when)}"))
-    if len(rows) > DECISIONS_SHOWN:
-        brief.line(f"- +{len(rows) - DECISIONS_SHOWN} more: ", Whole("tp-agent work decisions"))
 
 
 def _evidence_part(brief, state_dir, attached):

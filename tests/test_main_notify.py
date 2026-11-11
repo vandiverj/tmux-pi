@@ -236,7 +236,10 @@ class MainLauncherIdentityTests(unittest.TestCase):
         (self.root / "agent/orchestrator-claude.md").write_text("claude only\n")
         record_path = self.state / "main-launch.json"
         seen = []
-        for args in ([], ["--resume", "abc", "--model", "opus"]):
+        extra = self.root / "extra.md"
+        extra.write_text("extra rules\n")
+        reviewer_case = ["--append-system-prompt-file", str(extra), "--tools", "Read"]
+        for args in ([], ["--resume", "abc", "--model", "opus"], reviewer_case):
             run = subprocess.run([str(self.root / "bin/tp-main"), *args], env=self.env(), capture_output=True, timeout=25, cwd=str(self.root))
             self.assertEqual(run.returncode, 0, run.stderr)
             self.assertEqual(run.stdout.decode().split("\0")[:-1],
@@ -250,9 +253,72 @@ class MainLauncherIdentityTests(unittest.TestCase):
             self.assertEqual(pieces["orchestrator"]["sha256"], hashlib.sha256(b"core").hexdigest())
             self.assertEqual((pieces["hooks-settings"]["path"], pieces["plugins"]["path"]), ("claude/settings.json", "claude/plugins"))
             self.assertNotIn("claude only", record_path.read_text())
-        self.assertEqual([(r["start"], r["model"]) for r in seen], [("start", None), ("resume", "opus")])
-        self.assertEqual(json.loads(record_path.read_text()), seen[-1])   # one record: the second launch replaced the first
+        self.assertEqual([(r["start"], r["model"]) for r in seen], [("start", None), ("resume", "opus"), ("start", None)])
+        # The reviewer's case (round 3 F1): the caller's own instruction file and --tools are in the record, by path and hash.
+        caller = {p["name"]: p for p in seen[2]["instructions"]}["caller:--append-system-prompt-file"]
+        self.assertEqual((caller["path"], caller["sha256"]), (str(extra), hashlib.sha256(b"extra rules\n").hexdigest()))
+        self.assertEqual(seen[2]["tools"]["exposed"], ["Read"])
+        self.assertNotIn("tools.exposed", seen[2]["null_reasons"])
+        self.assertNotIn("extra rules", record_path.read_text())
+        self.assertFalse([p for p in seen[0]["instructions"] + seen[1]["instructions"] if p["name"].startswith("caller:")])
+        self.assertIsNone(seen[0]["tools"]["exposed"])  # no extra options: the default, with its reason
+        self.assertIn("tools.exposed", seen[0]["null_reasons"])
+        self.assertEqual(json.loads(record_path.read_text()), seen[-1])   # one record: the last launch replaced the others
+        self.caller_argument_table(extra)
         self.assertEqual(sorted(p.name for p in self.state.iterdir() if "launch" in p.name), ["main-launch.json"])
+
+    def caller_argument_table(self, extra):
+        """In-process attack table for what the caller of tp-main passes (both harnesses): every instruction/tool/settings/plugin option
+        in both forms, repeats, an unreadable file, a resume with extras, a mcp config that is hashed and never printed."""
+        import hashlib
+        sys.path.insert(0, str(ROOT / "lib"))
+        import launch_record
+        (self.root / "agent/orchestrator-pi.md").write_text("pi only\n")
+        (self.root / "bin/tp-pi").write_text("MAIN_TOOLS='read,bash'\n")
+        mcp = self.root / "mcp.json"
+        mcp.write_text('{"secret-token": "SECRETVALUE"}')
+        plugins = self.root / "plug"
+        plugins.mkdir()
+        gone = str(self.root / "missing.md")
+        digest = hashlib.sha256(b"extra rules\n").hexdigest()
+
+        def record(harness, *argv):
+            return launch_record.main_record(self.state, harness, "main-x", list(argv), root=self.root)
+
+        def callers(rec):
+            return [(p["name"], p["path"], p["sha256"]) for p in rec["instructions"] if p["name"].startswith("caller:")]
+
+        for harness in ("claude", "pi"):
+            for flag in ("--append-system-prompt-file", "--system-prompt-file"):
+                self.assertEqual(callers(record(harness, flag, str(extra))), [("caller:" + flag, str(extra), digest)], (harness, flag))
+                self.assertEqual(callers(record(harness, f"{flag}={extra}")), [("caller:" + flag, str(extra), digest)], (harness, flag))
+            for flag in ("--append-system-prompt", "--system-prompt"):
+                want = [("caller:" + flag, None, hashlib.sha256(b"inline text").hexdigest())]
+                self.assertEqual(callers(record(harness, flag, "inline text")), want, (harness, flag))
+                self.assertEqual(callers(record(harness, f"{flag}=inline text")), want, (harness, flag))
+            rec = record(harness, "--tools", "Read,Grep", "--tools=Edit")   # repeated: each recorded
+            self.assertEqual(rec["tools"]["exposed"], ["Read", "Grep", "Edit"], harness)
+            rec = record(harness, "--allowedTools", "Bash(ls)", "--allowed-tools=Read", "--disallowedTools", "Write", "--disallowed-tools=Edit")
+            self.assertEqual((rec["tools"]["allowed"], rec["tools"]["denied"]), (["Bash(ls)", "Read"], ["Write", "Edit"]), harness)
+            self.assertNotIn("allowed", record(harness)["tools"])
+            rec = record(harness, "--append-system-prompt-file", str(extra), "--append-system-prompt-file=" + str(extra))
+            self.assertEqual(len(callers(rec)), 2, harness)   # repeated: each recorded
+            rec = record(harness, "--append-system-prompt-file", gone)   # unreadable: path, sha null, a reason
+            self.assertEqual(callers(rec), [("caller:--append-system-prompt-file", gone, None)], harness)
+            self.assertIn("cannot be read", rec["null_reasons"]["instructions[caller:--append-system-prompt-file#0].sha256"])
+            rec = record(harness, "--resume", "abc", "--append-system-prompt-file", str(extra), "--tools", "Read", "--model", "opus")
+            self.assertEqual((rec["start"], rec["model"], rec["tools"]["exposed"], len(callers(rec))), ("resume", "opus", ["Read"], 1), harness)
+            self.assertEqual(callers(record(harness, "--", "--tools", "Read")), [])   # after `--`: not the harness's options
+            self.assertEqual(callers(record(harness, "--tools")), [])   # no value: not guessed at
+
+        rec = record("claude", "--settings", str(mcp), "--mcp-config=" + str(mcp), "--plugin-dir", str(plugins), "--settings", '{"a": 1}')
+        mcp_digest = hashlib.sha256(mcp.read_bytes()).hexdigest()
+        self.assertEqual(callers(rec), [("caller:--settings", str(mcp), mcp_digest), ("caller:--mcp-config", str(mcp), mcp_digest),
+                                        ("caller:--plugin-dir", str(plugins), None),
+                                        ("caller:--settings", None, hashlib.sha256(b'{"a": 1}').hexdigest())])
+        self.assertNotIn("SECRETVALUE", json.dumps(rec))
+        self.assertEqual(record("pi")["tools"]["exposed"], ["read", "bash"])   # pi's default MAIN_TOOLS without --tools
+        self.assertEqual(record("pi", "--tools", "read")["tools"]["exposed"], ["read"])
 
     def test_two_launches_in_one_session_keep_one_id_and_another_session_has_its_own(self):
         first = self.launch()

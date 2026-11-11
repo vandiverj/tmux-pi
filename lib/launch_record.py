@@ -293,6 +293,65 @@ def worker(facts, env=None):
     return record
 
 
+MAIN_FILE_ARGS = {"--append-system-prompt-file": "file", "--system-prompt-file": "file", "--append-system-prompt": "text",
+                  "--system-prompt": "text", "--settings": "settings", "--mcp-config": "settings", "--plugin-dir": "dir"}
+MAIN_TOOL_ARGS = {"--tools": "exposed", "--allowedTools": "allowed", "--allowed-tools": "allowed",
+                  "--disallowedTools": "denied", "--disallowed-tools": "denied"}
+
+
+def _caller_args(argv, known):
+    """(flag, value) for each of the `known` flags the caller passed, `--x value` and `--x=value`, repeats each, in order; scanning
+    stops at `--`. A known flag with no value is skipped. Other arguments (and their values) are not guessed at."""
+    found, i = [], 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--":
+            break
+        flag, eq, value = arg.partition("=")
+        if flag in known and eq:
+            found.append((flag, value))
+        elif arg in known and i + 1 < len(argv):
+            found.append((arg, argv[i + 1]))
+            i += 1
+        i += 1
+    return found
+
+
+def _sha256_file(path):
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest(), None
+    except OSError as error:
+        return None, f"{type(error).__name__}: cannot be read"
+
+
+def main_caller_inputs(argv, reasons):
+    """What the caller of tp-main passed that changes Main's instructions, tools, settings or plugins, read from the argv the harness
+    receives: (instruction entries, {"exposed": list|None, "allowed": [...], "denied": [...]}). Files and directories by path and sha256
+    of a file only (an mcp config or settings file is hashed, never printed); text forms by sha256 only."""
+    entries = []
+    for n, (flag, value) in enumerate(_caller_args(argv, MAIN_FILE_ARGS)):
+        kind, name, key = MAIN_FILE_ARGS[flag], "caller:" + flag, f"instructions[caller:{flag}#{n}]"
+        if kind == "text" or (kind == "settings" and value.lstrip().startswith("{")):
+            entries.append({"name": name, "path": None, "sha256": sha256(value), "version": None})
+            reasons[key + ".path"] = "given as text on the command line; no file holds it"
+        elif kind == "dir":
+            entries.append({"name": name, "path": value, "sha256": None, "version": None})
+            reasons[key + ".sha256"] = "a directory"
+        else:
+            digest, why = _sha256_file(value)
+            entries.append({"name": name, "path": value, "sha256": digest, "version": None})
+            if why:
+                reasons[key + ".sha256"] = why
+    tools = {"exposed": None, "allowed": [], "denied": []}
+    for flag, value in _caller_args(argv, MAIN_TOOL_ARGS):
+        kind = MAIN_TOOL_ARGS[flag]
+        if kind == "exposed":
+            tools["exposed"] = (tools["exposed"] or []) + [t for t in value.split(",") if t]
+        else:
+            tools[kind].append(value)
+    return entries, tools
+
+
 def main_record(state_dir, harness, main_id, argv, env=None, root=ROOT):
     """Main's own record (role main, route main) for bin/tp-main: the prompt files it appends, what tp-claude adds and points to
     (the Bash-suffix rule, its settings file with the hooks, the plugin directory), the harness, and the model and effort when the
@@ -324,6 +383,14 @@ def main_record(state_dir, harness, main_id, argv, env=None, root=ROOT):
         exposed = listed.split(",") if listed else None
         if exposed is None:
             reasons["tools.exposed"] = "bin/tp-pi has no one-line MAIN_TOOLS"
+    extra, caller_tools = main_caller_inputs(argv, reasons)
+    instructions += extra
+    if caller_tools["exposed"] is not None:
+        exposed = caller_tools["exposed"]
+        reasons.pop("tools.exposed", None)
+    tools = {"exposed": exposed, "denied": caller_tools["denied"]}
+    if caller_tools["allowed"]:
+        tools["allowed"] = caller_tools["allowed"]
     binary, version, why = resolve_harness(harness, env)
     if version is None:
         reasons["harness_version"] = why
@@ -341,7 +408,7 @@ def main_record(state_dir, harness, main_id, argv, env=None, root=ROOT):
     record = {
         "schema": SCHEMA, "status": "prepared" if binary else "failed", "task": main_id, "role": "main", "harness": harness,
         "harness_version": version, "model": model, "effort": effort, "tmux_pi_commit": commit, "tmux_pi_dirty": dirty,
-        "instructions": instructions, "tools": {"exposed": exposed, "denied": []},
+        "instructions": instructions, "tools": tools,
         "capabilities": {"supported": list(adapter["supported"]), "unsupported": list(adapter["unsupported"])},
         "preferences": None,
         "context": {"brief": None, "parent": None, "lane": None, "step": None, "base_commit": None, "evidence": []},

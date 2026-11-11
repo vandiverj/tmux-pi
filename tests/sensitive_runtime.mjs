@@ -231,6 +231,9 @@ assert.equal((await diff(repo))?.block, true, 'diff touching config/local.json m
     ["perl -e 'my $f = \".env\";' -e'system(\"cat\", $f);'", ASK_MAIN],
     ["python3 -c 'import sys; print(open(sys.stdin.read().strip() or \".env\").read())' <<< config/local.json", ASK_MAIN],
     ["bash --rcfile .env -ic 'python3 -c \"print(1)\"'", ASK_MAIN],
+    // sg1 round 8: a stdin shell's arguments (F1) and here-string text (F2) are data: no word after `-e` is skipped
+    ["bash -s -- -e config/local.json <<< 'cat \"$2\"'", ASK_MAIN],
+    ["python3 -c 'print(1)' <<< '-e config/local.json'", ASK_MAIN],
   ];
   for (const [command, named] of rows) {
     prompts.length = 0;

@@ -1001,7 +1001,10 @@ class SensitiveReadTableTests(unittest.TestCase):
                 (f"python3 -c 'open(\"{ENV}\").read()'", ask_main),
                 (f"python3 -c 'open(\"{ENV}\").read()'; grep -n x README.md",  # names the batched search, as round 2
                  f'mcp__tmux-pi-safe__safe_grep with pattern "x" and path "{CWD}/README.md"'),
-                (f"bash -c 'python3 -c \"open(\\\"{ENV}\\\")\"'", ask_main)]
+                (f"bash -c 'python3 -c \"open(\\\"{ENV}\\\")\"'", ask_main),
+                # sg1 round 8: a stdin shell's arguments (F1) and here-string or heredoc text (F2) are data, not options
+                (f"bash -s -- -e {LOCAL} <<< 'cat \"$2\"'", ask_main), (f"python3 -c 'print(1)' <<< '-e {LOCAL}'", ask_main),
+                (f"python3 -c 'print(1)' <<'EOF'\n-e {LOCAL}\nEOF", ask_main)]
         with tempfile.TemporaryDirectory() as task:
             record = Path(task) / "permission-request.json"
             for command, named in rows:
@@ -1292,6 +1295,12 @@ class SensitiveReadTableTests(unittest.TestCase):
             # ... through xargs, find -exec, fd -x and a loop
             f"printf '%s\\n' {LOCAL} | xargs python3 -c 'open(\"{ENV}\")'", f"find . -name x -exec perl -e'1' -e'2' {{}} \\;",
             f"fd -g '{ENV}' -x ruby -e 'x' -e 'y'", f"for f in {LOCAL}; do python3 -c 'x' -c $f; done",
+            # sg1 round 8: data that reaches code is data, not options: no word of a stdin shell's arguments or of here-string
+            # or heredoc text is skipped after `-e`, `-m` or any option-like word (F1, F2) ...
+            f"bash -s -- -e {LOCAL} <<'SH'\nwhile getopts e: o; do cat \"$OPTARG\"; done\nSH", f"sh -s -e {LOCAL} <<< 'cat \"$2\"'",
+            f"python3 -c 'x' <<< '-e {LOCAL}'", f"node -e 'x' <<'EOF'\nfirst\n-m {LOCAL}\nEOF", f"bash -c 'x' sh <<< '-e {LOCAL}'",
+            # ... and startup env set before the program, through a wrapper and nested, still refuses (F3)
+            f"env BASH_ENV={ENV} bash -c 'x'", f"find . -name x -exec env BASH_ENV={ENV} bash -c 'cat \"$1\"' sh {{}} \\;",
         ]
         kept = [  # each non-search cause, from the site that decides it
             (f"sh tools/x.sh {ENV}", sr.RUNS_CODE), (f"python3 tools/x.py {ENV}; grep -n x README.md", sr.RUNS_CODE),
@@ -1315,6 +1324,13 @@ class SensitiveReadTableTests(unittest.TestCase):
             (f"bun run tools/x.ts {LOCAL}", sr.RUNS_CODE), (f"php -f tools/x.php {LOCAL}", sr.RUNS_CODE),
             (f"osascript tools/x.scpt {LOCAL}", sr.RUNS_CODE), (f"bash -e tools/x.sh {LOCAL}", sr.RUNS_CODE),
             (f"source tools/x.sh {LOCAL}", sr.RUNS_CODE),
+            # sg1 round 8: a NAME=value after the script is its argument, not shell startup env (F3, round 6 rule 3), at a
+            # site too; and a script's arguments are its data, so `-e`/`-m` never hide the file after them (was allowed)
+            (f"bash tools/x.sh ENV={ENV}", sr.RUNS_CODE), (f"env bash tools/x.sh BASH_ENV={LOCAL}", sr.RUNS_CODE),
+            (f"python3 tools/x.py BASH_ENV={ENV}", sr.RUNS_CODE),
+            (f"find . -name x -exec sh tools/x.sh BASH_ENV={ENV} {{}} \\;", sr.RUNS_CODE),
+            (f"node tools/x.js -e {LOCAL}", sr.RUNS_CODE), (f"python3 tools/x.py -m {LOCAL}", sr.RUNS_CODE),
+            (f"bash tools/x.sh -e {LOCAL}", sr.RUNS_CODE),
             (f"ssh host cat {ENV}", sr.ELSEWHERE), (f"docker exec c cat {ENV}", sr.ELSEWHERE),
             (f"docker run --env-file {ENV} image", sr.ELSEWHERE), (f"kubectl exec pod -- cat {ENV}", sr.ELSEWHERE),
             (f"base64 {ENV}", sr.TRANSFORM), (f"base64 < {ENV}", sr.TRANSFORM), (f"xxd {LOCAL}", sr.TRANSFORM),

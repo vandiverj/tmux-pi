@@ -2169,31 +2169,35 @@ def _command_hit(prog, args, cmd, base, depth, bulk=False):
     # never has it: inline code that touches a sensitive name anywhere is a read, and refuses in a worker (sg1 round 7).
     if prog in _SHELLS:
         form, _, _ = _code_run(prog, args, base)
-        startup = _startup_hit(cmd, base)  # BASH_ENV=/ENV= naming a sensitive file: the shell sources it first
+        env = _before_program(cmd, prog, args)
+        startup = _startup_hit(env, base)  # BASH_ENV=/ENV= naming a sensitive file: the shell sources it first
         at = _dash_c_at(args)
         if at is not None:  # INLINE CODE: the line it runs is judged as any command line, its hit's cause as it is
             line = args[at]
             hit = (_unresolved(line) if isinstance(line, _Line) else None) or _shell_hit(line, base, depth + 1)
-            given = (startup or _words_hit(args[:at], base) or _words_hit(args[at + 1:], base) or _env_hit(cmd, base) or
+            given = (startup or _words_hit(args[:at], base) or _words_hit(args[at + 1:], base) or _env_hit(env, base) or
                      _input_text_hit(cmd, base))
             # A sensitive name reaching the line another way (an operand, an option value such as `--rcfile .env`, an env
             # value, stdin text), or options the parse does not show (`form` is not _INLINE): no cause.
             return _because(None, hit or given) if given or form != _INLINE else hit
         if startup:  # the shell runs the sensitive file before any script: not a script file the parse shows
             return _because(None, startup)
-        given = _other_hit(args, base, True) or (_env_hit(cmd, base) if form != _SCRIPT else None)
+        # Every word alone: no shell option takes text, and the words after a script or `-s` are its data, so none is
+        # skipped as an option's (`bash -s -- -e FILE <<EOF`, sg1 round 8).
+        given = _words_hit(args, base) or (_env_hit(env, base) if form != _SCRIPT else None)
         return _because(_runs_code(form), given)  # SCRIPT FILE; anything else: INLINE CODE, no cause
     if prog == "eval":
         return _shell_hit(" ".join(args), base, depth + 1)
     if prog in _INTERPRETERS:
         form, codes, rest = _code_run(prog, args, base)
+        if form == _SCRIPT:  # options from the closed list take no text; the script's arguments are its data (sg1 round 8)
+            return _because(_runs_code(form), _words_hit(args, base))  # SCRIPT FILE
         given = _other_hit(args, base, True)
-        if form == _SCRIPT:
-            return _because(_runs_code(form), given)  # SCRIPT FILE
         # INLINE CODE, or no parse: no cause, whatever hands it the name (a literal in any code or word after it, an
         # operand, an env value, here-string or heredoc text).
         literal = _first(_literal_hit(word, base) for word in codes + rest if isinstance(word, str) and word)
-        return _because(None, given or _words_hit(rest, base) or literal or _env_hit(cmd, base) or _input_text_hit(cmd, base))
+        return _because(None, given or _words_hit(rest, base) or literal or
+                        _env_hit(_before_program(cmd, prog, args), base) or _input_text_hit(cmd, base))
     return _other_command_hit(prog, args, cmd, base, depth, bulk)
 
 
@@ -2209,9 +2213,22 @@ def _words_hit(words, base):
     return _first(_other_hit([word], base, True) for word in words if isinstance(word, str))
 
 
-def _startup_hit(cmd, base):
-    """A sensitive file a shell sources before it runs anything, named by `BASH_ENV=` or `ENV=` on the command."""
-    for word in cmd.get("words", ()) if isinstance(cmd, dict) else ():
+def _before_program(cmd, prog, args):
+    """The words of `cmd` before the program that runs `args`: its assignments and wrappers (`F=x env G=y bash`), where
+    startup env and an env value are set. A `NAME=value` after the program is its argument, not its environment (sg1
+    round 8). When `args` is not found among the words (a line a wrapper hands a shell), every word, as before."""
+    words = cmd.get("words", []) if isinstance(cmd, dict) else []
+    args = list(args)
+    for k in range(len(words) - len(args), 0, -1):
+        name = posixpath.basename(words[k - 1]).lower() if isinstance(words[k - 1], str) else None
+        if words[k:k + len(args)] == args and _ALIASES.get(name, name) == prog:
+            return words[:k - 1]
+    return words
+
+
+def _startup_hit(words, base):
+    """A sensitive file a shell sources before it runs anything, named by `BASH_ENV=` or `ENV=` before it (_before_program)."""
+    for word in words:
         name, equals, value = word.partition("=")
         if equals and name in ("BASH_ENV", "ENV") and value:
             hit = _other_hit([value], base, True) or _read_hit(value, base, False)
@@ -2226,14 +2243,15 @@ def _input_text_hit(cmd, base):
     if not isinstance(cmd, dict):
         return None
     texts = list(cmd.get("strings", ())) + ["".join(holder) for holder, _ in cmd.get("heredocs", ())]
-    return _first(_literal_hit(text, base) or _other_hit(text.split(), base, True) for text in texts if isinstance(text, str))
+    # every word alone: stdin text is data, so no word is skipped after `-e`, `-f` or `--` (sg1 round 8)
+    return _first(_literal_hit(text, base) or _words_hit(text.split(), base) for text in texts if isinstance(text, str))
 
 
-def _env_hit(cmd, base):
-    """A sensitive path that an assignment on the command (`F=config/local.json python3 -c ...`, `env F=... node -e ...`)
-    hands the code it runs in its environment, whatever the variable is called; None when there is none."""
-    for word in cmd.get("words", ()) if isinstance(cmd, dict) else ():
-        if _ASSIGN.match(word):
+def _env_hit(words, base):
+    """A sensitive path that an assignment before the program (`F=config/local.json python3 -c ...`, `env F=... node -e
+    ...`; `words` from _before_program) hands the code it runs in its environment, whatever the variable is called."""
+    for word in words:
+        if isinstance(word, str) and _ASSIGN.match(word):
             value = word.partition("=")[2]
             hit = _other_hit([value], base, True) or _read_hit(value, base, False)
             if hit:

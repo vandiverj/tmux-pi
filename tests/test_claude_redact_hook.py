@@ -181,6 +181,10 @@ class RedactHookTests(unittest.TestCase):
                                 ("python3 -c 'import sys; print(open(sys.stdin.read().strip() or \"apps/web/.env.local\").read())' "
                                  "<<< apps/web/.env.local | base64", False),
                                 ("bash --rcfile apps/web/.env.local -ic 'python3 -c \"print(1)\"' | base64", False),
+                                # sg1 round 8: a stdin shell's arguments are data, not options (F1). Here-string text (F2)
+                                # never reaches "on" mode's check (bash_reads drops it: round 7's known limit); shadow
+                                # mode's rows in test_sensitive_read cover it.
+                                ("bash -s -- -e apps/web/.env.local <<< 'cat \"$2\"' | base64", False),
                                 ("grep -f apps/web/.env.local README.md | base64", True)):  # without base64 "on" redacts its output
             for worker in (True, False):
                 with self.subTest(command=command, worker=worker):

@@ -86,7 +86,7 @@ def _git(args, cwd, ok=(0,), timeout=None):
     given) or a missing git refuses."""
     env = {k: v for k, v in os.environ.items() if k not in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR")}
     try:
-        run = subprocess.run(["git", "-C", str(cwd)] + list(args), text=True, capture_output=True, timeout=timeout or GIT_TIMEOUT, env=env)
+        run = subprocess.run(["git", "-C", str(cwd)] + list(args), text=True, errors="surrogateescape", capture_output=True, timeout=timeout or GIT_TIMEOUT, env=env)
     except subprocess.TimeoutExpired as error:
         raise GitTimeout(f"git {' '.join(args)} could not run in {cwd} ({error.__class__.__name__})")
     except OSError as error:
@@ -939,7 +939,7 @@ def explicit_branch(branch):
     """`branch` (a lane's --branch) when `git check-ref-format --branch` accepts it as written, else ValueError."""
     run = None
     if isinstance(branch, str) and branch and not branch.startswith("-") and "\n" not in branch and "\x00" not in branch:
-        run = subprocess.run(["git", "check-ref-format", "--branch", branch], capture_output=True, text=True)
+        run = subprocess.run(["git", "check-ref-format", "--branch", branch], capture_output=True, text=True, errors="replace")
     if run is None or run.returncode != 0 or run.stdout.strip() != branch:
         raise ValueError(f"--branch {branch!r} is not a valid branch name")
     return branch

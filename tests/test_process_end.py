@@ -341,6 +341,36 @@ class ProcessEndTests(TmuxCase):
                     with self.assertRaisesRegex(RuntimeError, "cannot read tmux panes"):
                         worker_process.pane_table()
 
+    def test_a_process_table_row_that_is_not_utf8_does_not_hide_the_task_row_or_raise(self):
+        """PD1: another process's command line may hold any bytes; the table is still read and the task's row still matches."""
+        sys.path.insert(0, str(ROOT / "lib"))
+        import worker_process
+        task_dir = "/tmp/pd1-state/tasks/t1"
+        stubs = self.root / "pd1-stubs"
+        stubs.mkdir()
+        cases = {  # the foreign row, as printf octal escapes
+            "0xa0 byte": r"900 S foo \240 bar",
+            "lone 0xff": r"901 S \377",
+            "truncated multibyte": r"902 S caf\303",
+            "0xa0 inside the task path row": r"903 S bash /tmp/pd1-state/tasks/t1/run.sh \240",
+        }
+        for name, foreign in cases.items():
+            with self.subTest(name):
+                (stubs / "ps").write_text(
+                    "#!/bin/sh\n"
+                    "case \"$*\" in\n"
+                    f"*command=*) printf '%b\\n' '{foreign}' '100 S bash {task_dir}/run.sh' '101 Z defunct';;\n"
+                    "*) printf '%b\\n' '100 5 S Mon Jan  1 00:00:00 2026' '902 5 S Mon \\240 1';;\n"
+                    "esac\n")
+                (stubs / "ps").chmod(0o755)
+                with mock.patch.dict(os.environ, {"PATH": f"{stubs}{os.pathsep}{os.environ['PATH']}"}):
+                    rows = worker_process._commands()
+                    self.assertIn((100, f"bash {task_dir}/run.sh"), rows)
+                    self.assertIn(100, worker_process.task_processes(task_dir))
+                    self.assertNotIn(101, [pid for pid, _ in rows])
+                    self.assertEqual(worker_process._ps()[100][1:], ("S", "Mon Jan 1 00:00:00 2026"))
+        self.assertIn(903, worker_process.task_processes(task_dir, [(903, "bash /tmp/pd1-state/tasks/t1/run.sh \udca0")]))
+
     # --- T3: reap ----------------------------------------------------------------------------
 
     def test_reap_lists_without_yes_and_ends_only_finished_tasks_with_it(self):

@@ -805,7 +805,7 @@ SECRET_NAMES = re.compile(r"^(\.env|\.env\..*|.*\.pem|.*\.key|.*\.p12|.*\.pfx|id
 
 def workdir_files(workdir, runner=subprocess.run):
     """Text-candidate files in a workdir: git's tracked and untracked-not-ignored files, else a walk."""
-    r = runner(["git", "-C", workdir, "ls-files", "-co", "--exclude-standard"], capture_output=True, text=True, timeout=20)
+    r = runner(["git", "-C", workdir, "ls-files", "-co", "--exclude-standard"], capture_output=True, text=True, errors="surrogateescape", timeout=20)
     if r.returncode == 0:
         paths = r.stdout.splitlines()
     else:
@@ -851,7 +851,7 @@ def pick_files(task, workdir, model, config, runner=subprocess.run):
     # No tools, settings or MCP servers: the selector only reads the list it is given.
     r = runner(["claude", "-p", "--setting-sources", "", "--strict-mcp-config", "--tools", "",
                 "--model", packet_files["selector"], prompt],
-               capture_output=True, text=True, timeout=120, cwd=tempfile.gettempdir())
+               capture_output=True, text=True, errors="replace", timeout=120, cwd=tempfile.gettempdir())
     if r.returncode != 0:
         raise RouterError("file selector failed: {}".format((r.stderr or r.stdout).strip()[:300]))
     known, picked = set(files), []

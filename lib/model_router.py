@@ -430,7 +430,7 @@ def git_files_touched(workdir, runner=subprocess.run):
     """Number of changed or new files in a working tree (not attributed to one task), or None when unknown."""
     try:
         done = runner(["git", "-C", str(workdir), "status", "--porcelain", "--untracked-files=all", "--", ".", ":(exclude).tmux-pi"],
-                      capture_output=True, text=True, timeout=20)
+                      capture_output=True, text=True, errors="replace", timeout=20)
     except (OSError, subprocess.SubprocessError):
         return None
     return len([line for line in done.stdout.splitlines() if line.strip()]) if done.returncode == 0 else None

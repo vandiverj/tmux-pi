@@ -298,7 +298,7 @@ def _unsafe_followup(project, excluded=()):
     if not pending:
         return None
     try:
-        result = subprocess.run(["tmux", "list-panes", "-a", "-F", "#{pane_id} #{pane_dead}"], capture_output=True, text=True, timeout=3, check=True)
+        result = subprocess.run(["tmux", "list-panes", "-a", "-F", "#{pane_id} #{pane_dead}"], capture_output=True, text=True, errors="replace", timeout=3, check=True)
         alive = {line.split()[0] for line in result.stdout.splitlines() if len(line.split()) == 2 and line.split()[1] == "0"}
         if alive.intersection(pending):
             return "live worker could claim goal continuation as follow-up"
@@ -346,7 +346,7 @@ def _live_task(project, task_id):
         pane = meta.get("pane")
         if (d / "exit").exists() or (d / "pending-capability.json").exists() or state.get("state") not in ("starting", "working", "tool", "waiting") or not isinstance(pane, str) or not pane.startswith("%"):
             return False
-        result = subprocess.run(["tmux", "list-panes", "-a", "-F", "#{pane_id} #{pane_dead}"], capture_output=True, text=True, timeout=3, check=True)
+        result = subprocess.run(["tmux", "list-panes", "-a", "-F", "#{pane_id} #{pane_dead}"], capture_output=True, text=True, errors="replace", timeout=3, check=True)
         return any(line.split() == [pane, "0"] for line in result.stdout.splitlines())
     except (GoalError, OSError, ValueError, TypeError, subprocess.SubprocessError):
         return False
@@ -407,7 +407,7 @@ def _finalize_reviews(s, project):
                 root = Path(__file__).resolve().parent.parent
                 result = subprocess.run([str(root / "bin" / "tp-contract"), "collect", author_id],
                                         env={**os.environ, "TP_STATE_DIR": str(task_state(project))},
-                                        capture_output=True, text=True, timeout=20)
+                                        capture_output=True, text=True, errors="replace", timeout=20)
                 if result.returncode != 0 or result.stdout.strip() != "completed":
                     return "canonical collect unavailable: " + (result.stderr or result.stdout).strip()[:300]
         except (GoalError, OSError, TypeError, ValueError, subprocess.SubprocessError) as exc:

@@ -83,7 +83,7 @@ def main_project(worktree):
     """The main checkout of WORKTREE's repository: the parent of `git rev-parse --git-common-dir` (WORKTREE itself
     in the main checkout), or None when git cannot say."""
     run = subprocess.run(["git", "-C", worktree, "rev-parse", "--path-format=absolute", "--git-common-dir"],
-                         capture_output=True, text=True)
+                         capture_output=True, text=True, errors="surrogateescape")
     common = run.stdout.strip()
     if run.returncode != 0 or not common.startswith("/"):
         return None

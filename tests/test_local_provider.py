@@ -3,6 +3,7 @@
 The shared id (roster, catalog, routes, meta.json model, review provider checks) stays openai/...; only the --model handed to
 pi is the local provider's name. Real tp-spawn launches run once for the class on a private tmux server whose new-window does
 not start the worker (tests/lane_fixture.py); each launch's run.sh is then run with fake tp-pi / tp-claude that log their argv."""
+import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
 import os
 from pathlib import Path

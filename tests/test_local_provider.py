@@ -62,8 +62,10 @@ class ProviderAliasSettingTests(unittest.TestCase):
             ("this Mac", ALIAS, {"openai": "openai-codex"}),
             ("a provider not in the roster is allowed", {"provider_aliases": {"anthropic": "anthropic-work"}},
              {"anthropic": "anthropic-work"}),
-            ("two names to one provider", {"provider_aliases": {"openai": "codex", "azure": "codex"}},
-             {"openai": "codex", "azure": "codex"}),
+            ("two names to one provider (records could not name the shared one)",
+             {"provider_aliases": {"openai": "codex", "azure": "codex"}}, refused),
+            ("two names to two providers", {"provider_aliases": {"openai": "codex", "azure": "azure-work"}},
+             {"openai": "codex", "azure": "azure-work"}),
             ("a list", {"provider_aliases": [["openai", "openai-codex"]]}, refused),
             ("a string", {"provider_aliases": "openai-codex"}, refused),
             ("null", {"provider_aliases": None}, refused),
@@ -279,12 +281,16 @@ class BadAliasRefusesOnEveryRouteTests(unittest.TestCase):
         self.assertIn(MESSAGE, run.stderr)
         self.assertFalse(self.log.exists())
 
-    def test_tp_pi_refuses_before_starting_pi(self):
-        run = subprocess.run([str(ROOT / "bin/tp-pi"), "--model", SOL, "-p", "x"], env=self.env, text=True,
-                             capture_output=True, timeout=30)
-        self.assertNotEqual(run.returncode, 0)
-        self.assertIn(MESSAGE, run.stderr)
-        self.assertFalse(self.log.exists())
+    def test_tp_pi_refuses_every_start_before_starting_pi(self):
+        """Rule B: with or without --model, in either form; the saved/default model start (no --model) too."""
+        rows = [("--model value", ["--model", SOL, "-p", "x"]), ("--model= form", ["--model=" + SOL, "-p", "x"]),
+                ("no --model", ["-p", "x"]), ("no arguments", [])]
+        for name, args in rows:
+            with self.subTest(name):
+                run = subprocess.run([str(ROOT / "bin/tp-pi"), *args], env=self.env, text=True, capture_output=True, timeout=30)
+                self.assertEqual(run.returncode, 1)
+                self.assertEqual(run.stderr, "tp-pi: {}\n".format(MESSAGE))
+                self.assertFalse(self.log.exists())
 
 
 class PiLauncherAliasTests(unittest.TestCase):
@@ -300,7 +306,9 @@ class PiLauncherAliasTests(unittest.TestCase):
         self.record = self.base / "argv.json"
         pi = fake / "pi"
         pi.write_text('#!/usr/bin/env python3\nimport json, os, sys\n'
-                      'open(os.environ["TEST_PI_ARGV"], "w").write(json.dumps(sys.argv[1:]))\nprint("stub reply")\n')
+                      'open(os.environ["TEST_PI_ARGV"], "w").write(json.dumps(sys.argv[1:]))\n'
+                      'open(os.environ["TEST_PI_ARGV"] + ".aliases", "w").write(json.dumps(os.environ.get("TP_PROVIDER_ALIASES")))\n'
+                      'print("stub reply")\n')
         pi.chmod(0o755)
         self.local = self.base / "local.json"
         self.local.write_text(json.dumps(ALIAS))
@@ -312,6 +320,10 @@ class PiLauncherAliasTests(unittest.TestCase):
                              cwd=str(self.base))
         self.assertEqual(run.returncode, 0, run.stderr)
         return json.loads(self.record.read_text())
+
+    def aliases(self):
+        """TP_PROVIDER_ALIASES as pi received it (None: unset)."""
+        return json.loads(Path(str(self.record) + ".aliases").read_text())
 
     @staticmethod
     def models(argv):
@@ -331,12 +343,18 @@ class PiLauncherAliasTests(unittest.TestCase):
             with self.subTest(name):
                 argv = self.argv(tp_pi, args)
                 self.assertEqual(self.models(argv), expected)
+                self.assertEqual(json.loads(self.aliases()), ALIAS["provider_aliases"])  # every start, --model or not
                 if "--" in args:
                     self.assertEqual(argv[argv.index("--"):], args[args.index("--"):])
 
-    def test_no_alias_leaves_the_model_as_it_was(self):
+    def test_no_alias_leaves_the_argv_as_it_was_and_unsets_the_variable(self):
         self.local.write_text("{}")
-        self.assertEqual(self.models(self.argv([str(ROOT / "bin/tp-pi")], ["--model", SOL])), [SOL])
+        stale = {"TP_PROVIDER_ALIASES": json.dumps(ALIAS["provider_aliases"])}  # inherited from an aliased parent pi
+        for args in (["--model", SOL, "-p", "it's \"x\"\n"], ["--model=" + SOL], ["-p", "x"], []):
+            with self.subTest(args):
+                argv = self.argv([str(ROOT / "bin/tp-pi")], args, **stale)
+                self.assertEqual(argv[len(argv) - len(args):], args)
+                self.assertIsNone(self.aliases())
 
     def test_tp_main_pi_launch(self):
         self.assertEqual(self.models(self.argv([str(ROOT / "bin/tp-main")], ["--model", SOL], TP_MAIN_HARNESS="pi")), [CODEX_SOL])
@@ -358,63 +376,117 @@ class PiLauncherAliasTests(unittest.TestCase):
                 self.assertEqual(self.models(json.loads(self.record.read_text())), [CODEX_SOL])
 
 
+ASTRA, CODEX_ASTRA = "openai/gpt-6-astra", "openai-codex/gpt-6-astra"
+ALIASES_VAR = json.dumps(ALIAS["provider_aliases"])  # TP_PROVIDER_ALIASES as bin/tp-pi exports it
+# Reporter cases (Rule A's attack table): (name, TP_PROVIDER_ALIASES or None for unset, a task dir (False: pi Main with no
+# TP_TASK_DIR), events, expected state model, byModel keys, launched_model or None). Events: start/select/use with "provider/id"
+# (use: an assistant message with usage from that model). Every task dir holds a meta.json with a launch pair the reporter no
+# longer reads, so the "no variable" rows show it is not a second source.
+REPORTER_CASES = [
+    ("initial model", ALIASES_VAR, True, [("start", CODEX_SOL), ("use", CODEX_SOL)], SOL, {SOL}, CODEX_SOL),
+    ("switch Sol to Astra", ALIASES_VAR, True,
+     [("start", CODEX_SOL), ("use", CODEX_SOL), ("select", CODEX_ASTRA), ("use", CODEX_ASTRA)], ASTRA, {SOL, ASTRA}, CODEX_ASTRA),
+    ("switch to an unaliased provider", ALIASES_VAR, True,
+     [("start", CODEX_SOL), ("use", CODEX_SOL), ("select", SLOT), ("use", SLOT)], SLOT, {SOL, SLOT}, None),
+    ("and back", ALIASES_VAR, True,
+     [("start", CODEX_SOL), ("select", SLOT), ("use", SLOT), ("select", CODEX_SOL), ("use", CODEX_SOL)], SOL, {SOL, SLOT}, CODEX_SOL),
+    ("a model id containing /", ALIASES_VAR, True, [("start", "openai-codex/vendor/m-1"), ("use", "openai-codex/vendor/m-1")],
+     "openai/vendor/m-1", {"openai/vendor/m-1"}, "openai-codex/vendor/m-1"),
+    ("a provider that only starts like the target", ALIASES_VAR, True,
+     [("start", "openai-codexx/m"), ("use", "openai-codexx/m")], "openai-codexx/m", {"openai-codexx/m"}, None),
+    ("a name already shared", ALIASES_VAR, True, [("start", SOL), ("use", SOL)], SOL, {SOL}, None),
+    ("pi Main, no task dir or meta.json", ALIASES_VAR, False,
+     [("start", CODEX_SOL), ("use", CODEX_SOL), ("select", CODEX_ASTRA), ("use", CODEX_ASTRA)], ASTRA, {SOL, ASTRA}, CODEX_ASTRA),
+    ("no variable", None, True, [("start", CODEX_SOL), ("use", CODEX_SOL)], CODEX_SOL, {CODEX_SOL}, None),
+    ("empty variable", "", True, [("start", CODEX_SOL), ("use", CODEX_SOL)], CODEX_SOL, {CODEX_SOL}, None),
+    ("malformed JSON", "{openai", True, [("start", CODEX_SOL), ("use", CODEX_SOL)], CODEX_SOL, {CODEX_SOL}, None),
+    ("a JSON list", '[["openai", "openai-codex"]]', True, [("start", CODEX_SOL)], CODEX_SOL, set(), None),
+    ("JSON null", "null", True, [("start", CODEX_SOL)], CODEX_SOL, set(), None),
+    ("a non-string target", '{"openai": 1}', True, [("start", CODEX_SOL)], CODEX_SOL, set(), None),
+    ("a model id as target", '{"openai": "openai-codex/gpt-6.1-sol"}', True, [("start", CODEX_SOL)], CODEX_SOL, set(), None),
+]
+
+
 @unittest.skipUnless(shutil.which("node"), "node not installed")
 class ReporterSharedNameTests(unittest.TestCase):
-    """Rule 2: with the alias, state.json model and byModel carry the shared name; the launched name sits in launched_model.
-    The real reporter code runs on synthetic pi events (no model); it learns the shared name from the task's meta.json."""
+    """Rule A: every name the reporter records (state.json model, byModel keys) is the shared id, from the alias map bin/tp-pi
+    exports (TP_PROVIDER_ALIASES), for any model and with or without a task; the selected model's launched name is in
+    launched_model. The real reporter code runs on synthetic pi events (no model), all cases in one node process."""
 
     SCRIPT = r"""
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-const [root, meta] = process.argv.slice(1);
+const [root, spec] = process.argv.slice(1);
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'lp1-rep-'));
+const split = (name) => { const i = name.indexOf('/'); return { provider: name.slice(0, i), id: name.slice(i + 1) }; };
 try {
   fs.writeFileSync(path.join(tmp, 'package.json'), '{"type":"module"}');
   fs.copyFileSync(path.join(root, 'agent/extensions/reporter.ts'), path.join(tmp, 'reporter.ts'));
   fs.cpSync(path.join(root, 'agent/extensions/lib'), path.join(tmp, 'lib'), { recursive: true });
   const mod = await import(pathToFileURL(path.join(tmp, 'reporter.ts')).href);
-  const task = path.join(tmp, 'tasks', 'coder-lp1rep');
-  fs.mkdirSync(task, { recursive: true });
-  fs.writeFileSync(path.join(task, 'meta.json'), meta);
-  process.env.TP_TASK_DIR = task;
-  process.env.TP_TASK_ID = 'coder-lp1rep';
-  const h = {};
-  mod.default({ on(n, f) { h[n] = f; } });
-  h.session_start({}, { model: { provider: 'openai-codex', id: 'gpt-6.1-sol' } });
-  const use = { input: 10, output: 2, cost: { total: 0.1 } };
-  h.message_end({ message: { role: 'assistant', provider: 'openai-codex', model: 'gpt-6.1-sol', content: [], usage: use } });
-  h.message_end({ message: { role: 'assistant', provider: 'other', model: 'm', content: [], usage: use } });
-  console.log(fs.readFileSync(path.join(task, 'state.json'), 'utf8'));
+  const out = [];
+  for (const [n, c] of JSON.parse(spec).entries()) {
+    for (const k of ['TP_TASK_DIR', 'TP_TASK_ID', 'TP_STATE_DIR', 'TP_PROVIDER_ALIASES']) delete process.env[k];
+    if (c.aliases !== null) process.env.TP_PROVIDER_ALIASES = c.aliases;
+    const state = path.join(tmp, `state-${n}`);
+    let file;
+    if (c.task) {
+      const task = path.join(state, 'tasks', 'coder-lp1rep');
+      fs.mkdirSync(task, { recursive: true });
+      fs.writeFileSync(path.join(task, 'meta.json'), JSON.stringify({ model: 'openai/gpt-6.1-sol', launch_model: 'openai-codex/gpt-6.1-sol' }));
+      process.env.TP_TASK_DIR = task;
+      process.env.TP_TASK_ID = 'coder-lp1rep';
+      file = path.join(task, 'state.json');
+    } else {
+      fs.mkdirSync(state, { recursive: true });
+      process.env.TP_STATE_DIR = state;
+      file = path.join(state, 'main', 'state.json');
+    }
+    const h = {};
+    mod.default({ on(name, f) { h[name] = f; } });
+    for (const [kind, name] of c.events) {
+      const m = split(name);
+      if (kind === 'start') h.session_start({}, { model: m });
+      else if (kind === 'select') h.model_select({ model: m });
+      else h.message_end({ message: { role: 'assistant', provider: m.provider, model: m.id, content: [],
+                                      usage: { input: 10, output: 2, cost: { total: 0.1 } } } });
+    }
+    out.push(JSON.parse(fs.readFileSync(file, 'utf8')));
+  }
+  console.log(JSON.stringify(out));
 } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
 """
 
-    def state(self, meta):
-        run = subprocess.run(["node", "--input-type=module", "-e", self.SCRIPT, str(ROOT), json.dumps(meta)], text=True,
+    @classmethod
+    def states(cls, cases):
+        spec = [{"aliases": aliases, "task": task, "events": events} for _, aliases, task, events, *_ in cases]
+        run = subprocess.run(["node", "--input-type=module", "-e", cls.SCRIPT, str(ROOT), json.dumps(spec)], text=True,
                              capture_output=True, timeout=60, cwd=str(ROOT))
-        self.assertEqual(run.returncode, 0, run.stderr)
+        if run.returncode:
+            raise AssertionError(run.stderr)
         return json.loads(run.stdout)
 
-    def test_aliased_task_records_the_shared_name_and_keeps_the_launched_one_beside_it(self):
-        state = self.state({"model": SOL, "launch_model": CODEX_SOL})
-        self.assertEqual(state["model"], SOL)
-        self.assertEqual(set(state["byModel"]), {SOL, "other/m"})
-        self.assertEqual(state["byModel"][SOL]["cost"], 0.1)
-        self.assertEqual(state["launched_model"], CODEX_SOL)
+    @classmethod
+    def setUpClass(cls):
+        cls.results = cls.states(REPORTER_CASES)
 
-    def test_no_alias_records_are_as_before(self):
-        state = self.state({"model": CODEX_SOL})
-        self.assertEqual(state["model"], CODEX_SOL)
-        self.assertEqual(set(state["byModel"]), {CODEX_SOL, "other/m"})
-        self.assertNotIn("launched_model", state)
+    def test_every_recorded_name_is_the_shared_id(self):
+        for case, state in zip(REPORTER_CASES, self.results):
+            name, _, _, _, model, by_model, launched = case
+            with self.subTest(name):
+                self.assertEqual(state["model"], model)
+                self.assertEqual(set(state["byModel"]), by_model)
+                self.assertEqual(state.get("launched_model"), launched)
 
     def test_usage_buckets_follow_the_shared_name(self):
         import tp_usage
-        state = self.state({"model": SOL, "launch_model": CODEX_SOL})
+        state = self.results[1]  # switch Sol to Astra
         text = "\n".join(tp_usage.lines([(False, tp_usage.contribution([state])[0])], 1))
         self.assertIn(SOL, text.splitlines())
-        self.assertNotIn(CODEX_SOL, text)
+        self.assertIn(ASTRA, text.splitlines())
+        self.assertNotIn("openai-codex", text)
 
 
 class DiagnosticsTests(unittest.TestCase):

@@ -26,7 +26,7 @@ type State = {
 	state: "starting" | "working" | "tool" | "waiting" | "error";
 	tool: string;
 	model: string;
-	// The name pi ran the model under when this machine aliases its provider (meta.json launch_model); absent otherwise.
+	// The name pi runs the selected model under when this machine aliases its provider (TP_PROVIDER_ALIASES); absent otherwise.
 	launched_model?: string;
 	turns: number;
 	tools: number;
@@ -135,35 +135,40 @@ export default function (pi: ExtensionAPI) {
 		} catch {}
 	};
 
-	// A machine-local provider alias (config/local.json provider_aliases) changes only the name pi is launched with. meta.json keeps
-	// the shared id in model and the launched one in launch_model; every name this reporter records (state model, byModel keys)
-	// is the shared id, and the launched name is kept beside it in launched_model.
-	let shared = "", launched = "";
-	const readAlias = () => {
-		try {
-			const meta = JSON.parse(readFileSync(join(dir, "meta.json"), "utf8"));
-			if (typeof meta?.model === "string" && typeof meta?.launch_model === "string" && meta.launch_model !== meta.model) {
-				shared = meta.model;
-				launched = meta.launch_model;
+	// A machine-local provider alias (config/local.json provider_aliases) changes only the provider name pi is launched with.
+	// bin/tp-pi, which every pi start passes, exports the map it applied as TP_PROVIDER_ALIASES ({"shared": "launched"}). Every
+	// name this reporter records (state model, byModel keys) is the shared id: a "<launched>/<id>" name is recorded as
+	// "<shared>/<id>" for any id, with or without a task (main too), and the launched name of the selected model is kept in
+	// launched_model. A name whose provider is not an alias target, or a missing or malformed variable, is left as it is.
+	const sharedOf = new Map<string, string>();
+	try {
+		const aliases = JSON.parse(process.env.TP_PROVIDER_ALIASES || "{}");
+		if (aliases && typeof aliases === "object" && !Array.isArray(aliases)) {
+			for (const [from, to] of Object.entries(aliases)) {
+				if (typeof to === "string" && to && from && !from.includes("/") && !to.includes("/")) sharedOf.set(to, from);
 			}
-		} catch {}
-	};
-	const sharedName = (name: string) => {
-		if (launched && name === launched) {
-			s.launched_model = launched;
-			return shared;
 		}
-		return name;
+	} catch {}
+	// [shared name, launched name or "" when the name is not aliased]
+	const resolve = (name: string): [string, string] => {
+		const slash = name.indexOf("/");
+		const from = slash > 0 ? sharedOf.get(name.slice(0, slash)) : undefined;
+		return from ? [`${from}${name.slice(slash)}`, name] : [name, ""];
+	};
+	const select = (name: string) => {
+		const [shared, launched] = resolve(name);
+		s.model = shared;
+		if (launched) s.launched_model = launched;
+		else delete s.launched_model;
 	};
 
 	pi.on("session_start", (_event, ctx) => {
 		restore();
-		readAlias();
-		s.model = ctx.model ? sharedName(`${ctx.model.provider}/${ctx.model.id}`) : "";
+		select(ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "");
 		save();
 	});
 	pi.on("model_select", (event) => {
-		s.model = sharedName(`${event.model.provider}/${event.model.id}`);
+		select(`${event.model.provider}/${event.model.id}`);
 		save();
 	});
 	pi.on("agent_start", () => {
@@ -199,7 +204,7 @@ export default function (pi: ExtensionAPI) {
 			s.tokens.cacheWrite += d.cacheWrite;
 			s.cost += d.cost;
 			// The message names the model that produced it; the selected model is only a fallback.
-			const name = m.model ? sharedName(`${m.provider ? `${m.provider}/` : ""}${m.model}`) : s.model;
+			const name = m.model ? resolve(`${m.provider ? `${m.provider}/` : ""}${m.model}`)[0] : s.model;
 			if (name) {
 				const b = (s.byModel[name] ??= { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 });
 				b.input += d.input;

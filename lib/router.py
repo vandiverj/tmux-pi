@@ -120,8 +120,9 @@ class ProviderAliasError(RouterError):
 def check_provider_aliases(aliases):
     """Validate local "provider_aliases": shared provider prefix -> the pi provider this machine launches it with.
 
-    Both sides are provider names; no alias names itself and no alias target is itself aliased (no chains), so one
-    rewrite is final. Returns the mapping."""
+    Both sides are provider names; no alias names itself, no alias target is itself aliased (no chains), so one
+    rewrite is final, and no two shared names share a target, so the pi reporter (agent/extensions/reporter.ts, given the
+    map in TP_PROVIDER_ALIASES by bin/tp-pi) can record every launched name under its one shared name. Returns the mapping."""
     if not isinstance(aliases, dict):
         raise ProviderAliasError("provider_aliases must map a shared provider name to this machine's pi provider name")
     for shared, launched in aliases.items():
@@ -132,6 +133,12 @@ def check_provider_aliases(aliases):
             raise ProviderAliasError("provider_aliases {!r} aliases itself".format(shared))
         if launched in aliases:
             raise ProviderAliasError("provider_aliases {!r} -> {!r} is a chain: {!r} is aliased too".format(shared, launched, launched))
+    targets = {}
+    for shared, launched in aliases.items():
+        if launched in targets:
+            raise ProviderAliasError("provider_aliases {!r} and {!r} both launch as {!r}: records could not name the shared provider"
+                                     .format(targets[launched], shared, launched))
+        targets[launched] = shared
     return aliases
 
 

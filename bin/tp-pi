@@ -32,23 +32,23 @@ ROOT="$(cd "$(dirname "$src")/.." && pwd)"
 # Only pi's process uses it; PATH is unchanged, so commands pi runs keep the project's
 # Node. TP_PI_NODE overrides the interpreter; set it empty to run `pi` from PATH.
 # A machine-local provider alias (config/local.json "provider_aliases", lib/router.py launch_argv) rewrites the --model handed to
-# pi here, so every pi start with a model (tp-spawn, tp-main, tools/qual, ask_local) gets it once. A name already local is left
-# alone and a bad alias refuses before pi starts. Claude launches do not pass here.
-case " $* " in
-  *" --model"*)
-    rewritten="$(python3 -c '
-import shlex, sys
+# pi here, so every pi start with a model (tp-spawn, tp-main, tools/qual, ask_local) gets it once; a name already local is left
+# alone. The config is read and checked on every start, with or without --model, so a bad alias (or a bad local.json) refuses
+# with the loader's text before pi starts. The applied map is exported to pi as TP_PROVIDER_ALIASES (JSON; unset when there is
+# none) so agent/extensions/reporter.ts records every launched name under its shared one. Claude launches do not pass here.
+launch="$(python3 -c '
+import json, shlex, sys
 sys.path.insert(0, sys.argv[1] + "/lib")
 from router import RouterError, launch_argv, load_config
 try:
     config = load_config(sys.argv[1] + "/config/router.json", laya_model=False)
 except RouterError as exc:
     sys.exit("tp-pi: {}".format(exc))
-print(" ".join(shlex.quote(a) for a in launch_argv(sys.argv[2:], config)))
+aliases = (config.get("local") or {}).get("provider_aliases") or {}
+print("export TP_PROVIDER_ALIASES={}".format(shlex.quote(json.dumps(aliases))) if aliases else "unset TP_PROVIDER_ALIASES")
+print("set -- " + " ".join(shlex.quote(a) for a in launch_argv(sys.argv[2:], config)))
 ' "$ROOT" "$@")" || exit 1
-    eval "set -- $rewritten"
-    ;;
-esac
+eval "$launch"
 
 PI_NODE="${TP_PI_NODE-$HOME/.nvm/versions/node/v24.16.0/bin/node}"
 pi() {

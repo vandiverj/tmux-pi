@@ -147,3 +147,6 @@ simulated. **Evidence:** `hub/handoff/`.
    `hub-correct` (HB4) and `hub-episodes` (HB8) start first, since neither touches SG1's files; `hub-memory` (HB3) next;
    `hub-delivery` (HB2) after SG1 merges. HB5, HB6, HB7 after HB2-HB4 land.
 3. Each item ends with an adopt/revise/defer line here, backed by HB8 results.
+
+## Independent assessment (2026-11-10)
+The Fable assessment is mapped in `../assessment/README.md`. It confirms the HUB order. Its additions went into HB2, HB4b, HB5, HB6 and HB9 as notes on H35, H37, H38, H39 and H42; its new items are H43-H55. H48 (labelling one campaign's interventions) should run before HB7 is scoped.

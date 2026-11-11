@@ -45,6 +45,7 @@ def add_parsers(sub):
     p.add_argument("--status", choices=work.WORKSPACE_STATUS)
     p.add_argument("--objective")
     p.add_argument("--scope")
+    p.add_argument("--acceptance", help="what counts as done (the working brief shows it)")
     p.add_argument("--repo", action="append", default=[])
     p.add_argument("--ticket", action="append", default=[])
     p.add_argument("--tag", action="append", default=[])
@@ -52,10 +53,11 @@ def add_parsers(sub):
     ident(p)
     p.add_argument("text", nargs="?")
     p.add_argument("--done", type=int, metavar="N")
-    p = ws.add_parser("decide", help="record a decision made (a line in Decisions)")
+    p = ws.add_parser("decide", help="record a decision made (a line in Decisions): active only when --by owner with their exact words in --quote, else provisional until `work decision confirm`")
     ident(p)
     p.add_argument("text")
     p.add_argument("--source", default="")
+    record_options(p)
     p = ws.add_parser("block", help="record a blocker or question, or clear one (--clear N)")
     ident(p)
     p.add_argument("text", nargs="?")
@@ -101,15 +103,26 @@ def add_parsers(sub):
                         "lane:<name> (dispatch --lane <name>) | next:<n> (a next action; alone it blocks every dispatch) (repeatable)")
     p.add_argument("--priority", choices=work.PRIORITIES, default="normal")
     p.add_argument("--blocking", action="store_true")
+    p.add_argument("--kind", choices=work.RECORD_KINDS, default="design", help="the kind of record its answer becomes")
+    p.add_argument("--scope", default="workspace", help="global | project:<repo path> | workspace | lane:<n> | task:<id> | role:<r>")
     p = d.add_parser("answer", help="record the resolution and print what can resume")
     p.add_argument("id")
     p.add_argument("--text", required=True)
-    p.add_argument("--by", choices=["user", "agent"], default="user",
-                   help="who answered; recorded on the entry. A blocking decision is cleared only by --by user with their exact words in a non-empty --quote (policy, not authentication: --by cannot prove who spoke)")
+    p.add_argument("--by", choices=["user", "owner", "agent", "main"], default=None,
+                   help="who answered (default user; owner = user, main = agent); recorded on the entry. A blocking decision is cleared only by --by user with their exact words in a non-empty --quote (policy, not authentication: --by cannot prove who spoke). A worker process cannot answer as the user")
     p.add_argument("--quote", default="", help="the user's exact words, verbatim; recorded on the entry")
-    p = d.add_parser("withdraw", help="withdraw a decision; the entry stays")
+    p.add_argument("--supersedes", help="a record id this answer replaces (same scope only)")
+    p = d.add_parser("confirm", help="the owner confirms a provisional record with their exact words; it becomes active")
+    p.add_argument("id", help="<ws>/R<n>, <ws>/L<n> or <ws>/D<n>")
+    p.add_argument("--quote", required=True, help="the owner's exact words, verbatim")
+    p = d.add_parser("withdraw", help="withdraw a decision or record; the entry stays. An active record needs the owner's words in --quote")
     p.add_argument("id")
     p.add_argument("--reason", default="")
+    p.add_argument("--quote", default="", help="the owner's exact words (required to withdraw an active record)")
+    p = ws.add_parser("records", help="every decision record with its kind, scope, provenance and status (read-only)")
+    p.add_argument("--status", choices=work.RECORD_STATUS)
+    p.add_argument("--workspace")
+    p.add_argument("--json", action="store_true")
     p = ws.add_parser("promote", help="write a DRAFT *.context.md from a note or workspace into a working tree (no git is run)")
     p.add_argument("id", help="note or workspace id")
     p.add_argument("--as", dest="kind_as", choices=["context", "task"], default="context")
@@ -139,6 +152,16 @@ def add_parsers(sub):
     p.add_argument("--no-checkpoint", action="store_true", help="there is no checkpoint of this run to compare with: the live records and the workspace are what you checked")
     p = ws.add_parser("compacted", help="mark this session's recovery as pending by adding a recovery generation (for the compaction hooks)")
     p.add_argument("--reason", default="compaction")
+
+
+def record_options(p):
+    p.add_argument("--kind", choices=work.RECORD_KINDS, default="design")
+    p.add_argument("--scope", default="workspace", help="global | project:<repo path> | workspace | lane:<n> | task:<id> | role:<r>")
+    p.add_argument("--by", choices=["owner", "user", "main", "agent"], default="main",
+                   help="who made it (default main). Only --by owner with a non-empty --quote is active; a worker process cannot use --by owner")
+    p.add_argument("--quote", default="", help="the owner's exact words, verbatim")
+    p.add_argument("--question", default="", help="the question this answers; two active records in one scope answering the same question are shown as a conflict")
+    p.add_argument("--supersedes", help="a record id this one replaces (same scope only)")
 
 
 def _extend(meta, key, values):
@@ -206,7 +229,7 @@ def leaf(args):
 
 # Every `work` subcommand that changes nothing in the work store. Anything not listed here is a mutation: `run` calls
 # `post_mutation` after it, so a new mutating subcommand gets the stale-checkpoint trigger without anyone remembering to add it.
-READ_ONLY = frozenset({"show", "list", "decisions", "note show", "decision list"})
+READ_ONLY = frozenset({"show", "list", "decisions", "records", "note show", "decision list"})
 NOT_MUTATIONS = READ_ONLY | {"recover", "compacted", "recovered", "checkpoint"}
 
 
@@ -219,6 +242,9 @@ def workspace_written(args):
     cmd = args.work_command
     if cmd in {"set", "next", "decide", "block", "link"}:
         return args.id
+    if cmd == "decision" and args.decision_command in ("confirm", "withdraw"):
+        match = work.RECORD_ID_RE.match(getattr(args, "id", "") or "")
+        return match.group(1) if match else None
     if cmd == "archive":
         return None if args.kind == "note" else args.id
     if cmd == "decision":
@@ -443,6 +469,12 @@ def _read_command(args):
     if cmd == "note":
         doc = work.load("note", args.id)
         return {**_summary(doc), "meta": doc.meta, "text": doc.body}
+    if cmd == "records":
+        skipped = []
+        rows = [r for r in work.all_records(skipped) if (not args.status or r["status"] == args.status)
+                and (not args.workspace or r["workspace"] == args.workspace)]
+        _report_skipped(skipped)
+        return rows if args.json else records_text(rows)
     skipped = []
     rows = work.open_decisions(args.all, skipped=skipped)
     _report_skipped(skipped)
@@ -454,6 +486,17 @@ def _report_skipped(skipped):
     names = work.skipped_files(skipped)
     if names:
         print(f"warning: {len(names)} unreadable work files skipped: {', '.join(names)}", file=sys.stderr)
+
+
+def records_text(rows):
+    if not rows:
+        return "no records"
+    out = []
+    for r in rows:
+        by = r["provenance"]["by"] or "unknown"
+        links = "".join(f" {k.replace('_', '-')}: {r[k]}" for k in ("supersedes", "superseded_by") if r.get(k))
+        out.append(f"{r['id']} {r['status'] or 'open question'} [{r['kind']} {r['scope']}] by {by}{links}: {(r['text'] or r['question'] or '').splitlines()[0] if (r['text'] or r['question']) else ''}")
+    return "\n".join(out)
 
 
 def decisions_text(rows):
@@ -477,6 +520,7 @@ def _write_command(args, session_dir, task_status):
         for title, text in (("Objective", args.objective),):
             if text:
                 body = set_section(body, title, text.strip())
+                meta["objective_at"] = work.now()
         doc = work.create("workspace", args.title, args.id, meta, body)
         return _summary(doc)
     if cmd == "note" and args.note_command == "add":
@@ -516,8 +560,12 @@ def _write_command(args, session_dir, task_status):
             _extend(doc.meta, key, values)
         if args.objective is not None:
             doc.body = set_section(doc.body, "Objective", args.objective.strip())
+            doc.meta["objective_at"] = work.now()  # each part carries the time it was written (the working brief shows it)
         if args.scope is not None:
             doc.body = set_section(doc.body, "Scope", args.scope.strip())
+        if args.acceptance is not None:
+            doc.body = set_section(doc.body, "Acceptance", args.acceptance.strip())
+            doc.meta["acceptance_at"] = work.now()
     elif cmd == "next":
         if args.done:
             _checklist(doc, "Next actions", args.done, lambda l: l.replace("- [ ]", "- [x]", 1))
@@ -526,7 +574,7 @@ def _write_command(args, session_dir, task_status):
         else:
             raise WorkError("give the action text or --done N")
     elif cmd == "decide":
-        doc.body = append_line(doc.body, "Decisions", f"- {stamp} {args.text.strip()}" + (f" Source: {args.source}" if args.source else ""))
+        return _decide(args, doc, stamp)
     elif cmd == "block":
         if args.clear:
             _checklist(doc, "Blockers / questions", args.clear, lambda l: l.replace("- [ ]", "- [x]", 1))
@@ -618,6 +666,145 @@ def _archive(args):
     return {**_summary(doc), "kind": doc.kind}
 
 
+WORKER_REFUSAL = ("refused: a worker process (TP_TASK_ID or TP_TASK_DIR is set) cannot write as the owner or confirm a record; worker "
+                  "text never becomes an active record. Report it to main (tp-agent request), which asks the owner")
+
+
+def _provenance(by_arg, quote, source=""):
+    """{by, quote, at, source} of a record written now. A worker process is always `worker`; one asking to write as the owner is
+    refused (never silently downgraded)."""
+    by = work.normal_by(by_arg) or "main"
+    if work.in_worker():
+        if by == "owner":
+            raise WorkError(WORKER_REFUSAL)
+        by = "worker"
+    quote = (quote or "").strip()
+    return {"by": by, "quote": quote or None, "at": work.now(), "source": (source or "").strip() or None}
+
+
+def _supersedable(ident, new):
+    """(doc, record) of the record `new` replaces; refused when it is not in force, is an open question, or is in another scope."""
+    old_doc, old = work.find_record(ident)
+    if old["id"] == new["id"]:
+        raise WorkError("a record cannot supersede itself")
+    if old["status"] in ("superseded", "withdrawn"):
+        raise WorkError(f"{ident} is already {old['status']}" + (f" (by {old['superseded_by']})" if old.get("superseded_by") else ""))
+    if old["status"] is None:
+        raise WorkError(f"{ident} is an open question, not a record; answer or withdraw it")
+    if work.scope_key(old) != work.scope_key(new):
+        raise WorkError(f"refused: {ident} is in scope {work.scope_key(old)} and the new record in {work.scope_key(new)}; a record supersedes "
+                        "only one in the same scope (withdraw the old one, or write the new one in its scope)")
+    return old_doc, old
+
+
+def _supersede_now(doc, old_doc, old, new):
+    """Mark `old` superseded by `new` (a pointer both ways: `new` already carries `supersedes`). An active record is replaced only by
+    an active one: a provisional replacement waits, and `decision confirm` finishes it. Returns the state of the supersession."""
+    if new["status"] != "active" and old["status"] == "active":
+        return f"pending: {old['id']} stays active until the owner confirms {new['id']}"
+    old = {**old, "status": "superseded", "superseded_by": new["id"]}
+    work.put_record(doc if old_doc.id == doc.id else old_doc, old)
+    return f"{old['id']} superseded"
+
+
+def _save_both(doc, old_doc):
+    """Save the workspace holding the replacement first, then the other one holding the record it supersedes. A failure between the
+    two leaves the old rule in force and the new one present but pending (never neither): the supersession is committed only when the
+    old record carries `superseded_by`; `decision confirm NEW` completes it."""
+    doc.save()
+    if old_doc is not None and old_doc.id != doc.id:
+        old_doc.save()
+
+
+def _decide(args, doc, stamp):
+    prov = _provenance(args.by, args.quote, args.source)
+    text = args.text.strip()
+    if not text:
+        raise WorkError("give the decision text")
+    record = {"id": f"{doc.id}/R{work.next_line_number(doc)}", "workspace": doc.id, "form": "line", "kind": args.kind,
+              "scope": work.check_scope(args.scope), "provenance": prov, "status": work.record_status(prov["by"], prov["quote"]),
+              "supersedes": args.supersedes or None, "superseded_by": None, "question": (args.question or "").strip() or None, "text": text}
+    old = _supersedable(args.supersedes, record) if args.supersedes else None
+    flat = " ".join(text.split())  # the line shows one line; a multiline text is kept whole in the trailer (stored_fields)
+    doc.body = append_line(doc.body, "Decisions", f"- {stamp} {flat}" + (f" Source: {args.source}" if args.source else "")
+                           + f" <!-- record: {work.record_json(work.stored_fields(record))} -->")
+    note = _supersede_now(doc, *old, record) if old else None
+    _save_both(doc, old[0] if old else None)
+    value = {**_summary(doc), "record": {k: v for k, v in record.items() if k not in ("workspace", "form")}}
+    if record["status"] != "active":
+        value["note"] = f"provisional until the owner confirms it: tp-agent work decision confirm {record['id']} --quote \"their exact words\""
+    if note:
+        value["supersession"] = note
+    return value
+
+
+def _confirm(args):
+    if work.in_worker():
+        raise WorkError(WORKER_REFUSAL)
+    quote = (args.quote or "").strip()
+    if not quote:
+        raise WorkError("--quote must hold the owner's exact words")
+    doc, record = work.find_record(args.id)
+    if record["status"] in ("superseded", "withdrawn"):
+        raise WorkError(f"{record['id']} is {record['status']}; it cannot be confirmed")
+    if record["status"] == "active":  # already the owner's; changed only when its supersession was never committed (a failed second save)
+        old_doc = old = None
+        if record.get("supersedes"):
+            try:
+                old_doc, old = work.find_record(record["supersedes"])
+            except WorkError:
+                old = None
+        if old is None or old["status"] in ("superseded", "withdrawn"):
+            return {"id": record["id"], "status": "active", "changed": False}
+        note = _supersede_now(doc, old_doc, old, record)
+        _save_both(doc, old_doc)
+        return {"id": record["id"], "status": "active", "changed": True, "supersession": note}
+    if record["status"] is None and not record["text"]:
+        raise WorkError(f"{record['id']} is an open question with no answer; answer it: work decision answer {record['id']} --text ... --by user --quote ...")
+    record = {**record, "status": "active", "provenance": {**record["provenance"], "by": "owner", "quote": quote, "at": work.now()}}
+    if record["form"].startswith("entry"):
+        entries = work.decisions_of(doc)
+        for entry in entries:
+            if entry["id"] == record["id"]:
+                entry.update(status="answered", by="user", quote=quote, at=record["provenance"]["at"], _dirty=True,
+                             record=work.record_json({k: v for k, v in work.stored_fields(record).items() if k != "id"}))
+        work.put_decisions(doc, entries)
+    else:
+        work.put_record(doc, record)
+    note, old_doc = None, None
+    if record.get("supersedes"):
+        try:
+            old_doc, old = work.find_record(record["supersedes"])
+        except WorkError as error:
+            note = f"the record it supersedes cannot be read: {error}"
+        else:
+            if old["status"] not in ("superseded", "withdrawn"):
+                note = _supersede_now(doc, old_doc, old, record)
+    _save_both(doc, old_doc)
+    return {"id": record["id"], "status": "active", "changed": True, **({"supersession": note} if note else {})}
+
+
+def _withdraw_record(args, doc, record):
+    """Withdraw a line record, or an answered entry. An active record is the owner's: withdrawing it needs their words in --quote,
+    and a worker cannot."""
+    if record["status"] in ("superseded", "withdrawn"):
+        raise WorkError(f"{record['id']} is already {record['status']}")
+    if record["status"] == "active" and (work.in_worker() or not (args.quote or "").strip()):
+        raise WorkError(WORKER_REFUSAL if work.in_worker() else
+                        f"{record['id']} is active (the owner's); withdrawing it needs the owner's exact words in --quote")
+    reason = args.reason or "withdrawn"
+    if record["form"].startswith("entry"):
+        entries = work.decisions_of(doc)
+        for entry in entries:
+            if entry["id"] == record["id"]:
+                entry.update(status="withdrawn", withdrawn=reason, at=work.now(), _dirty=True)
+        work.put_decisions(doc, entries)
+    else:
+        work.put_record(doc, {**record, "status": "withdrawn", "withdrawn": reason})
+    doc.save()
+    return {"id": record["id"], "status": "withdrawn"}
+
+
 def _decision(args, task_status):
     sub = args.decision_command
     if sub == "add":
@@ -626,27 +813,54 @@ def _decision(args, task_status):
         entry = {"id": f"{doc.id}/D{work.next_decision_number(entries)}", "priority": args.priority, "status": "open",
                  "blocking": args.blocking, "question": args.question, "background": args.background, "options": args.options,
                  "recommended": args.recommended, "affects": args.affects or ["workspace"], "resolution": "", "by": "", "at": "",
-                 "quote": "", "withdrawn": ""}
+                 "quote": "", "withdrawn": "", "record": work.record_json({"kind": args.kind, "scope": work.check_scope(args.scope), "written": work.now()})}
         entry["_dirty"] = True
         entries.append(entry)
         work.put_decisions(doc, entries)
         doc.save()
         return entry
+    if sub == "confirm":
+        return _confirm(args)
+    if sub == "withdraw" and not work.DECISION_RE.match(args.id or ""):
+        return _withdraw_record(args, *work.find_record(args.id))
+    if sub == "withdraw":  # an answered entry whose workspace is archived is still withdrawable when its record outlives it
+        try:
+            found = work.find_record(args.id)
+        except WorkError:
+            found = None
+        if found and found[1]["status"] is not None and found[0].archived:
+            return _withdraw_record(args, *found)
     doc, entries, entry = work.find_decision(args.id)
+    if sub == "withdraw" and entry["status"] == "answered":
+        return _withdraw_record(args, doc, work.entry_record(doc.id, entry))
     if entry["status"] != "open":
         raise WorkError(f"{entry['id']} is already {entry['status']}")
     entry["_dirty"] = True
     if sub == "answer":
-        cleared = not (entry["blocking"] and not (args.by == "user" and args.quote.strip()))
+        by_arg = args.by or "user"
+        if work.in_worker():
+            if args.by in ("user", "owner"):
+                raise WorkError(WORKER_REFUSAL)
+            by_arg = "worker"
+        by = work.normal_by(by_arg)
+        cleared = not (entry["blocking"] and not (by == "owner" and args.quote.strip()))
         # An answer that is not --by user with a --quote is stored (by and quote on the entry) but never clears a blocking entry: it stays open, in the queue, until
         # the user answers or it is withdrawn. Policy only: nothing authenticates --by.
-        entry.update(status="answered" if cleared else "open", resolution=args.text, by=args.by, at=work.now(), quote=args.quote)
+        entry.update(status="answered" if cleared else "open", resolution=args.text, by=by_arg, at=work.now(), quote=args.quote)
+        record = work.entry_record(doc.id, entry)
+        record = {**record, "provenance": {"by": by, "quote": args.quote.strip() or None, "at": entry["at"], "source": None},
+                  "status": work.record_status(by, args.quote), "supersedes": args.supersedes or None}
+        old = _supersedable(args.supersedes, record) if args.supersedes else None
+        entry["record"] = work.record_json({k: v for k, v in work.stored_fields(record).items() if k != "id"})
         work.put_decisions(doc, entries)
+        note = _supersede_now(doc, *old, record) if old and cleared else None
         mentions = [l.strip() for l in _lines(get_section(doc.body, "Next actions")) if entry["id"] in l]
-        doc.save()
-        value = {"id": entry["id"], "status": entry["status"], "by": args.by, "clears_blocking": cleared,
+        _save_both(doc, old[0] if old and cleared else None)
+        value = {"id": entry["id"], "status": entry["status"], "by": by_arg, "clears_blocking": cleared,
                  "can_resume": resume_targets(entry, task_status) if cleared else [],
-                 "next_actions_mentioning": mentions if cleared else []}
+                 "next_actions_mentioning": mentions if cleared else [], "record_status": work.entry_record(doc.id, entry)["status"]}
+        if note:
+            value["supersession"] = note
         if not cleared:
             value["note"] = "recorded, but the blocking decision stays open until the user answers it with --by user and their exact words in --quote (or it is withdrawn)"
         return value

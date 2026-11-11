@@ -38,8 +38,11 @@ pure functions with string or number inputs and more than 2 branches). Fit it in
 A and B miss in at least one real or regression case, with no more than one misleading failure across the set.
 
 ## Missing before it can run
-- fast-check is not installed. It needs the owner's approval for a pinned, isolated install with `--ignore-scripts` (the
-  code-quality eval's approval covered only its four tools).
+- fast-check: owner approved a pinned install (2026-11-10). 4.10.2 (+ pure-rand 8.4.2) is installed with `--ignore-scripts` in
+  the code-quality eval's isolated tools dir, not in the repo. Smoke (same day): the `reviewNotice` decision copied from
+  `subagents.ts` and `subagents.mjs` agrees on 1,000 runs (node 24 runs the `.ts` copy directly); an equivalent rewrite passes;
+  a planted whitespace-stderr difference fails in 4 runs, shrinks to `[1, "!", " ", "-"]`, and replays from seed 20261110 and
+  its path. The real functions are closures with I/O, so each case needs its pure part copied or extracted first.
 - The repo has no `package.json` or `tsconfig`. Properties run under node 24 type stripping, or modules that need more are
   compiled with the local TypeScript 5.9.3 already in the npx cache. Check this per case.
 - Fixtures for cases 2 and 3 if no real intentional-difference pair or historical regression is found.

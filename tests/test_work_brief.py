@@ -156,6 +156,17 @@ class AttackTable(Base):
         for life in ("superseded", "withdrawn"):
             self.assertNotIn(f"| {life} |", text)
         self.assertEqual((counts["cells"], counts["shown"]), (110, 26))  # 4 writers x 5 scopes x 5 lifecycles + 2 old forms x 5 lifecycles
+        # Archiving a workspace: its global and project records stand (status untouched, still in Main's brief); the others follow it.
+        self.ok("work", "new", "Gone", "--id", "gone")
+        archived = {name: self.ok("work", "decide", "gone", f"archived {name}", "--scope", scope, *OWNER, "kept")["record"]["id"]
+                    for name, scope in (("global", "global"), ("project", scopes["project"]), ("workspace", "workspace"), ("lane", "lane:alpha"),
+                                        ("task", "task:coder-1"))}
+        before = {r["id"]: r["status"] for r in self.records() if r["workspace"] == "gone"}
+        self.ok("work", "archive", "gone", "--kind", "workspace")
+        after = {r["id"]: r["status"] for r in self.records() if r["workspace"] == "gone"}
+        self.assertEqual(after, {archived[n]: before[archived[n]] for n in ("global", "project")}, "archive changed a record or lost a standing one")
+        shown_after = {r["id"] for r in work_brief.in_force(self.records(), self.project, ["hub"])[0]}
+        self.assertEqual({n for n, i in archived.items() if i in shown_after}, {"global", "project"})
 
 
 class Start(Base):
@@ -214,14 +225,41 @@ class Start(Base):
         self.assertEqual(code, 0, err)
         self.assertIn("auto-attach of new failed", out, "unwritable state")
         self.assertTrue(first(out).startswith("no workspace attached"), "unwritable state")
-        # row: an unwritable store: read-only use still works (attaching writes the state directory only)
+        # row: a read-only workspaces folder: reading (and the brief) still works; nothing is written, so nothing is created
         os.chmod(store, 0o500)
         try:
-            self.brief("--attach")
+            text = self.brief("--attach")
         finally:
             os.chmod(store, 0o700)
-        self.assertEqual(self.attached(), ["new"], "unwritable store")
+        self.assertEqual(self.attached(), ["new"], "read-only workspaces folder")
+        self.assertIn('workspace new "New" (attached', text, "read-only workspaces folder")
         self.assertEqual(sorted(p.stem for p in store.glob("*.md")), ["broken", "elsewhere", "new", "old"], "a workspace was created")
+        # rows: an unusable store says so on the first line (exit 0), reads as no workspace and never suggests creating one
+        file_store = self.tmp / "a-file"
+        file_store.write_text("a file where the store should be")
+        locked = self.tmp / "locked"
+        (locked / "workspaces").mkdir(parents=True)
+        for name, root, why in (("store is a file", file_store, "it is not a directory"),
+                                ("store folder cannot be listed", locked, "Permission denied")):
+            if name.startswith("store folder") and os.geteuid() == 0:
+                continue  # root lists anything
+            if name.startswith("store folder"):
+                os.chmod(locked, 0o000)
+            try:
+                for argv in (("--attach",), ("--attach", "--hook-json", "--source", "startup")):
+                    code, out, err = self.call("brief", *argv, env={"TP_WORK_DIR": str(root)})
+                    text = json.loads(out)["hookSpecificOutput"]["additionalContext"] if "--hook-json" in argv else out
+                    self.assertEqual(code, 0, f"{name}: {err}")
+                    # the command's output goes through work_find.guard, which spells the store root as `store:` (see PATHS_LEGEND)
+                    self.assertTrue(text.startswith("working brief unavailable: work store store: unusable: "), f"{name}: {text!r}")
+                    self.assertIn(why, text.split("\n")[0], name)
+                    with mock.patch.dict(os.environ, {**self.env, "TP_WORK_DIR": str(root)}, clear=True):  # unguarded: the real path
+                        raw = work_brief.build(None, None)[0]
+                    self.assertTrue(raw.startswith(f"working brief unavailable: work store {root.resolve()} unusable: "), f"{name}: {raw!r}")
+                    for absent in ("work new", "none recorded", "no workspace attached"):
+                        self.assertNotIn(absent, text, f"{name}: {absent}")
+            finally:
+                os.chmod(locked, 0o700)
 
 
 class Compaction(Base):
@@ -253,6 +291,60 @@ class Compaction(Base):
                 self.assertEqual(self.attached(), ["hub"], row)
                 if write_between:
                     self.assertIn("commit nothing", brief, row)
+
+
+    def test_each_part_carries_its_own_time_against_the_real_compaction_lookup(self):
+        """No patched lookup: events are written with `work compacted` at set times. A part is STALE when its own write time is before the
+        newest compaction event; a write elsewhere in the file never refreshes it; a part with no stored time says `time unknown`."""
+        def at(day):
+            return mock.patch.object(work, "now", return_value=f"2026-01-{day:02d}T00:00:00Z")
+        with at(1):
+            self.ok("work", "new", "Hub", "--id", "hub", "--repo", str(self.project), "--objective", "old outcome")
+            self.ok("work", "set", "hub", "--acceptance", "old acceptance")
+            self.ok("work", "decision", "add", "hub", "--question", "old question?")
+            self.ok("work", "decide", "hub", "old rule", *OWNER, "keep it")
+            self.ok("work", "attach", "hub")
+        with at(2):
+            self.ok("work", "compacted", "--reason", "precompact:auto")
+        with at(3):
+            self.ok("work", "decision", "add", "hub", "--question", "new question?", "--blocking")
+            self.ok("work", "decide", "hub", "unrelated rule", *OWNER, "yes")
+        # a decision from before this change carries no time: hand-written entry
+        path = self.tmp / "work" / "workspaces" / "hub.md"
+        path.write_text(path.read_text().rstrip("\n") + "\n\n### hub/D9 · normal · open\nQuestion: ancient?\n")
+
+        def parts():
+            return {l.split(" [")[0]: l for l in self.brief().splitlines() if " [" in l and not l.startswith("- ")}
+
+        def stale(line):
+            return "STALE" in line
+        first = parts()
+        self.assertTrue(all(stale(first[k]) for k in ("outcome", "acceptance")), first)  # the day-2 compaction is already after them
+        self.assertNotIn("STALE", first["rules in force (active, owner-confirmed; global, project, workspace)"], first)  # last written day 3
+        with at(4):
+            self.ok("work", "compacted", "--reason", "session-start:compact")
+        lines = self.brief().splitlines()
+        by = {l.split(" [")[0]: l for l in lines if " [" in l and not l.startswith("- ")}
+        self.assertIn("[2026-01-01T00:00:00Z] STALE", by["outcome"])
+        self.assertIn("[2026-01-01T00:00:00Z] STALE", by["acceptance"])  # the later writes did not refresh them
+        self.assertIn("old rule", [l for l in lines if "old rule" in l][0])
+        self.assertTrue(all("STALE" in l for l in lines if l.startswith("- [") and "(hub/R" in l), lines)  # every rule predates the compaction
+        decisions = {l.split(" ")[1]: l for l in lines if l.startswith("- hub/D")}
+        self.assertEqual(sorted(decisions), ["hub/D1", "hub/D2", "hub/D9"])
+        self.assertIn("2026-01-01T00:00:00Z STALE", decisions["hub/D1"])
+        self.assertIn("2026-01-03T00:00:00Z STALE", decisions["hub/D2"])
+        self.assertIn("time unknown STALE", decisions["hub/D9"])
+        # a compaction between the writes: only the later part is fresh
+        with at(5):
+            self.ok("work", "set", "hub", "--objective", "new outcome")
+        by = {l.split(" [")[0]: l for l in self.brief().splitlines() if " [" in l and not l.startswith("- ")}
+        self.assertIn("[2026-01-05T00:00:00Z]:", by["outcome"])
+        self.assertIn("new outcome", by["outcome"])
+        self.assertIn("STALE", by["acceptance"])
+        # a workspace written before this change: the part exists, its time is unknown, and it is never called fresh
+        path.write_text(path.read_text().replace("objective_at: 2026-01-05T00:00:00Z\n", ""))
+        by = {l.split(" [")[0]: l for l in self.brief().splitlines() if " [" in l and not l.startswith("- ")}
+        self.assertIn("[time unknown] STALE", by["outcome"])
 
 
 class Realistic(Base):
@@ -297,6 +389,63 @@ class Realistic(Base):
         self.assertIn("provisional (not in force until the owner confirms): hub/R9", text)
         self.assertNotIn("a main guess", text)
         self.assertNotIn("no workspace attached", text)
+
+    def task(self, ident, role, state, result="", review_of=None, packet="", at=None):
+        task = self.state / "tasks" / ident
+        task.mkdir(exist_ok=True)
+        (task / "meta.json").write_text(json.dumps({"id": ident, "role": role, "worker": "claude", "created": "2026-01-01T00:00:00Z"}))
+        (task / "state.json").write_text(json.dumps({"state": state, "updated": "2026-01-01T00:00:00Z"}))
+        if result:
+            (task / "result.md").write_text(result)
+        if review_of:
+            (task / "review-of").write_text(review_of + "\n")
+        if packet:
+            (task / "packet.md").write_text(packet)
+        if at:
+            for name in ("result.md",):
+                os.utime(task / name, (at, at))
+        return task
+
+    def test_paused_tasks_are_shown_with_their_result_status_like_running_ones(self):
+        self.task("coder-running", "coder", "working")
+        self.task("coder-paused", "coder", "paused", "Need more context\nRESULT_STATUS: blocked\n")
+        self.task("coder-mute", "coder", "paused", "I stopped\n")  # paused with no result status
+        text = self.brief()
+        lines = [l for l in text.splitlines() if l.startswith("- coder-")]
+        self.assertEqual(len(lines), 3, text)
+        self.assertTrue(any(l.startswith("- coder-paused coder paused result_status: blocked") for l in lines), lines)
+        self.assertTrue(any(l.startswith("- coder-running coder working") for l in lines), lines)
+        self.assertNotIn("no active, paused or unreviewed tasks", text)
+
+    REVIEW = "{verdict}\nRESULT_STATUS: complete\n\nCoverage\n- lib/work_brief.py: reviewed the whole file and its callers\n"
+
+    def test_last_evidence_is_the_newest_approved_review_and_the_evidence_it_was_given(self):
+        def packet(*names):
+            return "".join(f"x\n# Evidence supplied by Main: {n}\n\nbody\n" for n in names) + "quoted: Evidence supplied by Main: no-heading.md\n"
+        self.assertIn("last approved review: none", self.brief())
+        author = self.task("coder-a", "coder", "settled", "done\nRESULT_STATUS: complete\n")
+        (author / "main-evidence").mkdir()
+        (author / "main-evidence" / "evidence.md").write_text("e")
+        (author / "main-evidence" / "later.md").write_text("newer by mtime but never given to a review")
+        # row: (review id, verdict text, packet names, mtime): only a complete approval counts, the newest wins
+        rows = [("review-1", self.REVIEW.format(verdict="REQUEST_CHANGES"), ["evidence.md"], 1_800_000_000),
+                ("review-2", "APPROVED\nRESULT_STATUS: complete\n", ["evidence.md"], 1_800_000_100),  # no Coverage: incomplete, approves nothing
+                ("review-3", self.REVIEW.format(verdict="APPROVED"), ["evidence.md"], 1_800_000_200),
+                ("review-4", self.REVIEW.format(verdict="REQUEST_CHANGES"), [], 1_800_000_300)]
+        for ident, result, names, when in rows:
+            self.task(ident, "reviewer", "settled", result, review_of="coder-a", packet=packet(*names), at=when)
+        line = [l for l in self.brief().splitlines() if l.startswith("last approved review")][0]
+        self.assertIn("review-3 of coder-a", line)
+        self.assertIn("approved 2027-01-15T08:03:20Z", line)
+        self.assertIn("tasks/coder-a/main-evidence/evidence.md", line)
+        self.assertNotIn("later.md", line)
+        self.assertNotIn("no-heading", line)
+        # a newer approval, given no evidence file, says so
+        self.task("review-5", "reviewer", "settled", self.REVIEW.format(verdict="APPROVED_WITH_NOTES") + "\nNotes\n- one note here\n",
+                  review_of="coder-a", packet=packet(), at=1_800_000_400)
+        line = [l for l in self.brief().splitlines() if l.startswith("last approved review")][0]
+        self.assertIn("review-5 of coder-a", line)
+        self.assertIn("evidence it was given: none attached", line)
 
 
 if __name__ == "__main__":

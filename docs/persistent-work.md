@@ -41,11 +41,37 @@ for the owner's confirm. `work decision withdraw ID` withdraws a record (an acti
 and `active` only when answered `--by user` with a quote (else `provisional`; an old `Decisions` line has no provenance, so it
 is provisional, id `<ws>/L<n>` by position).
 
+**Where records live and how long.** A record is stored in the workspace file that wrote it. Records of scope `global` or
+`project:` outlive that workspace: they are read from every workspace file, archived ones included, until withdrawn or superseded,
+and archiving never changes a record's status. Records of scope workspace, lane, task or role follow their workspace: once it is
+archived they are out of the brief and out of `work records`.
+
+**Writes that fail.** A supersession, confirm or answer that touches two workspace files saves the replacement first and marks the
+old record superseded second. A failure between the two leaves the old rule active and the new one present but pending, never
+neither.
+
+**Multiline text is one record.** `work decide` and `decision add|answer` text with newlines is stored as one record: the visible
+`Decisions` line is flattened to one line and the `<!-- record: {...} -->` trailer carries the exact text, newlines kept, and one
+status. It reads back as that one record. This also closes the route where a worker's text carried its own trailer through
+`work decide`: the text is flattened and stored under the command's own trailer, so it stays one provisional record. A trailer
+typed by hand into a workspace file is still read as the record it describes; that remains a known limit (F8), since the file
+itself is the owner's to edit.
+
+**Checkpoints keep records.** A checkpoint copies each open-decision entry's `Record:` field and `work recover` restores kind,
+scope, status and supersession. A checkpoint written before this field existed still validates and recovers the round-1 old form.
+
+**Each part has its own time.** Outcome, acceptance, each rule and each open decision show the time that part itself was last
+written (stored on write; never the file's update time). A part written before times were stored shows `time unknown` and is
+never called fresh. STALE means the part's time is before the newest compaction generation (or unknown).
+
 `tp-agent brief` prints Main's working brief (at most 60 lines, from records only, no model call): the workspace's outcome
 (`Objective`) and `Acceptance` (`work set ID --acceptance`), the active records in scope (global, the session's project, the
 attached workspace), conflicts between active records answering the same question, provisional ids, active work from the task
-index, open decision ids, named empty slots for obligations (HB5) and the launch record (HB2), the last evidence and checkpoint,
-and pointers. A part older than the newest compaction is marked STALE. Claude Main's SessionStart hook (startup, resume,
+index (running, pending and paused tasks, each with its result status), open decision ids, named empty slots for obligations (HB5)
+and the launch record (HB2), the last approved review (review id, reviewed task, verdict time, and the evidence file that review
+was given; `last approved review: none` when there is none), the last checkpoint, and pointers. If the work store is not a readable
+directory or cannot be listed, the first line is `working brief unavailable: work store <path> unusable: <reason>` (the path is
+shown as `store:` by the output guard), exit 0, and the brief never suggests creating a workspace. Claude Main's SessionStart hook (startup, resume,
 compact) runs `brief --attach`, which first attaches the newest active workspace whose `repos` hold the project (never creating
 one; with none, the first line says how to make one), and injects the brief; after a compaction the task index text follows it.
 The PreCompact hook attaches the same way before it checkpoints, and logs why when no checkpoint is written.

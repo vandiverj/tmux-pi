@@ -712,6 +712,8 @@ def _record(ws, ident, form, fields, text, fallback):
     fields = fields or {}
     prov = fields.get("provenance") if isinstance(fields.get("provenance"), dict) else {}
     by = prov.get("by", fallback["by"]) if fields else fallback["by"]
+    if isinstance(fields.get("text"), str) and fields["text"].strip():  # multiline text: the line holds it flattened, the trailer whole
+        text = fields["text"]
     value = {
         "id": ident, "workspace": ws, "form": form if fields else form + ":old", "text": text,
         "kind": fields.get("kind") if fields.get("kind") in RECORD_KINDS else fallback["kind"],
@@ -774,25 +776,38 @@ def records_of(doc):
     return [*line_records(doc), *(entry_record(doc.id, e) for e in decisions_of(doc))]
 
 
+def outlives(scope):
+    """Whether a record of this scope outlives its workspace: `global` and `project:` records stand until withdrawn or superseded,
+    archived workspace or not. Workspace, lane, task and role records follow their workspace."""
+    return scope == "global" or scope.startswith("project:")
+
+
 def all_records(skipped=None):
-    """The records of every non-archived workspace; a workspace that cannot be parsed is skipped and named in `skipped`."""
+    """The records of every live workspace, and the global and project records of archived ones (archiving never changes a record's
+    status); a workspace that cannot be parsed is skipped and named in `skipped`."""
     out = []
-    for doc in iter_docs("workspace", skipped=skipped):
-        try:
-            out += records_of(doc)
-        except Exception:  # noqa: BLE001 - per-document isolation
-            note_skipped(skipped, doc.path)
+    for archived in (False, True):
+        for doc in iter_docs("workspace", archived=archived, skipped=skipped):
+            try:
+                found = records_of(doc)
+            except Exception:  # noqa: BLE001 - per-document isolation
+                note_skipped(skipped, doc.path)
+                continue
+            out += [r for r in found if not archived or outlives(r["scope"])]
     return out
 
 
 def find_record(ident):
-    """(workspace Doc, record) for `<ws>/D<n>`, `<ws>/R<n>` or `<ws>/L<k>` in a non-archived workspace."""
+    """(workspace Doc, record) for `<ws>/D<n>`, `<ws>/R<n>` or `<ws>/L<k>`: in a live workspace, or a global or project record in an
+    archived one (it is still in force, so it can be superseded, confirmed or withdrawn there)."""
     match = RECORD_ID_RE.match(ident or "")
     if not match:
         raise WorkError(f"invalid record id {ident!r}; expected <workspace-id>/D<n>, /R<n> or /L<n>")
-    doc = load("workspace", match.group(1), include_archived=False)
+    doc = load("workspace", match.group(1))
     for record in records_of(doc):
         if record["id"] == ident:
+            if doc.archived and not outlives(record["scope"]):
+                raise WorkError(f"workspace {doc.id} is archived and read-only")
             return doc, record
     raise WorkError(f"unknown record: {ident}")
 
@@ -809,6 +824,8 @@ def stored_fields(record):
     for key in ("supersedes", "superseded_by", "question", "withdrawn"):
         if record.get(key):
             value[key] = record[key]
+    if "\n" in (record.get("text") or "") and record["form"].startswith("line"):
+        value["text"] = record["text"]  # a line record is one line of the file: the newlines live in the trailer, the line shows them as spaces
     return value
 
 

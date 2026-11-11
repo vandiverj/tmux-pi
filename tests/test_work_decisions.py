@@ -332,6 +332,63 @@ class Records(unittest.TestCase):
         self.ok("decision", "confirm", d, "--quote", "yes ship")
         self.assertEqual((self.records()[d]["status"], self.records()[d]["kind"]), ("active", "preference"))
 
+    def test_multiline_text_is_one_record_that_keeps_its_newlines(self):
+        """A decision with newlines (in the line form, and in an entry's question and answer) reads back as exactly one record with
+        one status and the whole text, also after the record is rewritten (superseded)."""
+        ws = self.ok("new", "Lines", "--id", "lines")["id"]
+        text = "Use safe_grep.\nNever use raw recursive grep.\n\n  Indented third line."
+        owner = ["--by", "owner", "--quote", "both rules"]
+        written = self.ok("decide", ws, text, *owner)["record"]
+        mine = [r for r in self.records().values() if r["workspace"] == ws]
+        self.assertEqual([(r["id"], r["text"], r["status"]) for r in mine], [(written["id"], text, "active")])
+        self.assertEqual(len([l for l in self.ok("show", ws, "--section", "decisions")["text"].split("\n") if l.strip()]), 1)
+        newer = self.ok("decide", ws, "single line replacement", "--supersedes", written["id"], *owner)["record"]["id"]
+        got = self.records()
+        self.assertEqual((got[written["id"]]["text"], got[written["id"]]["status"], got[written["id"]]["superseded_by"]), (text, "superseded", newer))
+        entry = self.ok("decision", "add", ws, "--question", "First?\nSecond?", "--scope", "global", "--kind", "preference")["id"]
+        self.ok("decision", "answer", entry, "--text", "Yes.\nAlways.", *owner)
+        got = self.records()[entry]
+        self.assertEqual((got["text"], got["question"], got["status"], got["scope"]), ("Yes.\nAlways.", "First?\nSecond?", "active", "global"))
+        self.assertEqual(len([r for r in self.records().values() if r["workspace"] == ws]), 3)
+
+    def test_a_failed_save_never_loses_the_old_rule(self):
+        """Cross-workspace supersession saves the replacement first and marks the old record second (decide, confirm and answer share the
+        path). A save that fails at either step leaves the old rule active; the replacement is present only when its own save worked."""
+        import errno
+        owner = ["--by", "owner", "--quote", "owner said"]
+        n = 0
+        for path in ("decide", "confirm", "answer"):
+            for failing in ("new", "old"):
+                n += 1
+                old_ws, new_ws = f"o{n}", f"n{n}"
+                self.ok("new", old_ws, "--id", old_ws)
+                self.ok("new", new_ws, "--id", new_ws)
+                old = self.ok("decide", old_ws, "the old rule", "--scope", "global", *owner)["record"]["id"]
+                if path == "decide":
+                    argv = ["decide", new_ws, "the new rule", "--scope", "global", "--supersedes", old, *owner]
+                elif path == "confirm":
+                    pending = self.ok("decide", new_ws, "the new rule", "--scope", "global", "--supersedes", old)["record"]["id"]
+                    argv = ["decision", "confirm", pending, "--quote", "yes"]
+                else:
+                    entry = self.ok("decision", "add", new_ws, "--question", "Which?", "--scope", "global")["id"]
+                    argv = ["decision", "answer", entry, "--text", "the new rule", "--supersedes", old, *owner]
+                target = {"new": new_ws, "old": old_ws}[failing]
+                real = work.Doc.save
+
+                def save(doc, real=real, target=target):
+                    if doc.id == target:
+                        raise OSError(errno.ENOSPC, "simulated disk full")
+                    return real(doc)
+
+                with self.subTest(path=path, failing=failing), mock.patch.object(work.Doc, "save", save):
+                    code, _, err = self.call(*argv)
+                    self.assertEqual(code, 1, err)
+                got = self.records()
+                with self.subTest(after=path, failing=failing):
+                    self.assertEqual((got[old]["status"], got[old]["superseded_by"]), ("active", None), "the old rule was lost")
+                    if failing == "old":  # the replacement is saved, the old rule still stands
+                        self.assertTrue(any(r["supersedes"] == old for r in got.values()), "the replacement is missing")
+
     def test_supersession_is_explicit_two_way_and_same_scope_only(self):
         a = self.ok("new", "A", "--id", "a")["id"]
         self.ok("new", "B", "--id", "b")
@@ -362,6 +419,37 @@ class Records(unittest.TestCase):
         self.ok("decision", "withdraw", new, "--quote", "drop it")
         self.assertEqual(self.records()[new]["status"], "withdrawn")
         self.refused("decision", "confirm", new, "--quote", "back", says="withdrawn; it cannot be confirmed")
+
+    def test_global_and_project_records_outlive_their_archived_workspace(self):
+        """Archiving a workspace never changes a record's status: global and project: records are still read from it (and can be superseded
+        or withdrawn there); workspace, lane, task and role records follow the workspace."""
+        owner = ["--by", "owner", "--quote", "owner said"]
+        self.ok("new", "Gone", "--id", "gone")
+        self.ok("new", "Live", "--id", "live")
+        project = f"project:{self.tmp}"
+        keep = {scope: self.ok("decide", "gone", f"{scope} rule", "--scope", scope, *owner)["record"]["id"]
+                for scope in ("global", project, "workspace", "lane:alpha", "task:coder-1", "role:coder")}
+        withdrawn = self.ok("decide", "gone", "global rule to withdraw", "--scope", "global", *owner)["record"]["id"]
+        entry = self.ok("decision", "add", "gone", "--question", "Which?", "--scope", "global")["id"]
+        self.ok("decision", "answer", entry, "--text", "entry rule", *owner)
+        self.ok("archive", "gone", "--kind", "workspace")
+        got = self.records()
+        # row: scope -> still read after the archive
+        for scope, ident in keep.items():
+            with self.subTest(scope=scope):
+                self.assertEqual(ident in got, scope in ("global", project), scope)
+                if ident in got:
+                    self.assertEqual(got[ident]["status"], "active", scope)
+        self.assertEqual(got[entry]["status"], "active")
+        # still in force: supersedable, withdrawable (line and entry forms), never confirmable twice; the archived file is the one written
+        new = self.ok("decide", "live", "global rule v2", "--scope", "global", "--supersedes", keep["global"], *owner)["record"]["id"]
+        self.ok("decision", "withdraw", withdrawn, "--reason", "moot", "--quote", "drop it")
+        self.ok("decision", "withdraw", entry, "--reason", "moot", "--quote", "drop it")
+        got = self.records()
+        self.assertEqual((got[keep["global"]]["status"], got[keep["global"]]["superseded_by"], got[new]["status"]), ("superseded", new, "active"))
+        self.assertEqual((got[withdrawn]["status"], got[entry]["status"]), ("withdrawn", "withdrawn"))
+        self.assertTrue((self.tmp / "work" / "archive" / "workspaces" / "gone.md").is_file())
+        self.refused("decision", "withdraw", keep["workspace"], "--quote", "x", says="archived and read-only")
 
 
 if __name__ == "__main__":

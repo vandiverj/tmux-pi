@@ -520,6 +520,7 @@ def _write_command(args, session_dir, task_status):
         for title, text in (("Objective", args.objective),):
             if text:
                 body = set_section(body, title, text.strip())
+                meta["objective_at"] = work.now()
         doc = work.create("workspace", args.title, args.id, meta, body)
         return _summary(doc)
     if cmd == "note" and args.note_command == "add":
@@ -559,10 +560,12 @@ def _write_command(args, session_dir, task_status):
             _extend(doc.meta, key, values)
         if args.objective is not None:
             doc.body = set_section(doc.body, "Objective", args.objective.strip())
+            doc.meta["objective_at"] = work.now()  # each part carries the time it was written (the working brief shows it)
         if args.scope is not None:
             doc.body = set_section(doc.body, "Scope", args.scope.strip())
         if args.acceptance is not None:
             doc.body = set_section(doc.body, "Acceptance", args.acceptance.strip())
+            doc.meta["acceptance_at"] = work.now()
     elif cmd == "next":
         if args.done:
             _checklist(doc, "Next actions", args.done, lambda l: l.replace("- [ ]", "- [x]", 1))
@@ -700,12 +703,16 @@ def _supersede_now(doc, old_doc, old, new):
     if new["status"] != "active" and old["status"] == "active":
         return f"pending: {old['id']} stays active until the owner confirms {new['id']}"
     old = {**old, "status": "superseded", "superseded_by": new["id"]}
-    if old_doc.id == doc.id:
-        work.put_record(doc, old)
-    else:
-        work.put_record(old_doc, old)
-        old_doc.save()
+    work.put_record(doc if old_doc.id == doc.id else old_doc, old)
     return f"{old['id']} superseded"
+
+
+def _save_both(doc, old_doc):
+    """Save the workspace holding the replacement first, then the other one holding the record it supersedes. A failure between the
+    two leaves the old rule still active and the new one present (never neither): the old record is marked only once the new exists."""
+    doc.save()
+    if old_doc is not None and old_doc.id != doc.id:
+        old_doc.save()
 
 
 def _decide(args, doc, stamp):
@@ -717,10 +724,11 @@ def _decide(args, doc, stamp):
               "scope": work.check_scope(args.scope), "provenance": prov, "status": work.record_status(prov["by"], prov["quote"]),
               "supersedes": args.supersedes or None, "superseded_by": None, "question": (args.question or "").strip() or None, "text": text}
     old = _supersedable(args.supersedes, record) if args.supersedes else None
-    doc.body = append_line(doc.body, "Decisions", f"- {stamp} {text}" + (f" Source: {args.source}" if args.source else "")
+    flat = " ".join(text.split())  # the line shows one line; a multiline text is kept whole in the trailer (stored_fields)
+    doc.body = append_line(doc.body, "Decisions", f"- {stamp} {flat}" + (f" Source: {args.source}" if args.source else "")
                            + f" <!-- record: {work.record_json(work.stored_fields(record))} -->")
     note = _supersede_now(doc, *old, record) if old else None
-    doc.save()
+    _save_both(doc, old[0] if old else None)
     value = {**_summary(doc), "record": {k: v for k, v in record.items() if k not in ("workspace", "form")}}
     if record["status"] != "active":
         value["note"] = f"provisional until the owner confirms it: tp-agent work decision confirm {record['id']} --quote \"their exact words\""
@@ -752,7 +760,7 @@ def _confirm(args):
         work.put_decisions(doc, entries)
     else:
         work.put_record(doc, record)
-    note = None
+    note, old_doc = None, None
     if record.get("supersedes"):
         try:
             old_doc, old = work.find_record(record["supersedes"])
@@ -761,7 +769,7 @@ def _confirm(args):
         else:
             if old["status"] not in ("superseded", "withdrawn"):
                 note = _supersede_now(doc, old_doc, old, record)
-    doc.save()
+    _save_both(doc, old_doc)
     return {"id": record["id"], "status": "active", "changed": True, **({"supersession": note} if note else {})}
 
 
@@ -794,7 +802,7 @@ def _decision(args, task_status):
         entry = {"id": f"{doc.id}/D{work.next_decision_number(entries)}", "priority": args.priority, "status": "open",
                  "blocking": args.blocking, "question": args.question, "background": args.background, "options": args.options,
                  "recommended": args.recommended, "affects": args.affects or ["workspace"], "resolution": "", "by": "", "at": "",
-                 "quote": "", "withdrawn": "", "record": work.record_json({"kind": args.kind, "scope": work.check_scope(args.scope)})}
+                 "quote": "", "withdrawn": "", "record": work.record_json({"kind": args.kind, "scope": work.check_scope(args.scope), "written": work.now()})}
         entry["_dirty"] = True
         entries.append(entry)
         work.put_decisions(doc, entries)
@@ -804,6 +812,13 @@ def _decision(args, task_status):
         return _confirm(args)
     if sub == "withdraw" and not work.DECISION_RE.match(args.id or ""):
         return _withdraw_record(args, *work.find_record(args.id))
+    if sub == "withdraw":  # an answered entry whose workspace is archived is still withdrawable when its record outlives it
+        try:
+            found = work.find_record(args.id)
+        except WorkError:
+            found = None
+        if found and found[1]["status"] is not None and found[0].archived:
+            return _withdraw_record(args, *found)
     doc, entries, entry = work.find_decision(args.id)
     if sub == "withdraw" and entry["status"] == "answered":
         return _withdraw_record(args, doc, work.entry_record(doc.id, entry))
@@ -829,7 +844,7 @@ def _decision(args, task_status):
         work.put_decisions(doc, entries)
         note = _supersede_now(doc, *old, record) if old and cleared else None
         mentions = [l.strip() for l in _lines(get_section(doc.body, "Next actions")) if entry["id"] in l]
-        doc.save()
+        _save_both(doc, old[0] if old and cleared else None)
         value = {"id": entry["id"], "status": entry["status"], "by": by_arg, "clears_blocking": cleared,
                  "can_resume": resume_targets(entry, task_status) if cleared else [],
                  "next_actions_mentioning": mentions if cleared else [], "record_status": work.entry_record(doc.id, entry)["status"]}

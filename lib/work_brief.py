@@ -3,8 +3,8 @@
 Parts (docs/plans/det-prep/hub/interfaces.md section 5): the workspace and its outcome and acceptance; the active records whose
 scope covers this Main (global, project:<repo> holding the session's project, and workspace for an attached workspace); the active
 work from the session's task records (tasks, reviews with their verdict, lanes); the open decisions (ids only, never question text,
-as the index); obligations (HB5) and the launch record (HB2) as named empty slots until those records exist; the last evidence
-pointer; pointers. Each part states its record time, and a part older than the newest compaction is marked stale.
+as the index); obligations (HB5) and the launch record (HB2) as named empty slots until those records exist; the last approved
+review and the evidence it was given; pointers. Each part states its record time, and a part older than the newest compaction is marked stale.
 
 With `attach`, a session with no attached workspace attaches the newest active workspace whose `repos` covers the project (the
 others that match are listed); with none, the first line says so and how to make one. Nothing is ever created. The text that
@@ -18,6 +18,7 @@ import re
 
 import work
 import work_checkpoint
+import review_verdict
 import work_index
 
 MAX_LINES = 60
@@ -123,34 +124,85 @@ def attach_newest(state_dir, ws_id):
     work_commands.run(argparse.Namespace(work_command="attach", id=ws_id), state_dir)  # takes the store lock itself
 
 
-def _evidence(state_dir):
-    """The newest `tasks/*/main-evidence/evidence.md` of this run: (path relative to the run, mtime) or None."""
+def store_problem():
+    """Why the work store cannot be read, or None. A store that does not exist yet is not a problem (nothing was ever written); one that
+    exists but is not a readable directory, or whose listing fails, is."""
+    try:
+        root = work.store_root()
+        if not root.exists():
+            return None
+        if not root.is_dir():
+            return "it is not a directory"
+        for folder in (root, *(root / sub for sub in work.KINDS.values())):
+            if folder.exists():
+                if not folder.is_dir():
+                    return f"{folder.name} is not a directory"
+                with os.scandir(folder):
+                    pass
+    except (OSError, RuntimeError, ValueError) as error:
+        return _clip(getattr(error, "strerror", None) or error, 120)
+    return None
+
+
+def _utc(timestamp):
+    from datetime import datetime, timezone
+    return datetime.fromtimestamp(timestamp, timezone.utc)
+
+
+def _approved_review(state_dir):
+    """The newest APPROVED review of this run: (review id, reviewed task, verdict time, evidence files it was given) or None. Read from the
+    session's reviewer task records (`tasks/*/review-of`, `result.md`) by the one verdict reader (review_verdict); a review that is
+    incomplete or asks for changes approves nothing. The evidence is what the review's packet carries under `# Evidence supplied by Main:`."""
     if state_dir is None:
         return None
     best = None
-    for path in sorted((Path(state_dir) / "tasks").glob("*/main-evidence/evidence.md")):
+    for marker in sorted((Path(state_dir) / "tasks").glob("*/review-of")):
+        task = marker.parent
         try:
-            if path.is_symlink():
+            result = task / "result.md"
+            if marker.is_symlink() or result.is_symlink() or not result.is_file():
                 continue
-            when = path.stat().st_mtime
-        except OSError:
+            verdict, _, incomplete = review_verdict.assess(review_verdict.read_review(result))
+            if verdict not in ("APPROVED", "APPROVED_WITH_NOTES") or incomplete is not None:
+                continue
+            when = result.stat().st_mtime
+            reviewed = marker.read_text(encoding="utf-8", errors="replace").strip()
+        except (OSError, ValueError):
             continue
-        if best is None or when > best[1]:
-            best = (path, when)
+        if best is None or when > best[0]:
+            best = (when, task, reviewed)
     if best is None:
         return None
-    from datetime import datetime, timezone
-    return best[0].relative_to(state_dir).as_posix(), datetime.fromtimestamp(best[1], timezone.utc)
+    when, task, reviewed = best
+    given = []
+    try:
+        with open(task / "packet.md", encoding="utf-8", errors="replace") as packet:
+            for line in packet:
+                match = re.match(r"^# Evidence supplied by Main: (\S.*?)\s*$", line)
+                if match and match.group(1) not in given:
+                    given.append(match.group(1))
+    except OSError:
+        pass
+    return task.name, reviewed, _utc(when), given
 
 
 class Brief:
     def __init__(self, compaction):
         self.lines, self.compaction = [], compaction
 
-    def head(self, name, when, text=""):
-        stale = " STALE (recorded before the last compaction at " + _stamp(self.compaction) + ")" if (
-            when is not None and self.compaction is not None and when < self.compaction) else ""
-        self.lines.append(_clip(f"{name} [{_stamp(when) if when else 'no record'}]{stale}:" + (f" {text}" if text else "")))
+    def stale(self, when):
+        """STALE when the part's own time is before the newest compaction; a part with no time cannot be called fresh."""
+        if self.compaction is None:
+            return ""
+        if when is None:
+            return " STALE (no record time; cannot be called fresh)"
+        return " STALE (recorded before the last compaction at " + _stamp(self.compaction) + ")" if when < self.compaction else ""
+
+    def head(self, name, when, text="", unknown=False):
+        """`unknown`: the part exists but nothing says when it was written (shown as `time unknown`); otherwise no time = no record."""
+        label = _stamp(when) if when else ("time unknown" if unknown else "no record")
+        stale = self.stale(when) if (when is not None or unknown) else ""
+        self.lines.append(_clip(f"{name} [{label}]{stale}:" + (f" {text}" if text else "")))
 
     def add(self, text):
         self.lines.append(_clip(text))
@@ -161,6 +213,14 @@ def build(state_dir, workdir=None, attach=False, index=None):
     it is called after the attach, so it sees it. Every part fails on its own: a broken part says it is unavailable and why; the rest
     is still built."""
     project = project_dir(workdir)
+    problem = store_problem()
+    if problem:  # not "none recorded": the store is there and cannot be read, so nothing below could say what is recorded
+        root = work.store_root()
+        brief = Brief(last_compaction(state_dir))
+        brief.add(f"working brief unavailable: work store {root} unusable: {problem}")
+        _work(brief, index() if callable(index) else index)
+        brief.add("pointers: tp-agent work show ID | tp-agent work records | tp-agent list (the work store must be fixed first)")
+        return "\n".join(brief.lines), {"attached": [], "auto_attached": None, "matching": [], "store_problem": problem}
     skipped, notes = [], []
     attached = list(dict.fromkeys(work_index.attached_ids(state_dir))) if state_dir else []
     try:
@@ -197,11 +257,12 @@ def build(state_dir, workdir=None, attach=False, index=None):
         how = "attached automatically: the newest active workspace for this project" if ws_id == auto else "attached"
         brief.add(f"workspace {ws_id} \"{doc.meta.get('title', ws_id)}\" ({how}; status {doc.meta.get('status')})"
                   + (f"; also matching: {', '.join(others)}" if ws_id == auto and others else ""))
-        when = work.updated_at(doc)
-        objective = (work.get_section(doc.body, "Objective") or "").strip()
-        brief.head("outcome", when, objective or f"not recorded (tp-agent work set {ws_id} --objective TEXT)")
+        objective = (work.get_section(doc.body, "Objective") or "").strip()  # each part's own write time (`work set` stores it); never the file's
+        brief.head("outcome", _when(doc.meta.get("objective_at")), objective or f"not recorded (tp-agent work set {ws_id} --objective TEXT)",
+                   unknown=bool(objective))
         acceptance = (work.get_section(doc.body, "Acceptance") or "").strip()
-        brief.head("acceptance", when, acceptance or f"not recorded (tp-agent work set {ws_id} --acceptance TEXT)")
+        brief.head("acceptance", _when(doc.meta.get("acceptance_at")), acceptance or f"not recorded (tp-agent work set {ws_id} --acceptance TEXT)",
+                   unknown=bool(acceptance))
     _rules(brief, project, attached, skipped)
     _work(brief, index() if callable(index) else index)
     _decisions(brief, docs)
@@ -229,7 +290,8 @@ def _rules(brief, project, attached, skipped):
     brief.head("rules in force (active, owner-confirmed; global, project, workspace)", newest, "" if shown else "none recorded")
     for r in shown[:RULES_SHOWN]:
         quote = r["provenance"]["quote"] or ""
-        tail = f" ({r['id']}, {_stamp(_when(r['provenance']['at']))})"  # kept whole: the head is clipped, never the id and time
+        at = _when(r["provenance"]["at"])
+        tail = f" ({r['id']}, {_stamp(at)}{', STALE' if brief.stale(at) else ''})"  # kept whole: the head is clipped, never the id and time
         head = f"- [{r['kind']} {_clip(_scope_label(r['scope']), 40)}] {_clip(r['text'], 120)} — owner: \"{_clip(quote, 60)}\""
         brief.add(_clip(head, LINE_CHARS - len(tail)) + tail)
     if len(shown) > RULES_SHOWN:
@@ -254,7 +316,7 @@ def _work(brief, index):
     if "error" in index:
         brief.add(f"active work: unavailable ({_clip(index['error'], 160)})")
         return
-    rows = [*index.get("active", []), *index.get("unstatused", []), *index.get("pending", [])]
+    rows = [*index.get("active", []), *index.get("paused", []), *index.get("unstatused", []), *index.get("pending", [])]
     newest = max((_when(r.get("updated")) for r in rows if _when(r.get("updated"))), default=None)
     brief.head("active work (session task records)", newest, "" if rows else "no active, paused or unreviewed tasks")
     for r in rows[:TASKS_SHOWN]:
@@ -269,8 +331,16 @@ def _work(brief, index):
                                         for name, e in sorted(lanes.items())))
 
 
+def _entry_time(entry):
+    """When an open decision was written: the time its `Record:` field stored at `decision add` (or the answer attempt's `At:`); None
+    for an entry that carries neither (written before HB3a)."""
+    fields = work._loads(entry.get("record") or "") or {}
+    return _when(fields.get("written")) or _when(entry.get("at"))
+
+
 def _decisions(brief, docs):
-    """Open decisions of the attached workspaces: ids, priority and blocking only (question text stays in the file, as in the index)."""
+    """Open decisions of the attached workspaces: id, priority, blocking and the decision's own time (question text stays in the file,
+    as in the index)."""
     rows, newest = [], None
     for ws_id, doc in docs.items():
         try:
@@ -278,23 +348,32 @@ def _decisions(brief, docs):
         except Exception as error:  # noqa: BLE001
             brief.add(f"open decisions of {ws_id}: unavailable ({_clip(error, 120)})")
             continue
-        rows += entries
-        when = work.updated_at(doc)
-        newest = when if newest is None or when > newest else newest
+        rows += [(e, _entry_time(e)) for e in entries]
     if not docs:
         return
-    rows.sort(key=lambda e: (not e["blocking"], work.PRIORITY_RANK.get(e["priority"], 9)))
-    text = ", ".join(f"{e['id']} [{e['priority']}{' blocking' if e['blocking'] else ''}]" for e in rows[:DECISIONS_SHOWN])
-    more = f" +{len(rows) - DECISIONS_SHOWN}" if len(rows) > DECISIONS_SHOWN else ""
-    brief.head("open decisions", newest, (text + more + "; tp-agent work decisions shows each question") if rows else "none")
+    rows.sort(key=lambda row: (not row[0]["blocking"], work.PRIORITY_RANK.get(row[0]["priority"], 9)))
+    known = [when for _, when in rows if when]
+    brief.head("open decisions", max(known, default=None), "none" if not rows else "tp-agent work decisions shows each question",
+               unknown=bool(rows) and not known)
+    for e, when in rows[:DECISIONS_SHOWN]:
+        brief.add(f"- {e['id']} [{e['priority']}{' blocking' if e['blocking'] else ''}] "
+                  f"{_stamp(when) if when else 'time unknown'}{brief.stale(when)}")
+    if len(rows) > DECISIONS_SHOWN:
+        brief.add(f"- +{len(rows) - DECISIONS_SHOWN} more: tp-agent work decisions")
 
 
 def _evidence_part(brief, state_dir, attached):
-    found = _evidence(state_dir)
+    found = _approved_review(state_dir)
     if found:
-        brief.head("last evidence", found[1], found[0])
+        review, reviewed, when, given = found
+        names = []
+        for name in given:
+            path = Path(state_dir) / "tasks" / reviewed / "main-evidence" / name
+            names.append(path.relative_to(state_dir).as_posix() if path.is_file() else name)
+        brief.head("last approved review", when, f"{review} of {reviewed}, approved {_stamp(when)}; evidence it was given: "
+                   + (", ".join(names) if names else "none attached"))
     else:
-        brief.add("last evidence: none recorded (no tasks/*/main-evidence/evidence.md in this run)")
+        brief.add("last approved review: none")
     if attached:
         try:
             latest = work_checkpoint.latest(attached[0])["valid"]

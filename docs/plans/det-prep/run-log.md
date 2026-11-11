@@ -1027,3 +1027,29 @@ Each lane: checkpoint, Main's evidence, openai-codex review, notes closed, `lane
     fresh check task (fixes/ls1c-s1c-check.md) gives it a first review against main.
   - Follow-up: a later-round packet should leave out what came from main (diff against the previous round's tree merged
     with the new base).
+
+## 2026-11-11 (midday): PD1, LP1, Q4a, LM1, PR1 merged; owner away, Main decides by its recommendation
+- PD1 (process-decode) and LP1 (local-provider) merged (c547fae, c372c71); main's code equals the serial-tested tree 07ae0e8
+  (5321 tests, OK). Post-LP1: config/local.json has `provider_aliases` openai -> openai-codex (owner-authorized); the owner's
+  local rename of config/model-catalog.json and config/router.json is saved untracked in .tmux-pi/plans/ and reverted;
+  `tp-route --check` passes. d4f2003: lib/trial_shadow.py pid_is_run reads ps with surrogateescape (PD1 follow-up).
+- PR1 (test-speed), round 2 APPROVED_WITH_NOTES. Same code, serial vs parallel: 3442 s vs 791 s, the same 5325 ids, 77 skips
+  both. Known limits from the review:
+  - F1: the serial tree 07ae0e8 and the parallel tree 5eb1b98 differ in PR1's four files, so this is before/after evidence and
+    not a same-tree run; the comparison script did not wrap the run in the 5,400 s alarm.
+  - F2: the author's report says logging needs `--log`, but tests/run_bounded.py writes its default log without it.
+  - The children keep the caller's TMPDIR (Main approved the exception; TMUX_TMPDIR is private per child).
+  - The 110-pty figure is a sampled-window peak.
+- Q4a (tq1-setup), LM1 (lmstudio-cap) and PR1 merged (01747c7, d5faa23, d0bf9cc). The combined discovery on the merged tree
+  da25880 (parallel runner, -j 8): 5331 tests in 601 s, OK (skipped=78). LM1's cap is now in force: live LM Studio tests are
+  opt-in (TP_LIVE_LMSTUDIO=1), 300 s, one at a time, 20 per run.
+- HB3a: the last-round review found the family again (F1: the rules overflow command `--status active` missed pending and
+  provisional records). Closing over it needs the owner's terminal override, and the owner was away and had said to decide by
+  recommendation, so Main fixed it (4f20d56: the remedy lists every status; the campaign runs each remedy). The focused review
+  was APPROVED_WITH_NOTES. Known limits:
+  - 18 or more attached workspaces can exceed the 60-line brief (64 lines). Automatic startup attaches one.
+  - Round 6's report needs qualifying: the attack/environment history lacks retained logs, the replacement fixture drops the
+    task lane fields, and the inventory has 37 call sites, not 38.
+- RR1 (review-rounds): Sonnet worker plus Main fix e04cc16. Tasks from before the meta.json `gate` field count as gated by the
+  sweep.md that the gated retry wrote into the replaced author. HB8a's earlier findings drop from 49.6k to 13.9k chars (packet
+  ~396k).

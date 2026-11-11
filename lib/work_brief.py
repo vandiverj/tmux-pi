@@ -3,7 +3,8 @@
 Parts (docs/plans/det-prep/hub/interfaces.md section 5): the workspace and its outcome and acceptance; the active records whose
 scope covers this Main (global, project:<repo> holding the session's project, and workspace for an attached workspace); the active
 work from the session's task records (tasks, reviews with their verdict, lanes); the open decisions (ids only, never question text,
-as the index); obligations (HB5) and the launch record (HB2) as named empty slots until those records exist; the last approved
+as the index); obligations (HB5) as a named empty slot until those records exist; the launch records (HB2b, lib/launch_record.py:
+each listed task's contract version, role, route and unsupported capabilities, and Main's own record); the last approved
 review and the evidence it was given; pointers. Each part states its record time, and a part older than the newest compaction is marked stale.
 
 Size: at most MAX_LINES lines, by section budgets (`assemble`), never by a cut of the whole text. The fixed parts are never cut; the
@@ -19,6 +20,7 @@ import os
 from pathlib import Path
 import re
 
+import launch_record
 import work
 import work_checkpoint
 import review_verdict
@@ -383,11 +385,11 @@ def build(state_dir, workdir=None, attach=False, index=None):
                    unknown=bool(acceptance))
     sections = {name: Brief(brief.compaction) for name in MORE}
     _rules(sections["rules"], project, attached, skipped)
-    _work(sections["work"], index() if callable(index) else index)
+    _work(sections["work"], index() if callable(index) else index, state_dir)
     _decisions(sections["decisions"], docs)
     tail = Brief(brief.compaction)
     tail.add("obligations (HB5): no obligation records exist yet")
-    tail.add("launch record (HB2): no launch record exists yet")
+    _main_launch(tail, state_dir)
     _evidence_part(tail, state_dir, attached)
     if work.skipped_count(skipped):
         tail.add(work.skipped_line(skipped))
@@ -451,7 +453,37 @@ def _scope_label(scope):
     return "project:" + Path(scope[len("project:"):]).name if scope.startswith("project:") else scope
 
 
-def _work(brief, index):
+def _task_launch(state_dir, task_id):
+    """A task's launch.json (HB2b) as one short phrase: contract version, role, route, unsupported capabilities; `no record` for a
+    task started before launch records existed (or by a launcher that writes none); never the record's paths or hashes."""
+    if state_dir is None or not task_id or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]*", str(task_id)):
+        return None
+    try:
+        record = launch_record.read(Path(state_dir) / "tasks" / str(task_id) / launch_record.NAME)
+    except launch_record.RecordError as error:
+        return f"unusable: {error}"
+    return launch_record.summary(record) if record else "no record"
+
+
+def _main_launch(brief, state_dir):
+    """Main's own launch record (bin/tp-main writes <state dir>/main-launch.json at each start and recovery)."""
+    name = "launch record (HB2; tasks: [launch: ...] in active work; Main)"
+    if state_dir is None:
+        brief.add(f"{name}: no session state directory, so no launch record was read")
+        return
+    try:
+        record = launch_record.read(Path(state_dir) / launch_record.MAIN_NAME)
+    except launch_record.RecordError as error:
+        brief.add(f"{name}: unavailable ({_clip(error, 160)})")
+        return
+    if record is None:
+        brief.head(name, None, "none (Main was started before launch records, or not by tp-main)")
+        return
+    brief.head(name, _when(record.get("recorded")), f"{record.get('harness')} {record.get('start')}, model "
+               f"{record.get('model') or 'harness default'}, " + launch_record.summary(record), unknown=True)
+
+
+def _work(brief, index, state_dir=None):
     if index is None:
         brief.add("active work: no session state directory, so no task records were read")
         return
@@ -465,7 +497,10 @@ def _work(brief, index):
         extra = "".join(f" {k}: {r[k]}" for k in ("verdict", "result_status") if r.get(k))
         lane = f" lane {r['lane']}/{r['lane_step']}" if r.get("lane") else ""
         brief.unit(f"task {r.get('id')}")
-        brief.line(Whole(f"- {r.get('id')} {r.get('role')} {r.get('status')}{extra}{lane}"))
+        row = Whole(f"- {r.get('id')} {r.get('role')} {r.get('status')}{extra}{lane}")
+        launch = _task_launch(state_dir, r.get("id"))
+        # The launch note is prose after the row; a row that leaves it too little room is shown alone, as before.
+        brief.line(row, f" [launch: {launch}]") if launch and LINE_CHARS - len(row) >= 20 else brief.line(row)
     lanes = sorted((index.get("lanes") or {}).items())
     if lanes:
         brief.add_list("lanes:", [f"{name} " + ", ".join(f"{k} {v}" for k, v in sorted(e.get("by_status", {}).items())) for name, e in lanes],

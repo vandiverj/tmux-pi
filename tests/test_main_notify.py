@@ -154,6 +154,7 @@ class MainLauncherIdentityTests(unittest.TestCase):
         (self.root / "bin").mkdir()
         (self.root / "agent").mkdir()
         shutil.copy(ROOT / "bin/tp-main", self.root / "bin/tp-main")
+        (self.root / "lib").symlink_to(ROOT / "lib")  # the launch record writer (HB2b), reading the copy's own agent/ through --root
         for name in ("orchestrator.md", "orchestrator-claude.md"):
             (self.root / "agent" / name).write_text("core\n")
         stub = self.root / "bin/tp-claude"
@@ -225,6 +226,33 @@ class MainLauncherIdentityTests(unittest.TestCase):
         recorded = json.loads((sessions / "tasks" / task / "dispatch.json").read_text())["main"]
         self.assertEqual(recorded, (sessions / "main-id").read_text().strip())
         self.assertRegex(recorded, r"^main-[0-9a-f]{16}$")
+
+    def test_each_start_and_recovery_rewrites_mains_launch_record_and_leaves_its_prompt_as_it_was(self):
+        # HB2b: <state dir>/main-launch.json, one record rewritten at each launch (not appended), naming what Main was given by
+        # path and hash; the harness gets the same arguments as before.
+        import hashlib
+        stub = self.root / "bin/tp-claude"
+        stub.write_text('#!/usr/bin/env bash\nfor a in "$@"; do printf \'%s\\0\' "$a"; done\n')
+        (self.root / "agent/orchestrator-claude.md").write_text("claude only\n")
+        record_path = self.state / "main-launch.json"
+        seen = []
+        for args in ([], ["--resume", "abc", "--model", "opus"]):
+            run = subprocess.run([str(self.root / "bin/tp-main"), *args], env=self.env(), capture_output=True, timeout=25, cwd=str(self.root))
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertEqual(run.stdout.decode().split("\0")[:-1],
+                             ["--allowedTools", "Bash(tp-agent:*)", "--append-system-prompt", "core\n\nclaude only", *args])
+            record = json.loads(record_path.read_text())
+            seen.append(record)
+            self.assertEqual((record["schema"], record["role"], record["route"], record["harness"]), ("tp-launch:v1", "main", "main", "claude"))
+            self.assertEqual(record["task"], (self.state / "main-id").read_text().strip())
+            pieces = {p["name"]: p for p in record["instructions"]}
+            self.assertEqual(pieces["system-prompt"]["sha256"], hashlib.sha256(b"core\n\nclaude only").hexdigest())
+            self.assertEqual(pieces["orchestrator"]["sha256"], hashlib.sha256(b"core").hexdigest())
+            self.assertEqual((pieces["hooks-settings"]["path"], pieces["plugins"]["path"]), ("claude/settings.json", "claude/plugins"))
+            self.assertNotIn("claude only", record_path.read_text())
+        self.assertEqual([(r["start"], r["model"]) for r in seen], [("start", None), ("resume", "opus")])
+        self.assertEqual(json.loads(record_path.read_text()), seen[-1])   # one record: the second launch replaced the first
+        self.assertEqual(sorted(p.name for p in self.state.iterdir() if "launch" in p.name), ["main-launch.json"])
 
     def test_two_launches_in_one_session_keep_one_id_and_another_session_has_its_own(self):
         first = self.launch()

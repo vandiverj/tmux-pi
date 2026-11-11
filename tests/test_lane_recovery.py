@@ -254,6 +254,18 @@ class HandOverAndPreambleTests(RecoveryCase):
         self.assertTrue(prompt.startswith(preamble.contract(harness) + "\n\n# Repository Instructions\n\n"), prompt[:200])
         self.assertEqual(prompt.count("contract: worker v"), 1)
         self.assertEqual((review / "packet.md").read_text().count("# Worker Role\n\n# Code reviewer\n"), 1)
+        # HB2b: the lane step and its review each name their route, and the preamble they were given comes from the main tree.
+        import hashlib
+        for task, route, parent, role, harness_ in ((direct, "lane", None, "coder", "pi"),
+                                                    (review, "review", "coder-direct0001", "code-reviewer", harness)):
+            record = json.loads((task / "launch.json").read_text())
+            pieces = {p["name"]: p for p in record["instructions"]}
+            self.assertEqual((record["route"], record["role"], record["harness"], record["context"]["parent"]), (route, role, harness_, parent))
+            self.assertEqual(os.path.realpath(pieces["preamble"]["path"]), os.path.realpath(self.repo / ".tmux-pi/worker-preamble.md"))
+            self.assertEqual(pieces["contract"]["sha256"], hashlib.sha256(preamble.contract(harness_).encode()).hexdigest())
+            self.assertIsNotNone(pieces["preamble"]["sha256"])
+        self.assertEqual(json.loads((direct / "launch.json").read_text())["context"]["lane"], "alpha")
+        self.assertEqual(json.loads((direct / "launch.json").read_text())["context"]["step"], "s1")
 
 
 class ReviewOverrideTests(RecoveryCase):

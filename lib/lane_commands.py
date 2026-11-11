@@ -362,7 +362,7 @@ def create_lane(repo_dir, name, domain, touches, base=None, machine=None, repo_c
 
 def _disk_kb(worktree):
     try:
-        run = subprocess.run(["du", "-sk", worktree], text=True, capture_output=True, timeout=DU_TIMEOUT)
+        run = subprocess.run(["du", "-sk", worktree], text=True, errors="replace", capture_output=True, timeout=DU_TIMEOUT)
     except subprocess.TimeoutExpired:
         return None, f"du took longer than {DU_TIMEOUT}s"
     except OSError as error:

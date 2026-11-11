@@ -241,7 +241,7 @@ def eval_dir(runner=subprocess.run):
     state = os.environ.get("TP_STATE_DIR")
     if not state and os.environ.get("TMUX"):
         try:
-            state = runner(["tmux", "display-message", "-p", "#{@tp_state_dir}"], capture_output=True, text=True,
+            state = runner(["tmux", "display-message", "-p", "#{@tp_state_dir}"], capture_output=True, text=True, errors="surrogateescape",
                            timeout=5).stdout.strip()
         except (OSError, subprocess.SubprocessError):
             state = ""

@@ -38,6 +38,7 @@ CONFIG = {
     "TP_BENCH_PROJECT",  # bin/tp-bench:155: --project default, not caller identity
     "TP_BENCH_RESULTS",  # bin/tp-bench:156: --results-dir default, not caller identity
     "TP_BENCH_WORK",  # bin/tp-bench:157: --work-root default, not caller identity
+    "TP_PROVIDER_ALIASES",  # bin/tp-pi: the applied local provider_aliases map exported to pi for agent/extensions/reporter.ts; recomputed on every start, not caller identity
     "TP_HL1",  # lib/bench/compare.py:5,37: arm-gate configuration allowed to differ between records
     "TP_X1_ARM",  # lib/bench/compare.py:5,37: arm-gate configuration allowed to differ between records
     "TP_TRUST_CAPTURE_TIMEOUT",  # lib/trust_dialog.py:22,37: capture-timeout test hook, read at each call, not caller identity

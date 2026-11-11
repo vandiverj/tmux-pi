@@ -207,7 +207,7 @@ def notice(task_id, found):
 
 
 def _git(workdir, *args):
-    run = subprocess.run(["git", "-C", str(workdir), *args], text=True, capture_output=True)
+    run = subprocess.run(["git", "-C", str(workdir), *args], text=True, errors="surrogateescape", capture_output=True)
     if run.returncode:
         raise ValueError(f"git {' '.join(args)} failed in {workdir}: {run.stderr.strip() or run.stdout.strip()}")
     return run.stdout
@@ -215,7 +215,7 @@ def _git(workdir, *args):
 
 def head_commit(workdir):
     """The commit a task starts from (recorded in dispatch.json as base_commit), or None outside a git repository."""
-    run = subprocess.run(["git", "-C", str(workdir), "rev-parse", "--verify", "HEAD^{commit}"], text=True, capture_output=True)
+    run = subprocess.run(["git", "-C", str(workdir), "rev-parse", "--verify", "HEAD^{commit}"], text=True, errors="surrogateescape", capture_output=True)
     return run.stdout.strip() if run.returncode == 0 else None
 
 
@@ -225,7 +225,7 @@ def repo_top(workdir):
 
 def _git_env(workdir, index, *args):
     env = dict(os.environ, GIT_INDEX_FILE=str(index))
-    run = subprocess.run(["git", "-C", str(workdir), *args], text=True, capture_output=True, env=env)
+    run = subprocess.run(["git", "-C", str(workdir), *args], text=True, errors="surrogateescape", capture_output=True, env=env)
     if run.returncode:
         raise ValueError(f"git {' '.join(args)} failed in {workdir}: {run.stderr.strip() or run.stdout.strip()}")
     return run.stdout
@@ -254,7 +254,7 @@ def clean_worktree(workdir, base_commit, target):
 
 
 def remove_worktree(workdir, target):
-    subprocess.run(["git", "-C", str(workdir), "worktree", "remove", "--force", str(target)], text=True, capture_output=True)
+    subprocess.run(["git", "-C", str(workdir), "worktree", "remove", "--force", str(target)], text=True, errors="replace", capture_output=True)
 
 
 PATCH_NOTE = ("The patch is the state of {workdir} when this investigation was started, compared with the commit the task started "

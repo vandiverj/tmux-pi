@@ -179,7 +179,7 @@ def chain_labels(state_dir, task_id):
 
 
 def git(workdir, *args, env=None):
-    run = subprocess.run(["git", "-C", workdir, *args], capture_output=True, text=True, env=env)
+    run = subprocess.run(["git", "-C", workdir, *args], capture_output=True, text=True, errors="surrogateescape", env=env)
     return run
 
 
@@ -451,7 +451,7 @@ LS_CHUNK = 256  # paths given to one `git ls-tree` call (one call lists them all
 
 def commit_of(top, name):
     """The full id of the commit `name` names (a commit id, ref or HEAD), or None when it names no commit (a tree, or nothing)."""
-    run = subprocess.run(["git", "-C", top, "rev-parse", "--verify", "-q", f"{name}^{{commit}}"], capture_output=True, text=True)
+    run = subprocess.run(["git", "-C", top, "rev-parse", "--verify", "-q", f"{name}^{{commit}}"], capture_output=True, text=True, errors="surrogateescape")
     return run.stdout.strip() if run.returncode == 0 and run.stdout.strip() else None
 
 
@@ -490,7 +490,7 @@ def read_manifest(top, blobid):
     """({copy path: [entries]}, None) from the manifest blob, or (None, why it cannot be used). Any entry of the wrong shape (not an
     object with text `path`, `source` and `commit`) makes the whole manifest unusable: a manifest is read whole or not at all.
     The size is asked first (`git cat-file -s`), and a blob over MAX_MANIFEST is not read; a read stops at MAX_MANIFEST + 1 bytes."""
-    size = subprocess.run(["git", "-C", top, "cat-file", "-s", blobid], capture_output=True, text=True)
+    size = subprocess.run(["git", "-C", top, "cat-file", "-s", blobid], capture_output=True, text=True, errors="surrogateescape")
     if size.returncode or not size.stdout.strip().isdigit():
         return None, "it cannot be read"
     if int(size.stdout) > MAX_MANIFEST:

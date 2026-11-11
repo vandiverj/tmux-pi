@@ -77,7 +77,7 @@ def read(path):
 def panes():
     """{pane id: "alive" | "dead"}; a pane missing here is gone (killed)."""
     try:
-        out = subprocess.run(["tmux", "list-panes", "-a", "-F", "#{pane_id} #{pane_dead}"], capture_output=True, text=True).stdout
+        out = subprocess.run(["tmux", "list-panes", "-a", "-F", "#{pane_id} #{pane_dead}"], capture_output=True, text=True, errors="replace").stdout
     except OSError:
         out = ""
     return {line.split()[0]: "alive" if line.endswith(" 0") else "dead" for line in out.splitlines() if line.strip()}

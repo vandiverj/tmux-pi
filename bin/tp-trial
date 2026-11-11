@@ -49,8 +49,8 @@ def main_state(explicit=None):
     session = os.getenv("TP_SESSION", "tmux-pi")
     if os.getenv("TMUX"):
         target = ["-t", os.environ["TMUX_PANE"]] if os.getenv("TMUX_PANE") else []
-        session = subprocess.check_output(["tmux", "display-message", "-p", *target, "#S"], text=True).strip()
-    found = subprocess.run(["tmux", "show-options", "-qv", "-t", "={}:".format(session), "@tp_state_dir"], text=True, capture_output=True)
+        session = subprocess.check_output(["tmux", "display-message", "-p", *target, "#S"], text=True, errors="surrogateescape").strip()
+    found = subprocess.run(["tmux", "show-options", "-qv", "-t", "={}:".format(session), "@tp_state_dir"], text=True, errors="surrogateescape", capture_output=True)
     if found.returncode or not found.stdout.strip():
         raise trial_shadow.ShadowError("no tmux-pi state directory; run this from the workspace (tp), or with TP_STATE_DIR or --state-dir set")
     return Path(found.stdout.strip()).resolve()

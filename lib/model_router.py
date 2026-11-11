@@ -54,6 +54,8 @@ def load_roster_config(root=ROOT, config_path=None):
     """(config, error): config/router.json with this machine's local overrides, without the learned head."""
     try:
         return router.load_config(config_path or Path(root) / "config" / "router.json", laya_model=False), None
+    except router.ProviderAliasError as exc:
+        raise RouteStop(str(exc)) from exc  # a bad alias refuses: no route may start pi with the shared name
     except (router.RouterError, OSError) as exc:
         return None, str(exc)[:200]
 
@@ -430,7 +432,7 @@ def git_files_touched(workdir, runner=subprocess.run):
     """Number of changed or new files in a working tree (not attributed to one task), or None when unknown."""
     try:
         done = runner(["git", "-C", str(workdir), "status", "--porcelain", "--untracked-files=all", "--", ".", ":(exclude).tmux-pi"],
-                      capture_output=True, text=True, timeout=20)
+                      capture_output=True, text=True, errors="replace", timeout=20)
     except (OSError, subprocess.SubprocessError):
         return None
     return len([line for line in done.stdout.splitlines() if line.strip()]) if done.returncode == 0 else None

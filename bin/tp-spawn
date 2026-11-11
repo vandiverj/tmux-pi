@@ -719,10 +719,32 @@ if [[ -n "$context_manifest_file" ]]; then
   jq . "$context_manifest_file" | tp_write "$task_dir/context-manifest.json" --root "$state_dir"
 fi
 
+# This machine's settings for the model (config/local.json), in one python start: the model id pi is launched with (the shared
+# provider rewritten by "provider_aliases"; null when unchanged; meta.json keeps the shared id in model and adds launch_model when
+# they differ) and the standing instruction for the model ("prompts").
+launch_model="$model" prompt=""
+if [[ -n "$model" ]]; then
+  local_settings="$(python3 - "$ROOT" "$model" "$worker" <<'EOF'
+import json, sys
+sys.path.insert(0, sys.argv[1] + "/lib")
+from router import RouterError, launch_model, load_config
+try:
+    config = load_config(sys.argv[1] + "/config/router.json")
+except RouterError as exc:
+    sys.exit("tp-spawn: {}".format(exc))
+launch = launch_model(sys.argv[2], config) if sys.argv[3] == "pi" else sys.argv[2]
+print(json.dumps({"launch": None if launch == sys.argv[2] else launch,
+                  "prompt": config["local"].get("prompts", {}).get(sys.argv[2], "")}))
+EOF
+)" || exit 1
+  if jq -e '.launch != null' <<<"$local_settings" >/dev/null; then launch_model="$(jq -j .launch <<<"$local_settings")"; fi
+  prompt="$(jq -j .prompt <<<"$local_settings")"
+fi
+
 # Build the worker command. Workers skip context files; the task is their context.
 if [[ "$worker" == pi ]]; then
   cmd=("$ROOT/bin/tp-pi" --no-context-files --name "$id" --session "$task_dir/transcript.jsonl")
-  if [[ -n "$model" ]]; then cmd+=(--model "$model"); fi
+  if [[ -n "$model" ]]; then cmd+=(--model "$launch_model"); fi
   if [[ -n "$thinking" ]]; then cmd+=(--thinking "$thinking"); fi
 else
   # Claude Code's default tool set omits Grep and Glob, and --tools does not combine
@@ -743,21 +765,9 @@ fi
 # flag, one value, so no harness has to merge repeats). Order is fixed, so a prompt cache can reuse its head: the worker
 # contract for this harness (every route, every worker), the repository's preamble and role section, its Project Tools
 # block, the prior task line (a continued task only), then the machine's instruction for this model (config/local.json
-# "prompts", for a mistake the model is known to make). lib/preamble.py system_text renders all but the last.
+# "prompts", for a mistake the model is known to make; read above with the alias). lib/preamble.py system_text renders all but the last.
 system_prompt="$preamble"
-if [[ -n "$model" ]]; then
-  prompt="$(python3 - "$ROOT" "$model" <<'EOF'
-import sys
-sys.path.insert(0, sys.argv[1] + "/lib")
-from router import RouterError, load_config
-try:
-    print(load_config(sys.argv[1] + "/config/router.json")["local"].get("prompts", {}).get(sys.argv[2], ""), end="")
-except RouterError as exc:
-    sys.exit("tp-spawn: {}".format(exc))
-EOF
-)" || exit 1
-  if [[ -n "$prompt" ]]; then system_prompt+="${system_prompt:+$'\n\n'}$prompt"; fi
-fi
+if [[ -n "$prompt" ]]; then system_prompt+="${system_prompt:+$'\n\n'}$prompt"; fi
 if [[ -n "$system_prompt" ]]; then
   cmd+=(--append-system-prompt "$system_prompt")  # system-prompt.md (written below with run.sh) holds exactly this
 fi
@@ -802,7 +812,7 @@ fi
 tmux set-option -p -t "$pane" remain-on-exit on
 tmux select-pane -t "$pane" -T "$id"
 
-jq -n --arg id "$id" --arg worker "$worker" --arg model "$model" --arg thinking "$thinking" \
+jq -n --arg id "$id" --arg worker "$worker" --arg model "$model" --arg launch_model "$launch_model" --arg thinking "$thinking" \
   --arg role "$role" --arg parent "$parent" --arg gate "$gate" --arg deliverable "$deliverable" --argjson route_info "$route_json" \
   --arg lane "$lane" --arg lane_step "$lane_step" --arg preamble_from "$preamble_from" \
   --arg pane "$pane" --arg workdir "$workdir" --arg created "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
@@ -810,6 +820,7 @@ jq -n --arg id "$id" --arg worker "$worker" --arg model "$model" --arg thinking 
   --argjson policy_decision "$policy_decision" --argjson context_manifest "$context_manifest" \
   --argjson decision "${decision_json:-null}" \
   '{id:$id, worker:$worker, model:$model, thinking:$thinking, pane:$pane, workdir:$workdir, created:$created}
+   + (if $launch_model == $model then {} else {launch_model:$launch_model} end)
    + (if $role == "" then {} else {role:$role} end)
    + (if $parent == "" then {} else {parent:$parent} end)
    + (if $gate == "" then {} else {gate:$gate} end)

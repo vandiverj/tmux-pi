@@ -2051,7 +2051,7 @@ def pid_is_run(pid, rdir):
     guess: a recorded pid may have been reused, or edited by the worker."""
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1:
         return False
-    out = subprocess.run(["ps", "-ww", "-o", "command=", "-p", str(pid)], text=True, capture_output=True)
+    out = subprocess.run(["ps", "-ww", "-o", "command=", "-p", str(pid)], text=True, errors="surrogateescape", capture_output=True)
     if out.returncode != 0:
         return False
     tails = {" --run-dir " + p for p in (os.path.abspath(str(rdir)), os.path.realpath(str(rdir)))}

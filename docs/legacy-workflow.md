@@ -331,6 +331,24 @@ credentials. Every key is optional:
   workdir's file list (`claude -p`, no tools; file names only, credentials
   names left out). Qwen3.6-35B-A3B passed 56 of 60 chores with picked files
   and 52 without; stronger workers gain nothing, so leave them out.
+- `provider_aliases` maps a shared provider name to the pi provider this
+  machine is logged in with, for example `{"openai": "openai-codex"}` on a Mac
+  where pi signs in to OpenAI through `openai-codex`. Only the `--model` handed
+  to pi is rewritten, in `bin/tp-pi` (so `tp-spawn` workers, `tp-main`,
+  `tools/qual` runs and `ask_local` all get it; a name already local is left
+  alone) and in the pi router call: the roster, catalog, routes, review provider
+  checks, `meta.json` `model`, `state.json` `model`, the usage buckets
+  (`byModel`, `tp-usage`) and the contract and family records all keep the
+  shared `openai/...` id, for every model the session runs (a later model
+  switch and pi Main too): `bin/tp-pi` exports the map as
+  `TP_PROVIDER_ALIASES` and the reporter records each `openai-codex/<id>` as
+  `openai/<id>`. The name pi was started with is kept beside it: `meta.json`
+  `launch_model` and `state.json` `launched_model` (the selected model's).
+  Claude launches are untouched. Both sides are provider names; an alias to
+  itself, to another aliased name (a chain), or two names to one provider are
+  refused, and a refused setting stops every route and every pi start (with or
+  without `--model`) before pi starts, with the same error. `bin/tp-route
+  --check` lists the active aliases.
 
 On a machine without Slotstream or MLX, leave those out and point `routes` at
 models it does have. `bin/tp-route --check` validates the result;

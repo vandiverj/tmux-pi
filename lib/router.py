@@ -1,5 +1,6 @@
 """Local Laya decision adapter and explicit OpenAI-compatible fallback."""
 
+import fcntl
 import hashlib
 import ipaddress
 import json
@@ -57,11 +58,105 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+BUDGET_VAR = "TP_LMSTUDIO_BUDGET"
+BUDGET_FILE_VAR = "TP_LMSTUDIO_BUDGET_FILE"
+ENDPOINT_VAR = "TP_LMSTUDIO_ENDPOINT"  # host:port of the LM Studio server; default port 1234 on a loopback name
+_LOOPBACK_NAMES = ("127.0.0.1", "localhost", "::1")
+
+
+class LmStudioBudgetError(OSError):
+    """A request to LM Studio was refused by the run's request cap (nothing was sent)."""
+
+
+def _lmstudio_port():
+    value = os.environ.get(ENDPOINT_VAR, "")
+    try:
+        return int(value.rpartition(":")[2]) if value else 1234
+    except ValueError:
+        return 1234
+
+
+def _is_lmstudio(request):
+    try:
+        parsed = urllib.parse.urlsplit(request.full_url)
+        host, port = parsed.hostname, parsed.port
+    except ValueError:
+        return False
+    return host in _LOOPBACK_NAMES and port == _lmstudio_port()
+
+
+class _Held:
+    """A response that keeps the budget lock (one request in flight per run) until it is closed."""
+
+    def __init__(self, response, fd):
+        self._response, self._fd = response, fd
+
+    def close(self):
+        try:
+            self._response.close()
+        finally:
+            if self._fd is not None:
+                fd, self._fd = self._fd, None
+                os.close(fd)  # closing the descriptor releases the flock
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def __iter__(self):
+        return iter(self._response)
+
+    def __getattr__(self, name):
+        return getattr(self._response, name)
+
+
+def _take_budget():
+    """Count one LM Studio request under an exclusive lock; return the locked descriptor. Raises LmStudioBudgetError."""
+    raw, path = os.environ[BUDGET_VAR], os.environ.get(BUDGET_FILE_VAR, "")
+    try:
+        cap = int(raw)
+        if cap < 0:
+            raise ValueError
+    except ValueError:
+        raise LmStudioBudgetError("{} must be a whole number of requests (0 or more), got {!r}; LM Studio request refused".format(BUDGET_VAR, raw)) from None
+    message = "LM Studio request refused: the run's cap is {} requests ({}={})".format(cap, BUDGET_VAR, raw)
+    if not path:
+        raise LmStudioBudgetError("{}; {} is not set".format(message, BUDGET_FILE_VAR))
+    try:
+        fd = os.open(path, os.O_RDWR)
+    except OSError as exc:
+        raise LmStudioBudgetError("{}; counter file {} cannot be opened ({})".format(message, path, type(exc).__name__)) from None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        text = os.pread(fd, 64, 0).decode("ascii", "replace").strip()
+        if not text.isdigit():
+            raise LmStudioBudgetError("{}; counter file {} is empty or not a number".format(message, path))
+        used = int(text)
+        if used >= cap:
+            raise LmStudioBudgetError("{} after {} requests".format(message, used))
+        os.ftruncate(fd, 0)
+        os.pwrite(fd, str(used + 1).encode("ascii"), 0)
+        os.fsync(fd)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
 def local_open(request, timeout):
-    # Do not send task text through a proxy or follow a remote redirect.
-    return urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect()).open(
-        request, timeout=timeout
-    )
+    fd = _take_budget() if BUDGET_VAR in os.environ and _is_lmstudio(request) else None
+    try:
+        # Do not send task text through a proxy or follow a remote redirect.
+        response = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect()).open(
+            request, timeout=timeout
+        )
+    except BaseException:
+        if fd is not None:
+            os.close(fd)
+        raise
+    return response if fd is None else _Held(response, fd)
 
 
 def local_base_url(value, backend="openai"):

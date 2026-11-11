@@ -162,6 +162,19 @@ class AskTests(StubCase):
         self.stub.reply('{"facts": [3]}', reasoning='{"facts": [4]}')  # content wins when both are there
         self.assertEqual(self.ask(), '{"facts": [3]}')
 
+    def test_lmstudio_cap_is_an_ask_error_and_sends_nothing(self):
+        """The router's cap on LM Studio requests reaches summarize_structured as its normal failure (an AskError), never a hang."""
+        with tempfile.TemporaryDirectory() as tmp:
+            counter = Path(tmp) / "count"
+            counter.write_text("0")
+            port = self.stub.url.split(":")[2].split("/")[0]
+            env = {"TP_LMSTUDIO_ENDPOINT": "127.0.0.1:" + port, "TP_LMSTUDIO_BUDGET": "0", "TP_LMSTUDIO_BUDGET_FILE": str(counter)}
+            with mock.patch.dict(os.environ, env), self.assertRaises(ss.AskError) as caught:
+                self.ask()
+        self.assertIn("cap is 0", str(caught.exception))
+        self.assertIn("TP_LMSTUDIO_BUDGET", str(caught.exception))
+        self.assertEqual(self.stub.requests, [])
+
     def test_request_shape(self):
         self.ask()
         (request,) = self.stub.requests
@@ -389,6 +402,25 @@ class RunnerStructuredTests(StubCase):
                 mock.patch("builtins.print"):
             summarize_run.main(["--model", "m", "--only", self.CHORE, "--split", "tune", "--out", str(self.dir / "o.jsonl")], env=self.env)
         self.assertEqual((structured.called, chores.called), (False, True))
+
+
+@unittest.skipUnless(os.environ.get("TP_LIVE_LMSTUDIO") == "1", "live LM Studio request: set TP_LIVE_LMSTUDIO=1 (budget 20, 300 s per request)")
+class LiveLmStudioTests(unittest.TestCase):
+    """One full-size (60k characters, the default limit) summarizer request to the real LM Studio, to determine the limit and wait
+    for the longer response. Opt-in; the budget is 20 requests, one at a time (tests/__init__.py)."""
+    TIMEOUT = 300
+
+    def test_full_size_request_returns_well_formed_facts(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(__import__("shutil").rmtree, root, True)
+        lines = ["def f{n}(x):\n    return x + {n}\n".format(n=n) for n in range(4000)]
+        (root / "big.py").write_text("".join(lines)[:ss.DEFAULT_BUDGET_CHARS])
+        text, record = ss.summarize(root, ["big.py"], "what do the functions return", endpoint=ss.default_endpoint(ROOT),
+                                    model=os.environ.get("TP_LIVE_LMSTUDIO_MODEL", "qwen/qwen3.6-35b-a3b"),
+                                    settings=ss.load_settings(ROOT), timeout=self.TIMEOUT)
+        self.assertIsInstance(text, str)
+        self.assertGreater(record["chars"], 50000)
+        self.assertGreaterEqual(record["kept"] + record["indexed"], 1)
 
 
 if __name__ == "__main__":

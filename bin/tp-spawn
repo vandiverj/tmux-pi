@@ -159,8 +159,8 @@ seen_env=" "
 for pair in ${worker_env[@]+"${worker_env[@]}"}; do
   [[ "$pair" == *=* ]] || die "bad --worker-env (want KEY=VAL): $pair"
   case "${pair%%=*}" in
-    TP_DOCS_TOOLS|TP_TRIAL_ID|LANE_BASE) ;;
-    *) die "--worker-env key not allowed: ${pair%%=*} (allowed: TP_DOCS_TOOLS, TP_TRIAL_ID, LANE_BASE)" ;;
+    TP_DOCS_TOOLS|TP_TRIAL_ID|LANE_BASE|TP_LMSTUDIO_BUDGET) ;;
+    *) die "--worker-env key not allowed: ${pair%%=*} (allowed: TP_DOCS_TOOLS, TP_TRIAL_ID, LANE_BASE, TP_LMSTUDIO_BUDGET)" ;;
   esac
   [[ "$seen_env" != *" ${pair%%=*} "* ]] || die "--worker-env ${pair%%=*} given twice"
   seen_env+="${pair%%=*} "
@@ -776,6 +776,8 @@ run_sh="$(
   printf 'cd %q\n' "$workdir"
   # The reporters (pi extension, Claude hook) write state.json/result.md here.
   printf 'export TP_TASK_ID=%q TP_TASK_DIR=%q\n' "$id" "$task_dir"
+  # LM Studio request cap (lib/router.py local_open): 0 for every worker, its own counter file; --worker-env TP_LMSTUDIO_BUDGET=N (Main only) overrides.
+  printf 'export TP_LMSTUDIO_BUDGET=0 TP_LMSTUDIO_BUDGET_FILE=%q\n' "$task_dir/lmstudio-budget.count"
   for pair in ${worker_env[@]+"${worker_env[@]}"}; do printf 'export %s=%q\n' "${pair%%=*}" "${pair#*=}"; done
   # The dispatching main's identity (bin/tp-main) follows the spawner, never --worker-env, so the worker's own dispatches are
   # tagged to the same main. Only when set and valid. It is not in the session environment: two mains may share a session.

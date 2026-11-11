@@ -2,13 +2,21 @@ import session_env  # noqa: F401  first: removes the caller's session, however t
 import copy
 import json
 import math
+import os
+import subprocess
 import sys
+import tempfile
+import threading
+import time
 import unittest
 import urllib.error
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "lib"))
+import router
 from router import (QUESTIONS, REVIEWS, RouterError, apply_rules, dispatch, feature_names, follow_up, laya_decision,
                     laya_route,
                     parse_markers, placement_policy,
@@ -524,3 +532,115 @@ class RouterTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LmStudioBudgetTests(unittest.TestCase):
+    """local_open's cap on requests to the LM Studio endpoint (TP_LMSTUDIO_BUDGET / TP_LMSTUDIO_BUDGET_FILE). The "LM Studio" here is
+    a stub on a free loopback port named through TP_LMSTUDIO_ENDPOINT; nothing touches 127.0.0.1:1234."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.hits, cls.active, cls.peak = [], [0], [0]
+        cls.lock = threading.Lock()
+        hits, active, peak, lock = cls.hits, cls.active, cls.peak, cls.lock
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                with lock:
+                    hits.append(self.server.server_address[1])
+                    active[0] += 1
+                    peak[0] = max(peak[0], active[0])
+                time.sleep(0.05)
+                with lock:
+                    active[0] -= 1
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            def log_message(self, *args):
+                pass
+
+        cls.servers = []
+        for _ in range(2):  # [0] is "LM Studio", [1] is a stub on another port
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            server.daemon_threads = True
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            cls.servers.append(server)
+            cls.addClassCleanup(server.server_close)
+            cls.addClassCleanup(server.shutdown)
+        cls.lm, cls.other = (s.server_address[1] for s in cls.servers)
+
+    def setUp(self):
+        self.hits[:] = []
+        self.peak[0] = 0
+        self.dir = Path(tempfile.mkdtemp())
+        self.addCleanup(__import__("shutil").rmtree, self.dir, True)
+        self.counter = self.dir / "count"
+
+    def env(self, budget="0", content="0"):
+        env = {"TP_LMSTUDIO_ENDPOINT": "127.0.0.1:{}".format(self.lm)}
+        if budget is not None:
+            env["TP_LMSTUDIO_BUDGET"] = budget
+            env["TP_LMSTUDIO_BUDGET_FILE"] = str(self.counter)
+        if content is not None:
+            self.counter.write_text(content)
+        return env
+
+    def send(self, env, port=None, host="127.0.0.1"):
+        """One local_open to the stub; returns "ok" or the refusal text."""
+        clean = {k: v for k, v in os.environ.items() if not k.startswith("TP_LMSTUDIO")}
+        request = router.urllib.request.Request("http://{}:{}/v1/chat/completions".format(host, port or self.lm), data=b"{}")
+        with mock.patch.dict(os.environ, dict(clean, **env), clear=True):
+            try:
+                with router.local_open(request, 5) as response:
+                    response.read()
+                return "ok"
+            except router.LmStudioBudgetError as exc:
+                return str(exc)
+
+    def test_the_cap_table(self):
+        cases = [  # name, env, sends, expected results, stub hits on the LM Studio port
+            ("no budget: unchanged", lambda: self.env(None, None), 3, ["ok"] * 3, 3),
+            ("budget 0: refused, nothing sent", lambda: self.env("0"), 1, ["refused"], 0),
+            ("budget 2: third refused", lambda: self.env("2"), 3, ["ok", "ok", "refused"], 2),
+            ("counter file missing", lambda: self.env("5", None), 1, ["refused"], 0),
+            ("counter file empty", lambda: self.env("5", ""), 1, ["refused"], 0),
+            ("counter file not a number", lambda: self.env("5", "lots"), 1, ["refused"], 0),
+            ("counter file negative", lambda: self.env("5", "-1"), 1, ["refused"], 0),
+            ("budget not a number", lambda: self.env("many"), 1, ["refused"], 0),
+            ("budget negative", lambda: self.env("-1"), 1, ["refused"], 0),
+            ("budget without a file", lambda: {"TP_LMSTUDIO_ENDPOINT": "127.0.0.1:{}".format(self.lm), "TP_LMSTUDIO_BUDGET": "5"}, 1, ["refused"], 0),
+        ]
+        for name, make_env, sends, expected, hits in cases:
+            with self.subTest(name):
+                self.hits[:] = []
+                self.counter.unlink(missing_ok=True)
+                env = make_env()
+                got = [self.send(env) for _ in range(sends)]
+                self.assertEqual(["ok" if r == "ok" else "refused" for r in got], expected)
+                self.assertEqual(self.hits.count(self.lm), hits)
+                for r in got:
+                    if r != "ok":
+                        self.assertIn("TP_LMSTUDIO_BUDGET", r)
+                        if name == "budget 2: third refused":
+                            self.assertIn("cap is 2", r)
+        with self.subTest("a stub on another port is never counted or limited"):
+            self.hits[:] = []
+            env = self.env("0")
+            self.assertEqual([self.send(env, port=self.other) for _ in range(3)], ["ok"] * 3)
+            self.assertEqual(self.counter.read_text(), "0")
+
+    def test_two_processes_share_one_counter_and_run_one_request_at_a_time(self):
+        env = dict(os.environ, **self.env("3"))
+        code = ("import sys, urllib.request; sys.path.insert(0, {!r}); import router\n"
+                "for _ in range(3):\n"
+                "    try:\n"
+                "        with router.local_open(urllib.request.Request('http://127.0.0.1:{}/x', data=b'{{}}'), 5) as r: r.read()\n"
+                "        print('ok')\n"
+                "    except router.LmStudioBudgetError: print('refused')\n").format(str(ROOT / "lib"), self.lm)
+        procs = [subprocess.Popen([sys.executable, "-c", code], env=env, stdout=subprocess.PIPE, text=True) for _ in range(2)]
+        out = [line for p in procs for line in p.communicate(timeout=30)[0].split()]
+        self.assertEqual((out.count("ok"), out.count("refused")), (3, 3))
+        self.assertEqual((self.counter.read_text(), self.hits.count(self.lm), self.peak[0]), ("3", 3, 1))

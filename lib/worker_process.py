@@ -321,7 +321,7 @@ def end_or_refuse(path):
 
 def _ps():
     """{pid: (pgid, stat, start)} for every process; an unreadable table refuses."""
-    run = subprocess.run(["ps", "-ax", "-o", "pid=,pgid=,stat=,lstart="], text=True, errors="replace", capture_output=True)
+    run = subprocess.run(["ps", "-ax", "-o", "pid=,pgid=,stat=,lstart="], text=True, errors="surrogateescape", capture_output=True)
     if run.returncode:
         raise RuntimeError(f"cannot read the process table: {run.stderr.strip() or 'ps failed'}")
     rows = {}

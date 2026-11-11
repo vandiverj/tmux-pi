@@ -757,7 +757,7 @@ def check_workdir(role, workdir=None, contexts=(), lane=None):
     for spec in contexts:
         command += ["--context", spec]
     command += ["--", "check"]
-    run = subprocess.run(command, text=True, errors="replace", capture_output=True)
+    run = subprocess.run(command, text=True, errors="surrogateescape", capture_output=True)
     if run.returncode:
         raise ValueError(run.stderr.strip() or "tp-spawn could not check the workdir")
     effective = run.stdout.strip()
@@ -1224,7 +1224,7 @@ def review(base, args):
         command += ["--same-provider", "--approved-by-user", args.approved_by_user]
     elif args.approved_by_user is not None:
         raise ValueError("--approved-by-user applies only with --same-provider")
-    run = subprocess.run(command + [args.id], text=True, errors="replace", capture_output=True, env={**os.environ, "TP_STATE_DIR": str(base)})
+    run = subprocess.run(command + [args.id], text=True, errors="surrogateescape", capture_output=True, env={**os.environ, "TP_STATE_DIR": str(base)})
     if run.returncode == 3:
         return {"id": args.id, "review": None, "status": "not_needed", "reason": run.stderr.strip()}
     if run.returncode:

@@ -939,7 +939,7 @@ def explicit_branch(branch):
     """`branch` (a lane's --branch) when `git check-ref-format --branch` accepts it as written, else ValueError."""
     run = None
     if isinstance(branch, str) and branch and not branch.startswith("-") and "\n" not in branch and "\x00" not in branch:
-        run = subprocess.run(["git", "check-ref-format", "--branch", branch], capture_output=True, text=True, errors="replace")
+        run = subprocess.run(["git", "check-ref-format", "--branch", branch], capture_output=True, text=True, errors="surrogateescape")
     if run is None or run.returncode != 0 or run.stdout.strip() != branch:
         raise ValueError(f"--branch {branch!r} is not a valid branch name")
     return branch

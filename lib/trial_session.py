@@ -306,7 +306,7 @@ def start_tp(argv, env, cwd=None, timeout=None, check=None, detach=None):
     args = [str(a) for a in argv]
     if detach is not None:
         return subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=detach, stderr=subprocess.STDOUT, start_new_session=True, cwd=cwd, env=env)
-    return subprocess.run(args, text=True, errors="replace", capture_output=True, timeout=timeout, env=env, cwd=cwd)
+    return subprocess.run(args, text=True, errors="surrogateescape", capture_output=True, timeout=timeout, env=env, cwd=cwd)
 
 
 def local_active(state, env=None):

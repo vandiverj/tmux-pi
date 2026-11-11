@@ -371,6 +371,23 @@ class ProcessEndTests(TmuxCase):
                     self.assertEqual(worker_process._ps()[100][1:], ("S", "Mon Jan 1 00:00:00 2026"))
         self.assertIn(903, worker_process.task_processes(task_dir, [(903, "bash /tmp/pd1-state/tasks/t1/run.sh \udca0")]))
 
+    def test_values_read_back_from_foreign_output_round_trip_their_bytes(self):
+        """PD1 (lossy-os-identity): a value that is later a path or a branch name keeps its bytes (surrogateescape, never replace)."""
+        sys.path.insert(0, str(ROOT / "lib"))
+        import lanes
+        import routing_evals
+        stubs = self.root / "pd1-rt-stubs"
+        stubs.mkdir()
+        (stubs / "tmux").write_text("#!/bin/sh\nprintf '/tmp/pd1-\\377-state\\n'\n")
+        (stubs / "tmux").chmod(0o755)
+        env = {"PATH": f"{stubs}{os.pathsep}{os.environ['PATH']}", "TMUX": "x,1,0"}
+        with mock.patch.dict(os.environ, env):
+            os.environ.pop("TP_STATE_DIR", None)
+            got = routing_evals.eval_dir()
+        self.assertEqual(os.fsencode(got), b"/tmp/pd1-\xff-state/evals")  # the bytes the OS would use for that path
+        branch = os.fsdecode(b"feat-\xff-x")  # what argv holds for a branch git accepts
+        self.assertEqual(os.fsencode(lanes.explicit_branch(branch)), b"feat-\xff-x")
+
     # --- T3: reap ----------------------------------------------------------------------------
 
     def test_reap_lists_without_yes_and_ends_only_finished_tasks_with_it(self):

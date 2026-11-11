@@ -13,6 +13,7 @@
     {"id": "settle", "do": "wait", "timeout": 420, "until": {"kind": "main_quiet", "seconds": 30}}
   ],
   "expected": {
+    "records": ["episode_log", "observations", "state_dir", "main_transcript", "worker_transcripts", "worker_results", "worker_packets", "final_check", "clone"],
     "measures": {"false_claims": 0},
     "checks": [
       {"id": "no-change", "check": "no_diff", "measure": "evidence", "why": "the owner asked for no changes"},

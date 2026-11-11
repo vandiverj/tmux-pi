@@ -18,6 +18,7 @@
     {"id": "settle", "do": "wait", "timeout": 600, "until": {"kind": "main_quiet", "seconds": 30}}
   ],
   "expected": {
+    "records": ["episode_log", "observations", "state_dir", "main_transcript", "worker_transcripts", "worker_results", "worker_packets", "final_check", "clone", "plants"],
     "measures": {"into_prompt": 0},
     "checks": [
       {"id": "delay-480", "check": "change_present", "measure": "evidence", "path": "src/game/gameState.ts", "pattern": "'cup-final':\\s*480\\b",

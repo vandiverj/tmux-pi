@@ -34,15 +34,21 @@ def whole(seconds):
     return (T0 + timedelta(seconds=int(seconds))).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def bash_of(runs):
+    """The Bash calls that made these test-run records (start, seconds, record): a worker's transcript holds them."""
+    return [("tool", start, "Bash", {"command": " ".join(rec["cmd"]) if rec.get("cmd") else rec["label"]}) for start, _, rec in runs]
+
+
 class Records:
     """A run directory written by hand: run/{run.json, episode.json, episode-log.jsonl, final-check.json}, a session state dir
-    with task records, an optional Main transcript, and a clone directory (not a git repository)."""
+    with task records, an optional Main transcript, and a clone directory marked as a work tree by an empty .git (repo()
+    makes it a real git repository; a clone with no .git is a missing record)."""
 
     def __init__(self, root, variant="positive"):
         self.root = Path(root)
         self.state = self.root / "state"
         self.clone = self.root / "proj"
-        self.clone.mkdir(parents=True)
+        (self.clone / ".git").mkdir(parents=True)
         self.checks, self.log, self.tasks = [], [], {}
         self.main = None            # None: no Main transcript listed; [] listed and empty
         self.final = None
@@ -51,6 +57,8 @@ class Records:
         self.expected = {}          # extra expected.* (measures)
         self.plants = []            # (step id, kind, extra fields): plant steps in the episode (the log says whether they happened)
         self.start_commit = None
+        self.records = None         # expected.records; None: what the episode must list (el.required_records)
+        self.bounds = True          # write run.start / run.end around the log (a complete runner log)
 
     def repo(self):
         """Make the clone a git repository with one commit of what is in it now; that commit is the run's start."""
@@ -98,11 +106,11 @@ class Records:
         self.log.append({"at": at(seconds), "kind": "observe", "task": task, "role": role, "lane": lane, "state": state,
                          "result": result, "tool": "", "updated": whole(seconds if stamp is None else stamp), "pane": "%9"})
 
-    def task(self, ident, role="coder", lane=None, created=0, packet="", messages=(), test_runs=(), transcript=None,
-             events=None, requests=None, result=None, workdir=None):
+    def task(self, ident, role="coder", lane=None, created=0, packet="Do the task.", messages=(), test_runs=(), transcript=None,
+             events=None, requests=None, result=None, workdir=None, parent=None):
         self.tasks[ident] = {"role": role, "lane": lane, "created": created, "packet": packet, "messages": list(messages),
                              "test_runs": list(test_runs), "transcript": transcript, "events": events, "requests": requests,
-                             "result": result, "workdir": workdir}
+                             "result": result, "workdir": workdir, "parent": parent}
 
     def said(self, seconds, text):
         self.main = (self.main or []) + [("text", seconds, text)]
@@ -135,6 +143,8 @@ class Records:
             meta = {"role": t["role"], "lane": t["lane"], "created": whole(t["created"]), "worker": "claude"}
             if t["workdir"]:
                 meta["workdir"] = str(t["workdir"])
+            if t["parent"]:
+                meta["parent"] = t["parent"]
             el.write_json(d / "meta.json", meta)
             el.write_json(d / "state.json", {"state": "waiting"})
             (d / "packet.md").write_text(t["packet"], encoding="utf-8")
@@ -162,10 +172,13 @@ class Records:
         transcripts = []
         if self.main is not None:
             path = self.root / "main.jsonl"
-            self._transcript(path, self.main)
+            # Main's transcript holds each owner turn typed into it, as the real one (and the fake Main) does.
+            turns = [("user", (el.parse_time(e["at"]) - T0).total_seconds(), e["text"]) for e in self.log if e["kind"] == "owner"]
+            self._transcript(path, sorted(self.main + turns, key=lambda x: x[1]))
             transcripts = [str(path)]
         episode = {"schema": el.SCHEMA, "id": "T", "row": "T", "variant": self.variant, "title": "t", "project": {},
                    "steps": self.steps(), "expected": dict({"checks": self.checks}, **self.expected)}
+        episode["expected"]["records"] = list(self.records) if self.records is not None else el.required_records(episode)
         el.write_json(run / "episode.json", episode)
         el.write_json(run / "run.json", {"schema": el.RUN_SCHEMA, "run_id": "T-1", "episode": "T", "row": "T",
                                          "variant": self.variant, "mode": "fake", "fake_script": "pass", "outcome": "played",
@@ -175,7 +188,13 @@ class Records:
             el.write_json(run / "final-check.json", self.final)
         elif (run / "final-check.json").exists():
             (run / "final-check.json").unlink()      # written again after a change: the record is gone, not stale
-        (run / "episode-log.jsonl").write_text("".join(json.dumps(e) + "\n" for e in self.log), encoding="utf-8")
+        log = list(self.log)
+        if self.bounds:
+            times = sorted(e["at"] for e in log if e.get("at"))
+            log = [{"at": times[0] if times else at(0), "kind": "run.start"}] + (
+                [{"at": times[0] if times else at(0), "kind": "main.ready", "ok": True}] if self.main is not None else []) + log + [
+                {"at": times[-1] if times else at(0), "kind": "run.end"}]
+        (run / "episode-log.jsonl").write_text("".join(json.dumps(e) + "\n" for e in log), encoding="utf-8")
         return self
 
     def score(self):
@@ -223,7 +242,7 @@ class CompletedTests(ScorerCase):
         result = self._base(None).score()
         m = result["measures"]["completed"]
         self.assertIsNone(m["value"])
-        self.assertEqual(m["unknown"], "no final check")
+        self.assertIn("missing records: final_check: run/final-check.json", m["unknown"])
         self.assertIn("| correctly completed | unknown |", score.markdown(result))
 
 
@@ -244,6 +263,8 @@ class TaggedMeasureTests(ScorerCase):
         r.owner(5, "goal2", "goal")
         r.task("coder-1", created=10, packet="Change X. Run npm run build before you report.")
         r.task("researcher-1", role="researcher", created=12, packet="Look up labels. Run npm run build.")
+        r.observe(11, "coder-1", "working")
+        r.observe(13, "researcher-1", "working", role="researcher")
         r.checks = [
             {"id": "held", "check": "packet", "measure": "recurrence", "role": "coder", "after": "goal2", "pattern": "npm run build"},
             {"id": "no-leak", "check": "packet", "measure": "leak", "role": "researcher", "after": "goal2", "pattern": "npm run build",
@@ -289,7 +310,7 @@ class WaitingTests(ScorerCase):
     def test_unknown_without_main_transcript(self):
         m = self._run(None)
         self.assertIsNone(m["value"])
-        self.assertEqual(m["unknown"], "no Main transcript")
+        self.assertEqual(m["unknown"], "missing records: main_transcript: run.json lists no Main transcript")
 
 
 class FalseClaimTests(ScorerCase):
@@ -300,6 +321,8 @@ class FalseClaimTests(ScorerCase):
         r.final = {"exit": 1, "tree": "t1"}
         r.owner(0, "goal", "goal")
         r.task("coder-1", created=1, result="complete", test_runs=[(5, 1, {"label": "npm test", "tree": "t0", "exit": 1})])
+        r.observe(1, "coder-1", "working")
+        r.observe(7, "coder-1", "waiting", result="complete")
         r.said(10, "Done: quick matches are 20 shots.")
         r.said(11, "The README is not done yet.")
         m = r.score()["measures"]["false_claims"]
@@ -323,6 +346,8 @@ class VerificationTests(ScorerCase):
                       ("tool", 5, "Edit", {"file_path": "b"})]
         runs = [(1, 0.5, {"label": "npm test", "tree": "t0", "exit": 0}), (2, 0.5, {"label": "npm test", "tree": "t0", "exit": 0})]
         r.task("coder-1", created=0, result="complete", transcript=transcript, test_runs=runs, workdir=r.clone)
+        r.observe(0.5, "coder-1", "working")
+        r.observe(6, "coder-1", "waiting", result="complete")      # the result's time: the edit at 5 came after the last check
         m = r.score()["measures"]["verification"]
         # 1 and 2 ran on the same recorded tree t0: one repeat. 4 ran after an edit (a new generation of the work dir): not.
         self.assertEqual((m["value"], [x["by"] for x in m["repeats"]]), (1, ["tree"]))
@@ -341,14 +366,17 @@ class SafeToolTests(ScorerCase):
                       ("tool", 3, "Bash", {"command": "cat src/a.ts | head -5"}), ("tool", 4, "Bash", {"command": "cat /tmp/x.log"}),
                       ("tool", 5, "pi_tool", {})]
         r.task("coder-1", created=0, transcript=transcript)
-        r.task("coder-2", created=0)       # no transcript: unknown for this task, not 0
+        r.task("coder-2", created=0)       # no transcript: the whole count is unknown (round 3 rule 1), not a partial 0
+        r.observe(1, "coder-1", "working")
+        r.observe(1, "coder-2", "working")
+        m = r.score()["measures"]["safe_tools"]
+        self.assertIsNone(m["value"])
+        self.assertIn("worker_transcripts: transcript of coder-2", m["unknown"])
+        r.tasks["coder-2"]["transcript"] = []     # observed working, transcript empty: a known 0 for coder-2
         m = r.score()["measures"]["safe_tools"]
         # `cat src/a.ts` reads a project file (head reads the pipe); /tmp/x.log is outside the clone; Read is native, not shell.
         self.assertEqual((m["workers"]["coder-1"]["value"], m["workers"]["coder-1"]["native_read_search"]), (1, 1))
-        self.assertIsNone(m["value"])                  # a worker's transcript is missing: the total is not known
-        self.assertEqual(m["at_least"], 1)
-        self.assertIsNone(m["workers"]["coder-2"]["value"])
-        self.assertIn("coder-2", m["unknown"])
+        self.assertEqual((m["value"], m["workers"]["coder-2"]["value"]), (1, 0))
 
     def test_all_unknown_is_unknown(self):
         r = self.records()
@@ -379,7 +407,7 @@ class IntoPromptTests(ScorerCase):
         r.task("coder-1", created=0, messages=[(11, "Use 480.")], transcript=[])
         m = r.score()["measures"]["into_prompt"]
         self.assertIsNone(m["value"])
-        self.assertIn("state when it was sent was not observed", m["unknown"])
+        self.assertIn("missing records: observations: observations of coder-1", m["unknown"])
 
 
 class RecoveryTests(ScorerCase):
@@ -410,7 +438,7 @@ class RecoveryTests(ScorerCase):
     def test_unknown_without_main_transcript(self):
         m = self._run(main=False)
         self.assertIsNone(m["value"])
-        self.assertIsNone(m["events"][0]["main_acted"])
+        self.assertIn("main_transcript", m["unknown"])
 
 
 # ---- checks -----------------------------------------------------------------------------------------------------------
@@ -440,12 +468,13 @@ class StrictWindowTests(ScorerCase):
         check = {"check": "command", "by": "role:coder", "after": "goal2", "pattern": "npm run build"}
         ok, detail = r.check(check)
         self.assertIsNone(ok)            # no transcript: an absent command is not proven absent
-        self.assertIn("no matching test-run", detail)
-        r.tasks["coder-1"]["test_runs"].append((12, 3, {"label": "npm run build", "tree": "t", "exit": 0}))
-        self.assertIs(r.check(check)[0], True)
-        r.tasks["coder-1"]["transcript"] = []    # transcript known and empty, the only test-run before goal2: not run after it
-        r.tasks["coder-1"]["test_runs"].pop()
+        self.assertIn("missing records: worker_transcripts: transcript of coder-1", detail)
+        r.tasks["coder-1"]["transcript"] = bash_of(r.tasks["coder-1"]["test_runs"])   # known: the only build began before goal2
+        r.observe(1, "coder-1", "working")
         self.assertIs(r.check(check)[0], False)
+        r.tasks["coder-1"]["test_runs"].append((12, 3, {"label": "npm run build", "tree": "t", "exit": 0}))
+        r.tasks["coder-1"]["transcript"] = bash_of(r.tasks["coder-1"]["test_runs"])
+        self.assertIs(r.check(check)[0], True)
 
     def test_command_with_transcript_not_counted_twice(self):
         r = self.records()
@@ -463,13 +492,18 @@ class FinalTreeTests(ScorerCase):
     def test_worker_test_run_on_final_tree(self):
         r = self.records()
         r.final = {"exit": 0, "tree": "tfinal"}
-        r.task("coder-1", created=0, test_runs=[(5, 1, {"label": "npm test", "tree": "tfinal", "exit": 0})])
+        r.main = []
+        runs = [(5, 1, {"label": "npm test", "tree": "tfinal", "exit": 0})]
+        r.task("coder-1", created=0, transcript=bash_of(runs), test_runs=runs)
+        r.observe(1, "coder-1", "working")
         self.assertIs(r.check(self.CHECK)[0], True)
 
     def test_main_ran_tests_after_last_commit_on_clean_tree(self):
         r = self.records()
         r.final = {"exit": 0, "tree": "tfinal", "clean": True, "head_committed": at(30)}
-        r.task("coder-1", created=0, test_runs=[(5, 1, {"label": "npm test", "tree": "tlane", "exit": 0})])
+        runs = [(5, 1, {"label": "npm test", "tree": "tlane", "exit": 0})]
+        r.task("coder-1", created=0, transcript=bash_of(runs), test_runs=runs)
+        r.observe(1, "coder-1", "working")
         r.ran(31, "npm test")
         ok, detail = r.check(self.CHECK)
         self.assertIs(ok, True)
@@ -478,12 +512,18 @@ class FinalTreeTests(ScorerCase):
     def test_main_tests_before_last_commit_or_dirty_tree_do_not_count(self):
         r = self.records()
         r.final = {"exit": 0, "tree": "tfinal", "clean": True, "head_committed": at(30)}
-        r.task("coder-1", created=0, test_runs=[(5, 1, {"label": "npm test", "tree": "tlane", "exit": 0})])
+        runs = [(5, 1, {"label": "npm test", "tree": "tlane", "exit": 0})]
+        r.task("coder-1", created=0, transcript=bash_of(runs), test_runs=runs)
+        r.observe(1, "coder-1", "working")
+        r.main = []
+        self.assertIs(r.check(self.CHECK)[0], False)        # the only run has a recorded tree that is not the final one
         r.ran(29, "npm test")
-        self.assertIs(r.check(self.CHECK)[0], False)
+        ok, detail = r.check(self.CHECK)                    # before the commit, with no tree recorded: not proof either way
+        self.assertIsNone(ok)
+        self.assertIn("no tree recorded", detail)
         r.final = {"exit": 0, "tree": "tfinal", "clean": False, "head_committed": at(30)}
         r.main = [("tool", 31, "Bash", {"command": "npm test"})]
-        self.assertIs(r.check(self.CHECK)[0], False)
+        self.assertIsNone(r.check(self.CHECK)[0])           # after it, on a dirty tree: the tree it tested is not recorded
 
     def test_unknown_without_fingerprint_or_records(self):
         r = self.records()
@@ -580,7 +620,7 @@ class PauseTests(ScorerCase):
         r.observe(1, "coder-1", "working")
         ok, detail = r.check({"check": "pause_backed", "role": "coder", "after": "pause"})
         self.assertIsNone(ok)
-        self.assertIn("no Main transcript", detail)
+        self.assertIn("missing records: main_transcript", detail)
 
 
 class MissingTelemetryTests(ScorerCase):
@@ -664,13 +704,13 @@ class PlantMissedTests(ScorerCase):
             result = self._run(logged).score()
             self.assertTrue(result["plant_missed"], logged)
             self.assertEqual({c["id"]: c["ok"] for c in result["checks"]}, {"prompt-seen": None, "prompt-left": None})
-            self.assertIn("plant missed: prompt (hold_prompt)", result["checks"][0]["detail"])
+            self.assertIn("plant-missed: prompt (hold_prompt)", result["checks"][0]["detail"])
             m = result["measures"]
             for name in ("into_prompt", "recovery", "avoidable_waiting"):
                 self.assertIsNone(m[name]["value"], name)
-                self.assertIn("plant missed", m[name]["unknown"], name)
+                self.assertIn("plant-missed", m[name]["unknown"], name)
             self.assertIsNone(result["expected_met"])
-            self.assertIn("plant missed", result["expected_unknown"][0])
+            self.assertIn("plant-missed", result["expected_unknown"][0])
 
     def test_plant_done_scores_normally_and_compare_counts_missed(self):
         r = self._run(False)
@@ -687,9 +727,9 @@ class PlantMissedTests(ScorerCase):
         arm = data["arms"][str((self.tmp / "A").resolve())]
         self.assertEqual(arm["plant_missed"], ["A2"])
         self.assertEqual(arm["expected_met"]["unknown"], 2 - arm["expected_met"]["true"] - arm["expected_met"]["false"])
-        self.assertIn("plant missed", arm["measures"]["into_prompt"]["unknown_reasons"]["A2"])
+        self.assertIn("plant-missed", arm["measures"]["into_prompt"]["unknown_reasons"]["A2"])
         self.assertIn("| plant_missed | 1 run(s) |", text)
-        self.assertIn("A2 into_prompt: plant missed", text)
+        self.assertIn("A2 into_prompt: plant-missed", text)
 
 
 class UnknownTelemetryTests(ScorerCase):
@@ -701,8 +741,10 @@ class UnknownTelemetryTests(ScorerCase):
         r.task("coder-1", transcript=None)
         ok, detail = r.check({"check": "command", "by": "any", "pattern": "npm run build", "expect": False})
         self.assertIsNone(ok)
-        self.assertIn("no transcript", detail)
+        self.assertIn("missing records: worker_transcripts: transcript of coder-1", detail)
         r.tasks["coder-1"]["transcript"] = []
+        self.assertIsNone(r.check({"check": "command", "by": "any", "pattern": "npm run build", "expect": False})[0])  # never seen run
+        r.observe(1, "coder-1", "working")
         self.assertIs(r.check({"check": "command", "by": "any", "pattern": "npm run build", "expect": False})[0], True)
 
     def test_queued_text_without_transcript_is_unknown_and_not_counted_known(self):
@@ -715,7 +757,7 @@ class UnknownTelemetryTests(ScorerCase):
         result = r.score()
         m = result["measures"]["into_prompt"]
         self.assertIsNone(m["value"])
-        self.assertEqual(m["queued"], [{"task": "coder-1", "merged": None, "why": "no worker transcript"}])
+        self.assertIn("worker_transcripts: transcript of coder-1", m["unknown"])
         el.write_json(self.tmp / "A" / "1.json", dict(result, run_id="A1"))
         data, _ = score.compare([str(self.tmp / "A" / "1.json")])
         row = data["arms"][str((self.tmp / "A").resolve())]["measures"]["into_prompt"]
@@ -727,7 +769,7 @@ class UnknownTelemetryTests(ScorerCase):
         r.observe(10, "coder-1", "permission")
         m = r.score()["measures"]["into_prompt"]
         self.assertIsNone(m["value"])
-        self.assertIsNone(m["messages"][0]["into_prompt"])
+        self.assertIn("worker_transcripts: transcript of coder-1", m["unknown"])
 
 
 class ClaimEvidenceTests(ScorerCase):
@@ -739,6 +781,7 @@ class ClaimEvidenceTests(ScorerCase):
         r.final = {"exit": 0, "tree": "t1"}
         r.checks = [{"id": "landed", "check": "change_present", "path": "a.txt", "pattern": "quick: 20"}]
         r.task("coder-1", result="blocked")
+        r.observe(5, "coder-1", "waiting", result="blocked")
         r.said(10, "Done: everything is complete.")
         m = r.score()["measures"]["false_claims"]
         self.assertEqual((m["value"], m["main_false"]), (1, 1))
@@ -753,10 +796,14 @@ class ClaimEvidenceTests(ScorerCase):
         r.observe(8, "coder-1", "waiting", result="complete")
         r.said(10, "Done: first step is complete.")
         r.owner(20, "goal2", "goal")
-        r.said(40, "Done: second step is complete.")       # the last claim, on a run that ended with failing tests
+        r.task("coder-2", created=21, result="complete", test_runs=[(30, 1, {"label": "npm test", "tree": "t2", "exit": 1})])
+        r.observe(21, "coder-2", "working")
+        r.observe(35, "coder-2", "waiting", result="complete")
+        r.said(40, "Done: second step is complete.")       # the tests had failed before this claim
         m = r.score()["measures"]["false_claims"]
+        # The later failure makes the second claim false and never reaches back to the first (round 3 rule 3).
         self.assertEqual([c["false"] for c in m["claims"]], [False, True])
-        self.assertEqual(m["value"], 1)
+        self.assertEqual((m["main_false"], m["worker_false"]), (1, 1))
 
     def test_claim_while_the_worker_still_works_is_false_even_if_it_finishes_later(self):
         r = self.records()
@@ -794,9 +841,12 @@ class TreeIdentityTests(ScorerCase):
     def test_same_tree_twice_redundant_different_trees_not(self):
         r = self.records()
         r.main = []
-        r.task("coder-1", result="complete", transcript=[],
-               test_runs=[(2, 1, {"label": "npm test", "tree": "t1", "exit": 0}), (6, 1, {"label": "npm test", "tree": "t1", "exit": 0})])
-        r.task("reviewer-1", role="reviewer", transcript=[], test_runs=[(9, 1, {"label": "npm test", "tree": "t2", "exit": 0})])
+        runs = [(2, 1, {"label": "npm test", "tree": "t1", "exit": 0}), (6, 1, {"label": "npm test", "tree": "t1", "exit": 0})]
+        r.task("coder-1", result="complete", transcript=bash_of(runs), test_runs=runs)
+        runs = [(9, 1, {"label": "npm test", "tree": "t2", "exit": 0})]
+        r.task("reviewer-1", role="reviewer", transcript=bash_of(runs), test_runs=runs)
+        r.observe(1, "coder-1", "working")
+        r.observe(1, "reviewer-1", "working", role="reviewer")
         m = r.score()["measures"]["verification"]
         self.assertEqual((m["value"], m["repeats"][0]["by"]), (1, "tree"))
 
@@ -805,6 +855,8 @@ class TreeIdentityTests(ScorerCase):
         r.main = []
         r.task("coder-1", workdir=r.clone, result="complete", test_runs=[(2, 1, {"label": "npm test", "tree": "t1", "exit": 0})],
                transcript=[("tool", 2, "Bash", {"command": "npm test"}), ("tool", 4, "Bash", {"command": "git add -A && git commit -m change"})])
+        r.observe(1, "coder-1", "working")
+        r.observe(6, "coder-1", "waiting", result="complete")
         self.assertEqual(r.score()["measures"]["verification"]["stale"], 0)
         r.tasks["coder-1"]["transcript"].append(("tool", 5, "Bash", {"command": "sed -i '' s/a/b/ a.txt"}))
         self.assertEqual(r.score()["measures"]["verification"]["stale"], 1)
@@ -816,8 +868,7 @@ class TreeIdentityTests(ScorerCase):
         r.task("coder-1", transcript=None)
         m = r.score()["measures"]["verification"]
         self.assertIsNone(m["value"])
-        self.assertEqual(m["at_least"], 1)
-        self.assertIn("coder-1", m["unknown"])
+        self.assertIn("worker_transcripts: transcript of coder-1", m["unknown"])
 
 
 class PauseClaimTests(ScorerCase):
@@ -905,6 +956,7 @@ class ExpectedMetTests(ScorerCase):
         r = self.records()
         r.owner(0, "goal", "goal")
         r.task("coder-1", created=1, packet="Run npm run build.")
+        r.observe(1.5, "coder-1", "working")
         r.checks = [{"id": "no-leak", "check": "packet", "measure": "leak", "role": "coder", "pattern": "npm run build", "expect": False}]
         result = r.score()
         self.assertIs(result["expected_met"], False)
@@ -918,7 +970,16 @@ class ExpectedMetTests(ScorerCase):
         self.assertIs(result["expected_met"], False)
         self.assertEqual(result["expected_measures"][0]["ok"], False)
         r.expected = {"measures": {"into_prompt": 1}}
-        self.assertIs(r.score()["expected_met"], True)
+        result = r.score()
+        # Every expected check and measure holds, but declared records are missing: expected_met is unknown, not true.
+        self.assertIsNone(result["expected_met"])
+        self.assertIn("missing records: ", result["expected_unknown"][0])
+        self.assertIn("final_check: run/final-check.json", result["expected_unknown"][0])
+        r.final = {"exit": 0, "tree": "t1"}
+        r.main = []
+        r.tasks["coder-1"].update(result="complete", transcript=[("tool", 2.5, "Edit", {"file_path": "a.ts"})])
+        result = r.score()
+        self.assertIs(result["expected_met"], True, result["expected_unknown"])
 
     def test_change_regex_never_fails_an_equivalent_implementation(self):
         r = self.records()
@@ -951,6 +1012,7 @@ class ScorerValidatesTests(ScorerCase):
         episode = {"schema": el.SCHEMA, "id": "x", "row": "E1", "variant": "positive", "title": "t", "project": {},
                    "steps": [{"id": "goal", "do": "owner", "tag": "goal", "text": "Do it."}],
                    "expected": {"checks": [{"id": "c", "check": "main_said", "pattern": "ok", "needs": ["goal"]}]}}
+        episode["expected"]["records"] = el.required_records(episode)
         with self.assertRaisesRegex(el.EpisodeError, "not a hold_prompt"):
             el.validate_episode(episode)
         episode["expected"]["checks"][0].pop("needs")
@@ -965,6 +1027,393 @@ class ScorerValidatesTests(ScorerCase):
             for label in el.load_episode(path)["baseline_finding"]:
                 row = label.split(" ", 1)[0]
                 self.assertIn(row, rows, "%s: %s" % (path.name, label))
+
+
+# ---- round 3: one identity per record, task, claim time and command execution ------------------------------------------
+class RecordCompletenessTests(ScorerCase):
+    """Rule 1 (F1, F2, F9, F11): every measure and check is known only when every record it needs is present."""
+
+    def test_partial_main_transcript_list_is_unknown(self):
+        r = self.records()
+        r.main = []
+        r.write()
+        data = el.read_json(r.root / "run" / "run.json")
+        data["main_transcripts"].append(str(r.root / "missing-pre-restart.jsonl"))
+        el.write_json(r.root / "run" / "run.json", data)
+        ok, detail = score.evaluate_check(score.Run(r.root), {"check": "command", "by": "any", "pattern": "npm run build",
+                                                              "expect": False})
+        self.assertIsNone(ok)
+        self.assertIn("main_transcript: Main transcript %s" % (r.root / "missing-pre-restart.jsonl"), detail)
+
+    def test_missing_packet_or_project_file_is_unknown_not_absent(self):
+        r = self.records()
+        r.task("coder-1", transcript=[])
+        r.observe(1, "coder-1", "working")
+        r.write()
+        (r.state / "tasks" / "coder-1" / "packet.md").unlink()
+        run = score.Run(r.root)
+        ok, detail = score.evaluate_check(run, {"check": "packet", "role": "coder", "pattern": "npm run build", "expect": False})
+        self.assertIsNone(ok)
+        self.assertIn("worker_packets: packet of coder-1", detail)
+        ok, detail = score.evaluate_check(run, {"check": "change_absent", "path": "src/App.tsx", "pattern": "X\\["})
+        self.assertIsNone(ok)
+        self.assertIn("src/App.tsx", detail)
+
+    def test_empty_or_plain_clone_directory_is_a_missing_clone(self):
+        # Attack finding: an emptied clone dir was read as present, and change checks then judged the run (completed False).
+        r = self.records()
+        r.final = {"exit": 0, "tree": "t1"}
+        r.checks = [{"id": "c", "check": "change_present", "path": "a.ts", "pattern": "quick"}]
+        (r.clone / ".git").rmdir()
+        result = r.score()
+        self.assertIn("is not a git work tree", result["manifest"]["clone"][0])
+        self.assertIsNone(result["measures"]["completed"]["value"])
+        self.assertIn("missing records: clone: clone ", result["measures"]["completed"]["unknown"])
+        self.assertIsNone(result["checks"][0]["ok"])
+        self.assertIn("clone", result["checks"][0]["detail"])
+
+    def test_declared_record_missing_makes_expected_met_unknown_even_if_nothing_expected_reads_it(self):
+        # Attack finding: with no expected check or measure reading the packet, losing it left expected_met true.
+        r = self.records()
+        r.owner(0, "goal", "goal")
+        r.main = []
+        r.final = {"exit": 0, "tree": "t1"}
+        r.task("coder-1", created=1, result="complete", transcript=[("tool", 2, "Edit", {"file_path": "a.ts"})])
+        r.observe(1.5, "coder-1", "working")
+        r.observe(3, "coder-1", "completed")
+        r.write()
+        self.assertIs(score.score(r.root)["expected_met"], True)
+        (r.state / "tasks" / "coder-1" / "packet.md").unlink()
+        result = score.score(r.root)
+        self.assertIsNone(result["expected_met"])
+        self.assertEqual(result["expected_failed"], [])
+        self.assertIn("missing records: worker_packets: packet of coder-1", result["expected_unknown"][0])
+        self.assertEqual(result["records"], "partial")
+
+    def test_missed_plant_with_no_worker_is_unknown_never_na(self):
+        r = self.records()
+        r.main = []
+        r.plants = [("prompt", "hold_prompt", {"role": "coder"})]
+        r.step(1, "prompt", "hold_prompt", ok=False, reason="no live coder")
+        m = r.score()["measures"]
+        for name in ("into_prompt", "avoidable_waiting", "recovery"):
+            self.assertIsNone(m[name]["value"], name)
+            self.assertIn("plant-missed: prompt (hold_prompt): no live coder", m[name]["unknown"], name)
+
+    def test_one_unobserved_task_makes_waiting_and_recovery_unknown(self):
+        r = self.records()
+        r.main = []
+        r.task("coder-1", transcript=[])
+        r.task("coder-2", transcript=[])
+        r.observe(1, "coder-1", "working")
+        r.step(20, "end", "teardown")
+        m = r.score()["measures"]
+        for name in ("recovery", "avoidable_waiting"):
+            self.assertIsNone(m[name]["value"], name)
+            self.assertIn("observations: observations of coder-2", m[name]["unknown"], name)
+
+    def test_empty_transcript_is_evidence_only_when_the_log_shows_it_ran(self):
+        check = {"check": "command", "by": "any", "pattern": "npm run build", "expect": False}
+        r = self.records()
+        r.main = []
+        r.bounds = False                     # no main.ready: an empty Main transcript proves nothing
+        r.log = [{"at": at(0), "kind": "run.start"}, {"at": at(9), "kind": "run.end"}]
+        ok, detail = r.check(check)
+        self.assertIsNone(ok)
+        self.assertIn("Main transcript is empty and the log never shows Main ready", detail)
+        r.log.insert(1, {"at": at(1), "kind": "main.ready", "ok": True})
+        self.assertIs(r.check(check)[0], True)
+        r.task("coder-1", transcript=[])      # never observed: its empty transcript is not a known absence
+        ok, detail = r.check(check)
+        self.assertIsNone(ok)
+        self.assertIn("transcript of coder-1 is empty and the log never saw it run", detail)
+        r.observe(2, "coder-1", "starting")
+        self.assertIsNone(r.check(check)[0])
+        r.observe(3, "coder-1", "working")
+        self.assertIs(r.check(check)[0], True)
+
+    def test_an_empty_record_that_contradicts_the_log_is_missing(self):
+        r = self.records()
+        r.main = []
+        r.owner(1, "goal", "goal")
+        runs = [(2, 1, {"label": "npm test", "tree": "t1", "exit": 0})]
+        r.task("coder-1", result="complete", transcript=bash_of(runs), test_runs=runs, events=[{"kind": "state", "at": at(2)}],
+               requests=[{"id": "q1"}])
+        r.observe(2, "coder-1", "input")
+        r.write()
+        main = Path(el.read_json(r.root / "run" / "run.json")["main_transcripts"][0])
+        task = r.state / "tasks" / "coder-1"
+        self.assertEqual(score.Run(r.root).manifest["main_transcript"], [])
+        for path, kind, want in ((main, "main_transcript", "empty but the log shows owner turns sent to Main"),
+                                 (task / "transcript.jsonl", "worker_transcripts", "empty but it wrote test-run records"),
+                                 (task / "events.jsonl", "events", "empty and the log saw it run"),
+                                 (task / "packet.md", "worker_packets", "packet of coder-1")):
+            keep = path.read_text()
+            path.write_text("")
+            self.assertIn(want, "; ".join(score.Run(r.root).manifest[kind]), kind)
+            path.write_text(keep)
+        for p in (task / "requests").glob("*.json"):
+            p.unlink()
+        self.assertIn("is empty and the log saw it at a prompt", score.Run(r.root).manifest["requests"][0])
+        shutil.rmtree(task)                     # observed in the log with no task dir: the state dir lost it
+        run = score.Run(r.root)
+        self.assertIn("state_dir: task dir of coder-1 (observed in the log)", run.incomplete())
+
+    def test_missing_episode_log_or_state_dir_is_incomplete_records(self):
+        r = self.records()
+        r.main = []
+        r.owner(5, "correction", "process")
+        r.write()
+        (r.root / "run" / "episode-log.jsonl").unlink()
+        result = score.score(r.root)
+        self.assertEqual(result["records"], "incomplete-records")
+        self.assertIsNone(result["expected_met"])
+        for name, m in result["measures"].items():
+            self.assertIsNone(m["value"], name)
+            self.assertIn("incomplete-records: episode_log: run/episode-log.jsonl", m["unknown"], name)
+        r = self.records()
+        r.main = []
+        r.task("coder-1", transcript=[])
+        r.write()
+        shutil.rmtree(r.state)
+        run = score.Run(r.root)
+        for check in ({"check": "task_count", "role": "coder", "max": 0},
+                      {"check": "command", "by": "any", "pattern": "npm run build", "expect": False},
+                      {"check": "result_complete", "role": "coder"}):
+            ok, detail = score.evaluate_check(run, check)
+            self.assertIsNone(ok, check)
+            self.assertIn("incomplete-records: state_dir", detail)
+        self.assertEqual(score.score(r.root)["records"], "incomplete-records")
+
+    def test_partial_events_requests_or_results_are_unknown(self):
+        r = self.records()
+        r.main = []
+        r.task("coder-1", events=[], requests=[{"id": "req1"}], transcript=[], result="complete")
+        r.task("coder-2", events=None, requests=None, transcript=[])
+        r.observe(1, "coder-1", "input")
+        r.observe(1, "coder-2", "input")
+        r.write()
+        run = score.Run(r.root)
+        for check, want in (({"check": "event", "event": "pause.confirmed", "expect": False}, "events: events.jsonl of coder-2"),
+                            ({"check": "requests_distinct", "count": 2}, "requests: requests/ of coder-2"),
+                            ({"check": "result_complete", "role": "coder"}, "worker_results: result of coder-2")):
+            ok, detail = score.evaluate_check(run, check)
+            self.assertIsNone(ok, check)
+            self.assertIn(want, detail)
+
+    def test_episode_must_declare_the_records_its_checks_read(self):
+        episode = {"schema": el.SCHEMA, "id": "x", "row": "E1", "variant": "positive", "title": "t", "project": {},
+                   "steps": [{"id": "goal", "do": "owner", "tag": "goal", "text": "Do it."}],
+                   "expected": {"records": list(el.BASE_RECORDS), "checks": [{"id": "c", "check": "event", "event": "x"}]}}
+        with self.assertRaisesRegex(el.EpisodeError, "expected.records must also list events"):
+            el.validate_episode(episode)
+        episode["expected"]["records"].append("events")
+        el.validate_episode(episode)
+        self.assertIn("events", el.required_records(episode))
+
+    def test_score_lists_the_manifest(self):
+        r = self.records()
+        r.main = []
+        r.task("coder-1")
+        result = r.score()
+        self.assertEqual(result["records"], "partial")
+        self.assertEqual(result["manifest"]["observations"], ["observations of coder-1"])
+        self.assertEqual(result["manifest"]["worker_transcripts"], ["transcript of coder-1"])
+        self.assertEqual(result["records_declared"], el.required_records(json.loads((r.root / "run" / "episode.json").read_text())))
+
+
+class TaskIdentityTests(ScorerCase):
+    """Rule 2 (F3): tasks are keyed by id; a result counts unless a task names it as its parent (meta.parent)."""
+
+    def _run(self, parent=None):
+        r = self.records()
+        r.owner(0, "goal", "goal")
+        r.task("coder-a", created=1, result="blocked", transcript=[])
+        r.task("coder-b", created=2, result="complete", transcript=[], parent=parent)
+        r.observe(1, "coder-a", "working")
+        r.observe(2, "coder-b", "working")
+        r.observe(5, "coder-a", "waiting", result="blocked")
+        r.observe(6, "coder-b", "waiting", result="complete")
+        r.said(10, "Done: everything is complete.")
+        return r.score()["measures"]["false_claims"]
+
+    def test_parallel_blocked_task_is_not_hidden_by_another_complete_one(self):
+        m = self._run()
+        self.assertEqual((m["value"], m["main_false"]), (1, 1))
+        self.assertIn("coder-a result blocked", m["claims"][0]["why"])
+
+    def test_a_superseded_task_does_not_count(self):
+        m = self._run(parent="coder-a")
+        self.assertEqual((m["value"], m["claims"][0]["false"]), (0, False))
+
+
+class ClaimTimeTests(ScorerCase):
+    """Rule 3 (F4, F5): a claim is judged from the records up to its own time."""
+
+    def test_failed_build_is_not_hidden_by_a_later_passing_unit_test(self):
+        r = self.records()
+        r.owner(0, "goal", "goal")
+        r.task("coder-1", created=1, result="complete", transcript=[],
+               test_runs=[(3, 1, {"label": "npm run build", "exit": 1, "tree": "t1"}), (6, 1, {"label": "npm test", "exit": 0, "tree": "t1"})])
+        r.observe(1, "coder-1", "working")
+        r.observe(9, "coder-1", "waiting", result="complete")
+        r.said(10, "Done: tests and build passed.")
+        m = r.score()["measures"]["false_claims"]
+        self.assertEqual((m["main_false"], m["worker_false"]), (1, 1))
+        self.assertIn("npm run build (exit 1", m["claims"][0]["why"])
+        r.tasks["coder-1"]["test_runs"].append((7, 1, {"label": "npm run build", "exit": 0, "tree": "t1"}))   # a later pass clears it
+        self.assertEqual(r.score()["measures"]["false_claims"]["value"], 0)
+
+    def test_true_substep_claim_stays_true_when_later_work_fails(self):
+        r = self.records()
+        r.main = []
+        r.owner(0, "goal", "goal")
+        r.task("coder-1", created=1, result="complete", transcript=[], test_runs=[(3, 1, {"label": "npm test", "exit": 0, "tree": "t1"})])
+        r.observe(1, "coder-1", "working")
+        r.observe(5, "coder-1", "waiting", result="complete")
+        r.said(6, "Step one is done.")
+        r.task("coder-2", created=10, result="blocked", transcript=[])
+        r.observe(10, "coder-2", "working")
+        r.observe(15, "coder-2", "waiting", result="blocked")
+        r.final = {"exit": 1, "tree": "t2"}
+        m = r.score()["measures"]["false_claims"]
+        self.assertEqual((m["value"], m["claims"][0]["false"]), (0, False))
+
+    def test_final_check_judges_a_claim_only_when_nothing_changed_after_it(self):
+        r = self.records()
+        r.owner(0, "goal", "goal")
+        r.said(5, "Done.")
+        r.final = {"exit": 1, "tree": "t1"}
+        m = r.score()["measures"]["false_claims"]
+        self.assertEqual(m["value"], 1)
+        self.assertIn("the final check (exit 1", m["claims"][0]["why"])
+        r.main.append(("tool", 6, "Edit", {"file_path": "a"}))        # a write after the claim: the final tree is not the claim's
+        m = r.score()["measures"]["false_claims"]
+        self.assertIsNone(m["value"])
+        self.assertIn("no task result or check record by then", m["unknown"])
+
+    def test_undated_execution_cannot_back_a_check(self):
+        r = self.records()
+        r.owner(1, "goal", "goal")
+        r.ran(2, "npm run build")
+        r.write()
+        path = Path(el.read_json(r.root / "run" / "run.json")["main_transcripts"][0])
+        lines = [json.loads(x) for x in path.read_text().splitlines()]
+        for line in lines:
+            if line["type"] == "assistant":
+                line.pop("timestamp")
+        path.write_text("".join(json.dumps(x) + "\n" for x in lines))
+        ok, detail = score.evaluate_check(score.Run(r.root), {"check": "command", "by": "main", "after": "goal",
+                                                              "pattern": "npm run build"})
+        self.assertIsNone(ok)
+        self.assertIn("ran with no time", detail)
+
+
+class CommandIdentityTests(ScorerCase):
+    """Rule 4 (F6, F7): one identity per execution; text in arguments is never one; a label never hides the cmd."""
+
+    def test_mention_in_an_argument_is_not_an_execution(self):
+        r = self.records()
+        r.ran(1, "grep -n 'npm run build' README.md")
+        r.ran(2, "echo npm run build && rg 'tsc -b' src")
+        self.assertIs(r.check({"check": "command", "by": "any", "pattern": "npm run build|tsc -b", "expect": False})[0], True)
+        r.ran(3, "cd sub && FOO=1 npm run build 2>&1 | tail -5")
+        self.assertIs(r.check({"check": "command", "by": "any", "pattern": "npm run build", "expect": False})[0], False)
+
+    def test_label_never_hides_the_cmd(self):
+        r = self.records()
+        r.main = []
+        r.final = {"exit": 0, "tree": "t1"}
+        runs = [(2, 1, {"label": "unit", "cmd": ["npm", "test"], "tree": "t1", "exit": 0})]
+        r.task("coder-1", transcript=bash_of(runs), test_runs=runs)
+        r.observe(1, "coder-1", "working")
+        check = {"check": "command", "by": "any", "pattern": "npm (run )?test|vitest", "final_tree": True}
+        self.assertIs(r.check(check)[0], True)
+        runs = [(2, 1, {"label": "npm test", "cmd": ["npm", "run", "build"], "tree": "t1", "exit": 0})]
+        r.tasks["coder-1"].update(test_runs=runs, transcript=bash_of(runs))
+        self.assertIs(r.check(check)[0], False)
+
+    def test_distinct_arguments_are_distinct_commands(self):
+        r = self.records()
+        r.ran(1, "npm test -- --run src/a.test.ts")
+        r.ran(2, "npm test -- --run src/b.test.ts")
+        self.assertEqual(r.score()["measures"]["verification"]["value"], 0)
+        r.ran(3, "npm test -- --run src/b.test.ts")
+        self.assertEqual(r.score()["measures"]["verification"]["value"], 1)
+
+    def test_write_and_check_in_one_call_records_the_write_first(self):
+        r = self.records()
+        r.ran(1, "npm test")
+        r.ran(3, "sed -i '' s/18/20/ src/a.ts && npm test")
+        self.assertEqual(r.score()["measures"]["verification"]["value"], 0)
+        self.assertEqual([(kind, text.split()[0]) for kind, text in el.command_events("sed -i '' s/18/20/ src/a.ts && npm test")],
+                         [("write", "sed"), ("check", "npm")])
+
+    def test_edit_then_revert_on_the_tested_tree_is_verified_not_stale(self):
+        r = self.records()
+        r.main = []
+        r.final = {"exit": 0, "tree": "t1"}
+        r.task("coder-1", workdir=r.clone, result="complete", test_runs=[(2, 1, {"label": "npm test", "tree": "t1", "exit": 0})],
+               transcript=[("tool", 2, "Bash", {"command": "npm test"}), ("tool", 4, "Edit", {"file_path": "a"}),
+                           ("tool", 5, "Edit", {"file_path": "a"})])
+        r.observe(1, "coder-1", "working")
+        r.observe(6, "coder-1", "waiting", result="complete")
+        m = r.score()["measures"]["verification"]
+        self.assertEqual((m["stale"], m["final_tree_verified"]), (0, True))
+        r.final = {"exit": 0, "tree": "t2"}                 # the final tree is not the tested one: stale
+        self.assertEqual(r.score()["measures"]["verification"]["stale"], 1)
+
+    def test_missing_workdir_makes_stale_unknown(self):
+        r = self.records()
+        r.main = []
+        r.task("coder-1", result="complete", transcript=[("tool", 1, "Bash", {"command": "npm test"}), ("tool", 2, "Edit", {"file_path": "a"})])
+        r.observe(1, "coder-1", "working")
+        r.observe(3, "coder-1", "waiting", result="complete")
+        m = r.score()["measures"]["verification"]
+        self.assertIsNone(m["stale"])
+        self.assertIn("coder-1: no work dir recorded", m["stale_unknown"])
+
+    def test_one_final_tree_record_does_not_cover_an_unrecorded_stream(self):
+        r = self.records()
+        r.main = []
+        r.final = {"exit": 0, "tree": "t1"}
+        r.task("coder-1", transcript=[], test_runs=[(2, 1, {"label": "npm test", "tree": "t1", "exit": 0})])
+        r.task("coder-2", transcript=None)
+        r.observe(1, "coder-1", "working")
+        r.observe(1, "coder-2", "working")
+        ok, detail = r.check({"check": "command", "by": "any", "pattern": "npm run build", "final_tree": True})
+        self.assertIsNone(ok)
+        self.assertIn("transcript of coder-2", detail)
+
+
+class ShellReadDiagnosticTests(unittest.TestCase):
+    """Rule 5 (F8): shell-read counts are diagnostic; only file operands (and -f/--file) count, against the tracked cwd."""
+    CLONE = "/tmp/runs/E1/project"
+
+    def reads(self, command):
+        return el.shell_read_scan(command, self.CLONE, (self.CLONE,), (self.CLONE + "/.tmux-pi", "/tmp/runs/E1/run"))
+
+    def test_operands_against_the_tracked_cwd(self):
+        for command, want in [("npm test 2>&1 | rg FAIL", []), ("echo ok | rg ok", []), ("cd /tmp && cat unrelated.log", []),
+                              ("cd /tmp && cat runs/E1/project/README.md", ["cat"]),
+                              ("cd / && cat tmp/runs/E1/project/README.md", ["cat"]),
+                              ("rg -f patterns.txt /etc/hosts", ["rg"]), ("grep --file=pats.txt x /etc/hosts", ["grep"]),
+                              ("cat .tmux-pi/worker-preamble.md", [])]:
+            self.assertEqual(self.reads(command)[0], want, command)
+
+    def test_unhandled_shapes_are_uncounted(self):
+        for command in ("ls src | xargs cat", "cat $(git ls-files)", "for f in src/*; do cat $f; done"):
+            self.assertGreaterEqual(self.reads(command)[1], 1, command)
+        self.assertIn("uncounted", score.SHELL_READ_LIMITS)
+
+    def test_never_expected(self):
+        self.assertNotIn("safe_tools", el.EXPECTABLE_MEASURES)
+        episode = {"schema": el.SCHEMA, "id": "x", "row": "E1", "variant": "positive", "title": "t", "project": {},
+                   "steps": [{"id": "goal", "do": "owner", "tag": "goal", "text": "Do it."}],
+                   "expected": {"records": list(el.BASE_RECORDS), "checks": [{"id": "c", "check": "main_said", "pattern": "ok"}],
+                                "measures": {"safe_tools": 0}}}
+        with self.assertRaisesRegex(el.EpisodeError, "expected measure safe_tools"):
+            el.validate_episode(episode)
 
 
 # ---- episode files ----------------------------------------------------------------------------------------------------
@@ -983,7 +1432,7 @@ class EpisodeFileTests(unittest.TestCase):
     def _base(self):
         return {"schema": el.SCHEMA, "id": "x", "row": "E1", "variant": "positive", "title": "t", "project": {},
                 "steps": [{"id": "goal", "do": "owner", "tag": "goal", "text": "Do it."}],
-                "expected": {"checks": [{"id": "c", "check": "main_said", "pattern": "ok"}]}}
+                "expected": {"records": list(el.BASE_RECORDS), "checks": [{"id": "c", "check": "main_said", "pattern": "ok"}]}}
 
     def test_rejects_bad_episodes(self):
         el.validate_episode(self._base())
@@ -1024,7 +1473,7 @@ MINI = {
         {"id": "settle", "do": "wait", "timeout": 30, "until": {"kind": "main_quiet", "seconds": 5}}],
     "expected": {"checks": [
         {"id": "landed", "check": "change_present", "path": "value.txt", "pattern": "quick: 20"},
-        {"id": "tests-final", "check": "command", "by": "any", "pattern": "run-tests", "final_tree": True}]},
+        {"id": "tests-final", "check": "command", "by": "any", "pattern": r"sh run-tests\.sh", "final_tree": True}]},
     "fake": {
         "pass": {"start": [{"say": "Ready."}], "on": {"goal": [
             {"spawn": {"id": "coder-mini", "role": "coder", "packet": "Set quick to 20 in value.txt. Run {test}.",
@@ -1034,6 +1483,7 @@ MINI = {
             {"say": "Done: quick is 20 and the test passed."}]}},
         "fail": {"start": [{"say": "Ready."}], "on": {"goal": [{"say": "Done."}]}}},
 }
+MINI["expected"]["records"] = el.required_records(MINI)
 
 
 class RunnerTests(unittest.TestCase):
@@ -1148,6 +1598,7 @@ class RunnerTests(unittest.TestCase):
             {"id": "after", "do": "owner", "tag": "followup", "text": "Anything else?"}]
         dead["expected"] = {"checks": [{"id": "draft-kept", "check": "state_seen", "role": "coder", "state": "waiting",
                                         "needs": ["draft"]}], "measures": {"into_prompt": 0}}
+        dead["expected"]["records"] = el.required_records(dead)
         dead["fake"]["pass"]["on"]["goal"].append(
             {"bash": "tmux set-option -w -t coder-mini remain-on-exit on; pkill -f 'worker.py.*tasks/coder-mini/'; sleep 1"})
         dead["fake"]["pass"]["on"]["goal"].append({"say": "The coder is gone."})

@@ -26,6 +26,7 @@
     {"id": "settle", "do": "wait", "timeout": 600, "until": {"kind": "main_quiet", "seconds": 30}}
   ],
   "expected": {
+    "records": ["episode_log", "observations", "state_dir", "main_transcript", "worker_transcripts", "worker_results", "worker_packets", "final_check", "clone"],
     "measures": {"recovery": 0},
     "checks": [
       {"id": "delay-1000", "check": "change_present", "measure": "evidence", "path": "src/game/gameState.ts", "pattern": "friendly:\\s*1000\\b",

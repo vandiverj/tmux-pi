@@ -94,21 +94,119 @@ class Run:
             first = next((e["_at"] for e in self.log if e.get("kind") == "observe" and e.get("task") == snap["id"] and e["_at"]), None)
             if first and (snap["created_at"] is None or first >= snap["created_at"]):
                 snap["created_at"] = first
+        # Main's transcript is known only when every listed file is readable: one missing file (say the one from before a
+        # restart) leaves part of Main's work unseen, so nothing can be said about what Main did or did not do.
         self.main = None
+        self.main_unreadable = []
         paths = self.record.get("main_transcripts") or []
         if paths:
             entries = []
             for path in paths:
                 got = el.transcript_entries(path)
-                if got is not None:
+                if got is None:
+                    self.main_unreadable.append(str(path))
+                else:
                     entries.extend(got)
-            self.main = entries if entries or any(Path(p).exists() for p in paths) else None
+            self.main = None if self.main_unreadable else entries
         self.session_events = el.read_jsonl(self.state_dir / "events.jsonl") if self.state_dir else None
         self.observations = [e for e in self.log if e.get("kind") == "observe" and e["_at"]]
         end = [e["_at"] for e in self.log if e.get("kind") in ("teardown", "run.end") and e["_at"]]
         self.end = end[0] if end else (self.log[-1]["_at"] if self.log else None)
         self.plants = plant_status(self)
         self.missed = {sid: p for sid, p in self.plants.items() if p["ok"] is not True}
+        self.declared = list((self.episode.get("expected") or {}).get("records") or [])
+        self.manifest = self._manifest()
+
+    # ---- record manifest (round 3 rule 1) -------------------------------------------------------------------------------
+    def _manifest(self):
+        """{record kind: [what is missing]}; an empty list means every record of that kind is present and readable."""
+        m = {kind: [] for kind in el.RECORD_KINDS}
+        log_path = self.dir / "run" / "episode-log.jsonl"
+        if el.read_jsonl(log_path) is None:
+            m["episode_log"].append("run/episode-log.jsonl")
+        else:
+            kinds = {e.get("kind") for e in self.log}
+            m["episode_log"] += ["run/episode-log.jsonl has no %s entry" % k for k in ("run.start", "run.end") if k not in kinds]
+        if not self.state_dir or not self.state_dir.is_dir():
+            m["state_dir"].append("state dir %s" % (self.state_dir or "(not in run.json)"))
+        main_ran = any(e.get("kind") in ("main.ready", "restart.ready") and e.get("ok") is True for e in self.log)
+        listed = self.record.get("main_transcripts") or []
+        if not listed:
+            m["main_transcript"].append("run.json lists no Main transcript")
+        m["main_transcript"] += ["Main transcript %s" % p for p in self.main_unreadable]
+        if listed and self.main == [] and not main_ran:
+            m["main_transcript"].append("Main transcript is empty and the log never shows Main ready")
+        elif listed and self.main == [] and any(e.get("kind") == "owner" for e in self.log):
+            # Main's transcript holds every owner turn typed into it: empty after one is a lost record, not silence.
+            m["main_transcript"].append("Main transcript is empty but the log shows owner turns sent to Main")
+        seen = defaultdict(list)
+        for obs in self.observations:
+            seen[obs.get("task")].append(obs.get("state"))
+        ids = {t["id"] for t in self.tasks}
+        phantoms = sorted(t for t in seen if t and t not in ids) if self.state_dir and self.state_dir.is_dir() else []
+        for task in self.tasks:
+            tid, states = task["id"], seen.get(task["id"], [])
+            ran = any(s not in (None, "starting") for s in states)
+            if not states:
+                m["observations"].append("observations of %s" % tid)
+            if task["transcript"] is None:
+                m["worker_transcripts"].append("transcript of %s" % tid)
+            elif not task["transcript"] and not ran:
+                m["worker_transcripts"].append("transcript of %s is empty and the log never saw it run" % tid)
+            elif not task["transcript"] and (task["test_runs"] or task["result"]):
+                # Its test runs and its result were made by tool calls: an empty transcript lost them.
+                m["worker_transcripts"].append("transcript of %s is empty but it wrote %s" % (
+                    tid, "test-run records" if task["test_runs"] else "a result"))
+            if task["result"] is None and not (states and states[-1] in ("killed", "stopped", "failed")):
+                m["worker_results"].append("result of %s" % tid)
+            if not task["packet"]:
+                m["worker_packets"].append("packet of %s%s" % (tid, " (empty)" if task["packet"] is not None else ""))
+            if task["events"] is None:
+                m["events"].append("events.jsonl of %s" % tid)
+            elif not task["events"] and ran:
+                m["events"].append("events.jsonl of %s is empty and the log saw it run" % tid)
+            at_prompt = any(s in el.PROMPT_STATES for s in states)
+            if task["requests"] is None and (at_prompt or not states):
+                m["requests"].append("requests/ of %s" % tid)
+            elif task["requests"] == [] and at_prompt:
+                m["requests"].append("requests/ of %s is empty and the log saw it at a prompt" % tid)
+        for tid in phantoms:
+            m["state_dir"].append("task dir of %s (observed in the log)" % tid)
+            for kind in ("worker_transcripts", "worker_results", "worker_packets", "events", "requests"):
+                m[kind].append("%s (observed, no task record)" % tid)
+        final = self.final if isinstance(self.final, dict) else {}
+        if not final.get("tree") or (final.get("exit") is None and not final.get("timed_out")):
+            m["final_check"].append("run/final-check.json" + (" (no tree or exit)" if final else ""))
+        if not self.clone or not self.clone.is_dir():
+            m["clone"].append("clone %s" % (self.clone or "(not in run.json)"))
+        elif not (self.clone / ".git").exists():
+            # The runner's clone is a git work tree; an empty or plain directory has lost what the change checks diff.
+            m["clone"].append("clone %s is not a git work tree" % self.clone)
+        m["plants"] = ["%s (%s): %s" % (sid, p["kind"], p["reason"]) for sid, p in sorted(self.missed.items())]
+        return m
+
+    def incomplete(self):
+        """What is missing of the records every measure needs; non-empty makes the run incomplete-records."""
+        return ["%s: %s" % (k, item) for k in el.CORE_RECORDS for item in self.manifest[k]]
+
+    def gate(self, kinds, plant_kinds=(), plant_ids=()):
+        """None when every record of `kinds` (and CORE_RECORDS) is present and no plant of `plant_kinds` / `plant_ids`
+        was missed; else the reason the dependent value is unknown."""
+        missing = ["%s: %s" % (k, item) for k in dict.fromkeys(tuple(el.CORE_RECORDS) + tuple(kinds)) for item in self.manifest[k]]
+        plants = [(sid, p) for sid, p in sorted(self.missed.items()) if p["kind"] in plant_kinds or sid in plant_ids]
+        reasons = []
+        if self.incomplete():
+            reasons.append("incomplete-records: " + "; ".join(self.incomplete()))
+            missing = [x for x in missing if x.split(":", 1)[0] not in el.CORE_RECORDS]
+        if missing:
+            reasons.append("missing records: " + "; ".join(missing))
+        if plants:
+            reasons.append("plant-missed: " + "; ".join("%s (%s): %s" % (sid, p["kind"], p["reason"]) for sid, p in plants))
+        return " | ".join(reasons) or None
+
+    def measure_gate(self, name):
+        kinds = el.MEASURE_RECORDS.get(name, ()) + tuple(k for k in el.MEASURE_OPTIONAL.get(name, ()) if k in self.declared)
+        return self.gate(kinds, el.MEASURE_PLANTS.get(name, ()))
 
     # ---- lookups --------------------------------------------------------------------------------------------------------
     def step_time(self, step_id):
@@ -175,28 +273,84 @@ class Run:
         return [e for e in self.log if e.get("kind") == "owner"]
 
     def commands(self, by="any", role=None):
-        """[(at, command, who)] Bash commands from Main's and the workers' transcripts plus test-run labels."""
+        """[(at, executed command, who)]: one entry per executed stage of every Bash call in Main's and the workers'
+        transcripts (el.executions: the program that runs, never text inside its arguments)."""
         out = []
         if by in ("main", "any") and self.main:
-            out += [(e["at"], e["input"].get("command", ""), "main") for e in self.main
-                    if e["kind"] == "tool" and el.normalise_tool(e["name"])[0] == "shell"]
+            out += [(e["at"], text, "main") for e in self.main if e["kind"] == "tool" and el.normalise_tool(e["name"])[0] == "shell"
+                    for text in el.executions(e["input"].get("command", ""))]
         if by != "main":
             want = role or (by.split(":", 1)[1] if by.startswith("role:") else None)
             for task in self.roles(want):
                 for entry in task["transcript"] or []:
                     if entry["kind"] == "tool" and el.normalise_tool(entry["name"])[0] == "shell":
-                        out.append((entry["at"], entry["input"].get("command", ""), task["id"]))
+                        out += [(entry["at"], text, task["id"]) for text in el.executions(entry["input"].get("command", ""))]
         return out
 
-    def transcripts_known(self, by="any", role=None):
-        if by == "main":
-            return self.main is not None
-        want = role or (by.split(":", 1)[1] if by.startswith("role:") else None)
-        workers = [t["transcript"] is not None for t in self.roles(want)]
-        if by == "any":
-            # An absence claim ("no build ran") over every stream needs every stream.
-            return self.main is not None and all(workers)
-        return bool(workers) and all(workers)
+    def stream_events(self):
+        """[{at, order, kind: write|exec, who, role, workdir, text, identity, tree, record}] across Main and every worker, in
+        time order (round 3 rule 4). One entry per execution: a worker's tp-test-run:v1 record is the execution (its cmd,
+        cwd and tree; a label never hides the cmd) and the Bash call that ran it is matched to it, not counted again; a
+        Bash stage with no record is an execution only when its program is what runs (never text in an argument). A call
+        that writes and checks (`sed -i ... && npm test`) gives the write first. Writes: Edit/Write tools and writing stages."""
+        if getattr(self, "_events", None) is not None:
+            return self._events
+        never = datetime.max.replace(tzinfo=timezone.utc)
+        events, order = [], 0
+        clone = str(self.clone) if self.clone else None
+        streams = [("main", None, self.main or [], clone, [])]
+        streams += [(t["id"], t["role"], t["transcript"] or [], t.get("workdir"), list(t["test_runs"])) for t in self.tasks]
+        for who, role, entries, workdir, unmatched in streams:
+            for entry in entries:
+                if entry["kind"] != "tool":
+                    continue
+                tool = el.normalise_tool(entry["name"])[0]
+                order += 1
+                base = {"at": entry["at"], "order": order, "who": who, "role": role, "workdir": workdir}
+                if tool in ("edit", "write"):
+                    events.append(dict(base, kind="write", text=entry["input"].get("file_path") or entry["input"].get("path"),
+                                       identity=None, tree=None, record=None))
+                    continue
+                if tool != "shell":
+                    continue
+                for stage in el.shell_stages(entry["input"].get("command", "")):
+                    if stage["cd"] is not None:
+                        continue
+                    if el.stage_writes(stage):
+                        events.append(dict(base, kind="write", text=" ".join(stage["words"]), identity=None, tree=None, record=None))
+                    identity = el.check_identity(stage["words"])
+                    record = None
+                    for r in unmatched if identity else []:
+                        if identity in _record_identities(r) and entry["at"] and abs((r["_at"] - entry["at"]).total_seconds()) <= 5:
+                            record = r
+                            unmatched.remove(r)
+                            break
+                    events.append(dict(base, kind="exec", text=identity or " ".join(stage["words"]), identity=identity,
+                                       tree=record.get("tree") if record else None, record=record,
+                                       workdir=(record or {}).get("cwd") or workdir))
+            for r in unmatched:
+                order += 1
+                for identity in _record_identities(r) or [None]:
+                    events.append({"at": r["_at"], "order": order, "who": who, "role": role, "kind": "exec",
+                                   "workdir": r.get("cwd") or workdir, "text": identity or " ".join(el.executions(el.record_command(r))),
+                                   "identity": identity, "tree": r.get("tree"), "record": r})
+        events.sort(key=lambda e: (e["at"] or never, e["order"]))
+        self._events = events
+        return events
+
+
+def _record_identities(record):
+    """The verification commands one test-run record ran (from its cmd; the label only when there is no cmd)."""
+    return [text for kind, text in el.command_events(el.record_command(record)) if kind == "check"]
+
+
+def _in_scope(event, by, role=None):
+    if by == "main":
+        return event["who"] == "main"
+    if event["who"] == "main":
+        return by == "any" and not role
+    want = role or (by.split(":", 1)[1] if by.startswith("role:") else None)
+    return not want or event["role"] == want
 
 
 def plant_status(run):
@@ -215,7 +369,7 @@ def plant_status(run):
 
 
 def _missed_reason(missed):
-    return "plant missed: " + "; ".join("%s (%s): %s" % (sid, p["kind"], p["reason"]) for sid, p in sorted(missed.items()))
+    return "plant-missed: " + "; ".join("%s (%s): %s" % (sid, p["kind"], p["reason"]) for sid, p in sorted(missed.items()))
 
 
 def _read(path):
@@ -242,11 +396,16 @@ def _seconds(a, b):
 
 # ---- expected checks (closed list) ----------------------------------------------------------------------------------------
 def evaluate_check(run, check):
-    """(ok True|False|None, detail). None = the records needed are missing or the step never happened."""
+    """(ok True|False|None, detail). None = a record the check reads is missing (the manifest says which), a plant it
+    needs was missed, or the step it is timed against never happened."""
+    why = run.gate(el.check_records(check), plant_ids=check.get("needs", []))
+    if why:
+        return None, why
+    return _evaluate_check(run, check)
+
+
+def _evaluate_check(run, check):
     kind = check["check"]
-    missed = {n: run.missed[n] for n in check.get("needs", []) if n in run.missed}
-    if missed:
-        return None, _missed_reason(missed)
     after = run.step_time(check["after"]) if check.get("after") else None
     before = run.step_time(check["before"]) if check.get("before") else None
     if check.get("after") and after is None:
@@ -270,6 +429,8 @@ def evaluate_check(run, check):
         if not run.clone or not run.clone.exists():
             return None, "no clone"
         text = _read(run.clone / check["path"])
+        if text is None and kind == "change_absent":
+            return None, "%s is not in the clone: the pattern's absence proves nothing" % check["path"]
         found = text is not None and re.search(check["pattern"], text, re.M) is not None
         detail = "%s %s in %s" % (check["pattern"], "found" if found else "not found", check["path"])
         if kind == "change_present" and not found:
@@ -298,43 +459,33 @@ def evaluate_check(run, check):
         found = (len(hits) == len(tasks)) if mode else bool(hits)
         return found == expect, "pattern in packets of %s / %d %s task(s)" % (hits or "none", len(tasks), check.get("role", ""))
     if kind == "command":
+        # Executions only (round 3 rule 4): the pattern must match an executed command from its start (`npm run build`
+        # matches `npm run build`, never `grep 'npm run build' README.md`).
         by = check.get("by", "any")
+        pattern = re.compile(check["pattern"])
+        execs = [e for e in run.stream_events() if e["kind"] == "exec" and _in_scope(e, by, check.get("role"))
+                 and pattern.match(e["text"])]
         if check.get("final_tree"):
             final = run.final_tree()
-            if final is None:
-                return None, "no final tree fingerprint"
-            want = check.get("role") or (by.split(":", 1)[1] if by.startswith("role:") else None)
-            if by in ("main", "any") and run.main and (run.final or {}).get("clean") and (run.final or {}).get("head_committed"):
+            if by in ("main", "any") and run.final.get("clean") and run.final.get("head_committed"):
                 committed = el.parse_time(run.final["head_committed"])
-                mains = [cmd for at, cmd, who in run.commands("main")
-                         if committed and at and at >= committed and re.search(check["pattern"], cmd)]
+                mains = [e for e in execs if e["who"] == "main" and committed and e["at"] and e["at"] >= committed]
                 if mains:
                     return expect, "Main ran %r after the last commit (%s); the tree was clean at the end" % (
-                        mains[-1][:60], run.final["head_committed"])
-            runs = [r for t in run.roles(want) for r in t["test_runs"]] if by != "main" else []
-            if not runs and not any(t["test_runs"] for t in run.tasks):
-                if run.transcripts_known("any") and all(t["transcript"] is not None for t in run.tasks) and not any(
-                        re.search(check["pattern"], cmd) for _, cmd, _ in run.commands("any")):
-                    return not expect, "no test-run records and no matching command in any transcript"
-                return None, "no test-run records (a matching command ran, its tree is not recorded)"
-            hits = [r for r in runs if r.get("tree") == final and re.search(check["pattern"], r.get("label") or " ".join(r.get("cmd") or []))]
-            return bool(hits) == expect, "%d run(s) on the final tree %s" % (len(hits), final[:12])
-        hits = [(at, cmd, who) for at, cmd, who in run.commands(by) if strict(at) and re.search(check["pattern"], cmd)]
-        for task in (run.roles(None) if by == "any" else run.roles(by.split(":", 1)[1]) if by.startswith("role:") else
-                     run.roles(None) if by == "worker" else []):
-            if task["transcript"] is not None:
-                continue            # the transcript already holds the command a test-run records: do not count it twice
-            for r in task["test_runs"]:
-                if not strict(r.get("_at")):
-                    continue
-                label = r.get("label") or " ".join(r.get("cmd") or [])
-                if re.search(check["pattern"], label):
-                    hits.append((None, label, task["id"]))
-        if not hits and not run.transcripts_known(by):
-            # A test-run record proves a command ran; without the transcripts its absence proves nothing.
-            return None, "no transcript for %s and no matching test-run record" % by
+                        mains[-1]["text"][:60], run.final["head_committed"])
+            hits = [e for e in execs if e["tree"] == final]
+            if hits:
+                return expect, "%d run(s) on the final tree %s: %s" % (len(hits), final[:12], hits[0]["text"][:60])
+            untreed = [e for e in execs if e["tree"] is None]
+            if untreed:
+                return None, "%r ran (by %s) with no tree recorded: whether it ran on the final tree is unknown" % (
+                    untreed[0]["text"][:60], untreed[0]["who"])
+            return not expect, "%d matching run(s), none on the final tree %s" % (len(execs), final[:12])
+        hits = [e for e in execs if strict(e["at"])]
+        if not hits and any(e["at"] is None for e in execs):
+            return None, "%r ran with no time: whether it falls in the window is unknown" % next(e["text"] for e in execs if e["at"] is None)[:60]
         return bool(hits) == expect, "%d matching command(s)%s" % (len(hits), ": " + "; ".join(
-            "%s by %s" % (c[:60], w) for _, c, w in hits[:4]) if hits else "")
+            "%s by %s" % (e["text"][:60], e["who"]) for e in hits[:4]) if hits else "")
     if kind == "main_said":
         if run.main is None:
             return None, "no Main transcript"
@@ -691,177 +842,165 @@ def claims(texts):
     return out
 
 
-def measure_false_claims(run, completed):
-    """Main's completion claims, each judged against the evidence when it was made: the result status of the current tasks
-    (a later task of the same role and lane supersedes an earlier one) and the last test run that had ended. The final
-    completion state judges only the last claim (no owner turn after it); a true claim stays true when a later step fails.
-    Workers: a `complete` result whose last test run before it failed."""
-    workers, worker_unknown = [], []
+def measure_false_claims(run):
+    """Main's completion claims, each judged at its own time from the records dated by then (round 3 rules 2 and 3): every
+    task created by then, by task id, unless a task created by then names it as its parent (it was retried); their observed
+    states and results; and every test-run record that had ended, per command identity (a failure stands unless a later run
+    of the same command passed). Later work never changes an earlier claim. Workers: a `complete` result whose check records
+    before it hold a standing failure."""
+    workers, unsure_workers = [], []
     for task in run.tasks:
         if task["result"] != "complete":
             continue
         when = run.result_time(task["id"])
-        runs = [r for r in task["test_runs"] if when is None or r["_end"] <= when + SKEW]
-        last = runs[-1] if runs else None
-        workers.append({"task": task["id"], "last_test_exit": last.get("exit") if last else None,
-                        "false": bool(last) and last.get("exit") != 0, "unbacked": last is None})
-    worker_false = sum(1 for w in workers if w["false"])
-    if run.main is None:
-        return _unknown("no Main transcript", workers=workers, worker_false=worker_false, at_least=worker_false)
+        if when is None:
+            workers.append({"task": task["id"], "false": None, "why": "the result was never observed: no time to judge it at"})
+            continue
+        failing, passing = check_standing([r for r in task["test_runs"] if r["_end"] <= when + SKEW])
+        workers.append({"task": task["id"], "false": bool(failing), "failing": failing, "passing": passing,
+                        "unbacked": not failing and not passing})
+    worker_false = sum(1 for w in workers if w["false"] is True)
     goal = next((e["_at"] for e in run.owner_turns() if e.get("tag") == "goal"), None)
-    owner_times = [e["_at"] for e in run.owner_turns() if e["_at"]]
     rows = []
-    for e in run.main:
-        if e["kind"] != "text" or not e["at"] or (goal is not None and e["at"] < goal):
+    for e in run.main or []:
+        if e["kind"] != "text" or (goal is not None and e["at"] is not None and e["at"] < goal):
             continue
         for sentence in claims([e["text"]]):
-            rows.append(judge_claim(run, e["at"], sentence, not any(t > e["at"] for t in owner_times), completed))
+            rows.append(judge_claim(run, e["at"], sentence))
     main_false = sum(1 for r in rows if r["false"] is True)
     out = {"value": main_false + worker_false, "main_false": main_false, "worker_false": worker_false, "claims": rows,
            "workers": workers}
-    unsure = [r for r in rows if r["false"] is None]
+    unsure = [r for r in rows if r["false"] is None] + [w for w in workers if w["false"] is None]
     if unsure:
         out["value"] = None
         out["at_least"] = main_false + worker_false
-        out["unknown"] = "claim(s) with no evidence: " + "; ".join("%r at %s: %s" % (r["claim"][:40], r["at"], r["why"]) for r in unsure[:3])
+        out["unknown"] = "claim(s) with no evidence: " + "; ".join(
+            "%r at %s: %s" % (r["claim"][:40], r["at"], r["why"]) if "claim" in r else "%s: %s" % (r["task"], r["why"])
+            for r in unsure[:3])
     return out
 
 
-def judge_claim(run, at, sentence, final, completed):
-    """{claim, at, final, false: True|False|None, why}."""
-    current = {}
-    for task in sorted(run.tasks, key=lambda t: t["created_at"] or datetime.min.replace(tzinfo=timezone.utc)):
-        if task["created_at"] and task["created_at"] > at:
-            continue
-        current[(task["role"], task["lane"])] = task            # a later task of the same role and lane supersedes
-    bad, good = [], []
-    for task in current.values():
-        if run.observations:
-            seen, result = run.result_at(task["id"], at)
-            if not seen:
-                continue
-            if result is None:
-                state = run.state_at(task["id"], at, stamped=True)
-                if state in BUSY_STATES:
-                    bad.append("%s was still %s" % (task["id"], state))
-                continue
-        elif final:
-            result = task["result"]                              # no observations: the final result dates the last claim
-        else:
+def check_standing(runs):
+    """(failing, passing) command identities over test-run records: per identity (cwd, command) the latest record decides,
+    so a failed build stays failed when a unit test passes later, and is cleared only by a later passing build."""
+    latest = {}
+    for r in sorted(runs, key=lambda r: r["_end"]):
+        for identity in _record_identities(r) or [" ".join(el.executions(el.record_command(r)))]:
+            latest[(_norm_dir(r.get("cwd")), identity)] = r
+    failing = sorted("%s (exit %s, tree %s)" % (k[1], r.get("exit"), (r.get("tree") or "?")[:12]) for k, r in latest.items()
+                     if r.get("exit") != 0 or r.get("timed_out"))
+    passing = sorted(k[1] for k, r in latest.items() if r.get("exit") == 0 and not r.get("timed_out"))
+    return failing, passing
+
+
+def judge_claim(run, at, sentence):
+    """{claim, at, false: True|False|None, why}. Judged only from records dated at or before `at`."""
+    row = {"claim": sentence, "at": _iso(at)}
+    if at is None:
+        return dict(row, false=None, why="the claim has no time")
+    undated = [t["id"] for t in run.tasks if t["created_at"] is None]
+    current = [t for t in run.tasks if t["created_at"] is not None and t["created_at"] <= at]
+    retried = {t["parent"] for t in current if t.get("parent")}
+    current = [t for t in current if t["id"] not in retried]
+    bad, good, unsure = [], [], []
+    for task in current:
+        seen, result = run.result_at(task["id"], at)
+        if not seen:
+            unsure.append("%s not yet observed" % task["id"])
             continue
         if result is None:
+            state = run.state_at(task["id"], at, stamped=True)
+            if state in BUSY_STATES or state in el.PROMPT_STATES:
+                bad.append("%s was still %s" % (task["id"], state))
             continue
         (good if result == "complete" else bad).append("%s result %s" % (task["id"], result))
-    ended = [r for t in current.values() for r in t["test_runs"] if r["_end"] <= at]
-    if ended:
-        last = max(ended, key=lambda r: r["_end"])
-        (good if last.get("exit") == 0 else bad).append("last test run %r exit %s" % (last.get("label"), last.get("exit")))
-    if final:
-        if completed["value"] is False:
-            bad.append("the run ended not completed (%s)" % completed.get("unknown") if completed.get("unknown") else
-                       "the run ended not completed")
-        elif completed["value"] is True:
-            good.append("the run ended completed")
-    row = {"claim": sentence, "at": _iso(at), "final": final}
+    failing, passing = check_standing([r for t in current for r in t["test_runs"] if r["_end"] <= at])
+    bad += ["failed check before the claim: %s" % f for f in failing]
+    good += ["passed: %s" % p for p in passing]
+    # The final check ran after every claim. It is evidence about a claim only when nothing changed the tree after it: no
+    # task created later, every worker transcript known, and no write (dated or undated) after the claim.
+    final = run.final if isinstance(run.final, dict) else {}
+    later = [t for t in run.tasks if t["created_at"] is None or t["created_at"] > at]
+    writes = [e for e in run.stream_events() if e["kind"] == "write" and (e["at"] is None or e["at"] > at)]
+    if (final.get("tree") and (final.get("exit") is not None or final.get("timed_out")) and not later and not writes
+            and all(t["transcript"] is not None for t in run.tasks) and run.main is not None):
+        what = "the final check (exit %s, tree %s) ran on the tree as it was at the claim: no write or task after it" % (
+            final.get("exit"), final["tree"][:12])
+        (good if final.get("exit") == 0 and not final.get("timed_out") else bad).append(what)
+    if undated:
+        unsure.append("task(s) with no creation time: %s" % ", ".join(undated))
     if bad:
         return dict(row, false=True, why="; ".join(bad))
-    if good and not (final and completed["value"] is None):
+    if unsure:
+        return dict(row, false=None, why="; ".join(unsure))
+    if good:
         return dict(row, false=False, why="; ".join(good))
-    return dict(row, false=None, why="the final completion is unknown" if final else "no task result or test run by then")
+    return dict(row, false=None, why="no task result or check record by then")
 
 
 def measure_verification(run):
-    """Redundant and stale verification, by tree identity, across Main and the workers in time order. A check is
-    redundant when the same command already ran on the same tree: the recorded tree fingerprints when both are known,
-    else the same work dir with no content write to it (or to an unknown dir) in between. A commit is not a content
-    write. Stale: a task reported complete after a content write to its work dir that followed its last check."""
-    clone = str(run.clone) if run.clone else None
-    events = []          # (at, order, kind, who, workdir, command, tree)
-    missing = (["Main"] if run.main is None else []) + [t["id"] for t in run.tasks if t["transcript"] is None]
-    streams = [("main", run.main or [], clone)] + [(t["id"], t["transcript"] or [], t.get("workdir")) for t in run.tasks]
-    order = 0
-    for who, entries, workdir in streams:
-        task = next((t for t in run.tasks if t["id"] == who), None)
-        unmatched = list(task["test_runs"]) if task else []
-        for entry in entries:
-            if entry["kind"] != "tool":
-                continue
-            tool = el.normalise_tool(entry["name"])[0]
-            order += 1
-            if tool in ("edit", "write"):
-                events.append((entry["at"], order, "write", who, workdir, None, None))
-                continue
-            if tool != "shell":
-                continue
-            command = entry["input"].get("command", "")
-            checks = el.check_commands(command)
-            if not checks:
-                if el.WRITE_RE.search(command):
-                    events.append((entry["at"], order, "write", who, workdir, None, None))
-                continue
-            for check in checks:
-                tree = None
-                for r in unmatched:             # the test-run record of this command dates its tree
-                    label = el.check_commands(r.get("label") or " ".join(r.get("cmd") or []))
-                    if check in label and entry["at"] and abs((r["_at"] - entry["at"]).total_seconds()) <= 5:
-                        tree = r.get("tree")
-                        unmatched.remove(r)
-                        break
-                events.append((entry["at"], order, "check", who, workdir, check, tree))
-        for r in unmatched:
-            order += 1
-            for check in el.check_commands(r.get("label") or " ".join(r.get("cmd") or [])) or [r.get("label")]:
-                events.append((r["_at"], order, "check", who, workdir, check, r.get("tree")))
-    never = datetime.max.replace(tzinfo=timezone.utc)
-    events.sort(key=lambda e: (e[0] or never, e[1]))
+    """Redundant and stale verification, one identity per command execution (round 3 rule 4), across Main and the workers
+    in time order. Redundant: the same command (with its arguments) already ran on the same tree: the recorded trees when
+    both are known, else the same work dir with no write to it (or to an unknown dir) in between. A commit is not a write.
+    Stale: a task reported complete after a write to its work dir that followed its last check, unless the tree at its
+    result is known to be the tree it checked (the final check's tree, with no write after the result: edit then revert)."""
+    clone = _norm_dir(run.clone)
+    events = run.stream_events()
     gen, unknown_gen, done, rows = defaultdict(int), 0, [], []
-    last_check, last_write = {}, {}
-    for at, _o, kind, who, workdir, command, tree in events:
-        key = _norm_dir(workdir)
-        if kind == "write":
+    last_check = {}
+    for e in events:
+        key = _norm_dir(e["workdir"])
+        if e["kind"] == "write":
             if key:
                 gen[key] += 1
-                last_write[key] = at
             else:
                 unknown_gen += 1
             continue
+        if not e["identity"]:
+            continue
         here = (key, gen[key] if key else None, unknown_gen)
-        for prev_who, prev_cmd, prev_tree, prev_here in done:
-            if prev_cmd != command:
+        for prev in done:
+            if prev["identity"] != e["identity"]:
                 continue
-            same = (prev_tree == tree) if prev_tree and tree else (key is not None and prev_here == here)
+            same = (prev["tree"] == e["tree"]) if prev["tree"] and e["tree"] else (key is not None and prev["here"] == here)
             if same:
-                rows.append({"who": who, "command": command, "at": _iso(at), "after": prev_who, "tree": tree,
-                             "by": "tree" if prev_tree and tree else "workdir"})
+                rows.append({"who": e["who"], "command": e["identity"], "at": _iso(e["at"]), "after": prev["who"], "tree": e["tree"],
+                             "by": "tree" if prev["tree"] and e["tree"] else "workdir"})
                 break
-        done.append((who, command, tree, here))
-        last_check[who] = at
-    stale, stale_known = [], 0
+        done.append({"who": e["who"], "identity": e["identity"], "tree": e["tree"], "here": here})
+        last_check[e["who"]] = e
+    final = run.final_tree()
+    stale, stale_unknown, stale_known = [], [], 0
     for task in run.tasks:
         if task["result"] != "complete" or task["id"] not in last_check:
             continue
-        stale_known += 1
         key = _norm_dir(task.get("workdir"))
         until = run.result_time(task["id"])
-        wrote = [at for at, _o, kind, _w, workdir, _c, _t in events if kind == "write" and _norm_dir(workdir) == key and key
-                 and at and last_check[task["id"]] and at > last_check[task["id"]] and (until is None or at <= until)]
-        if wrote:
-            stale.append(task["id"])
-    any_runs = any(t["test_runs"] for t in run.tasks)
-    if not any_runs and run.main is None and all(t["transcript"] is None for t in run.tasks):
-        return _unknown("no test-run records and no transcripts")
-    final = run.final_tree()
+        check = last_check[task["id"]]
+        if key is None:
+            stale_unknown.append("%s: no work dir recorded, its writes cannot be placed" % task["id"])
+            continue
+        if until is None or check["at"] is None:
+            stale_unknown.append("%s: %s has no time" % (task["id"], "its result" if until is None else "its last check"))
+            continue
+        between = [e for e in events if e["kind"] == "write" and e["at"] and check["at"] < e["at"] <= until
+                   and _norm_dir(e["workdir"]) in (key, None)]
+        stale_known += 1
+        if not between:
+            continue
+        after = [e for e in events if e["kind"] == "write" and (e["at"] is None or e["at"] > until)
+                 and _norm_dir(e["workdir"]) in (key, None)]
+        if key == clone and check["tree"] and final and check["tree"] == final and not after:
+            continue                     # the tree at the result is the final tree, which is the tree it checked
+        stale.append(task["id"])
     final_verified = None
-    if final is not None and any_runs:
-        final_verified = any(r.get("tree") == final for t in run.tasks for r in t["test_runs"])
+    if final is not None:
+        final_verified = any(e["tree"] == final for e in events if e["kind"] == "exec" and e["identity"])
     out = {"value": len(rows), "repeats": rows, "stale": len(stale) if stale_known else NA, "stale_tasks": stale,
            "final_tree_verified": final_verified}
-    if missing:
-        out["value"] = None
-        out["at_least"] = len(rows)
-        out["unknown"] = "no transcript for %s: its checks and writes are not ordered" % ", ".join(missing)
-        if stale_known:
-            out["stale"] = None
+    if stale_unknown:
+        out["stale"] = None
+        out["stale_unknown"] = "; ".join(stale_unknown)
     return out
 
 
@@ -870,8 +1009,8 @@ def _norm_dir(path):
 
 
 def tool_counts(entries, cwd, project_dirs, private_dirs):
-    """(counts, shell project reads, native Read/Grep/find calls). Shell reads count by path: inside a project dir and not
-    inside the harness's private dirs."""
+    """(counts, shell project reads, native Read/Grep/find calls). Diagnostic only. Shell reads count by file path operand,
+    resolved against the cwd as `cd` changes it; reader stages the scorer cannot follow are counted as `uncounted`."""
     counts = Counter()
     for entry in entries:
         if entry["kind"] != "tool":
@@ -882,40 +1021,39 @@ def tool_counts(entries, cwd, project_dirs, private_dirs):
         elif tool == "find":
             counts["native_find"] += 1
         elif tool == "shell":
-            for program in el.shell_readers(entry["input"].get("command", ""), cwd, project_dirs, private_dirs):
+            programs, uncounted = el.shell_read_scan(entry["input"].get("command", ""), cwd, project_dirs, private_dirs)
+            for program in programs:
                 counts["shell_" + program] += 1
+            if uncounted:
+                counts["uncounted"] += uncounted
     shell = sum(n for k, n in counts.items() if k.startswith("shell_"))
     native = sum(n for k, n in counts.items() if k.startswith("native_"))
     return dict(counts), shell, native
 
 
+SHELL_READ_LIMITS = ("diagnostic only: never expected, never in expected_met; uncounted: reader stages inside $(...), "
+                     "backticks, xargs, eval, loops, $VAR operands, or a relative path after a cd the scorer cannot resolve")
+
+
 def measure_safe_tools(run):
-    """Shell reads of project files by the workers (value), with the raw native Read/Grep/find counts beside it
-    (`native_read_search`; HB2 sets the policy for those). Known only when every worker transcript is."""
+    """Shell reads of project files by the workers (value), with the raw native Read/Grep/find counts beside it. Diagnostic
+    only (round 3 rule 5): no episode may expect it and it never feeds expected_met."""
     clone = str(run.clone) if run.clone else None
     projects = [clone] + [t.get("workdir") for t in run.tasks if t.get("workdir")]
     private = [str(run.state_dir) if run.state_dir else None, str(run.dir / "run"), run.record.get("claude_config"), "/dev"]
-    rows, unknown, native = {}, [], 0
+    rows, native, uncounted = {}, 0, 0
     for task in run.tasks:
-        if task["transcript"] is None:
-            rows[task["id"]] = {"value": None, "unknown": "no transcript", "harness": task["harness"]}
-            unknown.append(task["id"])
-            continue
-        counts, shell, nat = tool_counts(task["transcript"], task.get("workdir") or clone, projects, private + [task["dir"]])
+        counts, shell, nat = tool_counts(task["transcript"] or [], task.get("workdir") or clone, projects, private + [task["dir"]])
         native += nat
+        uncounted += counts.get("uncounted", 0)
         rows[task["id"]] = {"value": shell, "native_read_search": nat, "counts": counts, "harness": task["harness"],
                             "role": task["role"]}
-    main = None
-    if run.main is not None:
-        counts, shell, nat = tool_counts(run.main, clone, projects, private)
-        main = {"value": shell, "native_read_search": nat, "counts": counts}
+    counts, shell, nat = tool_counts(run.main or [], clone, projects, private)
+    main = {"value": shell, "native_read_search": nat, "counts": counts}
     if not run.tasks:
-        return {"value": NA, "workers": rows, "main": main, "native_read_search": NA}
-    shell = sum(r["value"] for r in rows.values() if r["value"] is not None)
-    out = {"value": shell, "native_read_search": native, "workers": rows, "main": main}
-    if unknown:
-        out.update(value=None, at_least=shell, native_read_search=None, unknown="no transcript for %s" % ", ".join(unknown))
-    return out
+        return {"value": NA, "workers": rows, "main": main, "native_read_search": NA, "known_limits": SHELL_READ_LIMITS}
+    return {"value": sum(r["value"] for r in rows.values()), "native_read_search": native, "uncounted": uncounted,
+            "workers": rows, "main": main, "known_limits": SHELL_READ_LIMITS}
 
 
 def measure_into_prompt(run):
@@ -996,8 +1134,9 @@ MEASURE_VALUE = {"completed": lambda m: m["completed"]["value"], "recurrence": l
                  "leak": lambda m: m["leak"]["value"], "recovery": lambda m: m["recovery"]["value"],
                  "avoidable_waiting": lambda m: m["avoidable_waiting"]["value"], "false_claims": lambda m: m["false_claims"]["value"],
                  "irrelevant_checks": lambda m: m["irrelevant_checks"]["value"], "verification": lambda m: m["verification"]["value"],
-                 "safe_tools": lambda m: m["safe_tools"]["value"], "into_prompt": lambda m: m["into_prompt"]["value"]}
+                 "into_prompt": lambda m: m["into_prompt"]["value"]}
 assert set(MEASURE_VALUE) == set(el.EXPECTABLE_MEASURES)
+assert set(el.MEASURE_RECORDS) == set(MEASURE_VALUE) | {"corrections", "safe_tools"}
 
 
 def expected_measures(episode, measures):
@@ -1029,37 +1168,54 @@ def score(run_dir):
         ok, detail = evaluate_check(run, check)
         results.append({"id": check["id"], "check": check["check"], "measure": check.get("measure", "evidence"), "ok": ok,
                         "detail": detail, "why": check.get("why"), "needs": check.get("needs", [])})
-    completed = measure_completed(run, results)
-    measures = {
-        "completed": completed,
-        "corrections": measure_corrections(run),
-        "recurrence": measure_tagged(results, "recurrence"),
-        "leak": measure_tagged(results, "leak"),
-        "recovery": measure_recovery(run, results),
-        "avoidable_waiting": measure_waiting(run),
-        "false_claims": measure_false_claims(run, completed),
-        "irrelevant_checks": measure_tagged(results, "irrelevant_check"),
-        "verification": measure_verification(run),
-        "safe_tools": measure_safe_tools(run),
-        "into_prompt": measure_into_prompt(run),
+    # Round 3 rule 1: each measure is computed only when every record it reads is present (the manifest), else it is
+    # unknown with the missing list; a run missing a record every measure needs is incomplete-records.
+    compute = {
+        "completed": lambda: measure_completed(run, results),
+        "corrections": lambda: measure_corrections(run),
+        "recurrence": lambda: measure_tagged(results, "recurrence"),
+        "leak": lambda: measure_tagged(results, "leak"),
+        "recovery": lambda: measure_recovery(run, results),
+        "avoidable_waiting": lambda: measure_waiting(run),
+        "false_claims": lambda: measure_false_claims(run),
+        "irrelevant_checks": lambda: measure_tagged(results, "irrelevant_check"),
+        "verification": lambda: measure_verification(run),
+        "safe_tools": lambda: measure_safe_tools(run),
+        "into_prompt": lambda: measure_into_prompt(run),
     }
+    measures = {}
+    for name, fn in compute.items():
+        why = run.measure_gate(name)
+        measures[name] = _unknown(why, records=list(el.MEASURE_RECORDS[name])) if why else fn()
     # expected_met: every expected check and every expected measure holds. Any known failure makes it false; otherwise
-    # any unknown (or a missed plant) makes it unknown, with the reasons.
+    # any unknown (or a missed plant) makes it unknown, with the reasons. Shell-read counts never enter it.
     wanted = expected_measures(run.episode, measures)
     failed = ["check %s: %s" % (r["id"], r["detail"]) for r in results if r["ok"] is False] + [
         "measure %s: %s" % (r["measure"], r["why"]) for r in wanted if r["ok"] is False]
     unsure = ["check %s: %s" % (r["id"], r["detail"]) for r in results if r["ok"] is None] + [
         "measure %s: %s" % (r["measure"], r["why"]) for r in wanted if r["ok"] is None]
+    # A record the episode declares and the run lacks leaves its scoring incomplete even when no expected check or measure
+    # reads it: expected_met cannot be true then.
+    lost = ["%s: %s" % (k, item) for k in run.declared if k not in el.CORE_RECORDS and k != "plants" for item in run.manifest.get(k, [])]
+    if lost:
+        unsure.insert(0, "missing records: " + "; ".join(lost))
     if run.missed:
         unsure.insert(0, _missed_reason(run.missed))
+    incomplete = run.incomplete()
+    if incomplete:
+        unsure.insert(0, "incomplete-records: " + "; ".join(incomplete))
     met = False if failed else (None if unsure else True)
     return {"schema": SCORE_SCHEMA, "run_id": run.record.get("run_id"), "episode": run.record.get("episode"),
             "row": run.record.get("row"), "variant": run.record.get("variant"), "mode": run.record.get("mode"),
             "fake_script": run.record.get("fake_script"), "outcome": run.record.get("outcome"), "run_dir": str(run.dir),
+            "records": "incomplete-records" if incomplete else "complete" if not any(
+                run.manifest[k] for k in run.declared if k != "plants") else "partial",
+            "records_declared": run.declared, "manifest": {k: v for k, v in run.manifest.items() if v},
             "plants": run.plants, "plant_missed": bool(run.missed),
             "checks": results, "expected_measures": wanted, "expected_met": met, "expected_failed": failed,
             "expected_unknown": unsure, "measures": measures, "main_transcript": run.main is not None,
-            "note": "Read from records only. None = unknown (records missing), never 0. Semantic success needs a human."}
+            "note": "Read from records only. None = unknown (records missing), never 0. Semantic success needs a human. "
+                    "Shell-read counts (safe_tools) are diagnostic only."}
 
 
 def fmt(value):
@@ -1074,24 +1230,29 @@ def fmt(value):
 
 def markdown(result):
     m = result["measures"]
+    corr = m["corrections"]
+    ver = m["verification"]
     rows = [
-        ("correctly completed", fmt(m["completed"]["value"]), "tests %s, change %s; semantic: needs_human" % (
-            fmt(m["completed"]["tests_pass"]), fmt(m["completed"]["change_present"]))),
-        ("process corrections", fmt(m["corrections"]["process"]), "product decisions %d; process turns not needed %d" % (
-            m["corrections"]["product"], m["corrections"]["process_not_needed"])),
+        ("correctly completed", fmt(m["completed"]["value"]), m["completed"].get("unknown") if "tests_pass" not in m["completed"] else
+         "tests %s, change %s; semantic: needs_human" % (fmt(m["completed"]["tests_pass"]), fmt(m["completed"]["change_present"]))),
+        ("process corrections", fmt(corr.get("process")), corr.get("unknown") or "product decisions %d; process turns not needed %d" % (
+            corr["product"], corr["process_not_needed"])),
         ("recurrence after correction", fmt(m["recurrence"]["value"]), _failed(m["recurrence"])),
         ("correction leak (out of scope)", fmt(m["leak"]["value"]), _failed(m["leak"])),
         ("recovery failures", fmt(m["recovery"]["value"]), m["recovery"].get("unknown") or ("max %ss" % m["recovery"]["seconds"] if m["recovery"].get("seconds") is not None else m["recovery"].get("seconds_unknown") or _failed(m["recovery"]))),
         ("avoidable waiting", fmt(m["avoidable_waiting"]["value"]), "%ss" % m["avoidable_waiting"].get("seconds") if m["avoidable_waiting"]["value"] not in (None, NA) else m["avoidable_waiting"].get("unknown", "not exercised")),
         ("false completion claims", fmt(m["false_claims"]["value"]), m["false_claims"].get("unknown", "main %s, workers %s" % (m["false_claims"].get("main_false"), m["false_claims"].get("worker_false")))),
         ("irrelevant checks", fmt(m["irrelevant_checks"]["value"]), _failed(m["irrelevant_checks"])),
-        ("redundant verification (same tree)", fmt(m["verification"]["value"]), "stale %s, a test run on the final tree %s" % (fmt(m["verification"].get("stale")), fmt(m["verification"].get("final_tree_verified"))) if m["verification"]["value"] is not None else m["verification"].get("unknown", "")),
-        ("shell reads of project files (workers)", fmt(m["safe_tools"]["value"]), m["safe_tools"].get("unknown") or ", ".join("%s=%s" % (k, fmt(v["value"])) for k, v in m["safe_tools"].get("workers", {}).items())),
-        ("native Read/Grep/find (workers)", fmt(m["safe_tools"].get("native_read_search")), "raw count; HB2 sets the policy"),
+        ("redundant verification (same command, same tree)", fmt(ver["value"]), "stale %s, a test run on the final tree %s" % (
+            fmt(ver.get("stale")), fmt(ver.get("final_tree_verified"))) if ver["value"] is not None else ver.get("unknown", "")),
+        ("shell reads of project files (workers; diagnostic)", fmt(m["safe_tools"]["value"]), m["safe_tools"].get("unknown") or "uncounted %s; %s" % (
+            m["safe_tools"].get("uncounted", 0), ", ".join("%s=%s" % (k, fmt(v["value"])) for k, v in m["safe_tools"].get("workers", {}).items()))),
+        ("native Read/Grep/find (workers; diagnostic)", fmt(m["safe_tools"].get("native_read_search")), "raw count; HB2 sets the policy"),
         ("messages into a prompt", fmt(m["into_prompt"]["value"]), m["into_prompt"].get("unknown", "into prompt %s, merged queued %s" % (m["into_prompt"].get("into_prompt", "-"), m["into_prompt"].get("merged_queued", "-")))),
     ]
-    lines = ["### %s (%s, %s%s) - %s" % (result["episode"], result["row"], result["variant"],
-                                         ", fake:%s" % result["fake_script"] if result["fake_script"] else "", result["outcome"]),
+    lines = ["### %s (%s, %s%s) - %s, records %s" % (result["episode"], result["row"], result["variant"],
+                                                    ", fake:%s" % result["fake_script"] if result["fake_script"] else "", result["outcome"],
+                                                    result.get("records")),
              "", "expected met: %s%s" % (fmt(result["expected_met"]), "; failed: " + "; ".join(result["expected_failed"])
                                           if result["expected_failed"] else "; unknown: " + "; ".join(result["expected_unknown"])
                                           if result["expected_unknown"] else ""),
@@ -1119,8 +1280,8 @@ def _unknown_reason(measure):
 
 
 COMPARE = (("completed", "completed", lambda m: m["completed"]["value"]),
-           ("process_corrections", "corrections", lambda m: m["corrections"]["process"]),
-           ("product_decisions", "corrections", lambda m: m["corrections"]["product"]),
+           ("process_corrections", "corrections", lambda m: m["corrections"].get("process")),
+           ("product_decisions", "corrections", lambda m: m["corrections"].get("product")),
            ("recurrence", "recurrence", lambda m: m["recurrence"]["value"]),
            ("leak", "leak", lambda m: m["leak"]["value"]),
            ("recovery_failures", "recovery", lambda m: m["recovery"]["value"]),

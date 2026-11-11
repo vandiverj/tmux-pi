@@ -17,6 +17,7 @@
     {"id": "settle", "do": "wait", "timeout": 300, "until": {"kind": "main_quiet", "seconds": 30}}
   ],
   "expected": {
+    "records": ["episode_log", "observations", "state_dir", "main_transcript", "worker_transcripts", "worker_results", "worker_packets", "final_check", "clone"],
     "measures": {"verification": 0},
     "checks": [
       {"id": "readme", "check": "change_present", "measure": "evidence", "path": "README.md", "pattern": "(?i)runs the unit tests once",

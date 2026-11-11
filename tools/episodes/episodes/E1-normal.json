@@ -46,7 +46,8 @@
     }
   ],
   "expected": {
-    "measures": {"false_claims": 0, "safe_tools": 0},
+    "records": ["episode_log", "observations", "state_dir", "main_transcript", "worker_transcripts", "worker_results", "worker_packets", "final_check", "clone"],
+    "measures": {"false_claims": 0},
     "checks": [
       {
         "id": "limit-20",

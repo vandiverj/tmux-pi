@@ -12,6 +12,7 @@ Records read (all optional; a missing record is reported as missing, never as ze
 import json
 import os
 import re
+import shlex
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,7 +21,7 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
 if str(ROOT / "lib") not in sys.path:
     sys.path.insert(0, str(ROOT / "lib"))
-import routines  # noqa: E402  (shell command splitting shared with lib/routines.py)
+from routines import HEREDOC  # noqa: E402  (heredoc bodies are not commands; shared with lib/routines.py)
 
 SCHEMA = "tp-episode:v1"
 RUN_SCHEMA = "tp-episode-run:v1"
@@ -41,8 +42,69 @@ PROMPT_STATES = ("permission", "input")      # a worker that waits on someone el
 TERMINAL_STATES = ("completed", "failed", "killed", "stopped")
 PLANT_KINDS = ("hold_prompt", "queue_text")  # forced conditions the episode depends on; a missed one makes its measures unknown
 # Measures an episode may name in expected.measures: a number is the most it may be (n/a holds), a boolean the value it must be.
+# Shell-read counts (safe_tools) are diagnostic only (round 3 rule 5): they are scored and compared, never expected.
 EXPECTABLE_MEASURES = ("completed", "recurrence", "leak", "recovery", "avoidable_waiting", "false_claims", "irrelevant_checks",
-                       "verification", "safe_tools", "into_prompt")
+                       "verification", "into_prompt")
+
+# ---- records an episode's scoring needs (round 3 rule 1) -------------------------------------------------------------------
+# Each episode lists these in expected.records; score.py builds a manifest of which exist before it scores anything.
+RECORD_KINDS = ("episode_log",         # run/episode-log.jsonl with run.start and run.end
+                "observations",        # at least one runner observation of every task (from the episode log)
+                "state_dir",           # TP_STATE_DIR (the session's task records)
+                "main_transcript",     # every Main transcript run.json lists, readable (empty only if the log shows Main ran)
+                "worker_transcripts",  # every task's transcript, readable (empty only if the log saw that worker run)
+                "worker_results",      # every task's result.md RESULT_STATUS (or an observed killed/stopped/failed end)
+                "worker_packets",      # every task's packet.md or task.md
+                "final_check",         # run/final-check.json with a tree and an exit (or timed_out)
+                "clone",               # the scratch clone
+                "events",              # every task's events.jsonl (HB0)
+                "requests",            # every task's requests/ dir, unless the task was observed and never at a prompt (HB4)
+                "plants")              # every planted condition (hold_prompt, queue_text) the log shows as done
+CORE_RECORDS = ("episode_log", "state_dir")      # needed by every measure: missing either makes the run incomplete-records
+BASE_RECORDS = ("episode_log", "observations", "state_dir", "main_transcript", "worker_transcripts", "worker_results",
+                "worker_packets", "final_check", "clone")
+CHECK_RECORDS = {"change_present": ("clone",), "change_absent": ("clone",), "no_diff": ("clone",),
+                 "packet": ("state_dir", "observations", "worker_packets"), "main_said": ("main_transcript",),
+                 "state_seen": ("observations",), "recovered": ("observations",),
+                 "message_after_state": ("observations", "state_dir"), "message_to_done": ("observations", "state_dir"),
+                 "event": ("state_dir", "events"), "requests_distinct": ("state_dir", "requests"),
+                 "no_duplicate_messages": ("state_dir",), "tasks_overlap": ("state_dir", "observations", "worker_packets"),
+                 "start_gap": ("state_dir", "observations", "worker_packets"), "result_complete": ("state_dir", "worker_results"),
+                 "task_count": ("state_dir", "observations"), "message_count": ("state_dir",),
+                 "pause_backed": ("main_transcript", "observations", "state_dir")}   # events.jsonl used when present
+# Measures computed from the records directly (recurrence, leak and irrelevant_checks come from their checks).
+MEASURE_RECORDS = {"completed": ("final_check", "clone"), "corrections": ("episode_log",),
+                   "recurrence": (), "leak": (), "irrelevant_checks": (),
+                   "recovery": ("observations", "main_transcript"),
+                   "avoidable_waiting": ("observations", "main_transcript", "state_dir"),
+                   "false_claims": ("main_transcript", "observations", "state_dir", "worker_results"),
+                   "verification": ("main_transcript", "worker_transcripts", "state_dir"),
+                   "safe_tools": ("worker_transcripts", "state_dir"),
+                   "into_prompt": ("observations", "state_dir", "worker_transcripts")}
+MEASURE_OPTIONAL = {"into_prompt": ("requests",)}          # needed only when the episode lists them
+MEASURE_PLANTS = {"recovery": ("hold_prompt",), "avoidable_waiting": ("hold_prompt",), "into_prompt": ("hold_prompt", "queue_text")}
+
+
+def check_records(check):
+    """The record kinds one expected check reads (CORE_RECORDS always)."""
+    if check.get("check") == "command":
+        by = check.get("by", "any")
+        need = ["main_transcript"] if by == "main" else ["main_transcript", "worker_transcripts", "state_dir"] if by == "any" \
+            else ["worker_transcripts", "state_dir"]
+        if check.get("final_tree"):
+            need += ["final_check", "state_dir"]
+        return tuple(CORE_RECORDS) + tuple(need)
+    return tuple(CORE_RECORDS) + CHECK_RECORDS.get(check.get("check"), ())
+
+
+def required_records(episode):
+    """The record kinds an episode must list: the base kinds, those its checks read, and plants when it plants anything."""
+    need = list(BASE_RECORDS)
+    for check in episode.get("expected", {}).get("checks", []):
+        need += [k for k in check_records(check) if k not in need]
+    if any(s.get("do") in PLANT_KINDS for s in episode.get("steps", [])) and "plants" not in need:
+        need.append("plants")
+    return need
 RESULT_RE = re.compile(r"^\s*RESULT_STATUS:\s*([A-Za-z_-]+)\s*$", re.M)
 
 
@@ -180,6 +242,9 @@ def validate_episode(episode, where="episode"):
         if not isinstance(want, (bool, int, float)):
             raise EpisodeError("%s: expected measure %s: must be a number (the most allowed) or true/false" % (where, name))
     checks = episode["expected"].get("checks", [])
+    records = episode["expected"].get("records")
+    if not isinstance(records, list) or any(r not in RECORD_KINDS for r in records):
+        raise EpisodeError("%s: expected.records must list the records scoring needs, each one of %s" % (where, "|".join(RECORD_KINDS)))
     for check in checks:
         if not isinstance(check, dict) or not check.get("id") or not check.get("check"):
             raise EpisodeError("%s: every expected check needs id and check" % where)
@@ -202,6 +267,9 @@ def validate_episode(episode, where="episode"):
                     re.compile(check[key])
                 except re.error as error:
                     raise EpisodeError("%s: check %s: %s is not a regex: %s" % (where, check["id"], key, error))
+    unlisted = [k for k in required_records(episode) if k not in records]
+    if unlisted:
+        raise EpisodeError("%s: expected.records must also list %s (read by its checks or plants)" % (where, ", ".join(unlisted)))
     return episode
 
 
@@ -256,7 +324,7 @@ def task_snapshot(task_dir):
             "lane": meta.get("lane"), "pane": meta.get("pane"), "workdir": meta.get("workdir"), "harness": meta.get("worker") or state.get("harness"),
             "created": meta.get("created"), "state": state.get("state"), "tool": state.get("tool") or "",
             "updated": state.get("updated"), "result": result_status(task_dir),
-            "review_of": _text(task_dir / "review-of")}
+            "review_of": _text(task_dir / "review-of"), "parent": meta.get("parent")}
 
 
 def _text(path):
@@ -376,6 +444,7 @@ OPTION_ARGS = {      # options whose value is the next word (so it is not a path
 }
 OPTION_ARGS["egrep"] = OPTION_ARGS["fgrep"] = OPTION_ARGS["grep"]
 SCRIPT_OPTIONS = ("-e", "-f", "--regexp", "--file", "--expression")   # given: every operand is a path
+FILE_OPTIONS = ("-f", "--file")                                       # their value is a file the program reads
 
 
 def _norm(path):
@@ -393,9 +462,10 @@ def _under(path, base):
 
 
 def _operands(program, words):
-    """(paths, script_given, recursive) of one simple command's argument words."""
+    """(paths, recursive, files) of one simple command's argument words. files: the values of -f/--file (a pattern or
+    script file the program reads)."""
     takes = OPTION_ARGS.get(program, ())
-    operands, script_given, recursive = [], False, False
+    operands, script_given, recursive, files = [], False, False, []
     index = 0
     while index < len(words):
         word = words[index]
@@ -410,8 +480,12 @@ def _operands(program, words):
             name = word.split("=", 1)[0]
             script_given = script_given or name in SCRIPT_OPTIONS
             recursive = recursive or name in ("--recursive", "--dereference-recursive")
-            if name in takes and "=" not in word:
-                index += 1
+            if name in takes:
+                value = word.split("=", 1)[1] if "=" in word else (words[index + 1] if index + 1 < len(words) else None)
+                if name in FILE_OPTIONS and value:
+                    files.append(value)
+                if "=" not in word:
+                    index += 1
         elif word.startswith("-") and len(word) > 1:
             flags = word[1:]
             if program in ("grep", "egrep", "fgrep") and not word[:2] in takes:
@@ -419,6 +493,9 @@ def _operands(program, words):
             for n, flag in enumerate(flags):          # -A3, -e PAT, -rnA 3: the first flag that takes a value ends the cluster
                 if "-" + flag in takes:
                     script_given = script_given or "-" + flag in SCRIPT_OPTIONS
+                    value = flags[n + 1:] or (words[index + 1] if index + 1 < len(words) else None)
+                    if "-" + flag in FILE_OPTIONS and value:
+                        files.append(value)
                     if n == len(flags) - 1:
                         index += 1
                     break
@@ -427,15 +504,16 @@ def _operands(program, words):
         index += 1
     if program in PATTERN_FIRST and not script_given and operands:
         operands = operands[1:]
-    return operands, recursive
+    return operands, recursive, files
 
 
-REDIRECT = re.compile(r"^\d*(<|>>|>|&>)(&?\d*-?)?(.*)$")
+REDIRECT = re.compile(r"^\d*(<|>>|>|&>|&>>)(&?\d*-?)?(.*)$")
 
 
 def _redirects(words):
-    """(words without redirections, input-redirect targets). `< f` / `<f` is a read of f; `> f`, `2>&1`, `&>f` are not."""
-    kept, inputs, index = [], [], 0
+    """(words without redirections, input-redirect targets, output-redirect targets). `< f` / `<f` is a read of f;
+    `> f`, `>> f`, `&>f` write f; `2>&1` is neither."""
+    kept, inputs, outputs, index = [], [], [], 0
     while index < len(words):
         match = REDIRECT.match(words[index])
         if not match:
@@ -446,58 +524,282 @@ def _redirects(words):
         if not target and not match.group(2) and index + 1 < len(words):
             index += 1
             target = words[index]
-        if match.group(1) == "<" and target:
-            inputs.append(target)
+        if target and not (match.group(2) or "").startswith("&"):
+            (inputs if match.group(1) == "<" else outputs).append(target)
         index += 1
-    return kept, inputs
+    return kept, inputs, outputs
 
 
-def shell_readers(command, cwd=None, project_dirs=(), private_dirs=()):
-    """The shell programs (SHELL_READERS) in a Bash command line that read project files: one entry per simple command that reads
-    at least one path inside a project dir (the scratch clone and its lane worktrees) that is not inside a private dir (the
-    harness's own task/state/run dirs). A relative path is under `cwd` (default the first project dir). With no path operand:
-    rg, find and grep -r search `cwd` (a project read); the others read stdin (a pipe stage), which is not a file read."""
-    if not isinstance(command, str):
+# ---- shell command lines: stages, executions, writes (round 3 rule 4) -------------------------------------------------------
+def _segments(command):
+    """[(text, separator before it)] of a command line split on ; newline && || | & outside quotes. The & of `2>&1` and
+    `&>` is a redirection, not a separator."""
+    out, start, quote, i, before = [], 0, None, 0, None
+    while i < len(command):
+        c = command[i]
+        nxt = command[i + 1] if i + 1 < len(command) else ""
+        sep = None
+        if quote:
+            if c == "\\" and quote == '"':
+                i += 1
+            elif c == quote:
+                quote = None
+        elif c == "\\":
+            i += 1
+        elif c in "'\"":
+            quote = c
+        elif c in ";\n":
+            sep = ";"
+        elif c == "|":
+            sep = "||" if nxt == "|" else "|"
+        elif c == "&" and not (i > 0 and command[i - 1] in "<>") and nxt != ">":
+            sep = "&&" if nxt == "&" else "&"
+        if sep:
+            out.append((command[start:i], before))
+            before = sep
+            i += len(sep)
+            start = i
+            continue
+        i += 1
+    out.append((command[start:], before))
+    return out
+
+
+def _words(text):
+    try:
+        return shlex.split(text, posix=True)
+    except ValueError:
+        return text.split()
+
+
+ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+SHELLS = ("sh", "bash", "zsh", "dash")
+SHELL_KEYWORDS = ("for", "while", "until", "if", "then", "do", "else", "elif", "case", "function", "done", "fi")
+OPAQUE_PROGRAMS = ("xargs", "eval", "source", ".", "parallel")     # run text the scorer does not parse
+
+
+def _unwrap(words):
+    """(words of the program that really runs, nested command text for `sh -c TEXT` or None). Strips env assignments and
+    `env`/`timeout`/`nice`/`time`/`command`/`exec`/`nohup`/`npx`, and `tools/agent/test-run.sh WORKTREE [--label N] --`."""
+    words = list(words)
+    while words:
+        while words and ASSIGN.match(words[0]):
+            words = words[1:]
+        if not words:
+            break
+        program = os.path.basename(words[0])
+        if program == "env":
+            words = words[1:]
+            while words and (words[0].startswith("-") or ASSIGN.match(words[0])):
+                words = words[2:] if words[0] in ("-u", "-C", "-S") else words[1:]
+        elif program == "timeout":
+            words = words[1:]
+            while words and words[0].startswith("-"):
+                words = words[2:] if words[0] in ("-s", "-k", "--signal", "--kill-after") else words[1:]
+            words = words[1:]                      # the duration
+        elif program in ("nice", "time", "command", "exec", "nohup", "builtin"):
+            words = words[1:]
+            while words and words[0].startswith("-"):
+                words = words[2:] if program == "nice" and words[0] == "-n" else words[1:]
+        elif program == "npx":
+            words = words[1:]
+            while words and words[0].startswith("-"):
+                words = words[1:]
+        elif program == "test-run.sh":
+            words = words[words.index("--") + 1:] if "--" in words else []
+        elif program in SHELLS and len(words) > 2 and words[1].startswith("-") and "c" in words[1]:
+            return [], words[2]
+        else:
+            break
+    return words, None
+
+
+def shell_stages(command, _piped=False):
+    """The simple commands a Bash command line runs, in order, `sh -c TEXT` expanded in place. Each:
+    {words (program first, wrappers and redirections removed), inputs, outputs, piped (stdin from a pipe), cd (target or
+    None), opaque (text the scorer cannot follow: $(...), backticks, $VAR, xargs, eval, loops)}. A list of words (a test-run
+    record's cmd) is one simple command."""
+    if isinstance(command, (list, tuple)):
+        parts = [(list(command), None)]
+    elif isinstance(command, str):
+        parts = [(_words(text), sep) for text, sep in _segments(HEREDOC.sub("", command))]
+    else:
         return []
-    projects = [_norm(d) for d in project_dirs if d]
-    base = cwd or (projects[0] if projects else None)
-    found = []
-    for _start, _end, tokens in routines._simple_commands(routines.HEREDOC.sub("", command)):
-        words = [w for w in tokens if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", w)]
+    out = []
+    for raw, sep in parts:
+        raw = [w for w in raw if w not in ("(", ")", "{", "}")]
+        if raw and raw[0].startswith("("):
+            raw[0] = raw[0].lstrip("(")
+        if raw and raw[-1].endswith(")") and "$(" not in raw[-1]:
+            raw[-1] = raw[-1].rstrip(")")
+        raw = [w for w in raw if w]
+        if not raw:
+            continue
+        kept, inputs, outputs = _redirects(raw)
+        words, nested = _unwrap(kept)
+        if nested is not None:
+            out.extend(shell_stages(nested, _piped=sep == "|"))
+            continue
         if not words:
             continue
         program = os.path.basename(words[0])
-        if program not in SHELL_READERS:
+        text = " ".join(raw)
+        opaque = ("$(" in text or "`" in text or program in OPAQUE_PROGRAMS or program in SHELL_KEYWORDS
+                  or any("$" in w for w in words[1:] + inputs))
+        out.append({"words": [program] + words[1:], "inputs": inputs, "outputs": outputs,
+                    "piped": sep == "|" or (_piped and not out),
+                    "cd": (words[1] if len(words) > 1 else "~") if program == "cd" else None, "opaque": opaque})
+    return out
+
+
+GIT_WRITES = ("checkout", "switch", "merge", "rebase", "reset", "apply", "stash", "cherry-pick", "pull", "restore", "am", "revert",
+              "mv", "rm", "clean")
+FILE_WRITERS = ("mv", "cp", "rm", "touch", "tee", "patch", "truncate", "ln", "rsync", "dd")
+
+
+def check_identity(words):
+    """The verification command a simple command runs, with its arguments (distinct targets are distinct commands), or None.
+    `npm run test` and `npm t` are `npm test`; `python -m pytest` is `pytest`."""
+    if not words:
+        return None
+    program, args = os.path.basename(words[0]), list(words[1:])
+    if program in ("npm", "pnpm", "yarn"):
+        if args[:1] in (["test"], ["t"], ["tst"]):
+            return " ".join(["npm", "test"] + args[1:])
+        if program == "yarn" and args[:1] and args[0] in ("build", "typecheck", "lint"):
+            args = ["run"] + args
+        if args[:2] == ["run", "test"]:
+            return " ".join(["npm", "test"] + args[2:])
+        if args[:1] == ["run"] and len(args) > 1 and re.match(r"^(build|typecheck|type-check|lint|check|test:.*|e2e)$", args[1]):
+            return " ".join(["npm"] + args)
+        return None
+    if program in ("vitest", "jest", "tsc", "pytest", "eslint", "mypy"):
+        return " ".join([program] + args)
+    if re.match(r"^python[0-9.]*$", program) and args[:1] == ["-m"] and len(args) > 1 and args[1] in ("unittest", "pytest"):
+        return " ".join(["pytest" if args[1] == "pytest" else "python -m unittest"] + args[2:])
+    if program in ("go", "cargo") and args[:1] in (["test"], ["build"], ["vet"]):
+        return " ".join([program] + args)
+    if program == "make" and args[:1] and args[0] in ("test", "check", "build"):
+        return " ".join([program] + args)
+    if program == "git" and "diff" in args and "--check" in args:
+        return " ".join([program] + args)
+    return None
+
+
+def _git_sub(args):
+    index = 0
+    while index < len(args) and args[index].startswith("-"):
+        index += 2 if args[index] in ("-C", "-c", "--git-dir", "--work-tree") else 1
+    return args[index] if index < len(args) else None
+
+
+def stage_writes(stage):
+    """Whether a simple command changes the working tree's content. `git add`/`git commit` do not (same tree)."""
+    if any(not _norm(t if t.startswith("/") else "/x/" + t).startswith("/dev/") for t in stage["outputs"]):
+        return True
+    words = stage["words"]
+    program, args = words[0], words[1:]
+    if program in FILE_WRITERS:
+        return True
+    if program == "sed" and any(a == "-i" or a.startswith("--in-place") or re.match(r"^-[a-zA-Z]*i", a) for a in args):
+        return True
+    if program == "perl" and any(re.match(r"^-[a-zA-Z]*i", a) for a in args):
+        return True
+    if program == "git":
+        return _git_sub(args) in GIT_WRITES
+    if program in ("npm", "pnpm", "yarn") and args[:1] and args[0] in ("install", "i", "ci", "add", "uninstall", "remove"):
+        return True
+    return False
+
+
+def command_events(command):
+    """[(kind, text)] in execution order for one Bash call (or one test-run record's cmd list): ("write", stage text) for a
+    stage that changes files, ("check", identity) for a verification runner. A stage that both writes and checks records the
+    write first. Text inside arguments (`grep 'npm run build' README.md`) is never an execution."""
+    out = []
+    for stage in shell_stages(command):
+        if stage["cd"] is not None:
             continue
-        args, redirected = _redirects(words[1:])
-        paths, recursive = _operands(program, args)
-        if not paths and (program in ("rg", "find") or recursive):
+        if stage_writes(stage):
+            out.append(("write", " ".join(stage["words"])))
+        identity = check_identity(stage["words"])
+        if identity:
+            out.append(("check", identity))
+    return out
+
+
+def executions(command):
+    """The executed commands of a Bash call (or a cmd list), one text per stage: the check identity for a verification
+    runner, else the program and its arguments (wrappers, env assignments and redirections removed). `cd` is not one."""
+    return [check_identity(s["words"]) or " ".join(s["words"]) for s in shell_stages(command) if s["cd"] is None]
+
+
+def record_command(record):
+    """The command a tp-test-run:v1 record ran: its `cmd` (a label never hides it), else its label as a command line."""
+    cmd = record.get("cmd")
+    if isinstance(cmd, list) and cmd:
+        return [str(w) for w in cmd]
+    return record.get("label") or ""
+
+
+def shell_read_scan(command, cwd=None, project_dirs=(), private_dirs=()):
+    """(programs, uncounted) for one Bash command line; diagnostic only. programs: one SHELL_READERS entry per simple command
+    that reads a file path operand (or a -f/--file operand, or an input redirect) inside a project dir and outside the
+    private dirs, resolved against the cwd as `cd` stages change it. With no path operand rg and grep -r search the cwd unless
+    their stdin is a pipe (then they read the pipe, not a file), find searches the cwd, the others read stdin. uncounted:
+    reader stages the scorer cannot follow ($(...), backticks, $VAR operands, xargs/eval/loops, a relative path after a cd
+    it cannot resolve)."""
+    if not isinstance(command, str):
+        return [], 0
+    projects = [_norm(d) for d in project_dirs if d]
+    here = _norm(cwd) if cwd else (projects[0] if projects else None)
+    found, uncounted = [], 0
+    for stage in shell_stages(command):
+        words = stage["words"]
+        if stage["cd"] is not None:
+            target = stage["cd"]
+            if target.startswith("/"):
+                here = _norm(target)
+            elif target.startswith("~") or target == "-" or "$" in target or here is None:
+                here = None
+            else:
+                here = _norm(os.path.join(here, target))
+            continue
+        program = words[0]
+        if program not in SHELL_READERS:
+            if stage["opaque"] and any(os.path.basename(w) in SHELL_READERS for w in words):
+                uncounted += 1                     # e.g. `xargs grep x`, `for f in ...; do cat $f`
+            continue
+        if stage["opaque"]:
+            uncounted += 1
+            continue
+        paths, recursive, files = _operands(program, words[1:])
+        if not paths and program == "find":
             paths = ["."]
-        paths = paths + redirected                      # `cmd < file` reads the file; output redirects read nothing
+        elif not paths and (program == "rg" or recursive) and not stage["piped"]:
+            paths = ["."]
+        paths = paths + files + stage["inputs"]
+        hit = False
         for path in paths:
-            if path.startswith("~") or base is None and not path.startswith("/"):
-                continue                                   # home or no known cwd: not a project path
-            full = _norm(path if path.startswith("/") else os.path.join(base, path))
+            if path.startswith("~"):
+                continue                                   # home: not a project path
+            if here is None and not path.startswith("/"):
+                uncounted += 1
+                break
+            full = _norm(path if path.startswith("/") else os.path.join(here, path))
             if any(_under(full, d) for d in private_dirs if d):
                 continue
             if any(_under(full, d) for d in projects):
-                found.append(program)
+                hit = True
                 break
-    return found
+        if hit:
+            found.append(program)
+    return found, uncounted
 
 
-TEST_RE = re.compile(r"\b(npm (?:run )?test|npx vitest|vitest(?: run)?|npm run build|npx tsc|tsc -b|pytest|python3? -m unittest|"
-                     r"go test|cargo test|git diff --check)\b")
-# A shell command that changes the working tree's content. `git commit`/`git add` do not (a commit of a tested tree is the same tree).
-WRITE_RE = re.compile(r"(\bsed -i\b|>>?\s*[\w./~-]|\bgit (?:checkout|switch|merge|rebase|reset|apply|stash|cherry-pick|pull|restore|am)\b|"
-                      r"\bnpm (?:install|ci)\b|\b(?:mv|cp|rm|touch|tee|patch)\b)")
-
-
-def check_commands(command):
-    """The verification commands named in a Bash command line, normalised (`npm run test` == `npm test`)."""
-    if not isinstance(command, str):
-        return []
-    return [re.sub(r"^npm run test$", "npm test", re.sub(r"\s+", " ", m.group(1))) for m in TEST_RE.finditer(command)]
+def shell_readers(command, cwd=None, project_dirs=(), private_dirs=()):
+    """The shell programs in a Bash command line that read project files (shell_read_scan's first part). Diagnostic only."""
+    return shell_read_scan(command, cwd, project_dirs, private_dirs)[0]
 
 
 # ---- runner log -----------------------------------------------------------------------------------------------------------

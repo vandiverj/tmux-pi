@@ -44,7 +44,7 @@ VERSION = 4
 
 
 def stamp(path):
-    """'mtime_ns:size' of a regular file, '-' when it is missing, 'x' when it is something else (it still exists), 'l' when the
+    """'mtime_ns:size' of a regular file, 'd<mtime_ns>' of a directory, '-' when it is missing, 'x' when it is something else (it still exists), 'l' when the
     entry exists but leads nowhere (a dangling link): that is not 'missing', request_file reads it as an unreadable request."""
     try:
         st = os.stat(path)
@@ -54,6 +54,8 @@ def stamp(path):
         except OSError:
             return "-"
         return "l"
+    if stat.S_ISDIR(st.st_mode):  # requests/: a record written (renamed) into it moves its mtime
+        return "d%d" % st.st_mtime_ns
     return "%d:%d" % (st.st_mtime_ns, st.st_size) if stat.S_ISREG(st.st_mode) else "x"
 
 

@@ -16,9 +16,11 @@ export type TaskRow = {
   notice?: RequestNotice
 }
 
-export type RequestRef = { id: string; kind: string; status: string; summary: string; how?: string }
+// opened/resolved: tp-agent's times (lib/hub_records.py row_requests), the order a row's transitions are announced in.
+export type RequestRef = { id: string; kind: string; status: string; summary: string; how?: string; opened?: string; resolved?: string }
 
-export type RequestNotice = { id: string; kind: string; state: 'open' | 'resolved'; summary: string; how?: string }
+// isClosed: an opening announced after its request had already closed (both between two polls), so there is nothing to answer.
+export type RequestNotice = { id: string; kind: string; state: 'open' | 'resolved'; summary: string; how?: string; isClosed?: boolean }
 
 export type TaskSummary = {
   active: number
@@ -40,6 +42,8 @@ export type NotifierState = {
   isIndexed: boolean
   delivered: string[]
   pending: TaskRow[]
+  // Request ids already closed at this notifier's first read: never replayed. Absent until that read (and in older values).
+  history?: string[]
 }
 
 declare module 'claude-code' {

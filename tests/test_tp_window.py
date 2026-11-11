@@ -430,6 +430,23 @@ class EveryLifecycleFileCountsTest(WindowFixture):
         os.unlink(path)
         self.assertEqual(tp_window.stamp(path), absent)
 
+    def test_the_fingerprint_moves_when_a_request_record_opens_or_closes(self):
+        # requests/ is a lifecycle input (an open capability request there makes a working task ask), so a record written
+        # into it, or rewritten when it closes, must change the fingerprint the window re-reads a task on.
+        import hub_records
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        d = Path(tmp.name) / "tasks" / "w1"
+        d.mkdir(parents=True)
+        seen = [tp_window.fingerprint(str(d), "alive")]
+        record, _ = hub_records.open_request(d, "capability", "browser", "tool: browser", "worker", "file")
+        seen.append(tp_window.fingerprint(str(d), "alive"))
+        os.utime(d / "requests", ns=(1, 1))  # same-tick writes cannot hide the close below
+        seen.append(tp_window.fingerprint(str(d), "alive"))
+        hub_records.resolve(d, record["id"], "main", "message", None, "main", "file")
+        seen.append(tp_window.fingerprint(str(d), "alive"))
+        self.assertEqual(len(set(seen)), 4, seen)
+
     def test_a_request_entry_that_exists_but_cannot_be_read_is_unreadable_and_a_missing_one_is_absent(self):
         import request_file
         tmp = tempfile.TemporaryDirectory()

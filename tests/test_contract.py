@@ -725,9 +725,10 @@ class EnforceKeepsTheRecordTests(unittest.TestCase):
         match = re.search(r"- \*\*Lifecycle State:\*\* `([^`]+)`", (self.task / "task.md").read_text())
         return match.group(1) if match else None
 
-    def enforce(self, send_fails=False, pane="", after_escape=None):
+    def enforce(self, send_fails=False, pane="", after_escape=None, reply=None):
         """Enforce a pause with a fake tmux: capture-pane shows `pane`, an Escape fails (send_fails) or runs after_escape
-        (the worker's reaction: a new state.json). Returns the tmux calls."""
+        (the worker's reaction: a new state.json) and writes `reply` as result.md (a turn that finished meanwhile).
+        Returns the tmux calls."""
         from unittest import mock
         self.tool.write_record(self.task, lifecycle_state="working", force=True)
         self.assertEqual(self.recorded_state(), "working")
@@ -742,6 +743,8 @@ class EnforceKeepsTheRecordTests(unittest.TestCase):
                     raise subprocess.CalledProcessError(1, command)
                 if after_escape:
                     (self.task / "state.json").write_text(json.dumps(after_escape))
+                if reply is not None:
+                    (self.task / "result.md").write_text(reply)
             return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
         decision = {"action": ("pause", "stalled"), "status": None, "elapsed": 60, "turns": 3}
         with mock.patch.dict(os.environ, {"TP_STATE_DIR": str(self.state), "TP_PAUSE_CONFIRM_SECONDS": "1"}), \
@@ -802,6 +805,17 @@ class EnforceKeepsTheRecordTests(unittest.TestCase):
         self.assertFalse((self.task / "checkpoints.json").exists())
         self.assertEqual(self.journal(), [])
         self.assertEqual([c for c in calls if c[0] == "send-keys"], [])
+        # Rule 4 (F1): it finishes its turn between the Escape and the confirmation (a statused reply written after the pause
+        # began). The prompt it is back at confirms the Escape, but a pause never overrides a finished turn.
+        (self.task / "state.json").write_text(json.dumps({"state": "working", "turns": 3, "tools": 4}))
+        calls = self.enforce(pane="❯ \n", after_escape={"state": "waiting", "turns": 4, "tools": 4, "updated": "later"},
+                             reply="Done.\nRESULT_STATUS: complete\n")
+        self.assertEqual(self.actions(), ["pause-requested", "pause-unneeded"])
+        self.assertEqual(self.journal(), ["pause.requested", "pause.unneeded"])
+        self.assertIn("RESULT_STATUS", json.loads((self.task / "checkpoints.json").read_text())["events"][-1]["why"])
+        self.assertNotEqual(self.tool.task_lifecycle(self.task, "alive")[0], "paused")
+        self.assertEqual([c[-1] for c in calls if c[0] == "send-keys"], ["Escape"])  # its reply box is not cleared
+        self.assertFalse(self.held())
 
     def test_a_pi_pause_is_confirmed_by_its_reporter_not_by_the_pane(self):
         meta = json.loads((self.task / "meta.json").read_text())

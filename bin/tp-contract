@@ -52,6 +52,7 @@ from contract import (DONE, RUNNING, ContractError, artifact_info, build, dynami
                       escalation_record, extension, is_local, ledger_row, load_research, message, note, pause_tries,
                       read_escalations, select_escalation, state_dir, summary_line, task_lifecycle, upsert, satisfies_dependency,
                       write_escalations)
+from result_status import RESULT_STATUS_RE  # noqa: E402
 from worker_process import end_or_refuse  # noqa: E402
 from task_record import approved_delegated_review, read_json, unresolved_review, write_record  # noqa: E402
 
@@ -277,14 +278,39 @@ def worker_stopped(d, meta, before):
     return True, "prompt shown, state {}".format(now_state or "unknown")
 
 
+def reply_mark(d):
+    """(mtime_ns, size) of result.md, None when there is none: what a finished turn changes."""
+    try:
+        st = (d / "result.md").stat()
+    except OSError:
+        return None
+    return st.st_mtime_ns, st.st_size
+
+
+def finished_turn(d, mark):
+    """Did the worker finish its turn after `mark` (reply_mark taken before the Escape)? Its reply was rewritten since and has
+    a RESULT_STATUS line. An interrupted partial turn writes no statused reply (Claude reports no Stop on an interrupt; pi's
+    aborted reply carries no RESULT_STATUS line), so only a completed turn passes."""
+    now_mark = reply_mark(d)
+    if now_mark is None or now_mark == mark:
+        return False
+    try:
+        return bool(RESULT_STATUS_RE.search((d / "result.md").read_text(errors="replace")))
+    except OSError:
+        return False
+
+
 def pause_worker(d, meta, events, reason, now):
     """Type an Escape and record a pause only when it is confirmed. "pause-requested" is saved before the Escape (so a
     failed send is not retried every few seconds), then "pause" if worker_stopped says so within PAUSE_CONFIRM_SECONDS,
     else "pause-unverified" (the dependency hold stays; the next tick may try again, lib/contract.py pause_may_try).
-    Returns the outcome: skipped (the worker finished meanwhile), confirmed or unverified."""
+    A pause never overrides a finished turn: when the worker's reply shows a completed turn written after the pause began
+    (finished_turn), "pause-unneeded" is recorded instead and the task's lifecycle stays what its result says.
+    Returns the outcome: skipped (the worker finished before the Escape), confirmed, unneeded or unverified."""
     before = read(d / "state.json")
     if before.get("state") not in ("working", "tool"):
         return "skipped"
+    mark = reply_mark(d)
     tries = pause_tries(events) + 1
     events.append({"action": "pause-requested", "reason": reason, "at": now, "tools": before.get("tools") or 0, "try": tries})
     save_events(d, events)
@@ -298,10 +324,14 @@ def pause_worker(d, meta, events, reason, now):
             wait = PAUSE_CONFIRM_SECONDS
         for _ in range(max(1, int(wait / PAUSE_POLL_SECONDS))):
             time.sleep(PAUSE_POLL_SECONDS)
+            # Claude interrupt evidence, accepted for HB4a (review F9; HB4b may replace it with a supported observation):
+            # Claude emits no Stop on an interrupt, so an unchanged tool/working state plus a prompt-looking pane without
+            # "esc to interrupt" counts as stopped (worker_stopped).
             confirmed, why = worker_stopped(d, meta, before)
             if confirmed:
                 break
-        if confirmed:
+        finished = finished_turn(d, mark)
+        if confirmed and not finished:
             # An interrupted worker puts queued messages (our reminders) back in its input box;
             # clear them so the user's next message is not appended to one.
             for _ in range(3):
@@ -309,6 +339,13 @@ def pause_worker(d, meta, events, reason, now):
                 time.sleep(0.1)
     except subprocess.CalledProcessError:
         pass  # confirmed stays as it was: an Escape that was not sent is unverified
+    # Looked at after the attempt whatever came of it (sent or not, confirmed or not): a finished turn is never paused.
+    if finished_turn(d, mark):
+        why = "the worker finished its turn: a reply with a RESULT_STATUS line was written after the pause began"
+        events.append({"action": "pause-unneeded", "reason": reason, "at": now, "why": why, "try": tries})
+        journal(d, "pause.unneeded", source="file", reason=reason, why=why, attempt=tries)
+        save_events(d, events)
+        return "unneeded"
     if confirmed:
         events.append({"action": "pause", "reason": reason, "at": now, "tools": before.get("tools") or 0})
         journal(d, "pause.confirmed", source="pane" if meta.get("worker") != "pi" else "file", reason=reason, why=why)

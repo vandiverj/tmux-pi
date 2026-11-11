@@ -1578,8 +1578,9 @@ test('two distinct requests opened before the main polls are two notices, each b
   await w.clock.advance(5000)
   expect(w.toasts.filter(text => text.includes(REQ_A))).toHaveLength(1)
   expect(w.toasts.filter(text => text.includes(REQ_B))).toHaveLength(1)
-  expect(w.submitted.join('\n')).toContain(`--resolves ${REQ_A}`)
-  expect(w.submitted.join('\n')).toContain(`--resolves ${REQ_B}`)
+  // Rule 6: the suggested command is the one tp-agent message parses (--text, not a bare argument).
+  expect(w.submitted.join('\n')).toContain(`tp-agent message coder-1 --resolves ${REQ_A} --text "..."`)
+  expect(w.submitted.join('\n')).toContain(`tp-agent message coder-1 --resolves ${REQ_B} --text "..."`)
   // One is answered: only its resolution is news.
   w.rows = [{ id: 'coder-1', status: 'needs_input', requests: [req(REQ_A, 'resolved', 'capability', 'message'), req(REQ_B, 'open', 'capability')] }]
   await w.clock.advance(20000)
@@ -1604,7 +1605,7 @@ test('a reload between open and resolve announces the resolution once and never 
   expect(w.submitted).toHaveLength(1)
 })
 
-test('a new session never announces a request that was resolved before it, and counts one the index showed as told', async ($, on) => {
+test('a new session never replays a request resolved before it, and announces each open one even when the index listed it', async ($, on) => {
   const w = world(on, MAIN)
   w.acceptsAppend = true
   w.rows = [
@@ -1613,13 +1614,97 @@ test('a new session never announces a request that was resolved before it, and c
   ]
   await $.session.start(start(true))
   await w.clock.advance(10000)
-  expect(w.submitted).toEqual([])
-  expect(w.toasts).toEqual([])
+  // The index never rendered the request id, so it is not delivered by it (rule 1): the first poll announces it.
+  expect(w.submitted).toHaveLength(1)
+  expect(w.submitted[0]).toContain(`coder-2 has an open capability request ${REQ_B}`)
+  expect(w.submitted[0]).not.toContain(REQ_A)
   w.rows = [w.rows[0], { id: 'coder-2', status: 'working', requests: [req(REQ_B, 'resolved', 'capability', 'message')] }]
   await w.clock.advance(5000)
+  expect(w.submitted).toHaveLength(2)
+  expect(w.submitted[1]).toContain(`coder-2: capability request ${REQ_B} (capability 1) is closed (message)`)
+  expect(w.submitted.join('\n')).not.toContain(REQ_A)
+})
+
+test('startup with several open requests announces each id', async ($, on) => {
+  const w = world(on, MAIN)
+  w.acceptsAppend = true
+  w.rows = [
+    { id: 'coder-1', status: 'needs_input', requests: [req(REQ_A, 'open', 'capability')], open_requests: [REQ_A] },
+    { id: 'coder-2', status: 'paused', requests: [req(REQ_B, 'open', 'input')], open_requests: [REQ_B] },
+  ]
+  await $.session.start(start(true))
+  await w.clock.advance(5000)
+  const told = w.submitted.join('\n')
+  expect(told).toContain(`coder-1 has an open capability request ${REQ_A}`)
+  expect(told).toContain(`coder-2 has an open input request ${REQ_B}`)
+})
+
+test('a request opened and superseded between polls is heard of: both openings, then the supersession, in order', async ($, on) => {
+  const w = world(on, MAIN)
+  w.rows = [{ id: 'coder-1', status: 'working' }]
+  await $.session.start(start(true))
+  w.rows = [{
+    id: 'coder-1',
+    status: 'needs_input',
+    requests: [
+      { ...req(REQ_A, 'superseded', 'capability', 'superseded'), opened: '2026-11-11T00:00:01Z', resolved: '2026-11-11T00:00:02Z' },
+      { ...req(REQ_B, 'open', 'capability'), opened: '2026-11-11T00:00:02Z' },
+    ],
+  }]
+  await w.clock.advance(5000)
   expect(w.submitted).toHaveLength(1)
-  expect(w.submitted[0]).toContain(`coder-2: capability request ${REQ_B}`)
-  expect(w.submitted[0]).not.toContain(REQ_A)
+  const lines = w.submitted[0].split('\n').slice(1)
+  expect(lines).toEqual([
+    `coder-1: capability request ${REQ_A} (capability 0) was opened`,
+    `coder-1 has an open capability request ${REQ_B} (capability 1): answer with tp-agent message coder-1 --resolves ${REQ_B} --text "...", or tp-agent inspect coder-1`,
+    `coder-1: capability request ${REQ_A} (capability 0) is closed (superseded)`,
+  ])
+  await w.clock.advance(20000)
+  expect(w.submitted).toHaveLength(1)
+})
+
+test('a request opened and resolved between polls is heard of with its id', async ($, on) => {
+  const w = world(on, MAIN)
+  w.rows = [{ id: 'coder-1', status: 'working' }]
+  await $.session.start(start(true))
+  w.rows = [{ id: 'coder-1', status: 'working', requests: [req(REQ_A, 'resolved', 'capability', 'message')] }]
+  await w.clock.advance(5000)
+  expect(w.submitted).toHaveLength(1)
+  expect(w.submitted[0]).toContain(`coder-1: capability request ${REQ_A} (capability 0) was opened`)
+  expect(w.submitted[0]).toContain(`coder-1: capability request ${REQ_A} (capability 0) is closed (message)`)
+})
+
+test('an open request on a settled or completed row is announced', async ($, on) => {
+  const w = world(on, MAIN)
+  w.rows = [{ id: 'coder-1', status: 'working' }, { id: 'coder-2', status: 'working' }]
+  await $.session.start(start(true))
+  w.rows = [
+    { id: 'coder-1', status: 'settled', requests: [req(REQ_A, 'open', 'capability')] },
+    { id: 'coder-2', status: 'completed', requests: [req(REQ_B, 'open', 'input')] },
+  ]
+  await w.clock.advance(5000)
+  const told = w.submitted.join('\n')
+  expect(told).toContain(`coder-1 has an open capability request ${REQ_A}`)
+  expect(told).toContain(`coder-2 has an open input request ${REQ_B}`)
+  expect(told).toContain('coder-1 settled: tp-agent collect coder-1') // the row's own notice still comes
+})
+
+test('a held opening whose request closed before the submit is told as opened, then closed', async ($, on) => {
+  const w = world(on, MAIN)
+  w.rows = [{ id: 'coder-1', status: 'working' }]
+  await $.session.start(start(true))
+  w.isRejecting = true
+  w.rows = [{ id: 'coder-1', status: 'needs_input', requests: [req(REQ_A, 'open', 'capability')] }]
+  await w.clock.advance(5000)
+  expect(w.submitted).toHaveLength(1) // tried, refused: nothing delivered
+  w.isRejecting = false
+  w.rows = [{ id: 'coder-1', status: 'working', requests: [req(REQ_A, 'resolved', 'capability', 'message')] }]
+  await w.clock.advance(60000)
+  expect(w.submitted.length).toBeGreaterThan(1)
+  const told = w.submitted[w.submitted.length - 1]
+  expect(told).toContain(`${REQ_A} (capability 0) was opened`)
+  expect(told).toContain(`${REQ_A} (capability 0) is closed (message)`)
+  expect(told).not.toContain('--resolves') // nothing left to answer
 })
 
 test('a task with no request records is announced as before', async ($, on) => {

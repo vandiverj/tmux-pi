@@ -37,12 +37,13 @@ import safe_write  # noqa: E402
 from result_status import RESULT_STATUS_RE  # noqa: E402
 
 EVENT_VERSION = 1
-# The closed list of interfaces.md section 3, plus pause.unverified, which the HB4a brief (rule 4) asks for and the list lacks
-# (proposed for interfaces.md in the HB4a report).
+# The closed list of interfaces.md section 3, plus pause.unverified, which the HB4a brief (rule 4) asks for, and
+# pause.unneeded (HB4a round 2 rule 4: the worker finished its turn before the pause took), which the list lacks
+# (both proposed for interfaces.md in the HB4a report).
 EVENT_KINDS = frozenset({
     "state", "request.opened", "request.resolved", "correction.requested", "correction.cancelled", "correction.delivered",
     "correction.confirmed", "correction.failed", "correction.unverified", "pause.requested", "pause.confirmed",
-    "pause.unverified", "hold.kept", "obligation.changed", "check.started", "check.finished", "queue.reason",
+    "pause.unverified", "pause.unneeded", "hold.kept", "obligation.changed", "check.started", "check.finished", "queue.reason",
     "lease.taken", "lease.released"})
 ACTORS = frozenset({"main", "worker", "reviewer", "hook", "watchdog", "owner", "test"})
 SOURCES = frozenset({"file", "hook", "rpc", "pane", "transcript"})
@@ -262,14 +263,22 @@ def _clip(text, n=160):
     return text if len(text) <= n else text[:n - 1] + "…"
 
 
+def open_requests(task_dir, kinds=None):
+    """The open requests of a task (of `kinds` when given), oldest first: what an "anything outstanding" reader asks."""
+    return [r for r in requests(task_dir) if r.get("status") == "open" and (kinds is None or r.get("kind") in kinds)]
+
+
 def row_requests(task_dir, keep=20):
-    """What `tp-agent list` shows of a task's requests: the newest `keep`, oldest first, as {id, kind, status, summary,
-    opened, resolved?, how?}. None when the task has no request files (its row is then what it was before HB4a)."""
+    """What `tp-agent list` shows of a task's requests, oldest id first, as {id, kind, status, summary, opened, resolved?,
+    how?}: EVERY open request, and the newest `keep` closed ones. Only history is bounded: an open request is never hidden
+    behind closed ones. None when the task has no request files (its row is then what it was before HB4a)."""
     found = requests(task_dir)
     if not found:
         return None
+    closed = [r["id"] for r in found if r.get("status") != "open"]
+    shown = set(closed[-keep:]) if keep > 0 else set()
     out = []
-    for r in found[-keep:]:
+    for r in (r for r in found if r.get("status") == "open" or r["id"] in shown):
         row = {k: r.get(k) for k in ("id", "kind", "status", "summary", "opened")}
         if r.get("status") != "open":
             row["resolved"] = r.get("resolved")

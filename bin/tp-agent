@@ -1670,7 +1670,7 @@ def _main(argv):
         if rel is None or Path(rel).parts != ("tasks", path.name) or not (path / "meta.json").is_file():
             raise ValueError("invalid worker task directory")
         # HB4a: the request record (requests/<req-id>.json, request.opened) is the record; the same request asked again while
-        # it is open is the same id. capability-request.json stays for older readers (mirror_capability).
+        # it is open is the same id. capability-request.json mirrors this one request for older readers (mirror_capability).
         ask = json.dumps([args.kind, args.what, args.reason])
         req, _ = hub_records.open_request(path, "capability", ask, f"{args.kind}: {args.what}", "worker", "file",
                                           detail={"capability": args.kind, "what": args.what, "reason": args.reason})
@@ -1773,14 +1773,16 @@ def _main(argv):
     print(json.dumps(value, indent=2))
 
 
-def mirror_capability(base, path):
-    """capability-request.json for older readers (lifecycle, inspect, the notifier): pending while any capability request
-    of the task is open, answered once none is. The request records under requests/ are the record."""
+def mirror_capability(base, path, request):
+    """capability-request.json for older readers (inspect, tp-list, the notifier's awaiting): it mirrors ONE request, the
+    capability request it names (the one `tp-agent request` asked last), with that request's own id, what and status:
+    "answered" once that request is closed, whatever other request is still open. An aggregate "anything outstanding"
+    reader (lib/contract.py task_lifecycle, bin/tp-review) reads requests/ (hub_records.open_requests), not this file."""
     file = path / "capability-request.json"
     legacy = read_json(file) if file.exists() else {}
-    if not isinstance(legacy, dict) or legacy.get("status") != "pending":
+    if not isinstance(legacy, dict) or legacy.get("id") != request.get("id") or legacy.get("status") != "pending":
         return
-    if any(r.get("kind") == "capability" and r.get("status") == "open" for r in hub_records.requests(path)):
+    if request.get("status") == "open":
         return
     legacy.update({"status": "answered", "answered": now()})
     atomic_json(file, legacy, base)
@@ -1798,7 +1800,7 @@ def resolve_by_message(base, path, request, delivery, confirmed):
                 "why": "the delivery was not confirmed; the request stays open"}
     record, changed = hub_records.resolve(path, request["id"], "main", "message", delivery, "main", "file")
     if record is not None and record.get("kind") == "capability":
-        mirror_capability(base, path)
+        mirror_capability(base, path, record)
     return {"request": request["id"], "resolved": changed, "status": (record or {}).get("status")}
 
 

@@ -6,5 +6,7 @@ module of its own because the status pane needs the list on every refresh and sh
 """
 from request_file import REQUEST_NAMES
 
+# requests/ (lib/hub_records.py, a directory) answers "is any capability request still open": capability-request.json mirrors
+# only the request it names, so it cannot say that alone.
 LIFECYCLE_FILES = ("state.json", "checkpoints.json", "result.md", "completed", "exit", "escalated", "stopped.json",
-                   "collected.json", "pending-capability.json") + REQUEST_NAMES
+                   "collected.json", "pending-capability.json", "requests") + REQUEST_NAMES

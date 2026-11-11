@@ -29,6 +29,7 @@ import re
 import subprocess
 from pathlib import Path
 
+import hub_records
 import request_file
 import safe_write
 from lifecycle_files import LIFECYCLE_FILES
@@ -49,10 +50,11 @@ DEPENDENCY_DONE = tuple(s for s in DONE if s != "paused")
 # A pause is recorded only when it is confirmed (bin/tp-contract cmd_enforce): "pause-requested" is written before the
 # Escape, then "pause" when a check shows the worker stopped, else "pause-unverified". An unverified pause keeps the
 # dependency hold, is not shown as paused, and is tried again at most PAUSE_RETRIES more times, PAUSE_RETRY_SECONDS
-# apart (a contract may set pause_retries); a failed send therefore never loops every few seconds.
+# apart (a contract may set pause_retries); a failed send therefore never loops every few seconds. "pause-unneeded": the
+# worker finished its turn (a statused reply written after the pause began), so no pause was installed and none is held.
 PAUSE_RETRIES = 2
 PAUSE_RETRY_SECONDS = 60
-PAUSE_ATTEMPT_ACTIONS = ("pause", "pause-requested", "pause-unverified", "extend")
+PAUSE_ATTEMPT_ACTIONS = ("pause", "pause-requested", "pause-unverified", "pause-unneeded", "extend")
 RATINGS = {"sources": ("ok", "weak", "missing"), "cleanup": ("none", "minor", "major"),
            "useful": ("yes", "partly", "no")}
 THINKING_RANK = {"off": 0, "minimal": 1, "low": 2, "medium": 3, "high": 4, "xhigh": 5, "max": 6}
@@ -585,7 +587,10 @@ def task_lifecycle(d, pane=None):
         replied_at = None
     life = lifecycle(state, pane, events, reply, completed_at, text("exit") or None, path("escalated").exists(), replied_at,
                      stopped=path("stopped.json").exists(), collected=path("collected.json").exists(),
-                     asking=any(request_file.is_pending(path(name)) for name in REQUEST_FILES),
+                     # a pending request file, or any open capability request in requests/ (the compatibility file
+                     # mirrors only the newest one, so it is not the aggregate)
+                     asking=any(request_file.is_pending(path(name)) for name in REQUEST_FILES)
+                     or bool(path("requests").is_dir() and hub_records.open_requests(d, ("capability",))),
                      capability_pending=path("pending-capability.json").exists())
     return life, state, events, reply
 

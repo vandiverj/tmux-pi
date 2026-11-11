@@ -1135,7 +1135,7 @@ export default function (pi: ExtensionAPI) {
 			if (a.action === "halted") void exclusive(() => decide(a)).catch((error) => post(`${a.id}: ${(error as Error).message}`, { kind: "failed", id: a.id }));
 			else if (a.action === "stop") {
 				post(`${a.id}: ${a.reason}; it was asked to save its report (${a.artifact}) and stop.`, { kind: "budget", id: a.id });
-			} else lastCtx?.ui.notify(`${a.id}: ${a.reason}; ${a.action !== "pause" ? "reminded it" : a.outcome === "unverified" ? "pressed Escape, but it is not confirmed paused (its --after hold stays)" : "paused it"}`, "info");
+			} else lastCtx?.ui.notify(`${a.id}: ${a.reason}; ${a.action !== "pause" ? "reminded it" : a.outcome === "unverified" ? "pressed Escape, but it is not confirmed paused (its --after hold stays)" : a.outcome === "unneeded" ? "pressed Escape, but it had already finished its turn (not paused)" : "paused it"}`, "info");
 		}
 		await pumpQueue();
 	};

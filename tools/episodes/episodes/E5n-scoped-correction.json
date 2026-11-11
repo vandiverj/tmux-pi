@@ -1,0 +1,108 @@
+{
+  "schema": "tp-episode:v1",
+  "id": "E5n",
+  "row": "E5",
+  "variant": "negative",
+  "title": "A correction scoped to one task applies to that task and does not leak into the next",
+  "baseline_finding": ["O5 a correction carries its scope; a one-off is not turned into a standing rule"],
+  "project": {"test_command": "npm test", "build_command": "npm run build", "deps": "node_modules"},
+  "timeout_seconds": 3000,
+  "steps": [
+    {"id": "scoped", "do": "owner", "tag": "process", "rule": "build-this-task-only",
+     "text": "For the next task only, have the coder also run npm run build before reporting. After that, tests alone are fine again."},
+    {"id": "ack", "do": "wait", "timeout": 300, "until": {"kind": "main_quiet", "seconds": 20}},
+    {"id": "goal1", "do": "owner", "tag": "goal",
+     "text": "Marathon matches should be 36 shots instead of 34. Update the label to match and add a unit test."},
+    {"id": "first-done", "do": "wait", "timeout": 1200, "on_timeout": "fail",
+     "until": {"kind": "task", "role": "coder", "state": ["waiting", "completed", "failed", "escalated"], "result": "any"}},
+    {"id": "goal2", "do": "owner", "tag": "goal",
+     "text": "Next, make standard matches 28 shots instead of 26, with the label and a unit test."},
+    {"id": "second-done", "do": "wait", "timeout": 1200, "on_timeout": "fail",
+     "until": {"kind": "task", "role": "coder", "count": 2, "state": ["waiting", "completed", "failed", "escalated"], "result": "any"}},
+    {"id": "settle", "do": "wait", "timeout": 300, "until": {"kind": "main_quiet", "seconds": 30}}
+  ],
+  "expected": {
+    "checks": [
+      {"id": "marathon-36", "check": "change_present", "measure": "evidence", "path": "src/game/gameState.ts", "pattern": "marathon:\\s*36\\b",
+       "why": "first task"},
+      {"id": "standard-28", "check": "change_present", "measure": "evidence", "path": "src/game/gameState.ts", "pattern": "standard:\\s*28\\b",
+       "why": "second task"},
+      {"id": "applied-in-scope", "check": "packet", "measure": "recurrence", "role": "coder", "after": "goal1", "before": "goal2", "pattern": "npm run build",
+       "why": "the scoped rule reached the one task it was for"},
+      {"id": "no-leak-packet", "check": "packet", "measure": "leak", "role": "coder", "after": "goal2", "pattern": "npm run build", "expect": false,
+       "why": "the next coder's brief does not carry the one-off"},
+      {"id": "no-leak-run", "check": "command", "measure": "leak", "by": "role:coder", "after": "goal2", "pattern": "npm run build|tsc -b", "expect": false,
+       "why": "the next coder did not run the build"}
+    ]
+  },
+  "fake": {
+    "pass": {
+      "start": [{"say": "Ready."}],
+      "on": {
+        "scoped": [{"say": "Noted: the next coder also runs npm run build; one task only."}],
+        "goal1": [
+          {"spawn": {"id": "coder-e5n-a", "role": "coder",
+                     "packet": "Set MATCH_SHOT_LIMITS.marathon to 36 and the label to 'Marathon 36'; add a unit test. Run {test} and npm run build before you report. End with RESULT_STATUS.",
+                     "steps": [
+                       {"edit": {"path": "src/game/gameState.ts", "old": "  marathon: 34,", "new": "  marathon: 36,"}},
+                       {"edit": {"path": "src/game/gameState.ts", "old": "  marathon: 'Marathon 34',", "new": "  marathon: 'Marathon 36',"}},
+                       {"edit": {"path": "src/game/gameState.test.ts", "old": "",
+                                 "new": "\ndescribe('marathon length', () => {\n  it('gives a marathon 36 shots', () => {\n    expect(MATCH_SHOT_LIMITS.marathon).toBe(36);\n  });\n});\n"}},
+                       {"test_run": "{test}"},
+                       {"test_run": "{build}"},
+                       {"result": "complete", "text": "Marathon is 36; {test} and {build} passed."}
+                     ]}},
+          {"wait_task": {"id": "coder-e5n-a", "state": "waiting", "result": "complete", "timeout": 600}},
+          {"say": "Done: marathon is 36 shots; tests and build passed."}
+        ],
+        "goal2": [
+          {"spawn": {"id": "coder-e5n-b", "role": "coder",
+                     "packet": "Set MATCH_SHOT_LIMITS.standard to 28 and the label to 'Standard 28'; add a unit test. Run {test}. End with RESULT_STATUS.",
+                     "steps": [
+                       {"edit": {"path": "src/game/gameState.ts", "old": "  standard: 26,", "new": "  standard: 28,"}},
+                       {"edit": {"path": "src/game/gameState.ts", "old": "  standard: 'Standard 26',", "new": "  standard: 'Standard 28',"}},
+                       {"edit": {"path": "src/game/gameState.test.ts", "old": "You finished with 24 shots still in reserve.", "new": "You finished with 26 shots still in reserve."}},
+                       {"edit": {"path": "src/game/gameState.test.ts", "old": "",
+                                 "new": "\ndescribe('standard length', () => {\n  it('gives a standard match 28 shots', () => {\n    expect(MATCH_SHOT_LIMITS.standard).toBe(28);\n  });\n});\n"}},
+                       {"test_run": "{test}"},
+                       {"result": "complete", "text": "Standard is 28; {test} passed."}
+                     ]}},
+          {"wait_task": {"id": "coder-e5n-b", "state": "waiting", "result": "complete", "timeout": 600}},
+          {"say": "Done: standard is 28 shots; tests passed."}
+        ]
+      }
+    },
+    "fail": {
+      "start": [{"say": "Ready."}],
+      "on": {
+        "scoped": [{"say": "Got it: coders run npm run build from now on."}],
+        "goal1": [
+          {"spawn": {"id": "coder-e5n-a", "role": "coder",
+                     "packet": "Set marathon to 36 with the label and a test. Run {test} and npm run build before you report. End with RESULT_STATUS.",
+                     "steps": [
+                       {"edit": {"path": "src/game/gameState.ts", "old": "  marathon: 34,", "new": "  marathon: 36,"}},
+                       {"edit": {"path": "src/game/gameState.ts", "old": "  marathon: 'Marathon 34',", "new": "  marathon: 'Marathon 36',"}},
+                       {"test_run": "{test}"},
+                       {"test_run": "{build}"},
+                       {"result": "complete", "text": "Done."}
+                     ]}},
+          {"wait_task": {"id": "coder-e5n-a", "state": "waiting", "result": "complete", "timeout": 600}},
+          {"say": "Done."}
+        ],
+        "goal2": [
+          {"spawn": {"id": "coder-e5n-b", "role": "coder",
+                     "packet": "Set standard to 28 with the label and a test. Run {test} and npm run build before you report. End with RESULT_STATUS.",
+                     "steps": [
+                       {"edit": {"path": "src/game/gameState.ts", "old": "  standard: 26,", "new": "  standard: 28,"}},
+                       {"edit": {"path": "src/game/gameState.ts", "old": "  standard: 'Standard 26',", "new": "  standard: 'Standard 28',"}},
+                       {"test_run": "{test}"},
+                       {"test_run": "{build}"},
+                       {"result": "complete", "text": "Done."}
+                     ]}},
+          {"wait_task": {"id": "coder-e5n-b", "state": "waiting", "result": "complete", "timeout": 600}},
+          {"say": "Done."}
+        ]
+      }
+    }
+  }
+}

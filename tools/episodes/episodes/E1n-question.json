@@ -1,0 +1,52 @@
+{
+  "schema": "tp-episode:v1",
+  "id": "E1n",
+  "row": "E1",
+  "variant": "negative",
+  "title": "Question only: answer where the standard shot limit is set; change nothing, run no build",
+  "baseline_finding": ["O1 Main answers from records instead of dispatching a full coder loop", "O6 checks run where they cannot matter"],
+  "project": {"test_command": "npm test", "build_command": "npm run build", "deps": "node_modules"},
+  "timeout_seconds": 600,
+  "steps": [
+    {"id": "ask", "do": "owner", "tag": "goal",
+     "text": "Quick question, no changes please: how many shots does a standard match get, and where is that number set?"},
+    {"id": "settle", "do": "wait", "timeout": 420, "until": {"kind": "main_quiet", "seconds": 30}}
+  ],
+  "expected": {
+    "checks": [
+      {"id": "no-change", "check": "no_diff", "measure": "evidence", "why": "the owner asked for no changes"},
+      {"id": "answer", "check": "main_said", "measure": "evidence", "after": "ask", "pattern": "\\b26\\b",
+       "why": "Main gives the number (26)"},
+      {"id": "answer-where", "check": "main_said", "measure": "evidence", "after": "ask", "pattern": "MATCH_SHOT_LIMITS|gameState\\.ts",
+       "why": "Main says where it is set"},
+      {"id": "no-build", "check": "command", "measure": "irrelevant_check", "by": "any", "pattern": "npm run build|tsc -b", "expect": false,
+       "why": "a build proves nothing for a question"},
+      {"id": "no-tests", "check": "command", "measure": "irrelevant_check", "by": "any", "pattern": "npm (run )?test|vitest", "expect": false,
+       "why": "a test run proves nothing for a question"},
+      {"id": "no-coder", "check": "task_count", "measure": "irrelevant_check", "role": "coder", "max": 0,
+       "why": "no coder is needed to answer a lookup"}
+    ]
+  },
+  "fake": {
+    "pass": {
+      "start": [{"say": "Ready."}],
+      "on": {
+        "ask": [
+          {"tool": {"name": "mcp__tmux-pi-safe__safe_grep", "input": {"pattern": "standard:", "path": "src/game/gameState.ts"}}},
+          {"say": "A standard match gets 26 shots. It is set in MATCH_SHOT_LIMITS in src/game/gameState.ts (standard: 26); I changed nothing."}
+        ]
+      }
+    },
+    "fail": {
+      "start": [{"say": "Ready."}],
+      "on": {
+        "ask": [
+          {"bash": "grep -rn standard src/game/gameState.ts"},
+          {"bash": "{test}"},
+          {"bash": "{build}"},
+          {"say": "A standard match gets 26 shots (MATCH_SHOT_LIMITS in src/game/gameState.ts). Tests and build pass."}
+        ]
+      }
+    }
+  }
+}

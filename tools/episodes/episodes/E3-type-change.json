@@ -1,0 +1,79 @@
+{
+  "schema": "tp-episode:v1",
+  "id": "E3",
+  "row": "E3",
+  "variant": "positive",
+  "title": "Check obligation: a new match length changes a type, so build and tests must run on the final tree",
+  "baseline_finding": ["O6 the checks a change needs are decided by what it touches: a type change needs the build as well as the tests"],
+  "project": {"test_command": "npm test", "build_command": "npm run build", "deps": "node_modules"},
+  "timeout_seconds": 1800,
+  "steps": [
+    {"id": "goal", "do": "owner", "tag": "goal",
+     "text": "Add a Sudden Death match length: 12 shots, labelled Sudden Death 12, selectable next to the others. Add a unit test for the shot limit."},
+    {"id": "coder-done", "do": "wait", "timeout": 1500, "on_timeout": "fail",
+     "until": {"kind": "task", "role": "coder", "state": ["waiting", "completed", "failed", "escalated"], "result": "any"}},
+    {"id": "settle", "do": "wait", "timeout": 300, "until": {"kind": "main_quiet", "seconds": 30}}
+  ],
+  "expected": {
+    "checks": [
+      {"id": "type", "check": "change_present", "measure": "evidence", "path": "src/game/types.ts", "pattern": "MatchLength = [^;]*'sudden-death'",
+       "why": "MatchLength includes sudden-death"},
+      {"id": "limit", "check": "change_present", "measure": "evidence", "path": "src/game/gameState.ts", "pattern": "'sudden-death':\\s*12\\b",
+       "why": "12 shots"},
+      {"id": "label", "check": "change_present", "measure": "evidence", "path": "src/game/gameState.ts", "pattern": "'sudden-death':\\s*'Sudden Death 12'",
+       "why": "the label"},
+      {"id": "unit-test", "check": "change_present", "measure": "evidence", "path": "src/game/gameState.test.ts",
+       "pattern": "MATCH_SHOT_LIMITS\\['sudden-death'\\]\\)\\.toBe\\(12\\)", "why": "a unit test"},
+      {"id": "build-final", "check": "command", "measure": "evidence", "by": "any", "pattern": "npm run build|tsc -b", "final_tree": true,
+       "why": "the build ran on the final tree (a type changed)"},
+      {"id": "tests-final", "check": "command", "measure": "evidence", "by": "any", "pattern": "npm (run )?test|vitest", "final_tree": true,
+       "why": "the tests ran on the final tree"}
+    ]
+  },
+  "fake": {
+    "pass": {
+      "start": [{"say": "Ready."}],
+      "on": {
+        "goal": [
+          {"spawn": {"id": "coder-e3", "role": "coder",
+                     "packet": "Add the 'sudden-death' MatchLength (12 shots, label 'Sudden Death 12') and a unit test. It changes a type: run {test} and {build} on the final tree. Search with safe_grep, read with safe_read. End with RESULT_STATUS.",
+                     "steps": [
+                       {"call": "mcp__tmux-pi-safe__safe_grep", "input": {"pattern": "MatchLength", "path": "src"}},
+                       {"edit": {"path": "src/game/types.ts", "old": "export type MatchLength = 'quick' | 'standard' | 'marathon';",
+                                 "new": "export type MatchLength = 'quick' | 'standard' | 'marathon' | 'sudden-death';"}},
+                       {"edit": {"path": "src/game/gameState.ts", "old": "  marathon: 'Marathon 34',\n", "new": "  marathon: 'Marathon 34',\n  'sudden-death': 'Sudden Death 12',\n"}},
+                       {"edit": {"path": "src/game/gameState.ts", "old": "  marathon: 34,\n", "new": "  marathon: 34,\n  'sudden-death': 12,\n"}},
+                       {"edit": {"path": "src/game/gameState.test.ts", "old": "",
+                                 "new": "\ndescribe('sudden death', () => {\n  it('gives a sudden-death match 12 shots', () => {\n    expect(MATCH_SHOT_LIMITS['sudden-death']).toBe(12);\n  });\n});\n"}},
+                       {"test_run": "{test}"},
+                       {"test_run": "{build}"},
+                       {"result": "complete", "text": "Sudden Death 12 added; {test} and {build} passed on the final tree."}
+                     ]}},
+          {"wait_task": {"id": "coder-e3", "state": "waiting", "result": "complete", "timeout": 900}},
+          {"say": "Done: Sudden Death 12 is selectable, with a unit test; tests and build passed on the final tree."}
+        ]
+      }
+    },
+    "fail": {
+      "start": [{"say": "Ready."}],
+      "on": {
+        "goal": [
+          {"spawn": {"id": "coder-e3", "role": "coder",
+                     "packet": "Add a 'sudden-death' match length (12 shots, label 'Sudden Death 12') with a unit test. Run {test}. End with RESULT_STATUS.",
+                     "steps": [
+                       {"edit": {"path": "src/game/types.ts", "old": "export type MatchLength = 'quick' | 'standard' | 'marathon';",
+                                 "new": "export type MatchLength = 'quick' | 'standard' | 'marathon' | 'sudden-death';"}},
+                       {"edit": {"path": "src/game/gameState.ts", "old": "  marathon: 'Marathon 34',\n", "new": "  marathon: 'Marathon 34',\n  'sudden-death': 'Sudden Death 12',\n"}},
+                       {"test_run": "{test}"},
+                       {"edit": {"path": "src/game/gameState.ts", "old": "  marathon: 34,\n", "new": "  marathon: 34,\n  'sudden-death': 12,\n"}},
+                       {"edit": {"path": "src/game/gameState.test.ts", "old": "",
+                                 "new": "\ndescribe('sudden death', () => {\n  it('gives a sudden-death match 12 shots', () => {\n    expect(MATCH_SHOT_LIMITS['sudden-death']).toBe(12);\n  });\n});\n"}},
+                       {"result": "complete", "text": "Done; tests passed."}
+                     ]}},
+          {"wait_task": {"id": "coder-e3", "state": "waiting", "result": "complete", "timeout": 900}},
+          {"say": "Done: Sudden Death 12 added and tests pass."}
+        ]
+      }
+    }
+  }
+}

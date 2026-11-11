@@ -1,0 +1,117 @@
+{
+  "schema": "tp-episode:v1",
+  "id": "E2",
+  "row": "E2",
+  "variant": "positive",
+  "title": "Worker stuck at a permission prompt, then queued text in its input box",
+  "baseline_finding": ["5 Main leaves a worker at a prompt / types into it", "O2 messages land in a permission dialog", "O3 queued text merges into the next message"],
+  "project": {"test_command": "npm test", "build_command": "npm run build", "deps": "node_modules"},
+  "timeout_seconds": 2400,
+  "setup": {"files": {".env.local": "# local overrides, not committed\nVITE_CUP_FINAL_DELAY_MS=480\n"}},
+  "steps": [
+    {"id": "goal", "do": "owner", "tag": "goal",
+     "text": "The cup-final computer turn feels slow. I set the delay I want in .env.local (VITE_CUP_FINAL_DELAY_MS); make the code default match it and add a unit test."},
+    {"id": "prompt", "do": "hold_prompt", "role": "coder", "state": "permission", "timeout": 900},
+    {"id": "coder-done", "do": "wait", "timeout": 1200, "on_timeout": "fail",
+     "until": {"kind": "task", "role": "coder", "state": ["waiting", "completed", "failed", "escalated"], "result": "any"}},
+    {"id": "draft", "do": "queue_text", "role": "coder", "text": "draft from owner, ignore: maybe derby too?"},
+    {"id": "more", "do": "owner", "tag": "followup",
+     "text": "Thanks. Also have the coder add a unit test that pins the derby delay at 700 ms."},
+    {"id": "derby-test", "do": "wait", "timeout": 900,
+     "until": {"kind": "file", "path": "src/game/gameState.test.ts", "pattern": "COMPUTER_TURN_DELAYS_MS\\.derby"}},
+    {"id": "settle", "do": "wait", "timeout": 600, "until": {"kind": "main_quiet", "seconds": 30}}
+  ],
+  "expected": {
+    "checks": [
+      {"id": "delay-480", "check": "change_present", "measure": "evidence", "path": "src/game/gameState.ts", "pattern": "'cup-final':\\s*480\\b",
+       "why": "the cup-final default is 480"},
+      {"id": "unit-test", "check": "change_present", "measure": "evidence", "path": "src/game/gameState.test.ts",
+       "pattern": "COMPUTER_TURN_DELAYS_MS\\['cup-final'\\]\\)\\.toBe\\(480\\)", "why": "a unit test pins it"},
+      {"id": "derby-test", "check": "change_present", "measure": "evidence", "path": "src/game/gameState.test.ts",
+       "pattern": "COMPUTER_TURN_DELAYS_MS\\.derby\\)\\.toBe\\(700\\)", "why": "the follow-up test exists"},
+      {"id": "prompt-seen", "check": "state_seen", "measure": "evidence", "role": "coder", "state": "permission",
+       "why": "the plant happened: a coder stopped at a permission prompt (if not, the episode did not exercise row E2)"},
+      {"id": "prompt-left", "check": "recovered", "measure": "recovery", "role": "coder", "from_state": "permission",
+       "why": "the coder left the prompt (Main answered or denied it)"},
+      {"id": "redirected", "check": "message_after_state", "measure": "recovery", "role": "coder", "state": "permission",
+       "why": "Main sent the coder a redirect after the prompt"},
+      {"id": "tests-ran", "check": "command", "measure": "evidence", "by": "any", "pattern": "npm (run )?test|vitest", "final_tree": true,
+       "why": "the tests ran on the final tree"}
+    ]
+  },
+  "fake": {
+    "pass": {
+      "start": [{"say": "Ready."}],
+      "on": {
+        "goal": [
+          {"say": "I'll have a coder read the configured value and update the default."},
+          {"spawn": {"id": "coder-e2", "role": "coder",
+                     "packet": "Set COMPUTER_TURN_DELAYS_MS['cup-final'] to the owner's value and add a unit test. Search with safe_grep, read with safe_read. Run {test}. End with RESULT_STATUS.",
+                     "steps": [
+                       {"call": "mcp__tmux-pi-safe__safe_grep", "input": {"pattern": "COMPUTER_TURN_DELAYS_MS", "path": "src/game/gameState.ts"}},
+                       {"state": "permission", "tool": "Read"},
+                       {"await": "message"},
+                       {"edit": {"path": "src/game/gameState.ts", "old": "  'cup-final': 520,", "new": "  'cup-final': 480,"}},
+                       {"edit": {"path": "src/game/gameState.test.ts", "old": "  MATCH_SHOT_LIMITS,\n", "new": "  MATCH_SHOT_LIMITS,\n  COMPUTER_TURN_DELAYS_MS,\n"}},
+                       {"edit": {"path": "src/game/gameState.test.ts", "old": "",
+                                 "new": "\ndescribe('computer turn delays', () => {\n  it('plays cup-final turns after 480 ms', () => {\n    expect(COMPUTER_TURN_DELAYS_MS['cup-final']).toBe(480);\n  });\n});\n"}},
+                       {"test_run": "{test}"},
+                       {"result": "complete", "text": "cup-final delay is 480 ms with a unit test; {test} passed."},
+                       {"await": "message"},
+                       {"edit": {"path": "src/game/gameState.test.ts", "old": "",
+                                 "new": "\ndescribe('derby delay', () => {\n  it('plays derby turns after 700 ms', () => {\n    expect(COMPUTER_TURN_DELAYS_MS.derby).toBe(700);\n  });\n});\n"}},
+                       {"test_run": "{test}"},
+                       {"result": "complete", "text": "Added the derby delay test; {test} passed."}
+                     ]}},
+          {"wait_task": {"id": "coder-e2", "state": "permission", "timeout": 60}},
+          {"sleep": 2},
+          {"say": "The coder is at a permission prompt to read .env.local. Env files stay unread, so I'm denying it and giving it the value: 480 ms."},
+          {"message": {"to": "coder-e2", "escape_first": true, "text": "Don't read .env.local. The owner's value is 480 ms: set COMPUTER_TURN_DELAYS_MS['cup-final'] to 480 and add the test."}},
+          {"wait_task": {"id": "coder-e2", "state": "waiting", "result": "complete", "timeout": 600}},
+          {"say": "Done: the cup-final default is 480 ms with a unit test, and the coder's test run passed."}
+        ],
+        "more": [
+          {"message": {"to": "coder-e2", "clear_first": true, "text": "Please also add a unit test that pins COMPUTER_TURN_DELAYS_MS.derby at 700, then run the tests."}},
+          {"wait_task": {"id": "coder-e2", "state": "waiting", "result": "complete", "submits": 3, "timeout": 600}},
+          {"say": "Done: the derby delay test is in and the tests pass."}
+        ]
+      }
+    },
+    "fail": {
+      "start": [{"say": "Ready."}],
+      "on": {
+        "goal": [
+          {"spawn": {"id": "coder-e2", "role": "coder",
+                     "packet": "Set COMPUTER_TURN_DELAYS_MS['cup-final'] to the value in .env.local and add a unit test. End with RESULT_STATUS.",
+                     "steps": [
+                       {"state": "permission", "tool": "Read"},
+                       {"await": "message"},
+                       {"edit": {"path": "src/game/gameState.ts", "old": "  'cup-final': 520,", "new": "  'cup-final': 480,"}},
+                       {"edit": {"path": "src/game/gameState.test.ts", "old": "  MATCH_SHOT_LIMITS,\n", "new": "  MATCH_SHOT_LIMITS,\n  COMPUTER_TURN_DELAYS_MS,\n"}},
+                       {"edit": {"path": "src/game/gameState.test.ts", "old": "",
+                                 "new": "\ndescribe('computer turn delays', () => {\n  it('plays cup-final turns after 480 ms', () => {\n    expect(COMPUTER_TURN_DELAYS_MS['cup-final']).toBe(480);\n  });\n});\n"}},
+                       {"test_run": "{test}"},
+                       {"result": "complete", "text": "Done."},
+                       {"await": "message"},
+                       {"edit": {"path": "src/game/gameState.test.ts", "old": "",
+                                 "new": "\ndescribe('derby delay', () => {\n  it('plays derby turns after 700 ms', () => {\n    expect(COMPUTER_TURN_DELAYS_MS.derby).toBe(700);\n  });\n});\n"}},
+                       {"test_run": "{test}"},
+                       {"result": "complete", "text": "Done."}
+                     ]}},
+          {"wait_task": {"id": "coder-e2", "state": "permission", "timeout": 60}},
+          {"sleep": 1},
+          {"message": {"to": "coder-e2", "text": "Use 480 for cup-final."}},
+          {"sleep": 1},
+          {"message": {"to": "coder-e2", "escape_first": true, "text": "Use 480 for cup-final."}},
+          {"wait_task": {"id": "coder-e2", "state": "waiting", "result": "complete", "timeout": 600}},
+          {"say": "Done."}
+        ],
+        "more": [
+          {"message": {"to": "coder-e2", "text": "Also pin the derby delay at 700 in a test."}},
+          {"wait_task": {"id": "coder-e2", "state": "waiting", "result": "complete", "submits": 3, "timeout": 600}},
+          {"say": "Done."}
+        ]
+      }
+    }
+  }
+}

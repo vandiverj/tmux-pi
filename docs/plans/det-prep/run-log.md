@@ -1053,3 +1053,20 @@ Each lane: checkpoint, Main's evidence, openai-codex review, notes closed, `lane
 - RR1 (review-rounds): Sonnet worker plus Main fix e04cc16. Tasks from before the meta.json `gate` field count as gated by the
   sweep.md that the gated retry wrote into the replaced author. HB8a's earlier findings drop from 49.6k to 13.9k chars (packet
   ~396k).
+- 2026-11-11 afternoon. HB3a merged (54af2a2): full parallel discovery on the merged tree, 5349 tests in 636 s, OK
+  (skipped=78).
+- RR1 round 1 got REQUEST_CHANGES (retry-window-provenance). Both faults were Main's:
+  - F1: e04cc16 inferred the gate from the parent's sweep.md, so a sibling retry could gate an ordinary one.
+  - F2: the brief never said to record the triggering review.
+  Round 2 (Sonnet, brief hub/rr1-round2.md) records `gate_review`; a legacy child is gated by its own dispatch.json.
+  APPROVED_WITH_NOTES. Merged 16b8d4d; discovery 5376 tests in 577 s, OK.
+- HB4a round 5 (last) got REQUEST_CHANGES; both families recurred. Known limits are in hub/hb4/hb4b-known-limits.md.
+  - Closing needs the owner's `--override-review`.
+  - Main + lane with two "keep both" conflict resolutions (tree fa5e9d8): 5401 tests, OK.
+  - Main merged main into the lane between rounds, and the packet hit 1.04M chars. The merge was taken back off the lane. Rule
+    from now on: never merge main into a lane between review rounds.
+  - The worker got around guard refusals of edit commands with scratch scripts (review F5). The work was kept; the owner is to
+    see it.
+- HB8a round 8 got REQUEST_CHANGES; three families recurred at new sites. Under the owner's delegation, Main sent one
+  rule-first last round on Opus (hub/hb8/hb8a-round9.md): one function per record fact. A recurrence merges as is with HB8b
+  known limits. The retry recorded gate_review (RR1 in use).

@@ -15,59 +15,32 @@ is unknown with the reasons (round 4 rule 1). Every measure is {"value": ..., ..
 in `unknown`) and is never counted as 0; "n/a" means the episode does not exercise the measure. Semantic success is always
 needs_human: the scorer lists the evidence a person reads to judge it.
 
-The shell grammar (round 5 rule 1, round 6 rules 2 to 4, round 7; episode_lib.GRAMMAR holds the full text and grammar_call
-applies it):
-  A Bash call is read only if, after comment stripping (and heredoc bodies removed), it is a list of simple commands joined
-  by newline, `;` or `&&`, each with optional env assignments, words and redirects, optionally piped (`|`) into further
-  simple commands. Words split quote-aware with every redirect operator its own token: a redirect to a file (`>`, `>>`,
-  `>|`, `&>`, `2>`, `>& f`, a bare `> f`) is a write at its target, whatever the command (`cd . > a.txt` included),
-  resolved against the cwd where the redirect happens (the stage's cwd before a cd moves it; the outer cwd for a
-  test-run.sh call); `2>&1`, `>&2` and `>/dev/null` are not. A heredoc body is data only when its delimiter is quoted or
-  it holds no `$` or backtick. Each simple command is recognised word by word, never stripped (round 7 rule 1):
-  The wrapper table (round 7 rule 1; episode_lib.WRAPPERS). A stage is read only when every word is matched:
-    [NAME=value …] then any chain of
-      env [-i] [-u X] [NAME=value …] CMD …
-      command CMD …
-      timeout [-s X] [-k X] DURATION CMD …
-      nice [-n X] CMD …
-      time [-p] CMD …
-      npx [--yes] [-y] [--no-install] CMD …
-      tools/agent/test-run.sh WORKTREE [--timeout X] [--label X] -- CMD …
-    then the program and its arguments. A wrapper matches only as NAME, /usr/bin/NAME or /bin/NAME (test-run.sh:
-    tools/agent/test-run.sh with nothing, ./ or …/ before it); test-run.sh inside test-run.sh is not read; DURATION
-    is digits with an optional s, m, h or d. Uncertain (the WHOLE call, and the cwd after it in that shell): any other
-    option of a wrapper (`command -v`, `env -S`, `time -o`, `timeout --signal=K`), a wrapper at another path or with
-    nothing to run, a launcher (exec, builtin, nohup, sudo, stdbuf, cross-env, bunx …: LAUNCHERS), a launcher
-    subcommand (npm exec, pnpm dlx, uv run …), cd/pushd under a wrapper, an assignment-only stage, `$?`, `$(( ))`,
-    eval, source and `.`. A word holding an unresolved expansion or glob ($VAR, ${…}, a substitution, a leading ~,
-    *.ts) is read but has no known value: a check with one has no identity (rule 2). A check's identity is its argv
-    after the wrappers and assignments, as a JSON array, with its cwd.
-  A test-run.sh call under any chain of table wrappers is counted (its missing record is a lost record) and runs CMD in
-  its WORKTREE resolved against the stage's cwd; a writer inside it writes at that WORKTREE (round 7 rule 3). `cd DIR`
-  moves the cwd of the following commands only when it ran with exit 0; a known nonzero exit leaves the cwd where it was;
-  an unknown exit leaves it unknown (round 6 rule 4). Anything else makes the WHOLE call uncertain (episode_lib.GRAMMAR
-  lists it: `||`, `&`, `;;`, a list ending in && or |, compound commands, subshells, groups, sh -c, a shell reading stdin,
-  $( … ) running a runner or a write, an expanding heredoc, xargs/find -exec running one, a variable or glob program word,
-  a brace expansion, a malformed redirect, pushd/popd, unbalanced quotes …). An uncertain call is never read in part: it
-  is one marker that may have run any command and written anything, and the cwd after it in that shell is unknown.
-  Identity (round 7 rule 2): a check is its argv as a JSON array plus its cwd; a word with an unresolved expansion or glob
-  makes it a doubt with no identity, which can neither clear nor repeat another run.
-  One uncertainty gate (round 7 rule 4): every answer over an interval (absence, a count, staleness, a claim's standing,
-  final_tree_verified, message counts and absences) reads its events and messages through Run.gate, which gives the
-  doubts in the interval (uncertain calls, doubtful checks, uncertain writes, possible message calls); an answer that a
-  doubt could change is unknown with the reason. A known answer that no doubt can change (a match that happened, a count
-  already over its limit) stays known.
-  A tp-test-run:v1 record speaks for its own cmd only (rule 3): its exit backs a verification only when its cmd is one
-  simple command inside the grammar (no shell wrapper, not a list); otherwise it is an uncertain execution in its own cwd.
-  Its cmd is literal argv (exec'd with no shell). Every stage, and the write and the check inside one stage (write first),
-  has its own order point. A result exists from its own time: the record's end, else the tool result's time. An
-  Edit/Write is a write only when its result says it succeeded; with no result it is a write that may have happened.
+Records only (round 8, owner decision 2026-11-11). The scorer never reads a Bash command:
+  - The only evidence of a test run is a tp-test-run:v1 record tools/agent/test-run.sh wrote (cmd array, cwd, head, tree
+    fingerprint, exit, timed_out, seconds, log, summary): a worker's TP_STATE_DIR/tasks/<id>/test-runs/<n>.json, and Main's
+    records in the directory run.json names as main_test_runs (the runner gives Main a stated TMPDIR; test-run.sh writes
+    beside its log there). A `record: PATH` line in a tool result points at a record too (it says whose it is, and a named
+    record that is absent is lost); the command text around it is never read. A record's start is its file's mtime minus
+    its seconds; its end is the mtime. A numbered record absent below a later one is lost.
+  - Verification, repeats and staleness come from tree fingerprints. The tree a claim is about is the final tree of the
+    clone (run/final-check.json, lib/gate_record.fingerprint, the function tp_tree_fingerprint mirrors). A claim is
+    verified by a passing record whose tree is the final tree; a repeat is two records with the same cmd array, cwd and
+    tree; a verification is stale when the final tree differs from the tree of the task's last passing record. No write
+    is detected.
+  - Whatever only a Bash command could show is unknown, with the reason `ran outside test-run.sh`, never false or 0: the
+    absence of a matching record when the scope made Bash calls (any Bash call may have run the command), and a failure
+    followed by a Bash call (it may have been rerun). The report shows unknown apart from `not verified` (no record and no
+    Bash call that could stand for one).
+  - Messages come from messages.jsonl, requests from requests/ files and request.* events; never from Bash text. An
+    absent messages.jsonl is no message (known limit: a lost journal cannot be told from none).
+  - Shell reads of project files are not counted (safe_tools is unknown; the native and safe tool counts stay).
 """
 import argparse
 import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 from collections import Counter, defaultdict
@@ -101,12 +74,10 @@ def _unknown(reason, **extra):
 # status is not ok is unknown, with the reasons: the reader records each read in the scopes open at the time (Run.track), so
 # what a value depends on is what its code read, never a hand-kept table.
 OK, MISSING, EMPTY, UNREADABLE, UNDATED = "ok", "missing", "empty", "unreadable", "undated"
-REQUEST_ID = re.compile(r"\breq-[0-9A-Za-z_-]+")     # a request id (HB4 interfaces section 4) named in a notice
-UNKNOWN_PLACE = "?"            # a write or execution whose directory the scorer cannot resolve
-SAME = object()                # write_places: redirects resolve at the program's own cwd
-INF = float("inf")
 NEVER = datetime.max.replace(tzinfo=timezone.utc)
-END = (NEVER, INF)             # the end of the run: after every record
+RECORD_LINE = re.compile(r"(?m)^record: (/\S+\.json)\s*$")     # test-run.sh's pointer to the record it wrote
+OUTSIDE = "ran outside test-run.sh"
+
 
 
 class Rec:
@@ -139,10 +110,6 @@ class Task(dict):
 
     def get(self, key, default=None):
         return self[key] if key in self else default
-
-
-def _point(at, order=INF):
-    return (at, order) if at is not None else None
 
 
 class Run:
@@ -182,6 +149,7 @@ class Run:
         self._requests_written = bool(tasks_dir and tasks_dir.is_dir() and any(p.is_dir() for p in tasks_dir.glob("*/requests")))
         self._request_recs = {}
         self._load_tasks()
+        self._load_main_runs()
         status, events, why = el.read_jsonl_status(self.state_dir / "events.jsonl") if self.state_dir else (MISSING, None, "no state dir")
         if status == MISSING:
             status, why = OK, None             # the event journal is per task (interfaces.md section 3): absent by design
@@ -325,9 +293,8 @@ class Run:
         self._obs_recs = {}
         self._tasks = [self._load_task(p) for p in dirs]
         self._tasks_rec = self.add(Rec("task dirs", MISSING if phantoms else OK, self._tasks, why))
-        calls = self._message_calls()
         for task in self._tasks:
-            self._load_messages(task, calls)
+            self._load_messages(task)
 
     def _load_task(self, task_dir):
         tid = task_dir.name
@@ -367,17 +334,11 @@ class Run:
         values["packet"], sources["packet"] = packet, (self.add(Rec("packet of %s" % tid, status, packet)),)
         runs, bad = [], []
         for p in sorted((task_dir / "test-runs").glob("*.json"), key=lambda p: _num(p.stem)):
-            st, r, why = el.read_json_status(p)
-            if st != OK:
+            r, why = _test_run(p, tid, values["role"])
+            if why:
                 bad.append(why)
-                continue
-            # tp-test-run:v1 has no time field; it is written when the run ends: mtime minus seconds dates the start.
-            r["_end"] = datetime.fromtimestamp(p.stat().st_mtime, timezone.utc)
-            r["_at"] = r["_end"] - timedelta(seconds=float(r.get("seconds") or 0))
-            r["_stage"], r["_identity"], r["_why"] = el.record_shape(r)
-            # A write inside the cmd (an output redirect) comes before its check: the recorded tree is then not the tree it ran on.
-            r["_trees"] = {r["_identity"]: None if el.stage_writes(r["_stage"]) else r.get("tree")} if r["_identity"] else {}
-            runs.append(r)
+            else:
+                runs.append(r)
         values["test_runs"] = runs
         # tools/agent/test-run.sh numbers its records from 1 up: a gap below the highest is a lost record.
         numbers = {_num(p.stem) for p in (task_dir / "test-runs").glob("*.json")}
@@ -409,16 +370,6 @@ class Run:
             st, why = EMPTY, ("the log saw it run" if ran else "it wrote test-run records or a result" if runs or result
                               else "the log never observed %s, so whether it ran is unknown" % tid)
         values["transcript"], sources["transcript"] = entries, (self.add(Rec("transcript of %s" % tid, st, entries, why)),)
-        # Each test-run.sh call in the transcript writes one record: fewer records than calls is a lost record. Calls are
-        # executed stages under the grammar (round 5 rule 7): a comment or a quoted argument is not a call, and a stage
-        # that may not have run (an uncertain call, after a failed &&) is not counted.
-        calls = 0
-        for e in entries or []:
-            if e["kind"] == "tool" and el.normalise_tool(e["name"])[0] == "shell" and isinstance(e.get("input"), dict):
-                stages, ran_codes, _why = el.call_stages(e["input"].get("command") or "", e.get("exit"), e.get("blocked"))
-                calls += sum(1 for s, (ran, _c) in zip(stages, ran_codes) if ran is True and s.get("via") == "test-run.sh")
-        if runs_rec.status == OK and calls > len(runs):
-            runs_rec.status, runs_rec.why = MISSING, "%d test-run.sh call(s) in the transcript, %d record(s)" % (calls, len(runs))
         st, events, why = el.read_jsonl_status(task_dir / "events.jsonl")
         if st == MISSING and not self._events_written:
             st, why = OK, None                 # this build writes no events.jsonl: absent by design
@@ -443,12 +394,11 @@ class Run:
         return Task(self, values, sources)
 
     def _check_request_ids(self, session_events):
-        """Every request id the run says exists is read (round 5 rule 7): the ids are the union of the requests/ files, the
-        `request.*` events (ref) of the task's and the session's journals, and any `req-…` id a notice to Main or a tool
-        result in any transcript names (round 6 rule 5; REQUEST_ID: HB4's `req-<ulid>`, interfaces.md section 4: no
-        producer in lib/ or bin/ writes one in this build). An id
-        with no readable requests/ file is a lost record: that task's requests/ is missing (a notice id no task holds makes
-        every task's requests/ missing: which task lost it is unknown)."""
+        """Every request id the run's records name is read (round 5 rule 7; round 8 rule 4: from records only): the ids are
+        the union of the requests/ files and the `request.*` events (ref) of the task's and the session's journals. An id
+        an event names with no readable requests/ file is a lost record: that task's requests/ is missing (a session event
+        naming no task makes every task's requests/ missing: which task lost it is unknown). Transcript text (a notice, a
+        tool call, a tool result) is never read for ids."""
         if not self.state_dir:
             return
         held = {}
@@ -462,12 +412,6 @@ class Run:
         for e in session_events or []:
             if isinstance(e, dict) and str(e.get("kind", "")).startswith("request.") and e.get("ref"):
                 named[e.get("task")].add(str(e["ref"]))
-        # Round 7 rule 5: every text of every role names ids too: each user turn (a notice), assistant text, tool call
-        # input and tool result in Main's and every worker's transcript, and every record the run holds (packet, result,
-        # messages, events, the session's events, the episode log). Which task holds such an id is not said.
-        for text in self._request_texts(session_events):
-            for ident in REQUEST_ID.findall(text):
-                named[None].add(ident)
         everywhere = set().union(*held.values()) if held else set()
         for tid, ids in named.items():
             lost = sorted(i for i in ids if i not in (everywhere if tid is None or tid not in held else held[tid]))
@@ -478,76 +422,77 @@ class Run:
                 rec = self._request_recs[target]
                 if rec.status == OK:
                     rec.status = MISSING
-                    rec.why = "request id(s) %s named by %s have no readable requests/ file" % (
-                        ", ".join(lost[:3]), "a notice or a tool result" if tid is None else "an event")
+                    rec.why = "request id(s) %s named by an event have no readable requests/ file" % ", ".join(lost[:3])
             if not targets and self._tasks_rec.status == OK:
                 self._tasks_rec.status, self._tasks_rec.why = MISSING, "request id(s) %s named for %s have no task's file" % (
-                    ", ".join(lost[:3]), tid or "a notice to Main")
+                    ", ".join(lost[:3]), tid or "no task")
 
-    def _request_texts(self, session_events):
-        """Every text the run holds that may name a request id (round 7 rule 5), with REQUEST_ID the producer's pattern."""
-        texts = []
-        for entries in [self._main or []] + [dict.get(task, "transcript") or [] for task in self._tasks]:
-            for e in entries:
-                texts += [str(e.get(k)) for k in ("text", "result_text") if e.get(k)]
-                if e.get("input") is not None:
-                    texts.append(json.dumps(e["input"], default=str))
-        for task in self._tasks:
-            texts += [str(dict.get(task, k) or "") for k in ("packet", "result")]
-            texts += [json.dumps(x, default=str) for k in ("events",) for x in dict.get(task, k) or []]
-            result = _read(Path(task["dir"]) / "result.md") if dict.get(task, "dir") else None
-            texts.append(result or "")
-            messages = el.read_jsonl(Path(task["dir"]) / "messages.jsonl") if dict.get(task, "dir") else None
-            texts += [json.dumps(m, default=str) for m in messages or []]
-        texts += [json.dumps(e, default=str) for e in session_events or []]
-        texts += [json.dumps({k: v for k, v in e.items() if not k.startswith("_")}, default=str) for e in self._log or []]
-        return texts
-
-    def _message_calls(self):
-        """{task id: (certain, possible)} `tp-agent message <id>` calls in Main's transcript; None when Main's transcript is
-        not readable (then an absent journal cannot be told from a lost one). Key None: calls that may have messaged any
-        task (round 6 rule 1): an uncertain call (it may have run any command), or a message whose target is not a plain
-        word (`tp-agent message $ID`)."""
-        if self._main is None:
-            return None
-        calls = defaultdict(lambda: [0, 0])
-        for entry in self._main:
-            if entry["kind"] != "tool" or el.normalise_tool(entry["name"])[0] != "shell":
-                continue
-            stages, runs, why = el.call_stages(entry["input"].get("command", ""), entry.get("exit"), entry.get("blocked"))
-            if why:
-                calls[None][1] += 1
-                continue
-            for stage, (ran, _code) in zip(stages, runs):
-                words = stage["words"]
-                if os.path.basename(words[0]) == "tp-agent" and len(words) > 1 and words[1] == "message":
-                    target = words[2] if len(words) > 2 and not el.unresolved(words[2]) else None
-                    calls[target][1] += 1
-                    calls[target][0] += 1 if ran and target else 0
-        return calls
-
-    def _load_messages(self, task, calls):
-        """messages.jsonl: absent is ok only when Main's transcript (readable) shows no message sent to the task; a journal
-        with fewer entries than Main's certain sends has lost some."""
+    def _load_messages(self, task):
+        """messages.jsonl (round 8 rule 4: the journal is the record of the messages sent to the task, never Main's Bash
+        text). Absent is no message: a lost journal cannot be told from none (known limit)."""
         tid = task["id"]
-        path = Path(task["dir"]) / "messages.jsonl"
-        status, lines, why = el.read_jsonl_status(path)
-        certain, possible = (calls or {}).get(tid, (0, 0))
-        anyone = (calls or {}).get(None, (0, 0))[1]
-        possible += anyone
+        status, lines, why = el.read_jsonl_status(Path(task["dir"]) / "messages.jsonl")
         if status == MISSING:
-            if calls is None:
-                why = "Main's transcript, which would show messages sent, is not readable"
-            elif possible > anyone:
-                why = "Main's transcript shows %d `tp-agent message %s` call(s)" % (possible - anyone, tid)
-            elif possible:
-                why = "Main's transcript holds %d call(s) that may have messaged any task (an uncertain call)" % anyone
-            else:
-                status, why = OK, None
-        elif status == OK and calls is not None and len(lines) < certain:
-            status, why = MISSING, "it holds %d message(s); Main's transcript shows %d sent" % (len(lines), certain)
+            status, why = OK, None
         dict.__setitem__(task, "messages", lines or [])
         task._sources["messages"] = (self.add(Rec("messages.jsonl of %s" % tid, status, lines, why)),)
+
+    def _load_main_runs(self):
+        """Main's tp-test-run:v1 records (round 8 rule 5): every test-run-*.json in run.json's main_test_runs (Main's stated
+        TMPDIR/tp-tools: test-run.sh with no TP_TASK_DIR writes its record beside its log there), plus every record a
+        `record: PATH` line in a tool result names. A record named in a worker's transcript is that worker's; one named only
+        in Main's, or in no transcript, is Main's. A named record that is absent is lost (its owner's source is missing)."""
+        listed = self.record.get("main_test_runs")
+        runs, bad = [], []
+        status, why = OK, None
+        files = []
+        if not listed:
+            status, why = MISSING, "run.json names no main_test_runs (the directory Main's test-run.sh records go to)"
+        elif Path(listed).is_dir():
+            files = sorted(Path(listed).glob("test-run-*.json"))
+        # Pointers: the record line test-run.sh prints, in the result of any tool call of any transcript.
+        task_by_id = {t["id"]: t for t in self._tasks}
+        owner_of, named_by = {}, defaultdict(list)
+        for who, entries in [("main", self._main or [])] + [(t["id"], dict.get(t, "transcript") or []) for t in self._tasks]:
+            for e in entries:
+                for path in RECORD_LINE.findall(e.get("result_text") or ""):
+                    real = os.path.realpath(path)
+                    named_by[real].append(who)
+                    if who != "main":
+                        owner_of[real] = who
+        held = {os.path.realpath(r["path"]) for t in self._tasks for r in dict.get(t, "test_runs") or []}
+        seen = set()
+        for path in files + [Path(p) for p in sorted(named_by) if p not in held]:
+            real = os.path.realpath(str(path))
+            if real in seen or real in held:
+                continue
+            seen.add(real)
+            who = owner_of.get(real, "main")
+            task = task_by_id.get(who)
+            if not Path(real).exists():
+                why_lost = "record: %s (named in a tool result of %s) is absent" % (path, who)
+                if task is None:
+                    status, why = MISSING, why or why_lost
+                else:
+                    rec = task._sources["test_runs"][0]
+                    if rec.status == OK:
+                        rec.status, rec.why = MISSING, why_lost
+                continue
+            r, problem = _test_run(Path(real), who, task["role"] if task is not None else None)
+            if problem:
+                if task is None:
+                    bad.append(problem)
+                else:
+                    rec = task._sources["test_runs"][0]
+                    rec.status, rec.why = UNREADABLE, problem
+                continue
+            if task is None:
+                runs.append(r)
+            else:
+                dict.get(task, "test_runs").append(r)
+        if bad:
+            status, why = UNREADABLE, "; ".join(bad)
+        self._main_runs_rec = self.add(Rec("Main test-runs", status, runs, why))
 
     # ---- record manifest (a report; scoring never reads it) ------------------------------------------------------------
     def _manifest(self):
@@ -721,375 +666,79 @@ class Run:
     def owner_turns(self):
         return [e for e in self.log if e.get("kind") == "owner"]
 
-    # ---- where a path is (round 4 rule 4) -------------------------------------------------------------------------------
-    def places(self):
-        """(project roots, deepest first; paths that are never project content)."""
-        def compute():
-            roots = [_norm_dir(self.clone)] if self.clone else []
-            for task in self.tasks:
-                if task.get("workdir"):
-                    roots.append(_norm_dir(task["workdir"]))
-            outside = [_norm_dir(p) for p in (self.state_dir, self.dir / "run", self.record.get("claude_config"), "/dev") if p]
-            return sorted(set(r for r in roots if r), key=len, reverse=True), outside
-        return self.cached("places", compute)
+    # ---- test-run records and Bash calls (round 8) ------------------------------------------------------------------------
+    def test_runs(self, who=None):
+        """Every tp-test-run:v1 record of `who` (task ids and/or "main"; None: everyone), by end time. Each is
+        {who, role, at, end, cmd, cwd, tree, exit, timed_out, text, path}; text is the cmd array joined as a shell would
+        quote it (what a check's pattern matches from its start)."""
+        out = []
+        for task in self.tasks:
+            if who is None or task["id"] in who:
+                out += task["test_runs"]
+        if who is None or "main" in who:
+            out += self.use(self._main_runs_rec) or []
+        return sorted(out, key=lambda r: (r["end"], r["path"]))
 
-    def place(self, path, cwd):
-        """The project root whose tree a path is in; None outside every project (a task dir, /tmp, the run records, a
-        .git dir); UNKNOWN_PLACE when it cannot be resolved ($VAR, or relative with no known cwd)."""
-        if not path or "$" in str(path) or "`" in str(path):
-            return UNKNOWN_PLACE
-        path = os.path.expanduser(str(path))
-        if not path.startswith("/"):
-            if cwd is None:
-                return UNKNOWN_PLACE
-            path = os.path.join(cwd, path)
-        full = el._norm(path)
-        roots, outside = self.places()
-        if any(el._under(full, d) for d in outside):
-            return None
-        for root in roots:
-            if el._under(full, root):
-                return None if el._under(full, os.path.join(root, ".git")) else root
-        return None
-
-    def write_places(self, stage, cwd, redirect_cwd=SAME):
-        """The places one writing stage changes (round 7 rule 3: at the cwd where each write happens): its output
-        redirections, resolved against redirect_cwd (the shell's cwd: the outer cwd of a test-run.sh call; default cwd;
-        None: unknown),
-        and the files the program writes (the last operand of cp/ln/rsync/install, every operand of mv/rm/touch/tee/
-        truncate, sed -i/perl -i files, dd of=), else its own cwd (`npm install`), resolved against cwd (the program's
-        cwd: a test-run.sh call's WORKTREE). A cd's redirect writes and the cd changes nothing else."""
-        here = cwd if redirect_cwd is SAME else redirect_cwd
-        redirects = [t for t in stage["outputs"] if not el._norm(t if t.startswith("/") else "/x/" + t).startswith("/dev/")]
-        out = {UNKNOWN_PLACE if el.unresolved(t) else self.place(t, here) for t in redirects}
-        words = stage["words"]
-        program, args = words[0], words[1:]
-        if program == "cd" or not el.stage_writes(dict(stage, outputs=[])):
-            return out
-        targets = []
-        ops = [a for a in args if not a.startswith("-")]
-        if program in ("cp", "ln", "rsync", "install"):
-            targets += ops[-1:]
-        elif program == "dd":
-            targets += [a[3:] for a in args if a.startswith("of=")]
-        elif program in ("mv", "rm", "touch", "tee", "truncate"):
-            targets += ops
-        elif program == "sed" and any(a == "-i" or a.startswith("--in-place") or re.match(r"^-[a-zA-Z]*i", a) for a in args):
-            targets += [a for a in el._operands("sed", [a for a in args if a != "-i" and not a.startswith("--in-place")])[0]
-                        if a != "''" and a]
-        elif program == "perl":
-            skip = False
-            for a in args:
-                if skip:
-                    skip = False
-                elif a in ("-e", "-E") or re.match(r"^-[a-zA-Z]*e$", a):
-                    skip = True
-                elif not a.startswith("-"):
-                    targets.append(a)
-        elif program == "git" and "-C" in args[:-1]:
-            targets.append(args[args.index("-C") + 1])
-        if not targets:
-            targets = ["."]
-        if stage["opaque"]:
-            return out | {UNKNOWN_PLACE}
-        return out | {self.place(t, cwd) for t in targets}
-
-    # ---- executions and writes ------------------------------------------------------------------------------------------
-    def stream_events(self, main=True, workers=True):
-        """[{at, order, kind: write|exec, who, role, cwd, place, ran, text, identity, tree, exit, timed_out, record}] across
-        Main and every worker, in time order. Each Bash stage is placed in its own cwd (`cd` tracked per stage; a Claude
-        harness keeps a cd inside its start dir for the next call, pi does not); only a stage that ran counts as run (ran
-        None: it may not have; round 4 rule 5). A worker's tp-test-run:v1 record is the execution of the stage it matches
-        (its cmd, cwd, tree and exit); a record no Bash call matches is an execution by itself, its writes included.
-        Writes: Edit/Write tools and writing stages, placed by their target path (round 4 rule 4)."""
-        if main and workers:
-            return self.cached("events", self._stream_events)
-        return self.cached("events:%s" % ("main" if main else "workers"), lambda: self._stream_events(main, workers))
-
-    def _stream_events(self, main=True, workers=True):
-        events = []
-        order = [0]
-
-        def point():
-            # Round 5 rule 2: every stage, and the write and the check inside one stage, gets its own order point.
-            order[0] += 1
-            return order[0]
-
-        def placed(where):
-            return self.place(where, None) if where else UNKNOWN_PLACE
-
-        clone = _norm_dir(self.clone) if self.clone else None
-        streams = [("main", None, self.main or [], clone, "claude", [])] if main else []
-        for t in self.tasks if workers else []:
-            streams.append((t["id"], t["role"], t["transcript"] or [], _norm_dir(t.get("workdir")), t.get("harness") or "claude",
-                            list(t["test_runs"])))
-        for who, role, entries, start, harness, unmatched in streams:
-            cwd, lost = start, None            # lost: why cwd is unknown (None while it is known)
-            for entry in entries:
-                if entry["kind"] != "tool":
-                    continue
-                tool = el.normalise_tool(entry["name"])[0]
-                # Round 5 rule 4: a result exists from its own time: the tool result's, never the call's start.
-                base = {"at": entry["at"], "who": who, "role": role, "identity": None, "tree": None, "record": None,
-                        "exit": None, "timed_out": False, "end": entry.get("result_at"), "why": None,
-                        "cwd_why": lost if cwd is None else None}
-                if tool in ("edit", "write"):
-                    # Round 5 rule 5: a write happened only if the tool says so. An error or blocked result is no write;
-                    # no result is a write that may have happened (the tree after it is unknown).
-                    if "result_at" in entry and entry.get("exit") != 0:
-                        continue
-                    ran = True if "result_at" in entry else None
-                    target = entry["input"].get("file_path") or entry["input"].get("path") or entry["input"].get("notebook_path")
-                    events.append(dict(base, kind="write", order=point(), cwd=cwd, place=self.place(target, cwd), ran=ran,
-                                       text=target, why=None if ran else "the %s call has no result" % entry["name"]))
-                    continue
-                if tool != "shell":
-                    continue
-                command = entry["input"].get("command", "")
-                stages, runs, reason = el.call_stages(command, entry.get("exit"), entry.get("blocked"))
-                if reason:
-                    # Round 7 rule 1: an uncertain call is never read in part. It is one marker that may have run any
-                    # command (a check, a message, a build) and written anything; every answer over an interval that
-                    # holds it is unknown (Run.gate). The cwd after it in that shell is unknown (pi resets it).
-                    why = "an uncertain call (%s)" % reason
-                    events.append(dict(base, kind="write", order=point(), cwd=None, place=UNKNOWN_PLACE, ran=None,
-                                       text=command[:80], why=why, uncertain=True))
-                    cwd = start if harness == "pi" else None
-                    lost = None if cwd is not None else "the cwd after %s" % why
-                    continue
-                here = cwd
-                for stage, (ran, code) in zip(stages, runs):
-                    if stage["cd"] is not None:
-                        # Round 7 rule 3: a cd's redirect (`cd . > a.txt`) is a write at the cwd before the cd moves it.
-                        if el.stage_writes(stage):
-                            at_write = point()
-                            for place in sorted(self.write_places(stage, here), key=str):
-                                events.append(dict(base, kind="write", order=at_write, cwd=here, place=place, ran=ran,
-                                                   text=" ".join(stage["words"]), why=None if ran else "it may not have run"))
-                        # Round 6 rule 4: `cd DIR` changes the cwd of the following commands only when it ran and its exit
-                        # is known to be 0 (the call's own exit for a single command; an && chain the call exited 0 from).
-                        # A known nonzero exit is a failed cd: the cwd stays. An unknown exit leaves the cwd unknown.
-                        if ran is True and code not in (0, None):
-                            continue
-                        here = _resolve_cd(here, stage["cd"]) if ran is True and code == 0 else None
-                        if here is None:
-                            base["cwd_why"] = base["cwd_why"] or ("cd %s may not have run" % stage["cd"] if ran is not True
-                                                                  else "whether cd %s succeeded is unknown (its exit is not"
-                                                                  " known)" % stage["cd"] if code is None
-                                                                  else "cd %s cannot be resolved" % stage["cd"])
-                        continue
-                    # Round 6 rule 3: a test-run.sh call runs CMD in its WORKTREE, resolved against the stage's cwd.
-                    where, where_why = (self.worktree_cwd(here, stage["wt"]) if stage.get("via") == "test-run.sh"
-                                        else (here, None))
-                    if el.stage_writes(stage):
-                        # Round 7 rule 3: a redirect writes at the shell's cwd; a writer inside test-run.sh WT writes at WT.
-                        at_write = point()
-                        inner = where if stage.get("via") == "test-run.sh" else here
-                        for place in sorted(self.write_places(stage, inner, here), key=str):
-                            events.append(dict(base, kind="write", order=at_write, cwd=here, place=place, ran=ran,
-                                               text=" ".join(stage["words"]),
-                                               why=None if ran else "it may not have run"))
-                    # Round 7 rule 2: a check's identity is its argv (JSON) plus its cwd; an unresolved word makes it a
-                    # doubt with no identity, which neither clears nor repeats another run.
-                    identity, doubt = el.stage_check(stage)
-                    if not identity and not stage["opaque"]:
-                        identity = _recorded_identity(stage, unmatched)
-                    record = None
-                    for r in unmatched if identity else []:
-                        # A record in another cwd is another check (round 6 rule 3): it never stands for this stage.
-                        if where is not None and _norm_dir(r.get("cwd")) not in (None, where):
-                            continue
-                        if r["_identity"] == identity and entry["at"] and abs((r["_at"] - entry["at"]).total_seconds()) <= 5:
-                            record = r
-                            unmatched.remove(r)
-                            break
-                    if record is not None:
-                        # Round 5 rule 3: the record speaks for its own cmd (one runner command): its cwd, tree and exit.
-                        where = _norm_dir(record.get("cwd")) or where
-                        events.append(dict(base, kind="exec", order=point(), cwd=where, place=placed(where), ran=True,
-                                           text=el.show_identity(identity), identity=identity, argv=stage["words"],
-                                           doubt=None, tree=record["_trees"][identity], record=record,
-                                           exit=record.get("exit"), timed_out=bool(record.get("timed_out")),
-                                           end=record["_end"]))
-                    else:
-                        events.append(dict(base, kind="exec", order=point(), cwd=where, place=placed(where), ran=ran,
-                                           text=el.show_identity(identity) if identity else " ".join(stage["words"]),
-                                           identity=identity, argv=stage["words"], doubt=doubt, exit=code,
-                                           why=doubt or (None if ran else "it may not have run"),
-                                           cwd_why=where_why or base["cwd_why"] if where is None else None))
-                if harness == "pi":
-                    cwd = start
-                elif here and start and el._under(here, start):
-                    cwd = here
-                elif here != cwd and harness != "claude":
-                    cwd = None                     # harness unknown: whether the cd persists is unknown
-                elif here is None and any(s["cd"] is not None for s in stages):
-                    cwd = None                     # a cd the scorer cannot resolve (or that may not have run)
-                else:
-                    cwd = start
-                lost = None if cwd is not None else (base["cwd_why"] or "whether a cd persists is unknown")
-            for r in unmatched:
-                # A record no Bash call matches is an execution by itself, at its own time and in its own cwd.
-                where = _norm_dir(r.get("cwd")) or start
-                base = {"at": r["_at"], "who": who, "role": role, "record": r, "cwd": where, "end": r["_end"],
-                        "timed_out": bool(r.get("timed_out"))}
-                if r["_why"] is None:
-                    stage, identity = r["_stage"], r["_identity"]
-                    if el.stage_writes(stage):
-                        at_write = point()
-                        for place in sorted(self.write_places(stage, where), key=str):
-                            events.append(dict(base, kind="write", order=at_write, place=place, ran=True,
-                                               text=" ".join(stage["words"]), identity=None, tree=None, exit=None, why=None))
-                    events.append(dict(base, kind="exec", order=point(), place=placed(where), ran=True,
-                                       text=el.show_identity(identity), identity=identity, argv=stage["words"], doubt=None,
-                                       tree=r["_trees"][identity], exit=r.get("exit"), why=None))
-                    continue
-                # A shell or a compound list: one uncertain execution (round 7 rule 1: never read in part). Its exit is
-                # the shell's; it may have run any check and written anything (the marker).
-                cmd = el.record_command(r)
-                text = " ".join(str(w) for w in cmd) if isinstance(cmd, list) else str(cmd)
-                events.append(dict(base, kind="exec", order=point(), place=placed(where), ran=None, text=text[:80],
-                                   identity=None, argv=None, doubt=r["_why"], tree=None, exit=None, why=r["_why"]))
-                events.append(dict(base, kind="write", order=point(), place=UNKNOWN_PLACE, ran=None, text=text[:80],
-                                   identity=None, tree=None, exit=None, why=r["_why"], uncertain=True))
-        events.sort(key=lambda e: (e["at"] or NEVER, e["order"]))
-        return events
-
-    def gate(self, about=("calls",), within=None, scope=None, place=None, tasks=None, main=True, workers=True):
-        """(events, messages, doubts): the one reader of the event list and the message journals for every answer over an
-        interval (round 7 rule 4). No measure reads stream_events or a journal by itself (a static test checks).
-        within: (start, end) points (start exclusive, end inclusive; None open) or a callable(at) on an event's time; an
-        undated event is in every interval. scope: callable(event) → bool. events: the stream events in the interval and
-        scope. messages: [(task id, message)] of `tasks` (ids). doubts: [{event, point, note}], every event in the interval
-        that could change an answer over it, by `about`:
-          "calls": an uncertain call (it may have run any command) and a check that is a doubt (a word unresolved);
-          "writes": a write to `place` (or to an unknown place) that is undated, or in the interval and may not have run
-                    or has an unknown place;
-          "messages": Main's uncertain call, and Main's `tp-agent message` call to one of `tasks` (or to a target that
-                    is not a plain word) that may not have run or whose target is unresolved.
-        An answer a doubt could change is unknown with the doubt's note; one no doubt can change stays known."""
-        if within is None:
-            inside = lambda e: True                                       # noqa: E731
-        elif callable(within):
-            inside = lambda e: e["at"] is None or within(e["at"])        # noqa: E731
-        else:
-            start, end = within
-            inside = lambda e: e["at"] is None or ((start is None or start < (e["at"], e["order"]))   # noqa: E731
-                                                   and (end is None or (e["at"], e["order"]) <= end))
-        events = [e for e in self.stream_events(main, workers) if inside(e) and (scope is None or scope(e))]
-        doubts = []
-
-        def doubt(e, note):
-            doubts.append({"event": e, "point": _point(e["at"], e["order"]), "note": note,
-                           "whole_call": bool(e.get("uncertain"))})     # whole_call: an uncertain call, not a doubtful check
-
-        for e in events:
-            if "calls" in about:
-                if e.get("uncertain"):
-                    doubt(e, _blind_note(e))
-                elif e["kind"] == "exec" and e.get("doubt"):
-                    doubt(e, "%s by %s: %s" % (e["text"][:60], e["who"], e["doubt"]))
-            if "writes" in about and e["kind"] == "write" and e["place"] is not None and (
-                    place == UNKNOWN_PLACE or e["place"] in (place, UNKNOWN_PLACE)):
-                if e["at"] is None or e["ran"] is not True or e["place"] == UNKNOWN_PLACE:
-                    doubt(e, "%s by %s (%s)" % ((e.get("text") or "a write")[:60], e["who"], e.get("why") or (
-                        "undated" if e["at"] is None else "its place is unknown" if e["place"] == UNKNOWN_PLACE
-                        else "it may not have run")))
-            if "messages" in about and e["who"] == "main":
-                if e.get("uncertain"):
-                    doubt(e, "%s (may have sent a message)" % _blind_note(e))
-                elif e["kind"] == "exec" and e.get("argv") and os.path.basename(e["argv"][0]) == "tp-agent" \
-                        and e["argv"][1:2] == ["message"]:
-                    target = e["argv"][2] if len(e["argv"]) > 2 else None
-                    unknown = target is None or el.unresolved(target)
-                    if (unknown or tasks is None or target in tasks) and (unknown or e["ran"] is not True):
-                        doubt(e, "%s by main at %s %s" % (" ".join(map(str, e["argv"]))[:60], _iso(e["at"]) if e["at"]
-                                                          else "an unknown time", "names no plain task" if unknown
-                                                          else "may not have run"))
-        messages = []
-        for task in self.tasks if tasks is not None else []:
-            if task["id"] in tasks:
-                messages += [(task["id"], m) for m in task["messages"]]
-        return events, messages, doubts
-
-    def worktree_cwd(self, here, worktree):
-        """(cwd, why) of a test-run.sh call (round 6 rule 3): CMD runs in `tp_worktree WORKTREE`
-        (tools/agent/_common.sh), the git top level of WORKTREE resolved against the stage's cwd. That is the resolved
-        WORKTREE when it is a checkout root the run knows (the clone, a task's work dir); a directory below one may sit in
-        another repository, so its top level, and the cwd, is unknown."""
-        if not worktree:
-            return None, "test-run.sh with no WORKTREE"
-        resolved = _resolve_cd(here, worktree)
-        if resolved is None:
-            return None, "test-run.sh's WORKTREE %s cannot be resolved" % worktree
-        if resolved in self.places()[0]:
-            return resolved, None
-        return None, ("test-run.sh runs in the git top level of %s (tp_worktree), which the scorer cannot tell" % worktree)
-
-    def same_tree(self, place, start, end):
-        """Whether `place`'s tree at point `end` is the tree at point `start` (points are (at, order)), from the write
-        history (round 4 rules 2 to 4): True when no write could have changed it in between, every candidate write dated;
-        False when a write that ran falls in between (written: not proof of a different tree, never proof of the same);
-        None when that is not known (an undated or unplaceable write, one that may not have run, or a place outside every
-        project, whose writes are not followed)."""
-        if start is None or end is None or place is None:
-            return None
-        events, _messages, doubts = self.gate(("writes",), within=(start, end), place=place)
-        for w in events:
-            if w["kind"] == "write" and w["at"] is not None and w["ran"] is True and w["place"] == place != UNKNOWN_PLACE:
-                return False                                                     # two unknown places may differ
-        return None if doubts else True
-
-    def tree_doubt(self, place, start, end):
-        """Why same_tree(place, start, end) is unknown: the first write in between that is undated, unplaceable or may not
-        have run (with its own reason, e.g. an uncertain call), as text; "" when none is found."""
-        if start is None or end is None:
-            return "a point has no time"
-        if place is None:
-            return "it ran outside every known project, whose writes are not followed"
-        doubts = self.gate(("writes",), within=(start, end), place=place)[2]
-        return doubts[0]["note"] if doubts else ""
-
-    def tree_at(self, place, point):
-        """The tree of `place` at `point` when a record fixes it: the latest recorded tree there with no write after it."""
-        if place is None or place == UNKNOWN_PLACE:
-            return None
-        recorded = [e for e in self.gate((), within=(None, point))[0] if e["kind"] == "exec" and e["tree"]
-                    and e["place"] == place and e["at"]]
-        if not recorded:
-            return None
-        last = recorded[-1]
-        return last["tree"] if self.same_tree(place, (last["at"], last["order"]), point) is True else None
+    def shell_calls(self, who=None, within=None):
+        """The Bash calls of `who` (task ids and/or "main"; None: everyone) whose time `within(at)` accepts (an undated
+        call is in every interval). Never read: only their presence matters (round 8 rule 3). Any one of them may have
+        run any command outside test-run.sh, so an answer it could change is unknown with that reason."""
+        streams = []
+        if who is None or "main" in who:
+            streams.append(("main", self.main or []))
+        for task in self.tasks:
+            if who is None or task["id"] in who:
+                streams.append((task["id"], task["transcript"] or []))
+        out = []
+        for owner, entries in streams:
+            for e in entries:
+                if e["kind"] == "tool" and el.normalise_tool(e["name"])[0] == "shell" and (
+                        within is None or e["at"] is None or within(e["at"])):
+                    out.append(dict(e, who=owner))
+        return out
 
 
-def _resolve_cd(here, target):
-    if "$" in target or "`" in target or target == "-":
-        return None
-    target = os.path.expanduser(target)
-    if target.startswith("/"):
-        return el._norm(target)
-    return el._norm(os.path.join(here, target)) if here else None
+def _test_run(path, who, role):
+    """(record, problem) for one tp-test-run:v1 file: problem names what makes it unreadable (not the schema, no cmd
+    array, no cwd or tree, no exit), else None. tp-test-run:v1 has no time field; it is written when the run ends: its
+    mtime is the end, and mtime minus seconds the start."""
+    status, raw, why = el.read_json_status(path)
+    if status != OK:
+        return None, why
+    cmd = raw.get("cmd")
+    if raw.get("schema") != "tp-test-run:v1":
+        return None, "%s is not a tp-test-run:v1 record" % path
+    if not isinstance(cmd, list) or not cmd or not all(isinstance(w, str) for w in cmd):
+        return None, "%s has no cmd array" % path
+    if not raw.get("cwd") or not raw.get("tree"):
+        return None, "%s has no cwd or tree" % path
+    if not isinstance(raw.get("exit"), int) and raw.get("timed_out") is not True:
+        return None, "%s has no exit" % path
+    try:
+        end = datetime.fromtimestamp(Path(path).stat().st_mtime, timezone.utc)
+        seconds = float(raw.get("seconds") or 0)
+    except (OSError, TypeError, ValueError) as error:
+        return None, "%s: %s" % (path, error)
+    return {"who": who, "role": role, "at": end - timedelta(seconds=seconds), "end": end, "cmd": list(cmd),
+            "cwd": _norm_dir(raw["cwd"]), "tree": raw["tree"], "exit": raw.get("exit"),
+            "timed_out": raw.get("timed_out") is True, "text": shlex.join(cmd), "path": str(path),
+            "label": raw.get("label")}, None
 
 
-def _recorded_identity(stage, records):
-    """A stage that is not on the check list is still a check when a tp-test-run:v1 record ran exactly it: the agent ran it
-    through the test runner (the episode's own test command, say `sh run-tests.sh`). Its argv (JSON) is its identity
-    (round 7 rule 2); a stage with an unresolved word has none."""
-    if stage.get("opaque"):
-        return None
-    argv = el._argv(stage["words"])
-    return argv if any(argv in r["_trees"] for r in records) else None
-
-
-
-
-def _in_scope(event, by, role=None):
+def _scope(run, by, role=None):
+    """The actors a check's `by` (main, any, role:NAME) and `role` select: task ids, plus "main" for main and for any
+    with no role."""
     if by == "main":
-        return event["who"] == "main"
-    if event["who"] == "main":
-        return by == "any" and not role
+        return ["main"]
     want = role or (by.split(":", 1)[1] if by.startswith("role:") else None)
-    return not want or event["role"] == want
+    ids = [t["id"] for t in run.tasks if not want or t["role"] == want]
+    return ids + (["main"] if by == "any" and not want else [])
+
+
+def _outside(calls, what="it"):
+    """The reason an answer is unknown because Bash calls (never read) may have run `what` outside test-run.sh."""
+    who = sorted({c["who"] for c in calls})
+    return "unknown: %s: %d Bash call(s) by %s could have run %s" % (OUTSIDE, len(calls), ", ".join(who), what)
 
 
 def plant_status(run):
@@ -1157,13 +806,6 @@ def tracked_check(run, check):
     return ok, detail, []
 
 
-def _blind_note(e):
-    """The reason an uncertain call (or a check with an unresolved word) leaves an answer over its interval unknown."""
-    return "%s by %s at %s may have run any command (%s)" % (
-        (e.get("text") or "a call")[:60], e["who"], _iso(e["at"]) if e["at"] else "an unknown time",
-        e.get("doubt") or e.get("why") or "")
-
-
 def _decide(hits, unsure, expect, detail):
     """Round 4 rule 2: a dated match decides that something happened; its absence is known only when no candidate could
     be in the window (no undated or uncertain one)."""
@@ -1193,10 +835,9 @@ def _evaluate_check(run, check):
         return at is not None and (after is None or at >= after) and (before is None or at <= before)
 
     def sent_to(task_ids, within):
-        # Round 7 rule 4: a task's journal and the possible message calls to it in the interval, through the gate.
+        # Round 8 rule 4: the messages sent to a task are its journal (messages.jsonl), never Main's Bash text.
         ids = [task_ids] if isinstance(task_ids, str) else list(task_ids)
-        _events, journal, doubts = run.gate(("messages",), within=within, tasks=ids, workers=False)
-        return [m for _tid, m in journal], [d["note"] for d in doubts]
+        return [m for t in run.tasks if t["id"] in ids for m in t["messages"]], []
 
     def created_in(task):
         # Task times come from the runner's own observations (same clock as the steps): no slack.
@@ -1237,41 +878,35 @@ def _evaluate_check(run, check):
         found = (len(hits) == len(tasks)) if mode else bool(hits)
         return found == expect, "pattern in packets of %s / %d %s task(s)" % (hits or "none", len(tasks), check.get("role", ""))
     if kind == "command":
-        # Executions only: the pattern must match an executed command from its start (`npm run build` matches
-        # `npm run build`, never `grep 'npm run build' README.md`), in a stage that ran (round 4 rule 5).
-        by = check.get("by", "any")
+        # Round 8 rule 1: a command ran only when a tp-test-run:v1 record shows it: the pattern matches the record's cmd
+        # (joined as a shell would quote it) from its start, and the record is by an actor in scope. Bash is never read:
+        # with no matching record, any Bash call in scope may have run it outside test-run.sh (unknown, rule 3).
+        who = _scope(run, check.get("by", "any"), check.get("role"))
         pattern = re.compile(check["pattern"])
-        # Only the streams the check can match are read; the final-tree question reads every writer.
-        # Round 7 rule 4: through the gate. An uncertain call may have run any command, matching or not; a check with an
-        # unresolved word may be the command (no candidate needs to match).
-        final_tree = bool(check.get("final_tree"))
-        events, _messages, doubts = run.gate(
-            ("calls",), within=None if final_tree else strict, scope=lambda e: _in_scope(e, by, check.get("role")),
-            main=by in ("main", "any") or final_tree, workers=by != "main" or final_tree)
-        execs = [e for e in events if e["kind"] == "exec" and pattern.match(e["text"])]
-        blind = [d["event"] for d in doubts if not (d["event"]["kind"] == "exec" and pattern.match(d["event"]["text"]))]
-        if final_tree:
+        runs = [r for r in run.test_runs(who) if pattern.match(r["text"])]
+        if check.get("final_tree"):
             final = run.final_tree()
             if not final:
                 return None, "no final tree"
-            hits, unsure = [], []
-            for e in execs:
-                # No record of the tree it ran on: it is the final tree only when no write to the clone followed it.
-                on_final = on_final_tree(run, e, final)
-                if on_final:
-                    hits.append(e)
-                elif on_final is None:
-                    unsure.append("%r (by %s) %s" % (e["text"][:60], e["who"], "may not have run on the final tree"))
-            unsure += [_blind_note(e) for e in blind]
-            return _decide(hits, unsure, expect, "%d run(s) on the final tree %s%s" % (
-                len(hits), final[:12], ": %s by %s" % (hits[0]["text"][:60], hits[0]["who"]) if hits else ""))
-        hits = [e for e in execs if strict(e["at"]) and e["ran"] is True]
-        unsure = ["%r (by %s) %s" % (e["text"][:60], e["who"], "has no time" if e["at"] is None else
-                                     "may not have run: %s" % (e.get("why") or "a stage that may not have run"))
-                  for e in execs if e["at"] is None or (strict(e["at"]) and e["ran"] is not True)]
-        unsure += [_blind_note(e) for e in blind]
-        return _decide(hits, unsure, expect, "%d matching command(s)%s" % (len(hits), ": " + "; ".join(
-            "%s by %s" % (e["text"][:60], e["who"]) for e in hits[:4]) if hits else ""))
+            # Rule 2: on the final tree means the record's tree is the final tree's fingerprint; a timed-out run did not run
+            # the command to its end.
+            hits = [r for r in runs if r["tree"] == final and not r["timed_out"]]
+            others = [r for r in runs if r not in hits]
+            detail = "%d test-run record(s) on the final tree %s%s%s" % (
+                len(hits), final[:12], ": %s by %s" % (hits[0]["text"][:60], hits[0]["who"]) if hits else "",
+                "; %d matching record(s) on another tree or timed out" % len(others) if others else "")
+            within = None
+        else:
+            hits = [r for r in runs if strict(r["at"])]
+            detail = "%d matching test-run record(s)%s" % (len(hits), ": " + "; ".join(
+                "%s by %s" % (r["text"][:60], r["who"]) for r in hits[:4]) if hits else "")
+            within = strict
+        if hits:
+            return expect, detail
+        calls = run.shell_calls(who, within)
+        if calls:
+            return None, "%s; %s" % (detail, _outside(calls))
+        return not expect, detail + "; no Bash call in scope that could have run it"
     if kind == "main_said":
         main = run.main
         if main is None:
@@ -1712,10 +1347,10 @@ def measure_false_claims(run):
         written = task["result_written"]
         if written is not None and when <= written < when + STAMP:
             when = written                          # the second is narrowed to the write itself
-            early = late = check_standing(run, [task["id"]], (when, INF))
+            early = late = check_standing(run, [task["id"]], when)
         else:
-            early = check_standing(run, [task["id"]], (when, INF))
-            late = check_standing(run, [task["id"]], (when + STAMP - timedelta(microseconds=1), INF))
+            early = check_standing(run, [task["id"]], when)
+            late = check_standing(run, [task["id"]], when + STAMP - timedelta(microseconds=1))
         failing, passing, unsure = early
         if (early[0], early[1]) != (late[0], late[1]):
             failing, unsure = [], unsure + ["a check ended within the second the result was stamped"]
@@ -1748,72 +1383,35 @@ def measure_false_claims(run):
 
 
 def check_standing(run, who, claim):
-    """(failing, passing, unsure) for a claim at point `claim` by the checks of `who` (task ids, or "main") that ended by
-    then. Check results are keyed by (cwd, command): per key the latest result on the claim's tree decides (round 4
-    rule 3): a recorded tree equal to the tree at the claim, or no write to that place between check and claim. A result
-    on another tree is skipped (a pass on t2 never clears a failure on t1 for a claim on t1); one that cannot be placed,
-    that may not have run, or has no exit, leaves the key unsure."""
-    by_key = defaultdict(list)
-    # Round 7 rule 4: through the gate. An uncertain call or a check with an unresolved word before the claim may have
-    # run a check that failed (or passed after a failure): the standing is unknown, whichever checks are known.
-    # A check with an unresolved word never clears a failure (round 7 rule 2: it neither clears nor repeats), so a known
-    # failure stays known after it; it still leaves a missing pass unknown (it may have been the check).
-    events, _messages, doubts = run.gate(("calls",), within=(None, claim), scope=lambda e: e["who"] in who)
-    blind = [(d["point"], d["note"], d["whole_call"]) for d in doubts]
-    for e in events:
-        if e["kind"] != "exec" or not e["identity"]:
+    """(failing, passing, unsure) for a claim at time `claim` by the test-run records of `who` (task ids, or "main") that
+    ended by then (round 8 rule 2). The claim is about the final tree: only records whose tree is the final tree's
+    fingerprint speak for it (a record on another tree neither backs nor fails it). Records are keyed by (cmd array,
+    cwd); per key the latest one decides. A failure is known only when no Bash call of `who` follows it before the claim:
+    one may have rerun the check outside test-run.sh (rule 3). With no record by then there is nothing to place on a tree
+    and the final tree is not read."""
+    by_then = [r for r in run.test_runs(who) if r["end"] <= claim]
+    if not by_then:
+        return [], [], []
+    final = run.final_tree()
+    if not final:
+        return [], [], ["no final tree: the tree the claim is about is unknown"]
+    keyed = defaultdict(list)
+    for r in by_then:
+        if r["tree"] == final:
+            keyed[(tuple(r["cmd"]), r["cwd"])].append(r)
+    failing, passing, unsure = [], [], []
+    for _key, rows in sorted(keyed.items(), key=lambda kv: str(kv[0])):
+        last = max(rows, key=lambda r: r["end"])
+        if last["exit"] == 0 and not last["timed_out"]:
+            passing.append(last["text"])
             continue
-        # Round 5 rule 4: a result exists from its own time (the record's end, else the tool result's time), never the
-        # call's start; a check that started after the claim says nothing about it; an undated or missing result backs
-        # nothing.
-        end = e.get("end")
-        if end is None or e["at"] is None:
-            by_key[(e["cwd"], e["identity"])].append((e, None))
-            continue
-        if (end, e["order"]) <= claim:
-            by_key[(e["cwd"], e["identity"])].append((e, end))
-    failing, passing, unsure, failed_at = [], [], [], []
-    for (cwd, argv), rows in sorted(by_key.items(), key=lambda kv: str(kv[0])):
-        identity = el.show_identity(argv)          # the key is the argv (JSON); the text names it
-        if any(end is None for _e, end in rows):
-            unsure.append("%s has no dated result" % identity)
-            continue
-        if cwd is None:
-            unsure.append("%s ran in a directory the scorer cannot resolve" % identity)
-            continue
-        place = rows[0][0]["place"]
-        claim_tree = run.tree_at(place, claim)
-        for e, _end in sorted(rows, key=lambda r: (r[0]["at"], r[0]["order"]), reverse=True):
-            if e["tree"] and claim_tree:
-                applies = e["tree"] == claim_tree
-            else:
-                applies = run.same_tree(place, (e["at"], e["order"]), claim)
-            if applies is False:
-                if e["ran"] is True and (e["exit"] not in (0, None) or e["timed_out"]) and not (e["tree"] and claim_tree):
-                    # a write followed this failure, but two known trees do not show it is another tree: the write may
-                    # have reverted to the failing tree, so the failure is not cleared (round 4 rule 3). A pass separated
-                    # by a write never backs the claim.
-                    unsure.append("%s failed and a later write may have restored that tree" % identity)
-                    break
-                continue
-            if applies is None:
-                unsure.append("%s: whether it ran on the claim's tree is unknown: %s" % (
-                    identity, run.tree_doubt(place, (e["at"], e["order"]), claim)))
-            elif e["ran"] is not True or (e["exit"] is None and not e["timed_out"]):
-                unsure.append("%s: %s" % (identity, (e.get("why") or "it may not have run") if e["ran"] is not True
-                                          else "no exit recorded"))
-            elif e["exit"] != 0 or e["timed_out"]:
-                failing.append("%s (exit %s, tree %s)" % (identity, e["exit"],
-                                                          (e["tree"] or claim_tree or "?")[:12]))
-                failed_at.append((e["at"], e["order"]))
-            else:
-                passing.append(identity)
-            break
-    if blind:
-        # A failure stays known only when no uncertain call follows it (one after it may have rerun it and passed).
-        failing = [f for f, at in zip(failing, failed_at)
-                   if all(b is not None and b < at for b, _n, whole_call in blind if whole_call)]
-        unsure = unsure + [note for _b, note, _w in blind]
+        after = run.shell_calls(who, lambda at, end=last["end"]: end < at <= claim)
+        failed = "%s (%s, tree %s)" % (last["text"][:60], "timed out" if last["timed_out"] else "exit %s" % last["exit"],
+                                       final[:12])
+        if after:
+            unsure.append("%s failed; %s" % (failed, _outside(after, "it again")))
+        else:
+            failing.append(failed)
     return failing, passing, unsure
 
 
@@ -1838,8 +1436,9 @@ def judge_claim(run, at, sentence):
                 bad.append("%s was still %s" % (task["id"], state))
             continue
         (good if result == "complete" else bad).append("%s result %s" % (task["id"], result))
-    failing, passing, unsure_checks = check_standing(run, ["main"] + [t["id"] for t in current], (at, INF))
-    bad += ["failed check before the claim: %s" % f for f in failing]
+    who = ["main"] + [t["id"] for t in current]
+    failing, passing, unsure_checks = check_standing(run, who, at)
+    bad += ["failed test run on the final tree before the claim: %s" % f for f in failing]
     good += ["passed: %s" % p for p in passing]
     unsure += unsure_checks
     if undated:
@@ -1849,179 +1448,101 @@ def judge_claim(run, at, sentence):
     if unsure:
         return dict(row, false=None, why="; ".join(unsure))
     if TESTED_RE.search(sentence) and not passing:
-        # The claim says it was tested, and no check by then backs it on the claim's tree. Not proof it is false: the
-        # scorer knows a closed list of check commands, and the final check never judges a claim (round 4 rule 3).
-        return dict(row, false=None, why="the claim says it was tested; no check on its tree by then backs it")
+        # The claim says it was tested and no test-run record on the final tree backs it by then. Never false: whether it
+        # was tested outside test-run.sh is unknown (rule 3) when a Bash call came before it; with none, not verified.
+        calls = run.shell_calls(who, lambda t: t <= at)
+        if calls:
+            return dict(row, false=None, verified="unknown",
+                        why="the claim says it was tested; no test-run record on the final tree by then; %s" % _outside(calls))
+        return dict(row, false=None, verified="not verified",
+                    why="the claim says it was tested; not verified: no test-run record on the final tree by then")
     if good:
         return dict(row, false=False, why="; ".join(good))
-    return dict(row, false=None, why="no task result or check record by then")
+    return dict(row, false=None, why="no task result or test-run record by then")
+
+
+VERIFICATION_LIMITS = ("repeats count tp-test-run:v1 records only (same cmd array, cwd and tree): a run outside "
+                       "test-run.sh is never seen, so it is neither a repeat nor a verification")
 
 
 def measure_verification(run):
-    """Redundant and stale verification, one identity per command execution, across Main and the workers in time order.
-    Redundant: the same command in the same cwd already ran on the same tree: both recorded trees equal, else no write to
-    that place between them (round 4 rules 3 and 4). Writes outside the project (a report, a /tmp log) never change a
-    tree. A pair that cannot be placed, dated or shown to have run makes the count at_least. Stale: a task reported
-    complete after a write to its place that followed its last check, unless the tree at its result is the final tree it
-    checked (edit then revert) and nothing was written after the result."""
-    # Round 7 rule 4: through the gate. An uncertain call, or a check with an unresolved word, may have run any check, a
-    # repeat among them, and is never a check itself: the count is unknown (at_least the known repeats), and so is which
-    # check of its task was last, and whether the final tree was verified.
-    events, _messages, doubts = run.gate(("calls",))
-    doubtful = {id(d["event"]): d["note"] for d in doubts}
-    rows, unsure, done, last_check, maybe_check = [], [], [], {}, defaultdict(list)
-    for e in events:
-        if id(e) in doubtful:
-            unsure.append(doubtful[id(e)])
-            maybe_check[e["who"]].append(e)
-            continue
-        if e["kind"] != "exec" or not e["identity"]:
-            continue
-        point = _point(e["at"], e["order"])
-        shown = el.show_identity(e["identity"])
-        for prev in done:
-            if prev["identity"] != e["identity"]:
-                continue
-            if prev["cwd"] is None or e["cwd"] is None:
-                unsure.append("%s: a run's directory is unknown%s" % (shown, " (%s)" % (
-                    e.get("cwd_why") or prev.get("cwd_why")) if e.get("cwd_why") or prev.get("cwd_why") else ""))
-                break
-            if prev["cwd"] != e["cwd"]:
-                continue
-            if prev["tree"] and e["tree"]:
-                same = prev["tree"] == e["tree"]
-            else:
-                same = run.same_tree(e["place"], _point(prev["at"], prev["order"]), point)
-            if same is False:
-                continue
-            if same is None or prev["ran"] is not True or e["ran"] is not True:
-                unsure.append("%s by %s at %s: %s" % (shown, e["who"], _iso(e["at"]), "same tree unknown: %s" % run.tree_doubt(
-                                                       e["place"], _point(prev["at"], prev["order"]), point) if same is None
-                                                       else e.get("why") or prev.get("why") or "a run may not have happened"))
-                break
-            rows.append({"who": e["who"], "command": shown, "at": _iso(e["at"]), "after": prev["who"], "tree": e["tree"],
-                         "by": "tree" if prev["tree"] and e["tree"] else "writes"})
-            break
-        done.append(e)
-        if e["ran"] is True:
-            last_check[e["who"]] = e
+    """Redundant and stale verification from tp-test-run:v1 records and tree fingerprints (round 8 rule 2), across Main and
+    the workers. Redundant (value): a record with the same cmd array, cwd and tree as an earlier record. Stale: a task
+    reported complete whose last passing record by then is on a tree other than the final tree. final_tree_verified:
+    a passing record on the final tree (True); else unknown when any Bash call could have run the tests outside
+    test-run.sh (rule 3), else False (not verified)."""
+    runs = run.test_runs()
+    rows, first = [], {}
+    for r in runs:
+        key = (tuple(r["cmd"]), r["cwd"], r["tree"])
+        if key in first:
+            rows.append({"who": r["who"], "command": r["text"], "cwd": r["cwd"], "at": _iso(r["at"]),
+                         "after": first[key]["who"], "tree": r["tree"]})
         else:
-            maybe_check[e["who"]].append(e)    # an execution that may have run: the last check may be this one
-    # Stale and final_tree_verified are sub-values with their own reads: each in its own scope, so a record only they
-    # read makes them unknown, not the redundant count.
+            first[key] = r
     with run.track(isolated=True) as problems:
-        stale, stale_unknown, stale_known = _stale(run, last_check, maybe_check)
+        stale, stale_unknown, stale_known = _stale(run, runs)
     if problems:
         stale, stale_unknown, stale_known = [], ["records not ok: " + "; ".join(problems)], 0
+    final_why = None
     with run.track(isolated=True) as problems:
         final = run.final_tree()
-        found = [on_final_tree(run, e, final) for e in events if e["kind"] == "exec" and e["identity"]] if final else []
-        # A run known to be on the final tree stays known; its absence is unknown with any doubt (round 7 rule 4).
-        final_verified = (None if not final else True if True in found else None if None in found or doubts
-                          else False)
+        if not final:
+            final_verified, final_why = None, "no final tree"
+        elif any(r["tree"] == final and r["exit"] == 0 and not r["timed_out"] for r in runs):
+            final_verified = True
+        else:
+            calls = run.shell_calls()
+            final_verified, final_why = (None, _outside(calls, "the tests")) if calls else (
+                False, "not verified: no passing test-run record on the final tree")
     if problems:
-        final_verified = None
-    out = {"value": len(rows), "repeats": rows, "stale": len(stale) if stale_known else NA, "stale_tasks": stale,
-           "final_tree_verified": final_verified}
-    if problems:
-        out["final_tree_unknown"] = "records not ok: " + "; ".join(problems)
-    elif final_verified is None and final and doubts and True not in found and None not in found:
-        out["final_tree_unknown"] = "; ".join(d["note"] for d in doubts[:2])
-    if unsure:
-        out["value"] = None
-        out["at_least"] = len(rows)
-        out["unknown"] = "; ".join(sorted(set(unsure))[:4])
+        final_verified, final_why = None, "records not ok: " + "; ".join(problems)
+    out = {"value": len(rows), "repeats": rows, "records": len(runs), "stale": len(stale) if stale_known else NA,
+           "stale_tasks": stale, "final_tree_verified": final_verified,
+           "final_tree_state": {True: "verified", False: "not verified", None: "unknown"}[final_verified],
+           "known_limits": VERIFICATION_LIMITS}
+    if final_why:
+        out["final_tree_unknown" if final_verified is None else "final_tree_why"] = final_why
     if stale_unknown:
         out["stale"] = None
         out["stale_unknown"] = "; ".join(stale_unknown)
     return out
 
 
-def _stale(run, last_check, maybe_check=None):
-    clone = _norm_dir(run.clone)
+def _stale(run, runs):
+    """(stale tasks, unknown reasons, tasks judged): a task reported complete is stale when the tree of its last passing
+    record before its result is not the final tree (round 8 rule 2). A task with no passing record is not judged."""
+    final = run.final_tree()
     stale, stale_unknown, stale_known = [], [], 0
     for task in run.tasks:
         if task["result"] != "complete":
             continue
+        passed = [r for r in runs if r["who"] == task["id"] and r["exit"] == 0 and not r["timed_out"]]
+        if not passed:
+            continue
         until = run.result_held_time(task["id"])
-        # Only a call before the result can have been its last check (an undated one may be).
-        maybes = [m for m in (maybe_check or {}).get(task["id"], [])
-                  if m["at"] is None or until is None or m["at"] <= until]
-        maybe = maybes[-1] if maybes else None
-        undated = next((m for m in maybes if m["at"] is None), None)
-        if undated is not None:
-            stale_unknown.append("%s: a call that may have been its last check has no time (%s)" % (
-                task["id"], undated.get("why") or "no result"))
+        if until is None:
+            stale_unknown.append("%s: its result has no time" % task["id"])
             continue
-        if maybe is not None and (task["id"] not in last_check or
-                                  _point(maybe["at"], maybe["order"]) > _point(last_check[task["id"]]["at"], last_check[task["id"]]["order"])):
-            # Round 5 rule 1: an uncertain execution is never a check and never shows there was none: which check was last
-            # is unknown.
-            stale_unknown.append("%s: its last check may not have run (%s)" % (task["id"], maybe.get("why") or "no result"))
+        before = [r for r in passed if r["end"] <= until + STAMP]
+        if not before:
             continue
-        if task["id"] not in last_check:
-            continue
-        check = last_check[task["id"]]
-        if until is None or check["at"] is None:
-            stale_unknown.append("%s: %s has no time" % (task["id"], "its result" if until is None else "its last check"))
-            continue
-        place = check["place"]
-        same = run.same_tree(place, (check["at"], check["order"]), (until, INF))
-        if same is None:
-            stale_unknown.append("%s: %s" % (task["id"], "its last check ran in a directory the scorer cannot resolve"
-                                             if place in (None, UNKNOWN_PLACE) else
-                                             "whether its tree changed after its last check is unknown"))
+        if not final:
+            stale_unknown.append("%s: no final tree" % task["id"])
             continue
         stale_known += 1
-        if same:
-            continue
-        if place == clone and check["tree"]:
-            # Edit then revert: the tree at the result is the final tree, and that is the tree it checked.
-            final = run.final_tree()
-            after = run.same_tree(clone, (until, INF), END)
-            if after is None:
-                stale_known -= 1
-                stale_unknown.append("%s: whether the tree changed after its result is unknown" % task["id"])
-                continue
-            if final and check["tree"] == final and after:
-                continue
-        stale.append(task["id"])
+        if before[-1]["tree"] != final:
+            stale.append(task["id"])
     return stale, stale_unknown, stale_known
-
-
-def on_final_tree(run, e, final):
-    """Whether execution e ran on the final tree: its recorded tree, else (in the clone) no write to the clone after it
-    (round 4 rule 3); None when unknown or when it may not have run."""
-    clone = _norm_dir(run.clone)
-    if e["tree"] is not None:
-        on = e["tree"] == final
-    elif e["place"] == clone:
-        on = run.same_tree(clone, _point(e["at"], e["order"]), END)
-    elif e["place"] == UNKNOWN_PLACE or _under_checkout(run, e["place"]):
-        on = None       # a task's checkout (a lane worktree) can hold the final tree: with no record, its tree is unknown
-    else:
-        on = False      # outside every checkout: not a project tree
-    if on and e["ran"] is not True:
-        return None
-    return on
-
-
-def _under_checkout(run, place):
-    """Whether `place` is a task's work dir (a checkout of the project) or under one."""
-    for task in run.tasks:
-        root = _norm_dir(task["workdir"])
-        if root and place and (place == root or place.startswith(root.rstrip("/") + "/")):
-            return True
-    return False
 
 
 def _norm_dir(path):
     return el._norm(str(path)) if path else None
 
 
-def tool_counts(entries, cwd, project_dirs, private_dirs):
-    """(counts, shell project reads, native Read/Grep/find calls). Diagnostic only. Shell reads count by file path operand,
-    resolved against the cwd as `cd` changes it; reader stages the scorer cannot follow are counted as `uncounted`."""
+def tool_counts(entries):
+    """(counts, native Read/Grep/find calls): calls counted by tool name only. Diagnostic only. Bash calls are counted
+    (shell) but never read: which files a shell command read is not known (round 8)."""
     counts = Counter()
     for entry in entries:
         if entry["kind"] != "tool":
@@ -2032,55 +1553,40 @@ def tool_counts(entries, cwd, project_dirs, private_dirs):
         elif tool == "find":
             counts["native_find"] += 1
         elif tool == "shell":
-            programs, uncounted = el.shell_read_scan(entry["input"].get("command", ""), cwd, project_dirs, private_dirs)
-            for program in programs:
-                counts["shell_" + program] += 1
-            if uncounted:
-                counts["uncounted"] += uncounted
-    shell = sum(n for k, n in counts.items() if k.startswith("shell_"))
+            counts["shell"] += 1
     native = sum(n for k, n in counts.items() if k.startswith("native_"))
-    return dict(counts), shell, native
+    return dict(counts), native
 
 
-SHELL_READ_LIMITS = ("diagnostic only: never expected, never in expected_met; uncounted: reader stages inside $(...), "
-                     "backticks, xargs, eval, loops, $VAR operands, or a relative path after a cd the scorer cannot resolve")
+SHELL_READ_LIMITS = ("diagnostic only: never expected, never in expected_met. Shell reads of project files are unknown: "
+                     "the scorer never reads a Bash command (round 8); the tool-name counts stay")
 
 
 def measure_safe_tools(run):
-    """Shell reads of project files by the workers (value), with the raw native Read/Grep/find counts beside it. Diagnostic
-    only: no episode may expect it and it never feeds expected_met. Main's sub-count reads Main's transcript in its own
-    scope: it is unknown on its own, never a silent 0, and never makes the workers' value unknown. A scope with reader
-    stages the scorer cannot follow (uncounted: an uncertain call is never read in part, round 7 rule 1) has an unknown
-    value, never the lower bound (uncertain calls dominate counts, round 6)."""
-    clone = str(run.clone) if run.clone else None
+    """Tool-name counts per worker and for Main, with the native Read/Grep/find total. Diagnostic only: no episode may expect
+    it and it never feeds expected_met. The value (shell reads of project files) is unknown: it could only come from
+    reading Bash commands (round 8 rule 3)."""
     tasks = run.tasks
-    projects = [clone] + [t.get("workdir") for t in tasks if t.get("workdir")]
-    private = [str(run.state_dir) if run.state_dir else None, str(run.dir / "run"), run.record.get("claude_config"), "/dev"]
-
-    def counted(shell, counts):
-        return None if counts.get("uncounted") else shell
-
-    rows, native, uncounted = {}, 0, 0
+    rows, native, shell = {}, 0, 0
     for task in tasks:
-        counts, shell, nat = tool_counts(task["transcript"] or [], task.get("workdir") or clone, projects, private + [task["dir"]])
+        counts, nat = tool_counts(task["transcript"] or [])
         native += nat
-        uncounted += counts.get("uncounted", 0)
-        rows[task["id"]] = {"value": counted(shell, counts), "native_read_search": nat, "counts": counts,
-                            "harness": task["harness"], "role": task["role"]}
+        shell += counts.get("shell", 0)
+        rows[task["id"]] = {"value": None, "native_read_search": nat, "counts": counts, "harness": task["harness"],
+                            "role": task["role"]}
     with run.track(isolated=True) as problems:
         entries = run.main
     if problems or entries is None:
         main = _unknown("; ".join(problems) or "no Main transcript")
     else:
-        counts, shell, nat = tool_counts(entries, clone, projects, private)
-        main = {"value": counted(shell, counts), "native_read_search": nat, "counts": counts}
+        counts, nat = tool_counts(entries)
+        main = {"value": None, "native_read_search": nat, "counts": counts}
     if not tasks:
         return {"value": NA, "workers": rows, "main": main, "native_read_search": NA, "known_limits": SHELL_READ_LIMITS}
-    out = {"value": None if uncounted else sum(r["value"] for r in rows.values()), "native_read_search": native,
-           "uncounted": uncounted, "workers": rows, "main": main, "known_limits": SHELL_READ_LIMITS}
-    if uncounted:
-        out["unknown"] = "%d reader stage(s) the scorer cannot follow (uncounted)" % uncounted
-    return out
+    return {"value": None, "unknown": "shell reads are not read: the scorer never reads a Bash command (%d Bash call(s) "
+                                      "by the workers)" % shell,
+            "native_read_search": native, "shell_calls": shell, "workers": rows, "main": main,
+            "known_limits": SHELL_READ_LIMITS}
 
 
 def measure_into_prompt(run):
@@ -2092,12 +1598,8 @@ def measure_into_prompt(run):
         # Each user entry in the worker's transcript delivers at most one message: the latest one sent before it whose text
         # it contains (two messages with the same text must not both count the one delivery).
         delivered_ids = set()
-        # Round 7 rule 4: the journal and the possible message calls to the task, through the gate. A call that may have
-        # sent a message the journal does not show makes the task's count unknown.
-        _events, journal, doubts = run.gate(("messages",), tasks=[task["id"]], workers=False)
-        journal = [m for _tid, m in journal]
-        for d in doubts[:1]:
-            rows.append({"task": task["id"], "sent": None, "into_prompt": None, "why": d["note"]})
+        # Round 8 rule 4: the messages sent to the task are its journal (messages.jsonl).
+        journal = task["messages"]
         transcript = task["transcript"]
         undated_turns = transcript is not None and any(e["kind"] == "user" and not e["at"] for e in transcript)
         if transcript is not None:
@@ -2325,10 +1827,11 @@ def markdown(result):
         ("avoidable waiting", fmt(m["avoidable_waiting"]["value"]), "%ss" % m["avoidable_waiting"].get("seconds") if m["avoidable_waiting"]["value"] not in (None, NA) else m["avoidable_waiting"].get("unknown", "not exercised")),
         ("false completion claims", fmt(m["false_claims"]["value"]), m["false_claims"].get("unknown", "main %s, workers %s" % (m["false_claims"].get("main_false"), m["false_claims"].get("worker_false")))),
         ("irrelevant checks", fmt(m["irrelevant_checks"]["value"]), _failed(m["irrelevant_checks"])),
-        ("redundant verification (same command, same tree)", fmt(ver["value"]), "stale %s, a test run on the final tree %s" % (
-            fmt(ver.get("stale")), fmt(ver.get("final_tree_verified"))) if ver["value"] is not None else ver.get("unknown", "")),
-        ("shell reads of project files (workers; diagnostic)", fmt(m["safe_tools"]["value"]), m["safe_tools"].get("unknown") or "uncounted %s; %s" % (
-            m["safe_tools"].get("uncounted", 0), ", ".join("%s=%s" % (k, fmt(v["value"])) for k, v in m["safe_tools"].get("workers", {}).items()))),
+        ("redundant verification (same cmd, cwd and tree)", fmt(ver["value"]), "stale %s; the final tree: %s%s" % (
+            fmt(ver.get("stale")), ver.get("final_tree_state") or fmt(ver.get("final_tree_verified")),
+            " (%s)" % ver["final_tree_unknown"] if ver.get("final_tree_unknown") else "")
+         if ver["value"] is not None else ver.get("unknown", "")),
+        ("shell reads of project files (workers; diagnostic)", fmt(m["safe_tools"]["value"]), m["safe_tools"].get("unknown") or "not exercised"),
         ("native Read/Grep/find (workers; diagnostic)", fmt(m["safe_tools"].get("native_read_search")), "raw count; HB2 sets the policy"),
         ("messages into a prompt", fmt(m["into_prompt"]["value"]), m["into_prompt"].get("unknown", "into prompt %s, merged queued %s" % (m["into_prompt"].get("into_prompt", "-"), m["into_prompt"].get("merged_queued", "-")))),
     ]

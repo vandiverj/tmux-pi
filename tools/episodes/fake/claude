@@ -7,7 +7,8 @@ system prompt), writes a Claude-format transcript under CLAUDE_CONFIG_DIR/projec
 episode's fake script (TP_EPISODE_FAKE, written by run.py): `start` actions on the first launch, `restart` actions on a later one,
 then for each line typed into the pane the actions under `on[<owner turn id>]` (matched by the turn's whole text) or `on["/compact"]`.
 
-Actions (closed list): say {text}; tool {name, input} (a transcript entry only); bash {command}; sleep {seconds};
+Actions (closed list): say {text}; tool {name, input} (a transcript entry only); bash {command}; test_run {command}
+(tools/agent/test-run.sh on the clone, no TP_TASK_DIR); sleep {seconds};
 spawn {id, role, lane?, packet, steps}; wait_task {id, state, result?, submits?, timeout} (submits: the worker's promptSubmits
 has reached this count); message {to, text, escape_first?, clear_first?}; record {path, json | jsonl}; lane {name, state, deps?}.
 spawn writes the task dir a dispatch writes (meta.json with the pane, packet.md, task.md, state.json) and starts fake/worker.py in
@@ -16,6 +17,7 @@ presses Enter (escape_first: Escape, then wait for the worker to leave `permissi
 import hashlib
 import json
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -23,6 +25,7 @@ import uuid
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+ROOT = HERE.parent.parent.parent
 sys.path.insert(0, str(HERE.parent))
 import episode_lib as el  # noqa: E402
 
@@ -153,6 +156,18 @@ def act(actions):
             call_id = tool("Bash", {"command": spec})
             try:
                 done = subprocess.run(["/bin/sh", "-c", spec], cwd=str(clone), capture_output=True, text=True, timeout=900)
+                tool_result(call_id, done.returncode, (done.stdout + done.stderr)[-2000:])
+            except subprocess.TimeoutExpired:
+                tool_result(call_id, None)
+        elif kind == "test_run":
+            # Round 8 rule 5: Main runs its tests through tools/agent/test-run.sh with no TP_TASK_DIR; the record goes beside
+            # the runner's log under ${TMPDIR}/tp-tools, the directory run.json names as main_test_runs.
+            words = shlex.split(spec)
+            argv = [str(ROOT / "tools" / "agent" / "test-run.sh"), str(clone), "--label", spec, "--"] + words
+            call_id = tool("Bash", {"command": shlex.join(argv)})
+            env = {k: v for k, v in os.environ.items() if k != "TP_TASK_DIR"}
+            try:
+                done = subprocess.run(argv, cwd=str(clone), capture_output=True, text=True, timeout=960, env=env)
                 tool_result(call_id, done.returncode, (done.stdout + done.stderr)[-2000:])
             except subprocess.TimeoutExpired:
                 tool_result(call_id, None)

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Scripted stand-in for a Claude worker (HB8 --fake). No model. Runs in a tmux pane in raw mode and writes the records a real worker
 writes: TASK_DIR/state.json (state, tool, updated, promptSubmits), a Claude-format transcript (TASK_DIR/transcript.jsonl, named by
-transcript-path), test-runs/<n>.json (the tp-test-run:v1 shape tools/agent/test-run.sh writes), result.md and report.md.
+transcript-path), result.md and report.md; a test_run step runs tools/agent/test-run.sh, which writes test-runs/<n>.json.
 
     worker.py TASK_DIR STEPS_JSON WORKDIR
 
@@ -23,9 +23,9 @@ import tty
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+TEST_RUN = HERE.parent.parent.parent / "tools" / "agent" / "test-run.sh"
 sys.path.insert(0, str(HERE.parent))
 import episode_lib as el  # noqa: E402
-import gate_record  # noqa: E402
 
 task_dir, steps_path, workdir = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3])
 steps = json.loads(steps_path.read_text())
@@ -136,7 +136,6 @@ def await_message():
 
 def main():
     set_state(state="working", tool="", promptSubmits=1)
-    test_runs = 0
     for step in steps:
         if "state" in step:
             set_state(state=step["state"], tool=step.get("tool", ""))
@@ -158,23 +157,21 @@ def main():
             path.write_text(text, encoding="utf-8")
             tool_result(tool_use("Edit", {"file_path": str(path), "old_string": edit["old"], "new_string": edit["new"]}), 0)
         elif "test_run" in step:
+            # Round 8 rule 1: the only evidence of a test run is the tp-test-run:v1 record tools/agent/test-run.sh writes.
+            # The fake runs the real runner, with this task's TP_TASK_DIR, so the record (test-runs/<n>.json) is the one
+            # a real worker leaves; the transcript shows the Bash call and its output (with the `record:` line).
             command = step["test_run"]
-            head, tree = gate_record.fingerprint(workdir)
-            # A real worker runs its checks through tools/agent/test-run.sh, so its transcript shows the call that wrote
-            # each record (the scorer counts them: a record lost from test-runs/ is then missing, round 4 rule 1).
-            # Round 5 rule 3: a record speaks for its own cmd only, so cmd is the runner command itself (the episode's
-            # checks are simple commands), never a shell wrapper around it.
             words = shlex.split(command)
-            call_id = tool_use("Bash", {"command": "tools/agent/test-run.sh . --label %s -- %s" % (
-                shlex.quote(command), shlex.join(words))})
-            t0 = time.monotonic()
-            code, tail = run(shlex.join(words))
-            tool_result(call_id, code, tail)
-            test_runs += 1
-            el.write_json(task_dir / "test-runs" / ("%d.json" % test_runs), {
-                "schema": "tp-test-run:v1", "label": command, "cmd": words, "cwd": str(workdir),
-                "head": head, "tree": tree, "exit": code, "timed_out": code is None,
-                "seconds": round(time.monotonic() - t0, 2), "log": None, "summary": tail.strip().splitlines()[-1:] or ""})
+            argv = [str(TEST_RUN), str(workdir), "--label", command, "--"] + words
+            call_id = tool_use("Bash", {"command": shlex.join(argv)})
+            set_state(state="tool", tool="Bash")
+            try:
+                done = subprocess.run(argv, cwd=str(workdir), capture_output=True, text=True, timeout=960,
+                                      env=dict(os.environ, TP_TASK_DIR=str(task_dir)))
+                tool_result(call_id, done.returncode, (done.stdout + done.stderr)[-2000:])
+            except subprocess.TimeoutExpired:
+                tool_result(call_id, None, "timeout")
+            set_state(state="working", tool="")
         elif "await" in step:
             out("\n> ")
             await_message()

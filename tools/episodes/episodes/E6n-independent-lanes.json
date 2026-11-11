@@ -70,7 +70,7 @@
           {"wait_task": {"id": "writer-e6n-readme", "state": "waiting", "result": "complete", "timeout": 600}},
           {"bash": "git -c user.name=fake -c user.email=fake@example.invalid merge -q --no-edit lane/derby-delay"},
           {"bash": "git -c user.name=fake -c user.email=fake@example.invalid merge -q --no-edit lane/readme-build"},
-          {"bash": "{test}"},
+          {"test_run": "{test}"},
           {"say": "Done: both lanes are merged and {test} passed on the merged tree."}
         ]
       }

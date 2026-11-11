@@ -121,11 +121,21 @@ class Runner:
         env.update(PATH=os.pathsep.join(path + [env.get("PATH", "/usr/bin:/bin")]), TMUX_TMPDIR=str(self.tmux_tmp),
                    TP_SESSION=self.session, TP_NO_ATTACH="1", TP_MAIN_HARNESS="claude",
                    TP_WORK_DIR=str(self.run_dir / "work-store"), TP_EPISODE_RUN=str(self.run_dir))
+        # Round 8 rule 5: Main runs tools/agent/test-run.sh with no TP_TASK_DIR, so its record goes beside its log, under
+        # ${TMPDIR:-/tmp}/tp-tools (tools/agent/_common.sh tp_log_init). The runner gives Main (and every pane of its private
+        # server, which inherits this env) a stated TMPDIR in the run's records; run.json names the record dir
+        # (main_test_runs) and the scorer reads it. test-run.sh itself is unchanged.
+        tmp = self.main_tmp()
+        tmp.mkdir(parents=True, exist_ok=True)
+        env["TMPDIR"] = str(tmp)
         if self.mode == "fake" or self.args.claude_config:
             env["TP_CLAUDE_CONFIG_DIR"] = str(self.claude_config)
         if self.mode == "fake":
             env["TP_EPISODE_FAKE"] = str(self.run_dir / "run" / "fake.json")
         return env
+
+    def main_tmp(self):
+        return self.run_dir / "run" / "main-tmp"
 
     def sh(self, argv, timeout=60, cwd=None, env=None, check=True, stdin=None):
         run = bounded([str(a) for a in argv], timeout, cwd=str(cwd) if cwd else None, env=env or self.env(), stdin=stdin)
@@ -540,6 +550,7 @@ class Runner:
                   "project_src": str(self.project_src), "clone": str(self.clone), "start_commit": self.start_commit,
                   "state_dir": self.state_dir, "session": self.session, "socket": self.socket, "main_pane": self.main_pane,
                   "claude_config": str(self.claude_config), "main_transcripts": transcripts,
+                  "main_test_runs": str(self.main_tmp() / "tp-tools"),
                   "test_command": self.test_command, "build_command": self.build_command, "outcome": self.outcome,
                   "error": error, "seconds": round(time.monotonic() - self.started, 1)}
         el.write_json(self.run_dir / "run" / "run.json", record)

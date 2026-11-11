@@ -13,8 +13,11 @@ structure, which text search and ast-grep (H13) miss by construction.
 - **B, + git co-change:** A plus a ranked list from plain `git log`, attached with `tp-review --evidence FILE` (the handoff point
   found for the code-quality eval; no code change). Per seed file: the top **K = 8** files by shared commits, each with its
   shared-commit count, coupling share (shared / seed commits) and up to 3 commit ids with subjects.
-- **C, + Code Maat:** A plus the same list computed by Code Maat (`coupling` analysis on a `git log --numstat` export of the same
-  range), cut to the same K = 8. Measured only to see whether it adds anything over B.
+- **C, + fallow hotspots (replaces Code Maat, owner 2026-11-10):** A plus `fallow health --hotspots --since <window>
+  --format json` computed at the reviewed change's base, listing which of the seed's candidate files are hotspots (churn x
+  complexity). Main's trial on main (1c689ec): 23 TS/JS files ranked in 0.35 s. It has **no co-change pairs**, so it cannot
+  replace B's list; it tests whether a hotspot mark helps the reviewer choose which listed files to open first. It sees only
+  TS/JS, never `lib/` or `bin/` Python. Code Maat comes back only if B adds coverage and B's ranking looks too crude.
 
 ## History rules
 - History is `git log --no-merges <base>` where `<base>` is the reviewed change's base: nothing after the reviewed change.
@@ -47,12 +50,13 @@ the list; elapsed time including building the list; reviewer tokens. Review roun
 the ranking's own recall at K = 8 without a reviewer (cheap, deterministic).
 
 ## Decision
-Recommend the simplest approach that adds coverage: B over C unless C finds ground-truth files B misses at the same K. Name
+Recommend the simplest approach that adds coverage: B alone unless the hotspot mark in C cuts irrelevant opens or finds a
+ground-truth file sooner. Name
 the trigger for the reviewer (for example "a finding whose cause is a rule, not a line, in a file with at least N commits").
 Adopt as on-demand only if B finds at least one ground-truth file A missed in two or more cases, and irrelevant opens stay
 under 3 per case.
 
 ## Missing before it can run
-- Code Maat needs a Java runtime; this Mac has none (`/usr/bin/java` is the stub). Arm C needs the owner's approval for a
-  pinned, isolated JRE and Code Maat jar (no global install). Arms A and B need nothing new.
+- Nothing to install: fallow 3.10.0 is already in the npx cache. (Code Maat would need a Java runtime, which this Mac lacks;
+  dropped unless B shows promise.)
 - The F1 fixture (case 1) and the extra historical cases (case 3).

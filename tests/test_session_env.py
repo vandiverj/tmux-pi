@@ -28,7 +28,7 @@ CONFIG = {
     "TP_ROOT", "TP_STATE_DIR", "TP_LIB_DIR", "TP_MODEL_CATALOG", "TP_ROUTING_EVALS_TEXT", "TP_ROUTING_EVALS", "TP_ROUTING_EVAL_DIR",
     "TP_WORKDIR", "TP_WORK_DIR", "TP_WORK_CONFIG", "TP_WORK_LOCK_TIMEOUT", "TP_SEND_CONFIRM_SECONDS", "TP_TICKET_PREFIXES", "TP_DOCS_TOOLS", "TP_DOCS_PROJECT",
     "TP_CTX_TOOLS", "TP_CTX_PROJECT", "TP_CTX_TODAY", "TP_CTX_NAV_MODULES", "TP_LOCAL_CONFIG", "TP_PROXY", "TP_TRUST",
-    "TP_TRUST_GUARD_LOG_DIR", "TP_CLAUDE_CONFIG_DIR", "TP_PI_NODE", "TP_NO_ATTACH", "TP_ROUTER_LLM_URL", "TP_ROUTER_BASE_URL",
+    "TP_TRUST_GUARD_LOG_DIR", "TP_CLAUDE_CONFIG_DIR", "TP_PI_NODE", "TP_NO_ATTACH", "TP_ROUTER_LLM_URL", "TP_LMSTUDIO_BUDGET", "TP_LMSTUDIO_BUDGET_FILE", "TP_LMSTUDIO_ENDPOINT", "TP_ROUTER_BASE_URL",
     "TP_ROUTER_MODEL", "TP_REDACTION", "TP_REDACTION_DIR", "TP_REDACTION_LLM_URL", "TP_REDACTION_WATCHDOG",
     "TP_REDACTION_SECRET_FILES", "TP_LMS", "TP_AGENT", "TP_PS", "TP_LAYA_DEVICE", "TP_STATUS_WINDOW", "TP_STATUS_CLOCK",
     "TP_STATUS_POLL", "TP_MAIN_HARNESS",  # launcher choice of harness, not who the caller is
@@ -126,22 +126,47 @@ class SessionEnvTests(unittest.TestCase):
             self.assertIs(sys.modules["session_env"], sys.modules["tests.session_env"])
 
     def test_every_way_of_running_the_suite_scrubs_before_any_test_code(self):
-        """One probe module, started the five ways the suite is run, with a dummy session in the caller's shell."""
+        """One probe module, started every way the suite is run, with a dummy session in the caller's shell. Each start also
+        gets the LM Studio cap (LM1 F1): budget 0 (20 with TP_LIVE_LMSTUDIO=1) and a fresh counter at "0" made by the test
+        process (or, under run_parallel, by the parent, so its modules share one), removed when the run ends; a budget the
+        caller already set is kept as it is."""
+        discover = ["-m", "unittest", "discover", "-s", "tests", "-p", "test_session_probe.py"]
+        # name: (argv, extra env, budget, who made the counter)
         runners = {
-            "-m unittest tests.X": ["-m", "unittest", "tests.test_session_probe"],
-            "single test id": ["-m", "unittest", "tests.test_session_probe.Probe.test_probe"],
-            "discover -s tests -t .": ["-m", "unittest", "discover", "-s", "tests", "-t", ".", "-p", "test_session_probe.py"],
-            "discover -s tests": ["-m", "unittest", "discover", "-s", "tests", "-p", "test_session_probe.py"],
-            "python3 tests/test_x.py": ["tests/test_session_probe.py"],
+            "-m unittest tests.X": (["-m", "unittest", "tests.test_session_probe"], {}, "0", "probe"),
+            "single test id": (["-m", "unittest", "tests.test_session_probe.Probe.test_probe"], {}, "0", "probe"),
+            "discover -s tests -t .": (discover[:5] + ["-t", "."] + discover[5:], {}, "0", "probe"),
+            "discover -s tests": (discover, {}, "0", "probe"),
+            "python3 tests/test_x.py": (["tests/test_session_probe.py"], {}, "0", "probe"),
+            "tests/run_parallel.py": (["tests/run_parallel.py", "-j", "1", "test_session_probe", "--log", "{tmp}/log.jsonl"], {},
+                                      "0", "parent"),
+            "TP_LIVE_LMSTUDIO=1 discover": (discover, {"TP_LIVE_LMSTUDIO": "1"}, "20", "probe"),
+            "caller set the budget": (discover, {"TP_LMSTUDIO_BUDGET": "0", "TP_LMSTUDIO_BUDGET_FILE": "{tmp}/caller.count"}, "0",
+                                      "caller"),
         }
-        for name, argv in runners.items():
+        for name, (argv, extra, budget, maker) in runners.items():
             with self.subTest(runner=name), tempfile.TemporaryDirectory() as tmp:
                 out = Path(tmp) / "seen.json"
-                env = {**outside_session(), "SESSION_PROBE_OUT": str(out), **{key: f"dummy-{key}" for key in SESSION_KEYS}}
+                (Path(tmp) / "caller.count").write_text("2")
+                env = {key: value for key, value in outside_session().items()
+                       if not key.startswith("TP_LMSTUDIO") and key != "TP_LIVE_LMSTUDIO"}
+                env.update({"SESSION_PROBE_OUT": str(out), **{key: f"dummy-{key}" for key in SESSION_KEYS}})
                 env.update(TMUX="/tmp/x,1,0", TMUX_PANE="%999")
-                run = subprocess.run([sys.executable, *argv], cwd=ROOT, env=env, text=True, capture_output=True)
+                env.update({key: value.format(tmp=tmp) for key, value in extra.items()})
+                run = subprocess.run([sys.executable, *(a.format(tmp=tmp) for a in argv)], cwd=ROOT, env=env, text=True,
+                                     capture_output=True)
                 self.assertEqual(run.returncode, 0, run.stderr)
-                self.assertEqual(json.loads(out.read_text()), [], "the probe saw the caller's session")
+                seen = json.loads(out.read_text())
+                self.assertEqual(seen["session"], [], "the probe saw the caller's session")
+                self.assertEqual(seen["budget"], budget, "the LM Studio budget this start got")
+                if maker == "caller":
+                    self.assertEqual((seen["counter"], seen["count"]), (str(Path(tmp) / "caller.count"), "2"))
+                    continue
+                self.assertEqual(seen["count"], "0", "a fresh counter")
+                made_by = re.search(r"tp-lmstudio-budget-(\d+)-", Path(seen["counter"]).name)
+                self.assertIsNotNone(made_by, seen["counter"])
+                self.assertEqual(int(made_by.group(1)) == seen["pid"], maker == "probe", seen)
+                self.assertFalse(Path(seen["counter"]).exists(), "the counter is removed when the run ends")
 
     def test_the_reviewers_repro_passes_under_discover_without_t(self):
         env = {**outside_session(), "TMUX": "/tmp/x,1,0", "TMUX_PANE": "%999"}

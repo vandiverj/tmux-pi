@@ -1198,7 +1198,7 @@ class RealSplitTests(unittest.TestCase):
 
     def test_frozen_files_are_data_not_code_and_name_no_private_path(self):
         # Nothing may treat a copy as live code: unittest discovery only descends into packages (tests/__init__.py exists, the
-        # calibration folders have none) and run_parallel globs tests/test_*.py without recursing; a bin/ copy keeps no exec bit.
+        # calibration folders have none), run_parallel loads each file through that same discovery; a bin/ copy keeps no exec bit.
         for folder in (ROOT / "tests" / "calibration", DATA, FIXTURES, self.FROZEN):
             self.assertFalse((folder / "__init__.py").exists(), folder)
         for path in self.FROZEN.rglob("*"):

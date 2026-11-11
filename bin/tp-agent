@@ -31,6 +31,7 @@ import review_verdict  # noqa: E402
 import safe_write  # noqa: E402
 import trust_dialog  # noqa: E402
 import work  # noqa: E402
+import work_brief  # noqa: E402
 import work_commands  # noqa: E402
 import work_find  # noqa: E402
 import work_index  # noqa: E402
@@ -1472,6 +1473,7 @@ def _main(argv):
     ls.add_argument("name", nargs="?")
     ls.add_argument("--repo", default=".")
     work_commands.add_parsers(sub)
+    work_brief.add_parser(sub)
     au = sub.add_parser("autonomy", help="opt in to autonomous protection: while recovery is pending no new worker starts (Claude main only)").add_subparsers(
         dest="autonomy_command", required=True)
     on = au.add_parser("on", help="turn it on for this run and arm recovery-pending (clear it once with: work recovered)")
@@ -1498,6 +1500,9 @@ def _main(argv):
         sys.exit(work_find.bounded(lambda: run_find(args)))
     if args.command == "work":
         sys.exit(work_find.bounded(lambda: run_work(args)))
+    if args.command == "brief":  # HB3a: fails open, prints the brief (or why it is unavailable) and exits 0
+        print(work_brief.run(args, state_dir, build_index, index_text.render, guard=work_find.guard))
+        return
     if args.command in ("lane", "lanes"):
         # Lanes live in the repository's git directory, not in a session. Creating or listing one needs no session; the steps
         # of a lane (lane close, and the open_step / queued / waiting_on of a row) are read from this session's tasks.

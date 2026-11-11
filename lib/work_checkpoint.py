@@ -46,7 +46,7 @@ RECOVERY_FILE = "session-recovery.json"
 MARKER_REASON_CHARS = 200
 TRUNCATED_LABEL = "truncated: workspace file is the authority"
 DECISION_KEYS = ("id", "priority", "status", "blocking", "question", "background", "options", "recommended", "affects", "resolution",
-                 "by", "at", "quote", "withdrawn", "extra")
+                 "by", "at", "quote", "withdrawn", "record", "extra")
 
 
 def _utcnow():
@@ -206,7 +206,7 @@ def snapshot(doc, run="", trigger="manual", tasks=(), summary=None, limit=None, 
 
 # ----------------------------------------------------------------- validation
 
-_ENTRY_TEXT_KEYS = tuple(key for key in DECISION_KEYS if key not in ("blocking", "affects"))
+_ENTRY_TEXT_KEYS = tuple(key for key in DECISION_KEYS if key not in ("blocking", "affects", "record"))  # `record` (HB3a) is optional: older checkpoints lack it
 _CUT_KEYS = ("tasks", "summary", "objective", *SECTIONS)
 
 
@@ -220,7 +220,7 @@ def _strings(value):
 
 def _entry_ok(entry):
     return (isinstance(entry, dict) and all(isinstance(entry.get(key), str) for key in _ENTRY_TEXT_KEYS)
-            and isinstance(entry.get("blocking"), bool) and _strings(entry.get("affects")))
+            and isinstance(entry.get("record", ""), str) and isinstance(entry.get("blocking"), bool) and _strings(entry.get("affects")))
 
 
 def _task_ok(task):

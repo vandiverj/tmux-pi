@@ -1,5 +1,7 @@
 """tests/run_bounded.py: the bound stops what it started (and only that), and every run leaves one valid JSON record."""
 import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -244,35 +246,132 @@ class RunBoundedTests(unittest.TestCase):
         record, _ = self.run_py(f"open({str(sockets / 'new')!r}, 'w').close()")
         self.assertEqual(record["leftovers"], ["new"])  # "old" was there before the run
         self.assertTrue((sockets / "new").exists())
+        # env= is the child's environment, and its TMUX_TMPDIR (not this process's) is where leftovers are looked for
+        other = self.dir / "own" / f"tmux-{os.getuid()}"
+        other.mkdir(parents=True)
+        record, _ = self.run_py(f"import os; open(os.path.join(os.environ['TMUX_TMPDIR'], 'tmux-{os.getuid()}', 'mine'), 'w')",
+                                env=dict(os.environ, TMUX_TMPDIR=str(other.parent)))
+        self.assertEqual((record["rc"], record["leftovers"]), (0, ["mine"]))
+
+
+PASSING = """import os, unittest
+class T(unittest.TestCase):
+    def test_env(self):
+        # the caller's session keys are gone, a caller's opt-in passes through, and the temp dirs are the child's own
+        self.assertEqual([k for k in ("TMUX", "TMUX_PANE", "TP_SESSION", "TP_TASK_ID", "TP_TASK_DIR", "TP_STATE_DIR")
+                          if k in os.environ], [])
+        self.assertEqual(os.environ.get("TP_LIVE_FAKE"), "1")
+        self.assertTrue(os.environ["TMUX_TMPDIR"].startswith("/tmp/tprp"), os.environ["TMUX_TMPDIR"])
+        self.assertEqual(os.environ["TMPDIR"], os.environ["RP_CALLER_TMP"])  # the caller's, as serially
+        with open(os.path.join(os.environ["RP_CALLER_TMP"], "tmux_tmpdir"), "w") as handle:
+            handle.write(os.environ["TMUX_TMPDIR"])
+    @unittest.skip("counted as skipped")
+    def test_skip(self): pass
+"""
+CALLER = {"TMUX": "/tmp/caller,1,0", "TMUX_PANE": "%9", "TP_SESSION": "s", "TP_TASK_ID": "t", "TP_TASK_DIR": "/nowhere",
+          "TP_STATE_DIR": "/nowhere", "TP_LIVE_FAKE": "1"}
 
 
 class RunParallelTests(unittest.TestCase):
-    def test_default_jobs_follow_cores_and_load(self):
-        with mock.patch("os.cpu_count", return_value=16):
-            with mock.patch("os.getloadavg", return_value=(1.0, 1.0, 1.0)):
-                self.assertEqual(run_parallel.default_jobs(), run_parallel.MAX_JOBS)  # quiet: cores//2, capped
-            with mock.patch("os.getloadavg", return_value=(9.0, 1.0, 1.0)):
-                self.assertEqual(run_parallel.default_jobs(), 2)  # busy
-        with mock.patch("os.cpu_count", return_value=2), mock.patch("os.getloadavg", return_value=(0.0, 0, 0)):
-            self.assertEqual(run_parallel.default_jobs(), 1)
+    """tests/run_parallel.py against a tiny tests dir: same ids as the loader, same verdict, isolated children."""
 
-    def test_module_run_is_logged_with_seconds_and_a_slow_module_is_stopped(self):
+    def setUp(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
-        tests = Path(temp.name)
-        log = tests / "log.jsonl"
-        (tests / "test_fast.py").write_text("import unittest\nclass T(unittest.TestCase):\n    def test_a(self): pass\n")
-        (tests / "test_slow.py").write_text("import unittest, time\nclass T(unittest.TestCase):\n"
-                                            "    def test_a(self): time.sleep(60)\n")
-        with mock.patch.object(run_parallel, "TESTS", tests):
-            fast = run_parallel.run("test_fast", timeout=20, log=log)
-            slow = run_parallel.run("test_slow", timeout=1, log=log)
-        self.assertEqual(fast[:3], ("test_fast", 0, 1))
-        self.assertEqual(slow[:2], ("test_slow", 124))
-        rows = [json.loads(l) for l in log.read_text().splitlines()]
-        self.assertEqual([r["timed_out"] for r in rows], [False, True])
-        self.assertIn("test_fast", rows[0]["per_file"])  # seconds per module, in run_bounded's format
-        self.assertEqual(rows[0]["files"], ["test_fast"])
+        self.dir = Path(temp.name)
+        self.tests = self.dir / "tests"
+        self.tests.mkdir()
+
+    def write(self, name, body):
+        (self.tests / (name + ".py")).write_text(body)
+
+    def main(self, *argv):
+        out = io.StringIO()
+        caller_tmp = self.dir / "caller-tmp"
+        caller_tmp.mkdir(exist_ok=True)
+        caller = dict(CALLER, TMPDIR=str(caller_tmp), RP_CALLER_TMP=str(caller_tmp))
+        with mock.patch.dict(os.environ, caller), contextlib.redirect_stdout(out):
+            code = run_parallel.main(["--times", str(self.dir / "times.json"), "--log", str(self.dir / "log.jsonl"),
+                                      "--outcomes-out", str(self.dir / "outcomes")] + list(argv), tests=self.tests)
+        return code, out.getvalue()
+
+    def loader_ids(self):
+        """The ids `unittest.TestLoader().discover(tests, 'test_*.py')` lists, loaded in this process."""
+        names = [p.stem for p in self.tests.glob("test_*.py")]
+        self.addCleanup(lambda: [sys.modules.pop(n, None) for n in names])
+        self.addCleanup(sys.path.remove, str(self.tests))  # discover put it there
+
+        def flat(suite):
+            for t in suite:
+                yield from flat(t) if isinstance(t, unittest.TestSuite) else [t]
+        return sorted(t.id() for t in flat(unittest.TestLoader().discover(str(self.tests), "test_*.py")))
+
+    def test_default_jobs_follow_cores(self):
+        self.assertEqual([run_parallel.default_jobs(c) for c in (18, 16, 4, 1)], [8, 8, 2, 1])
+
+    def test_failing_crashing_and_hanging_modules_fail_the_run_with_their_ids_and_totals(self):
+        self.write("test_rp_pass", PASSING)
+        self.write("test_rp_fail", "import unittest\nclass T(unittest.TestCase):\n    def test_ok(self): pass\n"
+                                   "    def test_bad(self): self.assertEqual(1, 2)\n"
+                                   "class C(unittest.TestCase):\n"
+                                   "    @classmethod\n    def setUpClass(cls): raise RuntimeError('fixture')\n"
+                                   "    def test_c(self): pass\n")
+        self.write("test_rp_exit", "import os, unittest\nclass T(unittest.TestCase):\n    def test_a(self): os._exit(3)\n")
+        self.write("test_rp_hang", "import time, unittest\nclass T(unittest.TestCase):\n"
+                                   "    def test_a(self): time.sleep(60)\n")
+        with mock.patch.object(run_parallel, "max_jobs", return_value=4):  # four jobs on any host, two-core included
+            code, out = self.main("-j", "4", "--timeout", "3")
+        self.assertEqual(code, 1, out)
+        self.assertFalse(os.path.exists((self.dir / "caller-tmp" / "tmux_tmpdir").read_text()))  # removed afterwards
+        lines = out.rstrip().splitlines()
+        self.assertRegex(lines[-3], r"^Ran 4 tests in [0-9.]+s$")  # 2 + 2 with results; a skipped test counts as run
+        # errors: the class fixture, the unit that exited without a result, the unit that hung
+        self.assertEqual(lines[-1], "FAILED (failures=1, errors=3, skipped=1)", out)
+        self.assertEqual(dict(line.rsplit(" ", 1) for line in (self.dir / "outcomes").read_text().splitlines()), {
+            "test_rp_pass.T.test_env": "ok", "test_rp_pass.T.test_skip": "skip", "test_rp_fail.T.test_ok": "ok",
+            "test_rp_fail.T.test_bad": "fail", "test_rp_fail.C.test_c": "not-run", "setUpClass (test_rp_fail.C)": "error",
+            "test_rp_exit.T.test_a": "unit-error", "test_rp_hang.T.test_a": "unit-error"})
+        self.assertIn("FAIL: test_rp_fail.T.test_bad\n" + "-" * 70 + "\nTraceback", out)
+        self.assertIn("AssertionError: 1 != 2", out)
+        self.assertIn("ERROR: test_rp_exit (the unit's process): wrote no unittest result (exit 3)", out)
+        self.assertIn("ERROR: test_rp_hang (the unit's process): hit the 3s timeout", out)
+        self.assertRegex(out, r"\s[0-9.]+s  ok    test_rp_pass \(2 tests\)")  # per-module seconds and result
+        self.assertNotIn("test_rp_pass.T.test_env", out)  # the env checks held in the child
+        rows = {r["files"][0]: r for r in map(json.loads, (self.dir / "log.jsonl").read_text().splitlines())}
+        self.assertEqual({m: r["timed_out"] for m, r in rows.items()},
+                         {"test_rp_pass": False, "test_rp_fail": False, "test_rp_exit": False, "test_rp_hang": True})
+        times = json.loads((self.dir / "times.json").read_text())
+        self.assertLess(times["test_rp_pass"], times["test_rp_hang"])  # the next run starts the hang first
+
+    def test_ids_equal_the_loaders_and_a_slow_module_is_split_by_class(self):
+        self.write("test_rp_pass", PASSING)
+        self.write("test_rp_two", "import unittest\nclass A(unittest.TestCase):\n    def test_1(self): pass\n"
+                                  "    def test_2(self): pass\nclass B(unittest.TestCase):\n    def test_1(self): pass\n")
+        (self.dir / "times.json").write_text(json.dumps({"test_rp_two": 999}))  # over --split-seconds
+        code, out = self.main("--split-seconds", "100")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(out.rstrip().splitlines()[-1], "OK (skipped=1)")
+        self.assertIn("5 tests in 3 units from 2 modules", out)
+        self.assertEqual([line.split()[0] for line in (self.dir / "outcomes").read_text().splitlines()], self.loader_ids())
+        times = json.loads((self.dir / "times.json").read_text())
+        self.assertEqual(sorted(k for k in times if k.startswith("test_rp_two")),
+                         ["test_rp_two", "test_rp_two.A", "test_rp_two.B"])
+
+    def test_plan_starts_longest_first_and_unrecorded_modules_by_size(self):
+        groups = [("test_a", ["test_a.T.t"]), ("test_b", ["test_b.T.t"]), ("test_c", ["test_c.T.t"]),
+                  ("test_d", ["test_d.T.t"])]
+        units = run_parallel.plan(groups, {"test_a": 5, "test_b": 50}, {"test_c": 10, "test_d": 900})
+        self.assertEqual([u["name"] for u in units], ["test_d", "test_c", "test_b", "test_a"])
+        split = run_parallel.plan([("test_x", ["test_x.A.t1", "test_x.A.t2", "test_x.B.t"])], {"test_x": 300}, {}, 240)
+        self.assertEqual([(u["name"], u["ids"], u["estimate"]) for u in split],
+                         [("test_x.A", ["test_x.A.t1", "test_x.A.t2"], 200), ("test_x.B", ["test_x.B.t"], 100)])
+
+    def test_serial_runs_the_one_process_discovery_without_the_callers_session(self):
+        with mock.patch.dict(os.environ, CALLER), mock.patch.object(run_parallel.subprocess, "call", return_value=7) as call:
+            self.assertEqual(run_parallel.main(["--serial"], tests=self.tests), 7)
+        (cmd,), kwargs = call.call_args
+        self.assertEqual(cmd, [sys.executable, "-m", "unittest", "discover", "-s", str(self.tests), "-p", "test_*.py"])
+        self.assertEqual(sorted(set(CALLER) & set(kwargs["env"])), ["TP_LIVE_FAKE"])
 
 
 if __name__ == "__main__":

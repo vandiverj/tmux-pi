@@ -119,20 +119,27 @@ class LocalClassifierTests(unittest.TestCase):
         self.assertNotIn(self.ids[2], out)
 
     def test_failures_keep_every_candidate_redacted(self):
-        cases = {
-            "unparseable": ({"choices": [{"message": {"content": "sure, all fine"}}]}, 0, {}),
-            "timeout": (answer([{"id": i, "secret": False} for i in range(3)]), 1.5, {"budget": 0.5}),
+        counter = Path(os.environ["TP_REDACTION_DIR"]) / "lmstudio-budget.count"
+        counter.write_text("0")
+        capped = {"TP_LMSTUDIO_ENDPOINT": self.url, "TP_LMSTUDIO_BUDGET": "0", "TP_LMSTUDIO_BUDGET_FILE": str(counter)}
+        clear = answer([{"id": i, "secret": False} for i in range(3)])
+        cases = {  # name: (reply, delay, config, env, status, requests the stub got)
+            "unparseable": ({"choices": [{"message": {"content": "sure, all fine"}}]}, 0, {}, {}, "unparseable", 1),
+            "timeout": (clear, 1.5, {"budget": 0.5}, {}, "timeout", 1),
             "bad ids": ({"choices": [{"message": {"content": json.dumps({"results": [
-                {"id": 0, "secret": False}, {"id": 1, "secret": False}, {"id": True, "secret": False}]})}}]}, 0, {}),
+                {"id": 0, "secret": False}, {"id": 1, "secret": False}, {"id": True, "secret": False}]})}}]}, 0, {}, {}, "ok", 1),
+            # the stub is LM Studio and the run's cap is 0 (lib/router.py local_open): a reply that clears all is never asked for
+            "capped": (clear, 0, {}, capped, "capped", 0),
         }
-        for name, (reply, delay, config) in cases.items():
-            with self.subTest(name=name):
-                Stub.reply, Stub.delay = reply, delay
+        for name, (reply, delay, config, env, status, requests) in cases.items():
+            with self.subTest(name=name), mock.patch.dict(os.environ, env):
+                Stub.reply, Stub.delay, Stub.bodies = reply, delay, []
                 out, classifier = self.redact(**config)
                 for token in self.ids:
                     self.assertNotIn(token, out)
+                self.assertEqual((classifier.stats["status"], len(Stub.bodies)), (status, requests))
                 Stub.delay = 0
-                self.assertFalse((Path(os.environ["TP_REDACTION_DIR"]) / "llm-down").exists())  # slow is not down
+                self.assertFalse((Path(os.environ["TP_REDACTION_DIR"]) / "llm-down").exists())  # slow or capped is not down
 
     def test_down_server_is_skipped_until_retry_interval(self):
         with mock.patch.dict(os.environ, {"TP_REDACTION_LLM_URL": "http://127.0.0.1:9"}):

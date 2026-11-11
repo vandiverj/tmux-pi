@@ -23,6 +23,10 @@ from session_env import outside_session  # noqa: E402
 HOOK = ROOT / "claude" / "plugins" / "tmux-pi" / "hooks" / "precompact.sh"
 
 
+RECORD = work.record_json({"kind": "preference", "scope": "global", "status": "superseded", "superseded_by": "other/R2",
+                           "provenance": {"by": "owner", "quote": "blue", "at": "2026-10-03T00:00:00Z"}})
+
+
 def decision(ws, number, question, status="open", blocking=False, **fields):
     entry = {"id": f"{ws}/D{number}", "priority": "normal", "status": status, "blocking": blocking, "question": question,
              "background": "", "options": "", "recommended": "", "affects": ["workspace"], "resolution": "", "by": "", "at": "",
@@ -84,7 +88,8 @@ class Snapshot(Base):
             blockers=["- [ ] need API key", "- [x] old blocker"], nexts=["- [ ] write tests", "- [x] write docs"], links=["- notes: n1"],
             decisions=[decision("demo", 1, "Which db?", blocking=True, background="two candidates", options="a | b",
                                 recommended="a", affects=["task:t1", "lane:x"]),
-                       decision("demo", 2, "Which colour?", status="answered", resolution="blue", by="user", at="2026-10-03T00:00:00Z")])
+                       decision("demo", 2, "Which colour?", status="answered", resolution="blue", by="user", at="2026-10-03T00:00:00Z",
+                                record=RECORD)])
 
     def test_it_copies_every_judgement_item_whole_and_validates(self):
         doc = self.full()
@@ -93,6 +98,12 @@ class Snapshot(Base):
         first = body["state"]["open_decisions"][0]
         self.assertEqual((first["id"], first["blocking"], first["options"], first["affects"]), ("demo/D1", True, "a | b", ["task:t1", "lane:x"]))
         self.assertEqual(body["state"]["open_decisions"][1]["resolution"], "blue")
+        self.assertEqual(body["state"]["open_decisions"][1]["record"], RECORD)  # the record (kind, scope, status, supersession) is copied whole
+        self.assertEqual(body["state"]["open_decisions"][0]["record"], "")
+        older = {k: v for k, v in cp.seal(body).items() if k != "sha256"}  # a checkpoint made before the `record` field: still valid
+        for entry in older["state"]["open_decisions"]:
+            entry.pop("record")
+        self.assertEqual(cp.check(cp.seal(older), "demo"), "")
         self.assertEqual(body["counts"], {"decisions": 2, "open_decisions": 2, "blockers": 2, "next_actions": 2, "sources": 1})
         self.assertIs(body["truncated"], False)
         self.assertEqual(body["summary"], {"authored_by": "agent", "text": "short summary"})
@@ -386,6 +397,7 @@ class Malformed(Base):
         "an open decision is text": lambda b: b["state"]["open_decisions"].append("x"),
         "an open decision field is a list": lambda b: b["state"]["open_decisions"][0].update(question=["q"]),
         "an open decision field is missing": lambda b: b["state"]["open_decisions"][0].pop("resolution"),
+        "an open decision record is a list": lambda b: b["state"]["open_decisions"][0].update(record=["r"]),
         "an open decision affects is text": lambda b: b["state"]["open_decisions"][0].update(affects="a"),
         "an open decision blocking is text": lambda b: b["state"]["open_decisions"][0].update(blocking="yes"),
         "tasks is a dict": lambda b: b.update(tasks={}),
@@ -504,7 +516,9 @@ class Freshness(Base):
 class Recover(Base):
     def lost(self):
         doc = self.workspace(decided=["- 2026-10-01 Use sqlite"], blockers=["- [ ] need key"], nexts=["- [ ] a", "- [x] b"], links=["- n1"],
-                             decisions=[decision("demo", 1, "Which db?", blocking=True, options="a | b")])
+                             decisions=[decision("demo", 1, "Which db?", blocking=True, options="a | b"),
+                                        decision("demo", 2, "Indent?", status="answered", resolution="tabs", by="user", quote="tabs",
+                                                 at="2026-10-03T00:00:00Z", record=RECORD)])
         cp.write(doc, "r", "manual")
         return doc
 
@@ -515,8 +529,13 @@ class Recover(Base):
         self.assertEqual((info["file"], info["source"]), ("file missing", "checkpoint"))
         text = cp.format_recover(info)
         for needle in ("workspace file missing", "recover demo: workspace file missing", "the latest valid checkpoint (the workspace file is unavailable)", "Use sqlite", "demo/D1",
-                       "need key", "Options: a | b", "(2, 1 unfinished", "- [x] b"):
+                       "need key", "Options: a | b", "(2, 1 unfinished", "- [x] b", f"Record: {RECORD}"):
             self.assertIn(needle, text)
+        # what recovery prints restores the record: kind, scope, status and the supersession link
+        entry = [e for e in info["state"]["open_decisions"] if e["id"] == "demo/D2"][0]
+        restored = work.entry_record("demo", work.parse_decisions("\n".join(cp.entry_lines(entry)))[0])
+        self.assertEqual((restored["kind"], restored["scope"], restored["status"], restored["superseded_by"]),
+                         ("preference", "global", "superseded", "other/R2"))
         self.assertIn("workspace file missing", cp.status("demo")["line"])
 
     def test_a_corrupt_workspace_file_is_recovered_from_the_checkpoint(self):
@@ -1036,6 +1055,27 @@ class HookScript(Base):
         self.assertEqual(run.returncode, 0)
         self.assertTrue(self.marker()["pending"])
         self.assertFalse((self.store / "checkpoints").exists())
+        # HB3a: why no checkpoint was written is kept in the run's hook-precompact.log.
+        self.assertRegex((self.state / "hook-precompact.log").read_text(),
+                         r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ precompact: no checkpoint written \(exit 1\): .*ghost")
+
+    def test_with_nothing_attached_it_attaches_the_newest_matching_workspace_and_checkpoints_it(self):
+        # HB3a: the newest active workspace whose repos hold the project is attached first, so the compaction is checkpointed.
+        project = self.tmp / "repo"
+        project.mkdir()
+        self.cli("work", "new", "Old", "--id", "old", "--repo", str(project))
+        self.cli("work", "new", "New", "--id", "new", "--repo", str(project))
+        run = self.run_hook(TP_MODE="orchestrator", TP_WORKDIR=str(project))
+        self.assertEqual((run.returncode, run.stdout, run.stderr), (0, "", ""))
+        self.assertEqual(json.loads((self.state / "session-work.json").read_text())["attached"], ["new"])
+        self.assertEqual(cp.latest("new")["valid"][1]["trigger"], "precompact")
+        self.assertFalse((self.state / "hook-precompact.log").exists())
+        # With no matching workspace nothing is created or attached, and the log says why there is no checkpoint.
+        (self.state / "session-work.json").unlink()
+        self.run_hook(TP_MODE="orchestrator", TP_WORKDIR=str(self.tmp / "elsewhere"))
+        self.assertFalse((self.state / "session-work.json").exists())
+        self.assertEqual(sorted(p.stem for p in (self.store / "workspaces").glob("*.md")), ["new", "old"])
+        self.assertIn("no workspace is attached to this session; no checkpoint written", (self.state / "hook-precompact.log").read_text())
 
     def test_it_never_fails_the_compaction(self):
         self.cli("work", "new", "Demo", "--id", "demo")
@@ -1050,7 +1090,8 @@ class HookScript(Base):
     def test_workers_and_other_sessions_are_left_alone(self):
         self.cli("work", "new", "Demo", "--id", "demo")
         self.attach("demo")
-        for env in ({}, {"TP_MODE": "worker"}, {"TP_MODE": "orchestrator", "TP_TASK_DIR": str(self.tmp)}):
+        for env in ({}, {"TP_MODE": "worker"}, {"TP_MODE": "orchestrator", "TP_TASK_DIR": str(self.tmp)},
+                    {"TP_MODE": "orchestrator", "TP_TASK_ID": "reviewer-1"}):  # HB3a: a worker/reviewer with TP_TASK_ID only
             run = self.run_hook(**env)
             self.assertEqual((run.returncode, run.stdout, run.stderr), (0, "", ""))
         self.assertIsNone(self.marker())
@@ -1224,6 +1265,8 @@ LEAVES = {
     "decision list": ("read", ["decision", "list"]), "promote": ("other", ["promote", "demo"]), "decisions": ("read", ["decisions"]),
     "checkpoint": ("read", ["checkpoint"]), "recover": ("read", ["recover"]), "compacted": ("read", ["compacted"]),
     "recovered": ("read", ["recovered", "--evidence", "checked"]),
+    # HB3a: the owner's confirm changes the record's workspace; `records` only reads.
+    "decision confirm": ("workspace", ["decision", "confirm", "demo/R1", "--quote", "yes"]), "records": ("read", ["records"]),
 }
 
 

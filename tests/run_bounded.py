@@ -40,9 +40,10 @@ def default_log():
     return Path(task_dir) / "tests.jsonl" if task_dir else ROOT / ".tmux-pi" / "test-times.jsonl"
 
 
-def tmux_sockets():
-    """Names of the tmux sockets in the directory `tmux -L` uses (the default socket is not counted)."""
-    base = Path(os.environ.get("TMUX_TMPDIR") or "/tmp")
+def tmux_sockets(env=None):
+    """Names of the tmux sockets in the directory `tmux -L` uses under env (default os.environ); the default socket is not
+    counted."""
+    base = Path((os.environ if env is None else env).get("TMUX_TMPDIR") or "/tmp")
     directory = base / f"tmux-{os.getuid()}"
     try:
         return {p.name for p in directory.iterdir() if p.name != "default"}
@@ -112,12 +113,13 @@ def append_record(log, record):
 
 
 def run_bounded(cmd, timeout=DEFAULT_TIMEOUT, grace=DEFAULT_GRACE, log=None, cwd=None, files=None, per_file=None,
-                echo=True):
+                echo=True, env=None):
     """Run cmd in a new session under the bound. Returns (record, output). Appends the record to `log` (default
     log when None; pass False to write nothing). `per_file` maps file to seconds and is filled from the unittest
-    `Ran N tests in Xs` line when the run has exactly one file."""
+    `Ran N tests in Xs` line when the run has exactly one file. `env` is the child's environment (default: this
+    process's); its TMUX_TMPDIR is where leftovers are looked for."""
     files = list(files or [])
-    before = tmux_sockets()
+    before = tmux_sockets(env)
     chunks = []
     started = time.monotonic()
     # Our own pipe and raw reads: a buffered proc.stdout.close() blocks on the lock a blocked reader holds, so a
@@ -126,7 +128,7 @@ def run_bounded(cmd, timeout=DEFAULT_TIMEOUT, grace=DEFAULT_GRACE, log=None, cwd
     try:
         try:
             proc = subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.DEVNULL, stdout=write_fd, stderr=write_fd,
-                                    start_new_session=True)
+                                    start_new_session=True, env=env)
         finally:
             os.close(write_fd)  # the child has its own copy; ours must go whether or not the launch worked
     except BaseException:
@@ -185,7 +187,7 @@ def run_bounded(cmd, timeout=DEFAULT_TIMEOUT, grace=DEFAULT_GRACE, log=None, cwd
             per_file[files[0]] = float(ran[-1][1])
     rc = None if timed_out else proc.returncode  # the leader's rc counts only when its group emptied in time
     record = {"cmd": list(cmd), "files": files, "seconds": round(seconds, 2), "rc": rc, "timed_out": timed_out,
-              "load1": load1(), "per_file": per_file, "leftovers": sorted(tmux_sockets() - before)}
+              "load1": load1(), "per_file": per_file, "leftovers": sorted(tmux_sockets(env) - before)}
     if log is not False:
         append_record(log or default_log(), record)
     return record, output

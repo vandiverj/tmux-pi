@@ -113,6 +113,8 @@ def ask(endpoint, model, system, user, schema, timeout):
     try:
         with router.local_open(request, timeout) as response:
             raw = response.read()
+    except router.LmStudioBudgetError as exc:
+        raise AskError(str(exc), url) from exc
     except urllib.error.HTTPError as exc:
         raise AskError("HTTP {} from {}".format(exc.code, url), url, exc.code) from exc
     except (socket.timeout, TimeoutError) as exc:

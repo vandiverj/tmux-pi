@@ -1,11 +1,13 @@
 """Local Laya decision adapter and explicit OpenAI-compatible fallback."""
 
+import fcntl
 import hashlib
 import ipaddress
 import json
 import math
 import os
 import re
+import socket
 import subprocess
 import tempfile
 import urllib.error
@@ -57,11 +59,163 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def local_open(request, timeout):
+BUDGET_VAR = "TP_LMSTUDIO_BUDGET"
+BUDGET_FILE_VAR = "TP_LMSTUDIO_BUDGET_FILE"
+ENDPOINT_VAR = "TP_LMSTUDIO_ENDPOINT"  # an extra LM Studio address: host:port, a base URL, or a bare port on loopback
+DEFAULT_LMSTUDIO_PORT = 1234  # LM Studio's own default; always guarded on loopback
+# The install whose configuration names this machine's LM Studio: config/local.json followup.base_url (the router's follow-up
+# judge, which summarize_structured.default_endpoint and llm_router.local_endpoint also use) and agent/models.json
+# providers.lmstudio.baseUrl (the redaction reviewer's, lib/redact_llm.py load_config). Tests point it at a temp root.
+LMSTUDIO_CONFIG_ROOT = Path(__file__).resolve().parent.parent
+
+
+class LmStudioBudgetError(OSError):
+    """A request to LM Studio was refused by the run's request cap (nothing was sent)."""
+
+
+def _host_key(host):
+    """One key per host: every loopback or unspecified address (127/8, ::1, ::ffff:127.x, 0.0.0.0, ::, any form inet_aton
+    reads such as 127.1 or 2130706433) and localhost or *.localhost are the same host, "loopback"; other names as written."""
+    host = (host or "").lower().rstrip(".")
+    if host == "localhost" or host.endswith(".localhost"):
+        return "loopback"
+    address = None
+    try:
+        address = ipaddress.ip_address(host.partition("%")[0])
+    except ValueError:
+        try:
+            address = ipaddress.IPv4Address(socket.inet_aton(host))
+        except (OSError, ValueError):
+            pass
+    if address is not None:
+        mapped = getattr(address, "ipv4_mapped", None)
+        address = mapped or address
+        if address.is_loopback or address.is_unspecified:
+            return "loopback"
+    return host
+
+
+def _endpoint(value):
+    """(host key, port) of a base URL, a host:port or a bare port (loopback); None when it names no host and port."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    value = value.strip()
+    if value.isdigit():
+        return ("loopback", int(value))
+    try:
+        parsed = urllib.parse.urlsplit(value if "://" in value else "http://" + value)
+        host, port = parsed.hostname, parsed.port
+    except ValueError:
+        return None
+    if not host:
+        return None
+    return (_host_key(host), port if port is not None else (443 if parsed.scheme == "https" else 80))
+
+
+def _config_value(path, *keys):
+    try:
+        value = json.loads(Path(path).read_text(encoding="utf-8"))
+        for key in keys:
+            value = value[key]
+        return value
+    except (OSError, ValueError, KeyError, TypeError, IndexError):
+        return None
+
+
+def lmstudio_endpoints():
+    """The (host key, port) pairs that are LM Studio on this machine: loopback:1234, TP_LMSTUDIO_ENDPOINT, and the two configured
+    base URLs under LMSTUDIO_CONFIG_ROOT. Per-run redirects (TP_LOCAL_CONFIG, TP_ROUTER_LLM_URL, TP_REDACTION_LLM_URL) are not
+    sources: they only choose where one request goes (tests aim them at stubs), and LM Studio itself is at one of these addresses."""
+    root = Path(LMSTUDIO_CONFIG_ROOT)
+    values = [str(DEFAULT_LMSTUDIO_PORT), os.environ.get(ENDPOINT_VAR),
+              _config_value(root / "config" / "local.json", "followup", "base_url"),
+              _config_value(root / "agent" / "models.json", "providers", "lmstudio", "baseUrl")]
+    return {found for found in map(_endpoint, values) if found}
+
+
+def is_lmstudio(url):
+    """Whether a request to url reaches LM Studio (its host and port match one of lmstudio_endpoints())."""
+    found = _endpoint(url) if "://" in str(url) else None
+    return found is not None and found in lmstudio_endpoints()
+
+
+class _Held:
+    """A response that keeps the budget lock (one request in flight per run) until it is closed."""
+
+    def __init__(self, response, fd):
+        self._response, self._fd = response, fd
+
+    def close(self):
+        try:
+            self._response.close()
+        finally:
+            if self._fd is not None:
+                fd, self._fd = self._fd, None
+                os.close(fd)  # closing the descriptor releases the flock
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def __iter__(self):
+        return iter(self._response)
+
+    def __getattr__(self, name):
+        return getattr(self._response, name)
+
+
+def _take_budget():
+    """Count one LM Studio request under an exclusive lock; return the locked descriptor. Raises LmStudioBudgetError."""
+    raw, path = os.environ[BUDGET_VAR], os.environ.get(BUDGET_FILE_VAR, "")
+    try:
+        cap = int(raw)
+        if cap < 0:
+            raise ValueError
+    except ValueError:
+        raise LmStudioBudgetError("{} must be a whole number of requests (0 or more), got {!r}; LM Studio request refused".format(BUDGET_VAR, raw)) from None
+    message = "LM Studio request refused: the run's cap is {} requests ({}={})".format(cap, BUDGET_VAR, raw)
+    if not path:
+        raise LmStudioBudgetError("{}; {} is not set".format(message, BUDGET_FILE_VAR))
+    try:
+        fd = os.open(path, os.O_RDWR)
+    except OSError as exc:
+        raise LmStudioBudgetError("{}; counter file {} cannot be opened ({})".format(message, path, type(exc).__name__)) from None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        text = os.pread(fd, 64, 0).decode("ascii", "replace").strip()
+        if not text.isdigit():
+            raise LmStudioBudgetError("{}; counter file {} is empty or not a number".format(message, path))
+        used = int(text)
+        if used >= cap:
+            raise LmStudioBudgetError("{} after {} requests".format(message, used))
+        os.ftruncate(fd, 0)
+        os.pwrite(fd, str(used + 1).encode("ascii"), 0)
+        os.fsync(fd)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _no_proxy_open(request, timeout):
     # Do not send task text through a proxy or follow a remote redirect.
-    return urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect()).open(
-        request, timeout=timeout
-    )
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect()).open(request, timeout=timeout)
+
+
+def local_open(request, timeout, send=None):
+    """Send request with send(request, timeout=...) (default: no proxy, no redirect). The one LM Studio guard: with
+    TP_LMSTUDIO_BUDGET set and the request bound for LM Studio (is_lmstudio), it counts the request against the run's cap and holds
+    the run's lock until the response is closed, or raises LmStudioBudgetError before anything is sent."""
+    fd = _take_budget() if BUDGET_VAR in os.environ and is_lmstudio(request.full_url) else None
+    try:
+        response = (send or _no_proxy_open)(request, timeout=timeout)
+    except BaseException:
+        if fd is not None:
+            os.close(fd)
+        raise
+    return response if fd is None else _Held(response, fd)
 
 
 def local_base_url(value, backend="openai"):

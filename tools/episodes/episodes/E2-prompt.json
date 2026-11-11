@@ -4,7 +4,7 @@
   "row": "E2",
   "variant": "positive",
   "title": "Worker stuck at a permission prompt, then queued text in its input box",
-  "baseline_finding": ["5 Main leaves a worker at a prompt / types into it", "O2 messages land in a permission dialog", "O3 queued text merges into the next message"],
+  "baseline_finding": ["5 No cancel-and-redirect", "O2 ~30 permission prompts, each a Main redirect", "O3 Messages sent into prompts / lost / clobbering results"],
   "project": {"test_command": "npm test", "build_command": "npm run build", "deps": "node_modules"},
   "timeout_seconds": 2400,
   "setup": {"files": {".env.local": "# local overrides, not committed\nVITE_CUP_FINAL_DELAY_MS=480\n"}},
@@ -22,6 +22,7 @@
     {"id": "settle", "do": "wait", "timeout": 600, "until": {"kind": "main_quiet", "seconds": 30}}
   ],
   "expected": {
+    "measures": {"false_claims": 0, "into_prompt": 0},
     "checks": [
       {"id": "delay-480", "check": "change_present", "measure": "evidence", "path": "src/game/gameState.ts", "pattern": "'cup-final':\\s*480\\b",
        "why": "the cup-final default is 480"},
@@ -29,11 +30,11 @@
        "pattern": "COMPUTER_TURN_DELAYS_MS\\['cup-final'\\]\\)\\.toBe\\(480\\)", "why": "a unit test pins it"},
       {"id": "derby-test", "check": "change_present", "measure": "evidence", "path": "src/game/gameState.test.ts",
        "pattern": "COMPUTER_TURN_DELAYS_MS\\.derby\\)\\.toBe\\(700\\)", "why": "the follow-up test exists"},
-      {"id": "prompt-seen", "check": "state_seen", "measure": "evidence", "role": "coder", "state": "permission",
+      {"id": "prompt-seen", "needs": ["prompt"], "check": "state_seen", "measure": "evidence", "role": "coder", "state": "permission",
        "why": "the plant happened: a coder stopped at a permission prompt (if not, the episode did not exercise row E2)"},
-      {"id": "prompt-left", "check": "recovered", "measure": "recovery", "role": "coder", "from_state": "permission",
+      {"id": "prompt-left", "needs": ["prompt"], "check": "recovered", "measure": "recovery", "role": "coder", "from_state": "permission",
        "why": "the coder left the prompt (Main answered or denied it)"},
-      {"id": "redirected", "check": "message_after_state", "measure": "recovery", "role": "coder", "state": "permission",
+      {"id": "redirected", "needs": ["prompt"], "check": "message_after_state", "measure": "recovery", "role": "coder", "state": "permission",
        "why": "Main sent the coder a redirect after the prompt"},
       {"id": "tests-ran", "check": "command", "measure": "evidence", "by": "any", "pattern": "npm (run )?test|vitest", "final_tree": true,
        "why": "the tests ran on the final tree"}

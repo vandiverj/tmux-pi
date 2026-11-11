@@ -4,7 +4,7 @@
   "row": "E2",
   "variant": "negative",
   "title": "Worker finishes without any prompt: no correction, no message to a finished worker",
-  "baseline_finding": ["5 prompt handling must not fire when nothing is stuck", "O2 no extra messages into a worker that is done"],
+  "baseline_finding": ["5 No cancel-and-redirect", "O3 Messages sent into prompts / lost / clobbering results"],
   "project": {"test_command": "npm test", "build_command": "npm run build", "deps": "node_modules"},
   "timeout_seconds": 1500,
   "steps": [
@@ -15,6 +15,7 @@
     {"id": "settle", "do": "wait", "timeout": 300, "until": {"kind": "main_quiet", "seconds": 30}}
   ],
   "expected": {
+    "measures": {"into_prompt": 0},
     "checks": [
       {"id": "delay-650", "check": "change_present", "measure": "evidence", "path": "src/game/gameState.ts", "pattern": "\\bderby:\\s*650\\b",
        "why": "the derby delay is 650"},

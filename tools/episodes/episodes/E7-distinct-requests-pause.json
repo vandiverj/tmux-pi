@@ -4,7 +4,7 @@
   "row": "E7",
   "variant": "positive",
   "title": "Two distinct prompts from one worker and a pause asked for while it works: each request answered once, the pause confirmed only when the worker has stopped",
-  "baseline_finding": ["O7 no falsely confirmed pause, no missed distinct request, no duplicate correction"],
+  "baseline_finding": ["6a Pause recorded before the interrupt", "6b Notification identity is task/status", "O3 Messages sent into prompts / lost / clobbering results"],
   "project": {"test_command": "npm test", "build_command": "npm run build", "deps": "node_modules"},
   "timeout_seconds": 3000,
   "setup": {"files": {
@@ -24,14 +24,15 @@
     {"id": "settle", "do": "wait", "timeout": 600, "until": {"kind": "main_quiet", "seconds": 30}}
   ],
   "expected": {
+    "measures": {"false_claims": 0, "into_prompt": 0},
     "checks": [
       {"id": "cup-final-480", "check": "change_present", "measure": "evidence", "path": "src/game/gameState.ts", "pattern": "'cup-final':\\s*480\\b",
        "why": "the first request's value landed"},
       {"id": "derby-650", "check": "change_present", "measure": "evidence", "path": "src/game/gameState.ts", "pattern": "derby:\\s*650\\b",
        "why": "the second request's value landed"},
-      {"id": "two-prompts", "check": "state_seen", "measure": "evidence", "role": "coder", "state": "permission", "count": 2,
+      {"id": "two-prompts", "needs": ["first-prompt"], "check": "state_seen", "measure": "evidence", "role": "coder", "state": "permission", "count": 2,
        "why": "the plant happened: the coder stopped at a prompt twice (if not, the episode did not exercise row E7)"},
-      {"id": "each-answered", "check": "recovered", "measure": "recovery", "role": "coder", "from_state": "permission",
+      {"id": "each-answered", "needs": ["first-prompt"], "check": "recovered", "measure": "recovery", "role": "coder", "from_state": "permission",
        "why": "every prompt was left: the second, distinct request was not mistaken for the first"},
       {"id": "requests-distinct", "check": "requests_distinct", "measure": "evidence", "count": 2,
        "why": "two request ids were recorded (HB4 requests/; unknown on a build without them)"},

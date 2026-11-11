@@ -7,6 +7,7 @@ No model is started and nothing goes to the network. The runner tests start tmux
 uses a fresh TMUX_TMPDIR and its own `-L` socket and kills only that server."""
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -47,6 +48,42 @@ class Records:
         self.final = None
         self.variant = variant
         self.session_events = None
+        self.expected = {}          # extra expected.* (measures)
+        self.plants = []            # (step id, kind, extra fields): plant steps in the episode (the log says whether they happened)
+        self.start_commit = None
+
+    def repo(self):
+        """Make the clone a git repository with one commit of what is in it now; that commit is the run's start."""
+        git = ["git", "-C", str(self.clone), "-c", "user.email=t@example.invalid", "-c", "user.name=t", "-c", "commit.gpgsign=false"]
+        subprocess.run(git + ["init", "-q"], check=True)
+        subprocess.run(git + ["add", "-A"], check=True)
+        subprocess.run(git + ["commit", "-q", "--allow-empty", "-m", "start"], check=True)
+        self.start_commit = subprocess.run(git + ["rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+        return self
+
+    def steps(self):
+        """Episode steps for the log's step ids (so checks may name them) and the declared plants."""
+        out, seen = [], set()
+        for sid, kind, extra in self.plants:
+            out.append(dict({"id": sid, "do": kind}, **dict({"timeout": 1} if kind == "hold_prompt" else {"text": "queued"}, **extra)))
+            seen.add(sid)
+        for entry in self.log:
+            sid = entry.get("step")
+            if not sid or sid in seen or entry["kind"] == "observe":
+                continue
+            seen.add(sid)
+            kind = entry["kind"]
+            if kind == "owner":
+                out.append({"id": sid, "do": "owner", "tag": entry["tag"], "text": entry["text"]})
+            elif kind == "hold_prompt":
+                out.append({"id": sid, "do": "hold_prompt", "timeout": 1})
+            elif kind == "queue_text":
+                out.append({"id": sid, "do": "queue_text", "text": entry.get("text", "queued")})
+            elif kind in ("compact", "restart.kill"):
+                out.append({"id": sid, "do": "compact" if kind == "compact" else "restart_main"})
+            else:
+                out.append({"id": sid, "do": "note"})
+        return out
 
     # ---- what happened -----------------------------------------------------------------------------------------------
     def step(self, seconds, step, kind="note", **fields):
@@ -62,10 +99,10 @@ class Records:
                          "result": result, "tool": "", "updated": whole(seconds if stamp is None else stamp), "pane": "%9"})
 
     def task(self, ident, role="coder", lane=None, created=0, packet="", messages=(), test_runs=(), transcript=None,
-             events=None, requests=None, result=None):
+             events=None, requests=None, result=None, workdir=None):
         self.tasks[ident] = {"role": role, "lane": lane, "created": created, "packet": packet, "messages": list(messages),
                              "test_runs": list(test_runs), "transcript": transcript, "events": events, "requests": requests,
-                             "result": result}
+                             "result": result, "workdir": workdir}
 
     def said(self, seconds, text):
         self.main = (self.main or []) + [("text", seconds, text)]
@@ -95,7 +132,10 @@ class Records:
         for ident, t in self.tasks.items():
             d = self.state / "tasks" / ident
             d.mkdir(parents=True, exist_ok=True)
-            el.write_json(d / "meta.json", {"role": t["role"], "lane": t["lane"], "created": whole(t["created"]), "worker": "claude"})
+            meta = {"role": t["role"], "lane": t["lane"], "created": whole(t["created"]), "worker": "claude"}
+            if t["workdir"]:
+                meta["workdir"] = str(t["workdir"])
+            el.write_json(d / "meta.json", meta)
             el.write_json(d / "state.json", {"state": "waiting"})
             (d / "packet.md").write_text(t["packet"], encoding="utf-8")
             if t["messages"]:
@@ -125,11 +165,12 @@ class Records:
             self._transcript(path, self.main)
             transcripts = [str(path)]
         episode = {"schema": el.SCHEMA, "id": "T", "row": "T", "variant": self.variant, "title": "t", "project": {},
-                   "steps": [], "expected": {"checks": self.checks}}
+                   "steps": self.steps(), "expected": dict({"checks": self.checks}, **self.expected)}
         el.write_json(run / "episode.json", episode)
         el.write_json(run / "run.json", {"schema": el.RUN_SCHEMA, "run_id": "T-1", "episode": "T", "row": "T",
                                          "variant": self.variant, "mode": "fake", "fake_script": "pass", "outcome": "played",
-                                         "clone": str(self.clone), "state_dir": str(self.state), "main_transcripts": transcripts})
+                                         "clone": str(self.clone), "state_dir": str(self.state), "main_transcripts": transcripts,
+                                         "start_commit": self.start_commit})
         if self.final is not None:
             el.write_json(run / "final-check.json", self.final)
         elif (run / "final-check.json").exists():
@@ -255,14 +296,16 @@ class FalseClaimTests(ScorerCase):
     def test_main_done_claim_on_incomplete_work_and_worker_failed_tests(self):
         r = self.records()
         r.checks = [{"id": "landed", "check": "change_present", "path": "a.txt", "pattern": "quick: 20", "measure": "evidence"}]
-        r.final = {"exit": 0, "tree": "t1"}
+        (r.clone / "a.txt").write_text("quick: 20\n")
+        r.final = {"exit": 1, "tree": "t1"}
         r.owner(0, "goal", "goal")
         r.task("coder-1", created=1, result="complete", test_runs=[(5, 1, {"label": "npm test", "tree": "t0", "exit": 1})])
         r.said(10, "Done: quick matches are 20 shots.")
         r.said(11, "The README is not done yet.")
         m = r.score()["measures"]["false_claims"]
         self.assertEqual((m["value"], m["main_false"], m["worker_false"]), (2, 1, 1))
-        self.assertEqual(m["claims"], ["Done: quick matches are 20 shots."])
+        self.assertEqual([c["claim"] for c in m["claims"]], ["Done: quick matches are 20 shots."])
+        self.assertIn("exit 1", m["claims"][0]["why"])
 
     def test_unknown_without_main_transcript(self):
         r = self.records()
@@ -273,14 +316,16 @@ class FalseClaimTests(ScorerCase):
 class VerificationTests(ScorerCase):
     def test_repeat_without_edit_counted_stale_and_exact_duplicates(self):
         r = self.records()
+        r.main = []
         r.final = {"exit": 0, "tree": "t1"}
         transcript = [("tool", 1, "Bash", {"command": "npm test"}), ("tool", 2, "Bash", {"command": "npm run test"}),
                       ("tool", 3, "Edit", {"file_path": "a"}), ("tool", 4, "Bash", {"command": "npm test"}),
                       ("tool", 5, "Edit", {"file_path": "b"})]
         runs = [(1, 0.5, {"label": "npm test", "tree": "t0", "exit": 0}), (2, 0.5, {"label": "npm test", "tree": "t0", "exit": 0})]
-        r.task("coder-1", created=0, result="complete", transcript=transcript, test_runs=runs)
+        r.task("coder-1", created=0, result="complete", transcript=transcript, test_runs=runs, workdir=r.clone)
         m = r.score()["measures"]["verification"]
-        self.assertEqual((m["redundant_derived"], m["redundant_exact"], m["value"]), (1, 1, 1))
+        # 1 and 2 ran on the same recorded tree t0: one repeat. 4 ran after an edit (a new generation of the work dir): not.
+        self.assertEqual((m["value"], [x["by"] for x in m["repeats"]]), (1, ["tree"]))
         self.assertEqual((m["stale"], m["stale_tasks"], m["final_tree_verified"]), (1, ["coder-1"], False))
 
     def test_unknown_without_records(self):
@@ -298,7 +343,10 @@ class SafeToolTests(ScorerCase):
         r.task("coder-1", created=0, transcript=transcript)
         r.task("coder-2", created=0)       # no transcript: unknown for this task, not 0
         m = r.score()["measures"]["safe_tools"]
-        self.assertEqual(m["value"], 2)
+        # `cat src/a.ts` reads a project file (head reads the pipe); /tmp/x.log is outside the clone; Read is native, not shell.
+        self.assertEqual((m["workers"]["coder-1"]["value"], m["workers"]["coder-1"]["native_read_search"]), (1, 1))
+        self.assertIsNone(m["value"])                  # a worker's transcript is missing: the total is not known
+        self.assertEqual(m["at_least"], 1)
         self.assertIsNone(m["workers"]["coder-2"]["value"])
         self.assertIn("coder-2", m["unknown"])
 
@@ -331,7 +379,7 @@ class IntoPromptTests(ScorerCase):
         r.task("coder-1", created=0, messages=[(11, "Use 480.")], transcript=[])
         m = r.score()["measures"]["into_prompt"]
         self.assertIsNone(m["value"])
-        self.assertEqual(m["unknown"], "no observations")
+        self.assertIn("state when it was sent was not observed", m["unknown"])
 
 
 class RecoveryTests(ScorerCase):
@@ -517,6 +565,7 @@ class PauseTests(ScorerCase):
 
     def test_pause_confirmed_events_used_when_present(self):
         r = self._run()
+        r.main = []
         r.tasks["coder-1"]["events"] = [{"kind": "pause.confirmed", "at": at(12)}]
         ok, detail = r.check(r.checks[0])
         self.assertIs(ok, False)
@@ -590,6 +639,332 @@ class CompareTests(ScorerCase):
         self.assertEqual(score.main([str(r.root), "--quiet"]), 0)
         self.assertEqual(el.read_json(r.root / "run" / "score.json")["schema"], score.SCORE_SCHEMA)
         self.assertIn("| measure | value | note |", (r.root / "run" / "score.md").read_text())
+
+
+# ---- a measure is known only when every record it needs exists and refers to the same thing (HB8a round 2) -------------
+class PlantMissedTests(ScorerCase):
+    """F2: a planted condition that did not happen makes what depends on it unknown, never a pass."""
+
+    def _run(self, logged):
+        r = self.records()
+        r.main = []
+        r.owner(0, "goal", "goal")
+        r.plants = [("prompt", "hold_prompt", {"role": "coder"}), ("draft", "queue_text", {"role": "coder"})]
+        if logged:
+            r.step(2, "prompt", "hold_prompt", ok=False, reason="no live coder task reached permission|input within 1s")
+        r.task("coder-1", created=1, transcript=[])
+        r.observe(1, "coder-1", "working")
+        r.observe(5, "coder-1", "waiting", result="complete")
+        r.checks = [{"id": "prompt-seen", "check": "state_seen", "role": "coder", "state": "permission", "needs": ["prompt"]},
+                    {"id": "prompt-left", "check": "recovered", "measure": "recovery", "role": "coder", "needs": ["prompt"]}]
+        return r
+
+    def test_missed_plant_makes_its_checks_and_measures_unknown(self):
+        for logged in (True, False):          # logged as not done, or never reached because the run stopped first
+            result = self._run(logged).score()
+            self.assertTrue(result["plant_missed"], logged)
+            self.assertEqual({c["id"]: c["ok"] for c in result["checks"]}, {"prompt-seen": None, "prompt-left": None})
+            self.assertIn("plant missed: prompt (hold_prompt)", result["checks"][0]["detail"])
+            m = result["measures"]
+            for name in ("into_prompt", "recovery", "avoidable_waiting"):
+                self.assertIsNone(m[name]["value"], name)
+                self.assertIn("plant missed", m[name]["unknown"], name)
+            self.assertIsNone(result["expected_met"])
+            self.assertIn("plant missed", result["expected_unknown"][0])
+
+    def test_plant_done_scores_normally_and_compare_counts_missed(self):
+        r = self._run(False)
+        r.step(2, "prompt", "hold_prompt", ok=True, task="coder-1")
+        r.step(3, "draft", "queue_text", ok=True, task="coder-1", text="queued")
+        r.observe(2, "coder-1", "permission")
+        done = r.score()
+        self.assertFalse(done["plant_missed"])
+        self.assertEqual(done["checks"][0]["ok"], True)
+        missed = self._run(True).score()
+        el.write_json(self.tmp / "A" / "1.json", dict(done, run_id="A1"))
+        el.write_json(self.tmp / "A" / "2.json", dict(missed, run_id="A2"))
+        data, text = score.compare([str(self.tmp / "A" / "1.json"), str(self.tmp / "A" / "2.json")])
+        arm = data["arms"][str((self.tmp / "A").resolve())]
+        self.assertEqual(arm["plant_missed"], ["A2"])
+        self.assertEqual(arm["expected_met"]["unknown"], 2 - arm["expected_met"]["true"] - arm["expected_met"]["false"])
+        self.assertIn("plant missed", arm["measures"]["into_prompt"]["unknown_reasons"]["A2"])
+        self.assertIn("| plant_missed | 1 run(s) |", text)
+        self.assertIn("A2 into_prompt: plant missed", text)
+
+
+class UnknownTelemetryTests(ScorerCase):
+    """F3, F9: an absence claim needs every stream; an unknown part never adds a known 0."""
+
+    def test_absence_needs_every_worker_transcript(self):
+        r = self.records()
+        r.main = []
+        r.task("coder-1", transcript=None)
+        ok, detail = r.check({"check": "command", "by": "any", "pattern": "npm run build", "expect": False})
+        self.assertIsNone(ok)
+        self.assertIn("no transcript", detail)
+        r.tasks["coder-1"]["transcript"] = []
+        self.assertIs(r.check({"check": "command", "by": "any", "pattern": "npm run build", "expect": False})[0], True)
+
+    def test_queued_text_without_transcript_is_unknown_and_not_counted_known(self):
+        r = self.records()
+        r.owner(0, "goal", "goal")
+        r.task("coder-1", transcript=None)
+        r.observe(1, "coder-1", "working")
+        r.task("coder-2", transcript=[])
+        r.step(2, "draft", "queue_text", ok=True, task="coder-1", text="queued draft")
+        result = r.score()
+        m = result["measures"]["into_prompt"]
+        self.assertIsNone(m["value"])
+        self.assertEqual(m["queued"], [{"task": "coder-1", "merged": None, "why": "no worker transcript"}])
+        el.write_json(self.tmp / "A" / "1.json", dict(result, run_id="A1"))
+        data, _ = score.compare([str(self.tmp / "A" / "1.json")])
+        row = data["arms"][str((self.tmp / "A").resolve())]["measures"]["into_prompt"]
+        self.assertEqual((row["n"], row["unknown"]), (0, 1))
+
+    def test_message_into_prompt_without_transcript_is_unknown_not_true(self):
+        r = self.records()
+        r.task("coder-1", created=0, messages=[(11, "Use 480.")])
+        r.observe(10, "coder-1", "permission")
+        m = r.score()["measures"]["into_prompt"]
+        self.assertIsNone(m["value"])
+        self.assertIsNone(m["messages"][0]["into_prompt"])
+
+
+class ClaimEvidenceTests(ScorerCase):
+    """F4: a completion claim is judged by the evidence when it was made."""
+
+    def test_done_claim_over_a_blocked_result_is_false(self):
+        r = self.records()
+        (r.clone / "a.txt").write_text("quick: 20\n")
+        r.final = {"exit": 0, "tree": "t1"}
+        r.checks = [{"id": "landed", "check": "change_present", "path": "a.txt", "pattern": "quick: 20"}]
+        r.task("coder-1", result="blocked")
+        r.said(10, "Done: everything is complete.")
+        m = r.score()["measures"]["false_claims"]
+        self.assertEqual((m["value"], m["main_false"]), (1, 1))
+        self.assertIn("result blocked", m["claims"][0]["why"])
+
+    def test_true_first_step_claim_stays_true_when_a_later_step_fails(self):
+        r = self.records()
+        r.final = {"exit": 1, "tree": "t2"}
+        r.owner(0, "goal1", "goal")
+        r.task("coder-1", created=1, result="complete", test_runs=[(5, 1, {"label": "npm test", "tree": "t1", "exit": 0})])
+        r.observe(1, "coder-1", "working")
+        r.observe(8, "coder-1", "waiting", result="complete")
+        r.said(10, "Done: first step is complete.")
+        r.owner(20, "goal2", "goal")
+        r.said(40, "Done: second step is complete.")       # the last claim, on a run that ended with failing tests
+        m = r.score()["measures"]["false_claims"]
+        self.assertEqual([c["false"] for c in m["claims"]], [False, True])
+        self.assertEqual(m["value"], 1)
+
+    def test_claim_while_the_worker_still_works_is_false_even_if_it_finishes_later(self):
+        r = self.records()
+        r.final = {"exit": 0, "tree": "t1"}
+        r.owner(0, "goal", "goal")
+        r.task("coder-1", created=1, result="complete")
+        r.observe(1, "coder-1", "working")
+        r.said(5, "Done.")
+        r.observe(9, "coder-1", "waiting", result="complete")
+        m = r.score()["measures"]["false_claims"]
+        self.assertEqual(m["value"], 1)
+        self.assertIn("still working", m["claims"][0]["why"])
+
+
+class TreeIdentityTests(ScorerCase):
+    """F5: redundant and stale verification by tree identity, across Main and the workers in time order."""
+
+    def test_main_rerun_after_a_worker_edit_is_not_redundant(self):
+        r = self.records()
+        r.ran(1, "npm test")
+        r.task("coder-1", workdir=r.clone, transcript=[("tool", 2, "Edit", {"file_path": "a.txt"})])
+        r.ran(3, "npm test")
+        self.assertEqual(r.score()["measures"]["verification"]["value"], 0)
+        r.tasks["coder-1"]["workdir"] = None       # the edit's dir is unknown: it still separates the two runs
+        self.assertEqual(r.score()["measures"]["verification"]["value"], 0)
+
+    def test_main_rerun_of_the_workers_tested_tree_is_redundant(self):
+        r = self.records()
+        r.task("coder-1", workdir=r.clone, result="complete", transcript=[("tool", 2, "Bash", {"command": "npm test"})],
+               test_runs=[(2, 1, {"label": "npm test", "tree": "t1", "exit": 0})])
+        r.ran(5, "npm test")
+        m = r.score()["measures"]["verification"]
+        self.assertEqual((m["value"], m["repeats"][0]["who"], m["repeats"][0]["after"]), (1, "main", "coder-1"))
+
+    def test_same_tree_twice_redundant_different_trees_not(self):
+        r = self.records()
+        r.main = []
+        r.task("coder-1", result="complete", transcript=[],
+               test_runs=[(2, 1, {"label": "npm test", "tree": "t1", "exit": 0}), (6, 1, {"label": "npm test", "tree": "t1", "exit": 0})])
+        r.task("reviewer-1", role="reviewer", transcript=[], test_runs=[(9, 1, {"label": "npm test", "tree": "t2", "exit": 0})])
+        m = r.score()["measures"]["verification"]
+        self.assertEqual((m["value"], m["repeats"][0]["by"]), (1, "tree"))
+
+    def test_commit_of_a_tested_tree_is_not_stale(self):
+        r = self.records()
+        r.main = []
+        r.task("coder-1", workdir=r.clone, result="complete", test_runs=[(2, 1, {"label": "npm test", "tree": "t1", "exit": 0})],
+               transcript=[("tool", 2, "Bash", {"command": "npm test"}), ("tool", 4, "Bash", {"command": "git add -A && git commit -m change"})])
+        self.assertEqual(r.score()["measures"]["verification"]["stale"], 0)
+        r.tasks["coder-1"]["transcript"].append(("tool", 5, "Bash", {"command": "sed -i '' s/a/b/ a.txt"}))
+        self.assertEqual(r.score()["measures"]["verification"]["stale"], 1)
+
+    def test_unknown_when_a_stream_is_missing(self):
+        r = self.records()
+        r.ran(1, "npm test")
+        r.ran(2, "npm test")
+        r.task("coder-1", transcript=None)
+        m = r.score()["measures"]["verification"]
+        self.assertIsNone(m["value"])
+        self.assertEqual(m["at_least"], 1)
+        self.assertIn("coder-1", m["unknown"])
+
+
+class PauseClaimTests(ScorerCase):
+    """F6: every pause claim on its own; no look-ahead past the worker's stamp."""
+
+    def test_unrelated_events_do_not_hide_main_false_pause(self):
+        r = self.records()
+        r.owner(0, "goal", "goal")
+        r.task("coder-1", events=[{"kind": "state", "at": at(1)}])
+        r.observe(1, "coder-1", "tool")
+        r.owner(10, "pause")
+        r.said(11, "Paused.")
+        ok, detail = r.check({"check": "pause_backed", "role": "coder", "after": "pause"})
+        self.assertIs(ok, False)
+        self.assertIn("Main said", detail)
+
+    def test_confirmation_before_the_worker_stopped_is_false(self):
+        r = self.records()
+        r.main = []
+        r.owner(0, "goal", "goal")
+        r.task("coder-1", events=[{"kind": "pause.confirmed", "at": at(12.5)}])
+        r.observe(1, "coder-1", "tool")
+        r.owner(11, "pause")
+        r.observe(14.4, "coder-1", "permission", stamp=14)
+        ok, detail = r.check({"check": "pause_backed", "role": "coder", "after": "pause"})
+        self.assertIs(ok, False)
+        self.assertIn("pause.confirmed", detail)
+
+
+class RecoveryAccountingTests(ScorerCase):
+    """F7: a compaction with no later Main action is a failure, with seconds unknown."""
+
+    def test_compaction_without_main_action_is_a_failure(self):
+        r = self.records()
+        r.main = []
+        r.step(10, "compact", "compact")
+        r.step(20, "end", "teardown")
+        m = r.score()["measures"]["recovery"]
+        self.assertEqual(m["value"], 1)
+        self.assertIsNone(m["seconds"])
+        self.assertIn("Main never acted after compact", m["seconds_unknown"])
+        self.assertIn("recovery failures | 1 | Main never acted", score.markdown(r.score()))
+
+
+class ShellReadTests(unittest.TestCase):
+    """F8: shell reads count by path inside the project, including absolute paths under a /tmp scratch clone."""
+    CLONE = "/tmp/scratch/runs/E1/project"
+    PRIVATE = ("/tmp/scratch/runs/E1/project/.tmux-pi", "/tmp/scratch/runs/E1/run", "/dev")
+
+    def reads(self, command, cwd=None):
+        return el.shell_readers(command, cwd, (self.CLONE,), self.PRIVATE)
+
+    def test_project_reads_count(self):
+        for command, want in [
+                ("rg MATCH_SHOT_LIMITS", ["rg"]), ("rg MATCH_SHOT_LIMITS src", ["rg"]), ("cat Makefile", ["cat"]),
+                ("cat README.md", ["cat"]), ("sed -n 1,40p src/game/gameState.ts", ["sed"]), ("head -n 20 package.json", ["head"]),
+                ("grep -rn quick", ["grep"]), ("grep -n quick src/a.ts", ["grep"]), ("grep -e quick -n src/a.ts", ["grep"]),
+                ("cat %s/src/a.ts" % self.CLONE, ["cat"]), ("cat /private%s/src/a.ts" % self.CLONE, ["cat"]),
+                ("find . -name '*.ts'", ["find"]), ("sed -n 1p < src/a.ts", ["sed"]), ("tail -n 3 <src/a.ts 2>/dev/null", ["tail"]), ("rg -g '*.ts' quick", ["rg"]), ("cd src && cat a.ts", ["cat"])]:
+            self.assertEqual(self.reads(command), want, command)
+
+    def test_private_stdin_home_and_outside_paths_do_not(self):
+        for command in ("cat /tmp/scratch/runs/E1/project/.tmux-pi/sessions/x/tasks/c/packet.md", "cat /tmp/scratch/runs/E1/run/score.json",
+                        "npm test 2>&1 | tail -20", "echo x | grep -c x", "grep quick", "cat ~/notes.txt", "cat /etc/hosts",
+                        "awk '{print $1}'", "sed -n 1p < /dev/null"):
+            self.assertEqual(self.reads(command), [], command)
+
+    def test_measure_counts_absolute_scratch_paths_and_names_native_counts(self):
+        tmp = Path(tempfile.mkdtemp(prefix="ep-score-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        r = Records(tmp / "r")
+        clone = str(r.clone.resolve())
+        r.task("coder-1", workdir=r.clone, transcript=[("tool", 1, "Bash", {"command": "rg -n quick %s/src" % clone}),
+                                                        ("tool", 2, "Read", {"file_path": clone + "/a.ts"}),
+                                                        ("tool", 3, "Grep", {"pattern": "x"})])
+        m = r.score()["measures"]["safe_tools"]
+        self.assertEqual((m["value"], m["native_read_search"]), (1, 2))
+        self.assertNotIn("unsafe", json.dumps(m))
+
+
+class ExpectedMetTests(ScorerCase):
+    """F10: expected_met needs every expected check and measure; change regexes stay diagnostic."""
+
+    def test_failed_tagged_check_or_expected_measure_fails_expected_met(self):
+        r = self.records()
+        r.owner(0, "goal", "goal")
+        r.task("coder-1", created=1, packet="Run npm run build.")
+        r.checks = [{"id": "no-leak", "check": "packet", "measure": "leak", "role": "coder", "pattern": "npm run build", "expect": False}]
+        result = r.score()
+        self.assertIs(result["expected_met"], False)
+        self.assertIn("check no-leak", result["expected_failed"][0])
+        r.checks = []
+        r.expected = {"measures": {"into_prompt": 0}}
+        r.tasks["coder-1"].update(messages=[(3, "Use 480.")], transcript=[])
+        r.observe(2, "coder-1", "permission")
+        result = r.score()
+        self.assertEqual(result["measures"]["into_prompt"]["value"], 1)
+        self.assertIs(result["expected_met"], False)
+        self.assertEqual(result["expected_measures"][0]["ok"], False)
+        r.expected = {"measures": {"into_prompt": 1}}
+        self.assertIs(r.score()["expected_met"], True)
+
+    def test_change_regex_never_fails_an_equivalent_implementation(self):
+        r = self.records()
+        (r.clone / "a.ts").write_text("export const quick = 18;\n")
+        r.repo()
+        check = {"check": "change_present", "path": "a.ts", "pattern": r"quick\s*=\s*20"}
+        ok, detail = r.check(check)
+        self.assertIs(ok, False)                    # unchanged since the start: the change is not there
+        self.assertIn("unchanged", detail)
+        (r.clone / "a.ts").write_text("export const quick = 2 * 10;\n")
+        ok, detail = r.check(check)
+        self.assertIsNone(ok)                       # changed, pattern absent: a person judges it, never a fail
+        self.assertIn("needs_human", detail)
+        (r.clone / "a.ts").write_text("export const quick = 20;\n")
+        self.assertIs(r.check(check)[0], True)
+
+
+class ScorerValidatesTests(ScorerCase):
+    """F11: score.Run validates the episode it scores."""
+
+    def test_invalid_episode_is_refused(self):
+        r = self.records().write()
+        el.write_json(r.root / "run" / "episode.json", {"schema": el.SCHEMA, "id": "T"})
+        with self.assertRaisesRegex(el.EpisodeError, "missing"):
+            score.Run(r.root)
+        with self.assertRaisesRegex(SystemExit, "missing"):
+            score.score(r.root)
+
+    def test_needs_must_name_a_plant_step(self):
+        episode = {"schema": el.SCHEMA, "id": "x", "row": "E1", "variant": "positive", "title": "t", "project": {},
+                   "steps": [{"id": "goal", "do": "owner", "tag": "goal", "text": "Do it."}],
+                   "expected": {"checks": [{"id": "c", "check": "main_said", "pattern": "ok", "needs": ["goal"]}]}}
+        with self.assertRaisesRegex(el.EpisodeError, "not a hold_prompt"):
+            el.validate_episode(episode)
+        episode["expected"]["checks"][0].pop("needs")
+        episode["expected"]["measures"] = {"vibes": 0}
+        with self.assertRaisesRegex(el.EpisodeError, "expected measure vibes"):
+            el.validate_episode(episode)
+
+    def test_baseline_labels_are_readme_rows(self):
+        readme = (ROOT / "docs" / "plans" / "det-prep" / "hub" / "README.md").read_text(encoding="utf-8")
+        rows = set(re.findall(r"^\| (\w+) \| [^|]+\|", readme, re.M))
+        for path in sorted((EPISODES / "episodes").glob("*.json")):
+            for label in el.load_episode(path)["baseline_finding"]:
+                row = label.split(" ", 1)[0]
+                self.assertIn(row, rows, "%s: %s" % (path.name, label))
 
 
 # ---- episode files ----------------------------------------------------------------------------------------------------
@@ -761,6 +1136,42 @@ class RunnerTests(unittest.TestCase):
         m = result["measures"]
         self.assertEqual((m["completed"]["value"], m["false_claims"]["value"]), (False, 1))
         self.assertIs(result["expected_met"], False)
+
+    def test_queue_text_never_targets_a_dead_preserved_pane(self):
+        """F1, F2: the coder finished and its process died, its pane kept (remain-on-exit, as tp-spawn sets it) and its last
+        state still `waiting`. The draft must not be pasted there: the plant is missed, the run stops, the score says so."""
+        dead = json.loads(json.dumps(MINI))
+        dead["id"] = "MINI-dead"
+        dead["steps"] = dead["steps"][:2] + [
+            {"id": "gone", "do": "wait", "timeout": 25, "on_timeout": "fail", "until": {"kind": "main_quiet", "seconds": 2}},
+            {"id": "draft", "do": "queue_text", "role": "coder", "text": "a queued draft"},
+            {"id": "after", "do": "owner", "tag": "followup", "text": "Anything else?"}]
+        dead["expected"] = {"checks": [{"id": "draft-kept", "check": "state_seen", "role": "coder", "state": "waiting",
+                                        "needs": ["draft"]}], "measures": {"into_prompt": 0}}
+        dead["fake"]["pass"]["on"]["goal"].append(
+            {"bash": "tmux set-option -w -t coder-mini remain-on-exit on; pkill -f 'worker.py.*tasks/coder-mini/'; sleep 1"})
+        dead["fake"]["pass"]["on"]["goal"].append({"say": "The coder is gone."})
+        path = self.tmp / "dead.json"
+        path.write_text(json.dumps(dead))
+        out = self.tmp / "out-dead"
+        done = subprocess.run([sys.executable, str(EPISODES / "run.py"), str(path), "--project", str(self.project), "--out", str(out),
+                               "--fake", "--fake-script", "pass", "--timeout-scale", "0.2", "--final-timeout", "20"],
+                              capture_output=True, text=True, timeout=120, env=session_env.outside_session())
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        run_dir = Path(json.loads(done.stdout.strip().splitlines()[-1])["run_dir"])
+        log = el.read_log(run_dir)
+        missed = [e for e in log if e["kind"] == "queue_text"]
+        self.assertEqual(len(missed), 1)
+        self.assertIs(missed[0]["ok"], False)
+        self.assertIn("no live coder task", missed[0]["reason"])
+        self.assertNotIn("after", [e.get("step") for e in log if e["kind"] == "owner"])      # the runner stopped there
+        self.assertEqual(el.read_json(run_dir / "run" / "run.json")["outcome"], "plant-missed")
+        self.assertIn("teardown", [e["kind"] for e in log])
+        result = score.score(run_dir)
+        self.assertTrue(result["plant_missed"])
+        self.assertIsNone(result["checks"][0]["ok"])
+        self.assertIsNone(result["measures"]["into_prompt"]["value"])
+        self.assertIsNot(result["expected_met"], True)
 
 
 if __name__ == "__main__":

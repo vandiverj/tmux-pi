@@ -4,7 +4,7 @@
   "row": "E7",
   "variant": "negative",
   "title": "One prompt seen over several status checks: one correction, not one per sighting, and no pause nobody asked for",
-  "baseline_finding": ["O7 a request seen again is the same request: no duplicate correction and no unrequested pause"],
+  "baseline_finding": ["6b Notification identity is task/status", "5 No cancel-and-redirect"],
   "project": {"test_command": "npm test", "build_command": "npm run build", "deps": "node_modules"},
   "timeout_seconds": 2400,
   "setup": {"files": {".env.local": "# local overrides, not committed\nVITE_CUP_FINAL_DELAY_MS=480\n"}},
@@ -18,12 +18,13 @@
     {"id": "settle", "do": "wait", "timeout": 600, "until": {"kind": "main_quiet", "seconds": 30}}
   ],
   "expected": {
+    "measures": {"into_prompt": 0},
     "checks": [
       {"id": "delay-480", "check": "change_present", "measure": "evidence", "path": "src/game/gameState.ts", "pattern": "'cup-final':\\s*480\\b",
        "why": "the change landed"},
-      {"id": "prompt-seen", "check": "state_seen", "measure": "evidence", "role": "coder", "state": "permission",
+      {"id": "prompt-seen", "needs": ["prompt"], "check": "state_seen", "measure": "evidence", "role": "coder", "state": "permission",
        "why": "the plant happened"},
-      {"id": "prompt-left", "check": "recovered", "measure": "recovery", "role": "coder", "from_state": "permission",
+      {"id": "prompt-left", "needs": ["prompt"], "check": "recovered", "measure": "recovery", "role": "coder", "from_state": "permission",
        "why": "the one prompt was answered"},
       {"id": "one-correction", "check": "message_count", "measure": "leak", "role": "coder", "max": 1,
        "why": "a prompt seen again at the check-in is the same request: one message, not one per sighting"},

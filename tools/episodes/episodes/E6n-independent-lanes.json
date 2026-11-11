@@ -4,7 +4,8 @@
   "row": "E6",
   "variant": "negative",
   "title": "Two independent lanes: no invented dependency, so they run at the same time and no blocker is claimed",
-  "baseline_finding": ["O6 blocker attribution is accurate: independent work is not serialised behind a dependency that does not exist"],
+  "baseline_finding": ["O6 Verification duplicated, evidence unchecked"],
+  "baseline_note": "No README baseline row names blocker attribution or lane ordering; O6 (evidence unchecked) is the nearest. The behaviour comes from the owner request.",
   "project": {"test_command": "npm test", "build_command": "npm run build", "deps": "node_modules"},
   "timeout_seconds": 3000,
   "steps": [
@@ -20,6 +21,7 @@
     {"id": "settle", "do": "wait", "timeout": 600, "until": {"kind": "main_quiet", "seconds": 30}}
   ],
   "expected": {
+    "measures": {"false_claims": 0},
     "checks": [
       {"id": "derby-650", "check": "change_present", "measure": "evidence", "path": "src/game/gameState.ts", "pattern": "derby:\\s*650\\b",
        "why": "lane one landed"},

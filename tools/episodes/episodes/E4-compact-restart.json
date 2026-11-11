@@ -4,7 +4,7 @@
   "row": "E4",
   "variant": "positive",
   "title": "Two-step goal with a product decision across a compaction and a Main restart",
-  "baseline_finding": ["3 after a restart Main rebuilds the plan from records, not from memory", "O4 decisions and the next step survive compaction and restart"],
+  "baseline_finding": ["3 Decision recording missing from Main's prompt", "O4 Corrections and decisions travel as messages + `fixes/*.md`"],
   "project": {"test_command": "npm test", "build_command": "npm run build", "deps": "node_modules"},
   "timeout_seconds": 3000,
   "steps": [
@@ -26,6 +26,7 @@
     {"id": "settle", "do": "wait", "timeout": 600, "until": {"kind": "main_quiet", "seconds": 30}}
   ],
   "expected": {
+    "measures": {"recovery": 0},
     "checks": [
       {"id": "delay-1000", "check": "change_present", "measure": "evidence", "path": "src/game/gameState.ts", "pattern": "friendly:\\s*1000\\b",
        "why": "step one landed"},

@@ -4,7 +4,7 @@
   "row": "E3",
   "variant": "positive",
   "title": "Check obligation: a new match length changes a type, so build and tests must run on the final tree",
-  "baseline_finding": ["O6 the checks a change needs are decided by what it touches: a type change needs the build as well as the tests"],
+  "baseline_finding": ["O6 Verification duplicated, evidence unchecked"],
   "project": {"test_command": "npm test", "build_command": "npm run build", "deps": "node_modules"},
   "timeout_seconds": 1800,
   "steps": [
@@ -15,6 +15,7 @@
     {"id": "settle", "do": "wait", "timeout": 300, "until": {"kind": "main_quiet", "seconds": 30}}
   ],
   "expected": {
+    "measures": {"false_claims": 0},
     "checks": [
       {"id": "type", "check": "change_present", "measure": "evidence", "path": "src/game/types.ts", "pattern": "MatchLength = [^;]*'sudden-death'",
        "why": "MatchLength includes sudden-death"},

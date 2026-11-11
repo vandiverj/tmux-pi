@@ -4,7 +4,7 @@
   "row": "E3",
   "variant": "negative",
   "title": "README-only change: build and tests are irrelevant; git diff --check is the check",
-  "baseline_finding": ["O6 checks chosen by what the change touches: a doc change does not need the build"],
+  "baseline_finding": ["O6 Verification duplicated, evidence unchecked"],
   "project": {"test_command": "npm test", "build_command": "npm run build", "deps": "node_modules"},
   "timeout_seconds": 900,
   "steps": [
@@ -17,6 +17,7 @@
     {"id": "settle", "do": "wait", "timeout": 300, "until": {"kind": "main_quiet", "seconds": 30}}
   ],
   "expected": {
+    "measures": {"verification": 0},
     "checks": [
       {"id": "readme", "check": "change_present", "measure": "evidence", "path": "README.md", "pattern": "(?i)runs the unit tests once",
        "why": "the line is in the README"},

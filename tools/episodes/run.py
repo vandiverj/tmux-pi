@@ -373,12 +373,31 @@ class Runner:
             time.sleep(pane_send.SETTLE_SECONDS)
             self.tmux("send-keys", "-t", pane, "Enter")
 
+    def pane_alive(self, pane):
+        """True when `pane` exists on the private server and its process has not exited (tp-spawn sets remain-on-exit, so a
+        finished worker's pane can stay listed but dead)."""
+        if not pane:
+            return False
+        done = self.tmux("display-message", "-p", "-t", pane, "#{pane_dead}", check=False)
+        return done.returncode == 0 and done.stdout.strip() == "0"
+
     def task_for(self, step):
+        """The newest live task the step names: matching role/state, not in a terminal state, with a live pane. A collected
+        worker's preserved pane is never a target. None when no such task is live."""
         snaps = self.observe()
         cand = [s for s in snaps if (not step.get("role") or s["role"] == step["role"]) and s["pane"]
+                and s["state"] not in el.TERMINAL_STATES
                 and (not step.get("state") or s["state"] in _list(step["state"]))]
         cand.sort(key=lambda s: s["created"] or "")
-        return cand[-1] if cand else None
+        for snap in reversed(cand):
+            if self.pane_alive(snap["pane"]):
+                return snap
+        return None
+
+    def plant_missed(self, step, reason, **fields):
+        """A planted condition did not happen: log it, mark the run, and stop playing (the steps after it assume it)."""
+        self.log(step["do"], step=step["id"], ok=False, reason=reason, **fields)
+        self.outcome = "plant-missed"
 
     def play(self):
         for step in self.episode["steps"]:
@@ -409,15 +428,23 @@ class Runner:
                 t0 = time.monotonic()
                 ok = self.wait_until(cond, float(step["timeout"]), step["id"])
                 task = self.task_for({"role": step.get("role"), "state": cond["state"]}) if ok else None
-                self.log("hold_prompt", step=step["id"], ok=ok, task=task and task["id"], state=task and task["state"],
-                         seconds=round(time.monotonic() - t0, 2))
+                seconds = round(time.monotonic() - t0, 2)
+                if task is None:
+                    self.plant_missed(step, "no live %s task reached %s within %ss" % (
+                        step.get("role") or "any", "|".join(_list(cond["state"])), step["timeout"]), seconds=seconds)
+                    return
+                self.log("hold_prompt", step=step["id"], ok=True, task=task["id"], state=task["state"], seconds=seconds)
             elif do == "queue_text":
                 task = self.task_for(step)
                 if not task:
-                    self.log("queue_text", step=step["id"], ok=False, reason="no task with a pane")
-                    continue
+                    self.plant_missed(step, "no live %s task with a pane" % (step.get("role") or "any"), text=step["text"])
+                    return
                 started = el.utc_now()
-                self.send_text(task["pane"], step["text"], enter=False)
+                try:
+                    self.send_text(task["pane"], step["text"], enter=False)
+                except subprocess.CalledProcessError as error:     # the pane went away between the check and the paste
+                    self.plant_missed(step, "paste into %s failed: %s" % (task["pane"], error), task=task["id"], text=step["text"])
+                    return
                 self.log("queue_text", at=started, step=step["id"], ok=True, task=task["id"], state=task["state"], text=step["text"])
             elif do == "compact":
                 started = el.utc_now()

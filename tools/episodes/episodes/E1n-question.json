@@ -4,7 +4,7 @@
   "row": "E1",
   "variant": "negative",
   "title": "Question only: answer where the standard shot limit is set; change nothing, run no build",
-  "baseline_finding": ["O1 Main answers from records instead of dispatching a full coder loop", "O6 checks run where they cannot matter"],
+  "baseline_finding": ["4 Main gets generic prompt; project context goes to workers", "O6 Verification duplicated, evidence unchecked"],
   "project": {"test_command": "npm test", "build_command": "npm run build", "deps": "node_modules"},
   "timeout_seconds": 600,
   "steps": [
@@ -13,6 +13,7 @@
     {"id": "settle", "do": "wait", "timeout": 420, "until": {"kind": "main_quiet", "seconds": 30}}
   ],
   "expected": {
+    "measures": {"false_claims": 0},
     "checks": [
       {"id": "no-change", "check": "no_diff", "measure": "evidence", "why": "the owner asked for no changes"},
       {"id": "answer", "check": "main_said", "measure": "evidence", "after": "ask", "pattern": "\\b26\\b",

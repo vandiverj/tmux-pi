@@ -38,6 +38,11 @@ CHECK_MEASURES = ("evidence", "recurrence", "leak", "recovery", "irrelevant_chec
 TASK_STATES = ("starting", "working", "tool", "permission", "input", "waiting", "completed", "failed", "killed", "stopped",
                "escalated")
 PROMPT_STATES = ("permission", "input")      # a worker that waits on someone else's answer
+TERMINAL_STATES = ("completed", "failed", "killed", "stopped")
+PLANT_KINDS = ("hold_prompt", "queue_text")  # forced conditions the episode depends on; a missed one makes its measures unknown
+# Measures an episode may name in expected.measures: a number is the most it may be (n/a holds), a boolean the value it must be.
+EXPECTABLE_MEASURES = ("completed", "recurrence", "leak", "recovery", "avoidable_waiting", "false_claims", "irrelevant_checks",
+                       "verification", "safe_tools", "into_prompt")
 RESULT_RE = re.compile(r"^\s*RESULT_STATUS:\s*([A-Za-z_-]+)\s*$", re.M)
 
 
@@ -165,6 +170,15 @@ def validate_episode(episode, where="episode"):
                 raise EpisodeError("%s: needs a positive timeout" % here)
         if step["do"] == "queue_text" and (not isinstance(step.get("text"), str) or "\n" in step["text"]):
             raise EpisodeError("%s: queue_text needs one line of text" % here)
+    plants = {s["id"] for s in episode["steps"] if s["do"] in PLANT_KINDS}
+    measures = episode["expected"].get("measures", {})
+    if not isinstance(measures, dict):
+        raise EpisodeError("%s: expected.measures must be an object" % where)
+    for name, want in measures.items():
+        if name not in EXPECTABLE_MEASURES:
+            raise EpisodeError("%s: expected measure %s: must be one of %s" % (where, name, "|".join(EXPECTABLE_MEASURES)))
+        if not isinstance(want, (bool, int, float)):
+            raise EpisodeError("%s: expected measure %s: must be a number (the most allowed) or true/false" % (where, name))
     checks = episode["expected"].get("checks", [])
     for check in checks:
         if not isinstance(check, dict) or not check.get("id") or not check.get("check"):
@@ -176,6 +190,9 @@ def validate_episode(episode, where="episode"):
         for ref in ("after", "before"):
             if check.get(ref) and check[ref] not in ids:
                 raise EpisodeError("%s: check %s names unknown step %s" % (where, check["id"], check[ref]))
+        for need in check.get("needs", []):
+            if need not in plants:
+                raise EpisodeError("%s: check %s needs %s, which is not a %s step" % (where, check["id"], need, "|".join(PLANT_KINDS)))
         missing = [key for key in CHECK_REQUIRED.get(check["check"], ()) if key not in check]
         if missing:
             raise EpisodeError("%s: check %s (%s) needs %s" % (where, check["id"], check["check"], ", ".join(missing)))
@@ -236,7 +253,7 @@ def task_snapshot(task_dir):
     meta = read_json(task_dir / "meta.json", {}) or {}
     state = read_json(task_dir / "state.json", {}) or {}
     return {"id": task_dir.name, "dir": str(task_dir), "role": meta.get("role") or task_dir.name.split("-")[0],
-            "lane": meta.get("lane"), "pane": meta.get("pane"), "harness": meta.get("worker") or state.get("harness"),
+            "lane": meta.get("lane"), "pane": meta.get("pane"), "workdir": meta.get("workdir"), "harness": meta.get("worker") or state.get("harness"),
             "created": meta.get("created"), "state": state.get("state"), "tool": state.get("tool") or "",
             "updated": state.get("updated"), "result": result_status(task_dir),
             "review_of": _text(task_dir / "review-of")}
@@ -345,12 +362,105 @@ def normalise_tool(name):
     return ("other", None)
 
 
-def shell_readers(command, private_dirs=()):
-    """The shell reading/searching commands in a Bash command line that read project files: one entry per simple command whose
-    program is in SHELL_READERS (after env assignments, `cd x &&` is its own command), unless every path operand is under one of
-    private_dirs (a task dir, /tmp) or the command only reads its stdin (a pipe stage with no path operand)."""
+PATTERN_FIRST = ("grep", "egrep", "fgrep", "rg", "sed", "awk")   # first operand is a pattern/script, not a path
+OPTION_ARGS = {      # options whose value is the next word (so it is not a path operand)
+    "grep": ("-e", "-f", "-A", "-B", "-C", "-m", "-d", "-D", "--regexp", "--file", "--max-count", "--context",
+             "--after-context", "--before-context", "--label", "--exclude", "--include", "--exclude-dir"),
+    "rg": ("-e", "-f", "-A", "-B", "-C", "-m", "-g", "-t", "-T", "-j", "-M", "-E", "-r", "--glob", "--iglob", "--type",
+           "--type-not", "--regexp", "--file", "--max-count", "--max-columns", "--threads", "--encoding", "--context",
+           "--after-context", "--before-context", "--sort", "--sortr", "--color", "--colors", "--max-depth", "--max-filesize",
+           "--replace", "--type-add", "--pre", "--pre-glob"),
+    "sed": ("-e", "-f", "--expression", "--file", "-l"),
+    "awk": ("-F", "-v", "-f"),
+    "head": ("-n", "-c"), "tail": ("-n", "-c"),
+}
+OPTION_ARGS["egrep"] = OPTION_ARGS["fgrep"] = OPTION_ARGS["grep"]
+SCRIPT_OPTIONS = ("-e", "-f", "--regexp", "--file", "--expression")   # given: every operand is a path
+
+
+def _norm(path):
+    """Absolute, normalised, with macOS /private/{tmp,var,etc} aliases folded."""
+    path = os.path.normpath(path)
+    for alias in ("/private/tmp", "/private/var", "/private/etc"):
+        if path == alias or path.startswith(alias + "/"):
+            path = path[len("/private"):]
+    return path
+
+
+def _under(path, base):
+    base = _norm(base).rstrip("/") or "/"
+    return path == base or path.startswith(base + "/")
+
+
+def _operands(program, words):
+    """(paths, script_given, recursive) of one simple command's argument words."""
+    takes = OPTION_ARGS.get(program, ())
+    operands, script_given, recursive = [], False, False
+    index = 0
+    while index < len(words):
+        word = words[index]
+        if program == "find":
+            if word.startswith("-") or word in ("(", "!", ")"):
+                break                       # find's expression starts: the rest are not paths
+            operands.append(word)
+        elif word == "--":
+            operands.extend(words[index + 1:])
+            break
+        elif word.startswith("--"):
+            name = word.split("=", 1)[0]
+            script_given = script_given or name in SCRIPT_OPTIONS
+            recursive = recursive or name in ("--recursive", "--dereference-recursive")
+            if name in takes and "=" not in word:
+                index += 1
+        elif word.startswith("-") and len(word) > 1:
+            flags = word[1:]
+            if program in ("grep", "egrep", "fgrep") and not word[:2] in takes:
+                recursive = recursive or "r" in flags or "R" in flags
+            for n, flag in enumerate(flags):          # -A3, -e PAT, -rnA 3: the first flag that takes a value ends the cluster
+                if "-" + flag in takes:
+                    script_given = script_given or "-" + flag in SCRIPT_OPTIONS
+                    if n == len(flags) - 1:
+                        index += 1
+                    break
+        else:
+            operands.append(word)
+        index += 1
+    if program in PATTERN_FIRST and not script_given and operands:
+        operands = operands[1:]
+    return operands, recursive
+
+
+REDIRECT = re.compile(r"^\d*(<|>>|>|&>)(&?\d*-?)?(.*)$")
+
+
+def _redirects(words):
+    """(words without redirections, input-redirect targets). `< f` / `<f` is a read of f; `> f`, `2>&1`, `&>f` are not."""
+    kept, inputs, index = [], [], 0
+    while index < len(words):
+        match = REDIRECT.match(words[index])
+        if not match:
+            kept.append(words[index])
+            index += 1
+            continue
+        target = match.group(3)
+        if not target and not match.group(2) and index + 1 < len(words):
+            index += 1
+            target = words[index]
+        if match.group(1) == "<" and target:
+            inputs.append(target)
+        index += 1
+    return kept, inputs
+
+
+def shell_readers(command, cwd=None, project_dirs=(), private_dirs=()):
+    """The shell programs (SHELL_READERS) in a Bash command line that read project files: one entry per simple command that reads
+    at least one path inside a project dir (the scratch clone and its lane worktrees) that is not inside a private dir (the
+    harness's own task/state/run dirs). A relative path is under `cwd` (default the first project dir). With no path operand:
+    rg, find and grep -r search `cwd` (a project read); the others read stdin (a pipe stage), which is not a file read."""
     if not isinstance(command, str):
         return []
+    projects = [_norm(d) for d in project_dirs if d]
+    base = cwd or (projects[0] if projects else None)
     found = []
     for _start, _end, tokens in routines._simple_commands(routines.HEREDOC.sub("", command)):
         words = [w for w in tokens if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", w)]
@@ -359,21 +469,27 @@ def shell_readers(command, private_dirs=()):
         program = os.path.basename(words[0])
         if program not in SHELL_READERS:
             continue
-        operands = [w for w in words[1:] if not w.startswith("-")]
-        paths = [w for w in operands if "/" in w or "." in w or w in ("src", "tests", "lib")]
-        if not paths:
-            if program == "find" or (program in ("grep", "egrep", "fgrep", "rg") and any(w in ("-r", "-R", "-rn", "-rl", "-Rn") for w in words)):
-                found.append(program)   # recursive search of the cwd
-            continue
-        if all(any(p.startswith(d) for d in private_dirs) for p in paths):
-            continue
-        found.append(program)
+        args, redirected = _redirects(words[1:])
+        paths, recursive = _operands(program, args)
+        if not paths and (program in ("rg", "find") or recursive):
+            paths = ["."]
+        paths = paths + redirected                      # `cmd < file` reads the file; output redirects read nothing
+        for path in paths:
+            if path.startswith("~") or base is None and not path.startswith("/"):
+                continue                                   # home or no known cwd: not a project path
+            full = _norm(path if path.startswith("/") else os.path.join(base, path))
+            if any(_under(full, d) for d in private_dirs if d):
+                continue
+            if any(_under(full, d) for d in projects):
+                found.append(program)
+                break
     return found
 
 
 TEST_RE = re.compile(r"\b(npm (?:run )?test|npx vitest|vitest(?: run)?|npm run build|npx tsc|tsc -b|pytest|python3? -m unittest|"
                      r"go test|cargo test|git diff --check)\b")
-WRITE_RE = re.compile(r"(\bsed -i\b|>>?\s*[\w./~-]|\bgit (?:commit|checkout|switch|merge|rebase|reset|apply|stash|cherry-pick|pull)\b|"
+# A shell command that changes the working tree's content. `git commit`/`git add` do not (a commit of a tested tree is the same tree).
+WRITE_RE = re.compile(r"(\bsed -i\b|>>?\s*[\w./~-]|\bgit (?:checkout|switch|merge|rebase|reset|apply|stash|cherry-pick|pull|restore|am)\b|"
                       r"\bnpm (?:install|ci)\b|\b(?:mv|cp|rm|touch|tee|patch)\b)")
 
 

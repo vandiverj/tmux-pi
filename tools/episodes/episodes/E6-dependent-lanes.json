@@ -4,7 +4,8 @@
   "row": "E6",
   "variant": "positive",
   "title": "Two lanes where the second needs the first: Main names the real blocker and starts the second lane promptly once the first is in",
-  "baseline_finding": ["O6 accurate blocker attribution and timely orchestration of dependent lanes"],
+  "baseline_finding": ["O6 Verification duplicated, evidence unchecked"],
+  "baseline_note": "No README baseline row names blocker attribution or lane ordering; O6 (evidence unchecked) is the nearest. The behaviour comes from the owner request.",
   "project": {"test_command": "npm test", "build_command": "npm run build", "deps": "node_modules"},
   "timeout_seconds": 3600,
   "steps": [
@@ -18,6 +19,7 @@
     {"id": "settle", "do": "wait", "timeout": 600, "until": {"kind": "main_quiet", "seconds": 30}}
   ],
   "expected": {
+    "measures": {"false_claims": 0},
     "checks": [
       {"id": "helper", "check": "change_present", "measure": "evidence", "path": "src/game/gameState.ts",
        "pattern": "export (function|const) getComputerTurnDelay", "why": "lane one: the helper is exported"},

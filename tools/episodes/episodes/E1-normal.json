@@ -4,11 +4,7 @@
   "row": "E1",
   "variant": "positive",
   "title": "Normal small task: quick matches get 20 shots, label and a unit test",
-  "baseline_finding": [
-    "1 packets carry repo rules the worker does not need",
-    "2 workers read with shell grep/sed instead of safe tools",
-    "O1 completion checked by Main, not just claimed"
-  ],
+  "baseline_finding": ["1 coder.md recommends `grep -rn`", "2 Tools block (with standing lines) dropped without a manifest", "O1 Workers search with shell grep/sed/cat"],
   "project": {
     "test_command": "npm test",
     "build_command": "npm run build",
@@ -50,6 +46,7 @@
     }
   ],
   "expected": {
+    "measures": {"false_claims": 0, "safe_tools": 0},
     "checks": [
       {
         "id": "limit-20",

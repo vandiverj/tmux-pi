@@ -61,7 +61,16 @@ def say(text):
 
 
 def tool(name, inp):
-    entry("assistant", [{"type": "tool_use", "id": "toolu_%d" % time.time_ns(), "name": name, "input": inp}])
+    call_id = "toolu_%d" % time.time_ns()
+    entry("assistant", [{"type": "tool_use", "id": call_id, "name": name, "input": inp}])
+    return call_id
+
+
+def tool_result(call_id, code, output=""):
+    """The call's result as Claude writes it: an error result names the exit code (round 4 rule 5 reads it)."""
+    error = code != 0
+    text = ("Exit code %s\n%s" % (code, output) if code is not None else "timed out\n" + output) if error else output
+    entry("user", [{"type": "tool_result", "tool_use_id": call_id, "content": text[-2000:], "is_error": error}])
 
 
 def tmux(*args):
@@ -141,8 +150,12 @@ def act(actions):
         elif kind == "sleep":
             time.sleep(float(spec))
         elif kind == "bash":
-            tool("Bash", {"command": spec})
-            subprocess.run(["/bin/sh", "-c", spec], cwd=str(clone), capture_output=True, timeout=900)
+            call_id = tool("Bash", {"command": spec})
+            try:
+                done = subprocess.run(["/bin/sh", "-c", spec], cwd=str(clone), capture_output=True, text=True, timeout=900)
+                tool_result(call_id, done.returncode, (done.stdout + done.stderr)[-2000:])
+            except subprocess.TimeoutExpired:
+                tool_result(call_id, None)
         elif kind == "spawn":
             spawn(spec)
         elif kind == "wait_task":

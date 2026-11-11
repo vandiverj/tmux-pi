@@ -14,6 +14,7 @@ Every input event goes to TASK_DIR/fake-worker.log (JSONL)."""
 import json
 import os
 import select
+import shlex
 import subprocess
 import sys
 import termios
@@ -32,7 +33,12 @@ state_path = task_dir / "state.json"
 transcript = task_dir / "transcript.jsonl"
 log_path = task_dir / "fake-worker.log"
 (task_dir / "transcript-path").write_text(str(transcript) + "\n")
-transcript.touch()       # a real worker's transcript exists from its first turn, even with no tool call
+if not transcript.exists():
+    # A real worker's transcript holds its first turn (the packet it was started with) before any tool call, so an empty
+    # one is a lost record (round 4 rule 1), never this fake's normal output.
+    first = next((p for p in (task_dir / "packet.md", task_dir / "task.md") if p.exists()), None)
+    el.append_jsonl(transcript, {"type": "user", "timestamp": el.utc_now(), "message": {
+        "role": "user", "content": first.read_text(encoding="utf-8") if first else "(no packet)"}})
 fd = sys.stdin.fileno()
 box = []
 
@@ -51,9 +57,20 @@ def set_state(**fields):
 
 
 def tool_use(name, inp):
+    call_id = "t%d" % time.time_ns()
     el.append_jsonl(transcript, {"type": "assistant", "timestamp": el.utc_now(),
-                                 "message": {"role": "assistant", "content": [{"type": "tool_use", "id": "t%d" % time.time_ns(),
+                                 "message": {"role": "assistant", "content": [{"type": "tool_use", "id": call_id,
                                                                               "name": name, "input": inp}]}})
+    return call_id
+
+
+def tool_result(call_id, code, output=""):
+    """The call's result as Claude writes it: an error result names the exit code (round 4 rule 5 reads it)."""
+    error = code != 0
+    text = ("Exit code %s\n%s" % (code, output) if code is not None else "timed out\n" + output) if error else output
+    el.append_jsonl(transcript, {"type": "user", "timestamp": el.utc_now(),
+                                 "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": call_id,
+                                                                          "content": text[-2000:], "is_error": error}]}})
 
 
 def run(command, timeout=900):
@@ -124,10 +141,12 @@ def main():
             if step["state"] == "permission":
                 out("\nDo you want to proceed?\n> 1. Yes\n  2. No, and tell Claude what to do differently (esc)\n")
         elif "call" in step:
-            tool_use(step["call"], step.get("input", {}))
+            call_id = tool_use(step["call"], step.get("input", {}))
             set_state(state="tool", tool=step["call"])
             if step["call"] == "Bash":
-                run(step["input"].get("command", ""))
+                tool_result(call_id, *run(step["input"].get("command", "")))
+            else:
+                tool_result(call_id, 0)
             set_state(state="working", tool="")
         elif "edit" in step:
             edit = step["edit"]
@@ -135,13 +154,17 @@ def main():
             text = path.read_text(encoding="utf-8") if path.exists() else ""
             text = text + edit["new"] if edit["old"] == "" else text.replace(edit["old"], edit["new"], 1)
             path.write_text(text, encoding="utf-8")
-            tool_use("Edit", {"file_path": str(path), "old_string": edit["old"], "new_string": edit["new"]})
+            tool_result(tool_use("Edit", {"file_path": str(path), "old_string": edit["old"], "new_string": edit["new"]}), 0)
         elif "test_run" in step:
             command = step["test_run"]
             head, tree = gate_record.fingerprint(workdir)
-            tool_use("Bash", {"command": command})
+            # A real worker runs its checks through tools/agent/test-run.sh, so its transcript shows the call that wrote
+            # each record (the scorer counts them: a record lost from test-runs/ is then missing, round 4 rule 1).
+            call_id = tool_use("Bash", {"command": "tools/agent/test-run.sh . --label %s -- /bin/sh -c %s" % (
+                shlex.quote(command), shlex.quote(command))})
             t0 = time.monotonic()
             code, tail = run(command)
+            tool_result(call_id, code, tail)
             test_runs += 1
             el.write_json(task_dir / "test-runs" / ("%d.json" % test_runs), {
                 "schema": "tp-test-run:v1", "label": command, "cmd": ["/bin/sh", "-c", command], "cwd": str(workdir),
@@ -152,6 +175,8 @@ def main():
             await_message()
         elif "result" in step:
             body = "%s\n\nRESULT_STATUS: %s\n" % (step.get("text", "Done."), step["result"])
+            el.append_jsonl(transcript, {"type": "assistant", "timestamp": el.utc_now(), "message": {
+                "role": "assistant", "content": [{"type": "text", "text": body}]}})
             (task_dir / "report.md").write_text(body)
             (task_dir / "result.md").write_text(body)
             set_state(state="waiting", tool="")

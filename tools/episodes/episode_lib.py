@@ -10,6 +10,7 @@ Records read (all optional; a missing record is reported as missing, never as ze
   Claude transcripts (JSONL, `message.content[]` tool_use / text parts) and pi transcripts (`toolCall` parts).
 """
 import json
+import itertools
 import os
 import re
 import shlex
@@ -158,6 +159,47 @@ def read_jsonl(path):
         if isinstance(value, dict):
             out.append(value)
     return out
+
+
+def read_jsonl_status(path):
+    """(status, entries, why) of a JSONL record for the scorer's evidence reader (round 4 rule 1): "missing" when the file is
+    absent, "unreadable" when it cannot be read or any non-blank line is not a JSON object (a lost line is lost evidence, not
+    an absent event), else "ok" with every entry (possibly none)."""
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        return "missing", None, "%s is absent" % path
+    except OSError as error:
+        return "unreadable", None, "%s: %s" % (path, error)
+    out = []
+    for n, line in enumerate(text.splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            value = json.loads(line)
+        except ValueError:
+            return "unreadable", None, "%s line %d is not JSON" % (path, n)
+        if not isinstance(value, dict):
+            return "unreadable", None, "%s line %d is not a JSON object" % (path, n)
+        out.append(value)
+    return "ok", out, None
+
+
+def read_json_status(path):
+    """(status, value, why) of a JSON record: missing, unreadable (not JSON or not an object) or ok."""
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return "missing", None, "%s is absent" % path
+    except (OSError, ValueError) as error:
+        return "unreadable", None, "%s: %s" % (path, error)
+    try:
+        value = json.loads(text)
+    except ValueError:
+        return ("empty" if not text.strip() else "unreadable"), None, "%s is %s" % (path, "empty" if not text.strip() else "not JSON")
+    if not isinstance(value, dict):
+        return "unreadable", None, "%s is not a JSON object" % path
+    return "ok", value, None
 
 
 def write_json(path, value):
@@ -373,7 +415,39 @@ def transcript_entries(path):
     lines = read_jsonl(path) if path else None
     if lines is None:
         return None
-    out = []
+    return transcript_from(lines)
+
+
+EXIT_RE = re.compile(r"(?i)\b(?:exit code|exited with code|exit status)[:\s]+(-?\d+)")
+
+
+def _result_text(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(str(p.get("text") or "") for p in content if isinstance(p, dict))
+    return ""
+
+
+def transcript_from(lines):
+    """Parsed transcript records -> entries (see transcript_entries). A tool entry carries `id` and, when the transcript
+    holds the call's result (Claude tool_result, pi toolResult), `exit`: 0 for a result that is not an error, the code an
+    error result names ("Exit code N"), else None with `blocked` True (an error with no exit code: the call may never have
+    run). With no result: exit None, blocked False (round 4 rule 5)."""
+    out, by_id = [], {}
+
+    def settle(call_id, is_error, content, at):
+        entry = by_id.get(call_id)
+        if entry is None:
+            return
+        if not is_error:
+            entry["exit"] = 0
+        else:
+            found = EXIT_RE.search(_result_text(content))
+            entry["exit"] = int(found.group(1)) if found else None
+            entry["blocked"] = found is None
+        entry["result_at"] = at
+
     for rec in lines:
         at = parse_time(rec.get("timestamp"))
         if rec.get("type") == "system" and rec.get("subtype") == "compact_boundary":
@@ -385,6 +459,9 @@ def transcript_entries(path):
         at = at or parse_time(msg.get("timestamp"))
         role = msg.get("role")
         content = msg.get("content")
+        if role == "toolResult":
+            settle(msg.get("toolCallId"), bool(msg.get("isError")), content, at)
+            continue
         if role == "user" and isinstance(content, str):
             out.append({"at": at, "kind": "user", "text": content})
             continue
@@ -398,10 +475,15 @@ def transcript_entries(path):
                 out.append({"at": at, "kind": "text", "text": part.get("text") or ""})
             elif kind == "text" and role == "user" and not rec.get("isMeta"):
                 out.append({"at": at, "kind": "user", "text": part.get("text") or ""})
-            elif kind == "tool_use":
-                out.append({"at": at, "kind": "tool", "name": part.get("name") or "", "input": part.get("input") or {}})
-            elif kind == "toolCall":
-                out.append({"at": at, "kind": "tool", "name": part.get("name") or "", "input": part.get("arguments") or {}})
+            elif kind in ("tool_use", "toolCall"):
+                entry = {"at": at, "kind": "tool", "name": part.get("name") or "", "id": part.get("id"),
+                         "input": (part.get("input") if kind == "tool_use" else part.get("arguments")) or {},
+                         "exit": None, "blocked": False}
+                out.append(entry)
+                if part.get("id"):
+                    by_id[part["id"]] = entry
+            elif kind == "tool_result":
+                settle(part.get("tool_use_id"), bool(part.get("is_error")), part.get("content"), at)
     return out
 
 
@@ -533,35 +615,45 @@ def _redirects(words):
 # ---- shell command lines: stages, executions, writes (round 3 rule 4) -------------------------------------------------------
 def _segments(command):
     """[(text, separator before it)] of a command line split on ; newline && || | & outside quotes. The & of `2>&1` and
-    `&>` is a redirection, not a separator."""
-    out, start, quote, i, before = [], 0, None, 0, None
+    `&>` is a redirection, not a separator. A `#` that starts a word outside quotes starts a comment, which runs to the end
+    of the line and is dropped (round 4 rule 5: a comment is never an execution); `;;` (a case arm's end) is one separator."""
+    out, buf, quote, i, before = [], [], None, 0, None
     while i < len(command):
         c = command[i]
         nxt = command[i + 1] if i + 1 < len(command) else ""
         sep = None
         if quote:
             if c == "\\" and quote == '"':
+                buf.append(c)
                 i += 1
+                c = command[i] if i < len(command) else ""
             elif c == quote:
                 quote = None
         elif c == "\\":
+            buf.append(c)
             i += 1
+            c = command[i] if i < len(command) else ""
         elif c in "'\"":
             quote = c
+        elif c == "#" and (not buf or buf[-1] in " \t\n;&|()"):
+            end = command.find("\n", i)
+            i = len(command) if end < 0 else end
+            continue
         elif c in ";\n":
-            sep = ";"
+            sep = ";;" if c == ";" and nxt == ";" else ";"
         elif c == "|":
             sep = "||" if nxt == "|" else "|"
-        elif c == "&" and not (i > 0 and command[i - 1] in "<>") and nxt != ">":
+        elif c == "&" and not (buf and buf[-1] in "<>") and nxt != ">":
             sep = "&&" if nxt == "&" else "&"
         if sep:
-            out.append((command[start:i], before))
-            before = sep
+            out.append(("".join(buf), before))
+            buf = []
+            before = ";" if sep == ";;" else sep
             i += len(sep)
-            start = i
             continue
+        buf.append(c)
         i += 1
-    out.append((command[start:], before))
+    out.append(("".join(buf), before))
     return out
 
 
@@ -617,8 +709,10 @@ def _unwrap(words):
 def shell_stages(command, _piped=False):
     """The simple commands a Bash command line runs, in order, `sh -c TEXT` expanded in place. Each:
     {words (program first, wrappers and redirections removed), inputs, outputs, piped (stdin from a pipe), cd (target or
-    None), opaque (text the scorer cannot follow: $(...), backticks, $VAR, xargs, eval, loops)}. A list of words (a test-run
-    record's cmd) is one simple command."""
+    None), opaque (text the scorer cannot follow: $(...), backticks, $VAR, xargs, eval, loops), sep (the separator before it:
+    None, ; & | && ||), cond (inside if/case/a loop/a function body: it may not run)}. A list of words (a test-run record's
+    cmd) is one simple command. `sh -c TEXT` is expanded in place: its first stage takes the outer separator; the rest run
+    only if that stage does, so after an outer && or || (or inside a condition) they are cond."""
     if isinstance(command, (list, tuple)):
         parts = [(list(command), None)]
     elif isinstance(command, str):
@@ -626,19 +720,56 @@ def shell_stages(command, _piped=False):
     else:
         return []
     out = []
+    depth, in_case, body, sub = 0, 0, False, 0
     for raw, sep in parts:
+        # `( ... )` runs in a subshell: a cd inside it ends with it (round 4 rule 4). Each stage carries its subshell depth.
+        opens = sum(1 for w in raw[:len(raw) - len(list(itertools.dropwhile(lambda w: w == "(", raw)))]) + (
+            len(raw[0]) - len(raw[0].lstrip("(")) if raw and raw[0] != "(" and not raw[0].startswith("$(") else 0)
+        tail = list(itertools.dropwhile(lambda w: w == ")", reversed(raw)))
+        closes = len(raw) - len(tail) + (len(tail[0]) - len(tail[0].rstrip(")")) if tail and "$(" not in tail[0]
+                                         and not (in_case and len(raw) == 1) and "(" not in tail[0] else 0)
+        sub += opens
+        stage_sub = sub
+        sub = max(0, sub - closes)
         raw = [w for w in raw if w not in ("(", ")", "{", "}")]
         if raw and raw[0].startswith("("):
             raw[0] = raw[0].lstrip("(")
         if raw and raw[-1].endswith(")") and "$(" not in raw[-1]:
             raw[-1] = raw[-1].rstrip(")")
         raw = [w for w in raw if w]
+        keyword = False
+        while raw and raw[0] in ("if", "then", "else", "elif", "do", "while", "until", "!", "fi", "done", "esac", "for", "case"):
+            word = raw.pop(0)
+            keyword = True
+            if word in ("if", "while", "until"):
+                depth += 1
+            elif word in ("fi", "done", "esac"):
+                depth = max(0, depth - 1)
+                in_case = max(0, in_case - 1) if word == "esac" else in_case
+            elif word in ("for", "case"):
+                depth += 1
+                in_case += word == "case"
+                if word == "case" and "in" in raw:
+                    raw = raw[raw.index("in") + 1:]
+                else:
+                    raw = []                    # `for x in a b`: no command in this part
+        if in_case and raw and raw[0].endswith(")") and "$(" not in raw[0]:
+            raw = raw[1:]                       # a case arm's pattern
+        if raw and (raw[0] == "function" or (raw[0].endswith("()") and len(raw[0]) > 2)):
+            body = True                         # a function body runs only when called: everything after is uncertain
+            continue
         if not raw:
             continue
+        cond = body or keyword or depth > 0
         kept, inputs, outputs = _redirects(raw)
         words, nested = _unwrap(kept)
         if nested is not None:
-            out.extend(shell_stages(nested, _piped=sep == "|"))
+            inner = shell_stages(nested, _piped=sep == "|")
+            for n, stage in enumerate(inner):
+                stage["sub"] = stage.get("sub", 0) + stage_sub
+                stage["sep"] = sep if n == 0 else stage["sep"]
+                stage["cond"] = stage["cond"] or cond or (n > 0 and sep in ("&&", "||"))
+            out.extend(inner)
             continue
         if not words:
             continue
@@ -647,8 +778,46 @@ def shell_stages(command, _piped=False):
         opaque = ("$(" in text or "`" in text or program in OPAQUE_PROGRAMS or program in SHELL_KEYWORDS
                   or any("$" in w for w in words[1:] + inputs))
         out.append({"words": [program] + words[1:], "inputs": inputs, "outputs": outputs,
-                    "piped": sep == "|" or (_piped and not out),
-                    "cd": (words[1] if len(words) > 1 else "~") if program == "cd" else None, "opaque": opaque})
+                    "piped": sep == "|" or (_piped and not out), "sep": sep, "cond": cond,
+                    "cd": (words[1] if len(words) > 1 else "~") if program == "cd" else None, "opaque": opaque,
+                    "sub": stage_sub})
+    return out
+
+
+def stage_runs(stages, exit=None, blocked=False):
+    """[(ran, exit)] per stage of one call (round 4 rule 5). ran True: the stage certainly ran (the start of an and-or list,
+    a pipeline member, or a stage after && in the call's last list when every link of that list is && and the call exited
+    0); None: uncertain (after ||, inside if/case/a loop, after && with a nonzero or unknown exit, or the call's result says
+    it may never have run). exit: the stage's exit status when the call's status gives it, else None. Shell is never run."""
+    if not stages:
+        return []
+    lists, current = [], []
+    for index, stage in enumerate(stages):
+        if index and stage["sep"] in (None, ";", "&"):
+            lists.append(current)
+            current = []
+        current.append(index)
+    lists.append(current)
+    out = [(None, None)] * len(stages)
+    for number, members in enumerate(lists):
+        last_list = number == len(lists) - 1
+        links = [stages[i]["sep"] for i in members[1:] if stages[i]["sep"] != "|"]
+        all_and = all(s == "&&" for s in links)
+        failed_link = False
+        for position, i in enumerate(members):
+            stage = stages[i]
+            sep = stage["sep"] if position else None
+            if sep in ("&&", "||"):
+                failed_link = failed_link or sep == "||" or not (last_list and all_and and exit == 0)
+            ran = None if (blocked or stage["cond"] or failed_link) else True
+            ends_pipeline = i == members[-1] or stages[i + 1]["sep"] != "|"
+            code = None
+            if ran and ends_pipeline and last_list:
+                if i == members[-1]:
+                    code = exit
+                elif all_and and exit == 0:
+                    code = 0
+            out[i] = (ran, code)
     return out
 
 

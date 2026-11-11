@@ -48,3 +48,16 @@ environment and log rules). Same edit list, same safety rules: no Claude/pi star
 private tmux `-L` sockets only, never the real lanes, safe_grep/Read only, never read claude/mcp.json, .env*, auth files or
 config/local.json; a guard refusal means stop and report; approve no prompt; commit nothing; no background shells.
 `RESULT_STATUS: complete` as the last line.
+
+## Main's decision on the worker's corpus result (addendum, same round)
+Refusing 41 more real reviews because evidence bullets or code sit inside a finding is the brief's mistake: lists and code are
+normal finding bodies. Replace rule 2's split with:
+- **Boundary lines** (close the section): ATX heading, a non-label line starting `**`/`__` that is not inside a list item,
+  thematic break, counted finding lead.
+- **Contained lines** (stay in the section, never carry a label for any finding): list items with any marker at any indent and
+  their continuation lines, `>` quotes, fenced code (whole fence), lines indented 4+ spaces. A label on one of these counts for
+  nothing, so the review's F1 list case still refuses (F7 has no closure of its own).
+- Label lines and prose lines as before. A 4+ space indented label no longer counts (contained).
+Known limit to state in docs and report: a standalone label line right after a contained block counts for the open finding.
+Recompute the oracle from this text first, rerun attack, corpus (report against round 3's 122/42 and your 81/84) and only the
+test module(s) you change; keep the 6 rows (adjust expectations only where this text says so).

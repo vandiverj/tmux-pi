@@ -157,6 +157,8 @@ class LaneFactsTests(LaneCase):
         self.assertIn(f"lane: alpha  step: s1  branch: lane/alpha  worktree: {self.worktree}", packet)
         self.assertIn(f"base: lane/integrate {base[:7]}  (LANE_BASE is set to this sha)", packet)
         self.assertIn(f"export LANE_BASE={base}\n", run_sh)
+        # every worker gets an LM Studio request cap of 0 and its own counter file (lib/router.py local_open)
+        self.assertIn(f"export TP_LMSTUDIO_BUDGET=0 TP_LMSTUDIO_BUDGET_FILE={task}/lmstudio-budget.count\n", run_sh)
         # lane-info.sh with no base argument now prints that base
         line = next(l for l in run_sh.splitlines() if l.startswith("export LANE_BASE="))
         out = subprocess.run(["bash", "-c", f'{line}\n{ROOT}/tools/agent/lane-info.sh {self.worktree}'], text=True, capture_output=True, timeout=30)

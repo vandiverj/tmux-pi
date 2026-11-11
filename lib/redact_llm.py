@@ -2,8 +2,8 @@
 
 The model sees each candidate's shape and surrounding lines, never its characters, so text
 in the output cannot steer it by quoting the value. It can only clear candidates: anything
-it does not explicitly call non-secret, and every candidate when the server is down, slow
-or returns something unparseable, stays redacted.
+it does not explicitly call non-secret, and every candidate when the server is down, slow, refused by the run's LM Studio
+request cap (lib/router.py local_open) or returns something unparseable, stays redacted.
 """
 import json
 import os
@@ -15,6 +15,7 @@ import urllib.error
 import urllib.request
 
 from redact import entropy
+import router
 from redaction_store import default_root
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -139,7 +140,8 @@ class LocalClassifier:
         try:
             req = urllib.request.Request(self.config["base_url"] + "/chat/completions", body,
                                          {"Content-Type": "application/json"})
-            with urllib.request.urlopen(req, timeout=self.budget) as response:
+            # Through the one LM Studio guard (lib/router.py local_open): a run's request cap refuses before sending.
+            with router.local_open(req, self.budget, send=urllib.request.urlopen) as response:
                 message = json.load(response)["choices"][0]["message"]
             raw = message.get("content") or message.get("reasoning_content") or message.get("reasoning") or ""
             results = json.loads(raw)["results"]
@@ -148,6 +150,9 @@ class LocalClassifier:
                        and isinstance(r.get("id"), int) and not isinstance(r.get("id"), bool) and r["id"] in index}
             keep -= cleared
             self.stats.update(status="ok", cleared=len(cleared))
+        except router.LmStudioBudgetError:
+            # Refused by the run's cap: like an unreachable server every candidate stays redacted, but it is not down.
+            self.stats["status"] = "capped"
         except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
             # A slow answer only costs this call; an unreachable server is skipped for down_retry_seconds.
             if isinstance(exc, TimeoutError) or "timed out" in str(exc):

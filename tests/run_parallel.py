@@ -15,6 +15,7 @@ from pathlib import Path
 TESTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(TESTS))
 import run_bounded  # noqa: E402
+import session_env  # noqa: E402,F401  one LM Studio budget and counter for every module this run starts
 
 ROOT = TESTS.parent
 MAX_JOBS = 4

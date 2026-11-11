@@ -2,13 +2,21 @@ import session_env  # noqa: F401  first: removes the caller's session, however t
 import copy
 import json
 import math
+import os
+import queue
+import subprocess
 import sys
+import tempfile
+import threading
 import unittest
 import urllib.error
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "lib"))
+import router
 from router import (QUESTIONS, REVIEWS, RouterError, apply_rules, dispatch, feature_names, follow_up, laya_decision,
                     laya_route,
                     parse_markers, placement_policy,
@@ -520,6 +528,237 @@ class RouterTests(unittest.TestCase):
         result = route_task("task", self.config, backend="openai", opener=lambda *_args, **_kwargs:
                             self.reply({"model": "claude-sonnet-5-5", "thinking": "high"}))
         self.assertEqual(result, {"worker": "claude", "model": "claude-sonnet-5-5", "thinking": "high"})
+
+
+class LmStudioBudgetTests(unittest.TestCase):
+    """The one LM Studio guard in local_open (TP_LMSTUDIO_BUDGET / TP_LMSTUDIO_BUDGET_FILE). "LM Studio" here is a stub on a free
+    loopback port that a row names as LM Studio (TP_LMSTUDIO_ENDPOINT or a temp config root); nothing touches 127.0.0.1:1234: rows
+    about port 1234 ask the predicate (is_lmstudio) only, and every send with a budget set is refused before a socket opens."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.hits, cls.active, cls.peak = [], [0], [0]
+        cls.lock = threading.Lock()
+        cls.events = queue.Queue()  # ("hit", n) from the stub, ("A"/"B", line) from the contention test's children
+        cls.hold, cls.release = [False], threading.Event()  # hold: the first hit waits for release
+        hits, active, peak, lock, events, hold, release = cls.hits, cls.active, cls.peak, cls.lock, cls.events, cls.hold, cls.release
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                with lock:
+                    hits.append(self.server.server_address[1])
+                    active[0] += 1
+                    peak[0] = max(peak[0], active[0])
+                    n = len(hits)
+                events.put(("hit", n))
+                if hold[0] and n == 1:
+                    release.wait(30)  # bound only: the test sets release as soon as the second request is seen waiting
+                with lock:
+                    active[0] -= 1
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            def log_message(self, *args):
+                pass
+
+        cls.servers = []
+        for _ in range(2):  # [0] is "LM Studio", [1] is a stub on another port
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            server.daemon_threads = True
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            cls.servers.append(server)
+            cls.addClassCleanup(server.server_close)
+            cls.addClassCleanup(server.shutdown)
+        cls.lm, cls.other = (s.server_address[1] for s in cls.servers)
+
+    def setUp(self):
+        self.hits[:] = []
+        self.peak[0] = 0
+        self.dir = Path(tempfile.mkdtemp())
+        self.addCleanup(__import__("shutil").rmtree, self.dir, True)
+        self.counter = self.dir / "count"
+        # The guard reads LM Studio's configured address under this root: an empty temp root, never this machine's config.
+        self.root = self.dir / "root"
+        patch = mock.patch.object(router, "LMSTUDIO_CONFIG_ROOT", self.root)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def configure(self, local=None, models=None):
+        """Write a temp config root: config/local.json followup.base_url and/or agent/models.json providers.lmstudio.baseUrl."""
+        for rel, value, body in (("config/local.json", local, lambda v: {"followup": {"base_url": v}}),
+                                 ("agent/models.json", models, lambda v: {"providers": {"lmstudio": {"baseUrl": v}}})):
+            if value is not None:
+                (self.root / rel).parent.mkdir(parents=True, exist_ok=True)
+                (self.root / rel).write_text(json.dumps(body(value)))
+
+    def env(self, budget="0", content="0", endpoint=True):
+        env = {"TP_LMSTUDIO_ENDPOINT": "127.0.0.1:{}".format(self.lm)} if endpoint else {}
+        if budget is not None:
+            env["TP_LMSTUDIO_BUDGET"] = budget
+            env["TP_LMSTUDIO_BUDGET_FILE"] = str(self.counter)
+        if content is not None:
+            self.counter.write_text(content)
+        return env
+
+    def send(self, env, port=None, host="127.0.0.1"):
+        """One local_open to the stub; returns "ok" or the refusal text."""
+        clean = {k: v for k, v in os.environ.items() if not k.startswith("TP_LMSTUDIO")}
+        request = router.urllib.request.Request("http://{}:{}/v1/chat/completions".format(host, port or self.lm), data=b"{}")
+        with mock.patch.dict(os.environ, dict(clean, **env), clear=True):
+            try:
+                with router.local_open(request, 5) as response:
+                    response.read()
+                return "ok"
+            except router.LmStudioBudgetError as exc:
+                return str(exc)
+
+    def test_the_cap_table(self):
+        lm = "http://localhost:{}/v1"
+        cases = [  # name, env (made after the counter is cleared), sends, expected results, stub hits on the LM Studio port, host
+            ("no budget: unchanged, no counter", lambda: self.env(None, None), 3, ["ok"] * 3, 3, "127.0.0.1"),
+            ("budget 0: refused, nothing sent", lambda: self.env("0"), 1, ["refused"], 0, "127.0.0.1"),
+            ("budget 2: third refused", lambda: self.env("2"), 3, ["ok", "ok", "refused"], 2, "127.0.0.1"),
+            ("counter file missing", lambda: self.env("5", None), 1, ["refused"], 0, "127.0.0.1"),
+            ("counter file empty", lambda: self.env("5", ""), 1, ["refused"], 0, "127.0.0.1"),
+            ("counter file not a number", lambda: self.env("5", "lots"), 1, ["refused"], 0, "127.0.0.1"),
+            ("counter file negative", lambda: self.env("5", "-1"), 1, ["refused"], 0, "127.0.0.1"),
+            ("budget not a number", lambda: self.env("many"), 1, ["refused"], 0, "127.0.0.1"),
+            ("budget negative", lambda: self.env("-1"), 1, ["refused"], 0, "127.0.0.1"),
+            ("budget without a file", lambda: {"TP_LMSTUDIO_ENDPOINT": "127.0.0.1:{}".format(self.lm), "TP_LMSTUDIO_BUDGET": "5"}, 1, ["refused"], 0, "127.0.0.1"),
+            # where LM Studio is (F2): the configured base URLs, with no TP_LMSTUDIO_ENDPOINT
+            ("config/local.json followup.base_url", lambda: (self.configure(local=lm.format(self.lm)), self.env("0", endpoint=False))[1], 1, ["refused"], 0, "127.0.0.1"),
+            ("agent/models.json lmstudio baseUrl", lambda: (self.configure(models=lm.format(self.lm)), self.env("0", endpoint=False))[1], 1, ["refused"], 0, "127.0.0.1"),
+            ("TP_LMSTUDIO_ENDPOINT as a base URL", lambda: dict(self.env("0"), TP_LMSTUDIO_ENDPOINT=lm.format(self.lm)), 1, ["refused"], 0, "127.0.0.1"),
+            ("TP_LMSTUDIO_ENDPOINT as a bare port", lambda: dict(self.env("0"), TP_LMSTUDIO_ENDPOINT=str(self.lm)), 1, ["refused"], 0, "127.0.0.1"),
+            # loopback names are one host: refused before a socket opens, so the stub need not listen there
+            ("sent to localhost", lambda: self.env("0"), 1, ["refused"], 0, "localhost"),
+            ("sent to [::1]", lambda: self.env("0"), 1, ["refused"], 0, "[::1]"),
+            ("sent to 127.0.0.2", lambda: self.env("0"), 1, ["refused"], 0, "127.0.0.2"),
+            ("sent to 0.0.0.0", lambda: self.env("0"), 1, ["refused"], 0, "0.0.0.0"),
+            ("sent to 127.1", lambda: self.env("0"), 1, ["refused"], 0, "127.1"),
+            ("sent to [::ffff:127.0.0.1]", lambda: self.env("0"), 1, ["refused"], 0, "[::ffff:127.0.0.1]"),
+            # a per-run redirect is not where LM Studio is: TP_LOCAL_CONFIG naming the stub leaves it a stub (tests rely on this)
+            ("TP_LOCAL_CONFIG followup on the stub", lambda: dict(self.env("0", endpoint=False), TP_LOCAL_CONFIG=self.write_redirect()), 2, ["ok"] * 2, 2, "127.0.0.1"),
+        ]
+        for name, make_env, sends, expected, hits, host in cases:
+            with self.subTest(name):
+                self.hits[:] = []
+                self.counter.unlink(missing_ok=True)
+                __import__("shutil").rmtree(self.root, True)
+                env = make_env()
+                got = [self.send(env, host=host) for _ in range(sends)]
+                self.assertEqual(["ok" if r == "ok" else "refused" for r in got], expected)
+                self.assertEqual(self.hits.count(self.lm), hits)
+                if name.startswith("no budget"):
+                    self.assertFalse(self.counter.exists())  # production: no counter is read or written
+                for r in got:
+                    if r != "ok":
+                        self.assertIn("TP_LMSTUDIO_BUDGET", r)
+                        if name == "budget 2: third refused":
+                            self.assertIn("cap is 2", r)
+        with self.subTest("a stub on another port is never counted or limited"):
+            self.hits[:] = []
+            env = self.env("0")
+            self.assertEqual([self.send(env, port=self.other) for _ in range(3)], ["ok"] * 3)
+            self.assertEqual(self.counter.read_text(), "0")
+
+    def write_redirect(self):
+        """A local config elsewhere whose follow-up judge is the stub, as tests name one through TP_LOCAL_CONFIG."""
+        path = self.dir / "redirect-local.json"
+        path.write_text(json.dumps({"followup": {"base_url": "http://127.0.0.1:{}/v1".format(self.lm)}}))
+        return str(path)
+
+    def test_where_lm_studio_is(self):
+        """is_lmstudio over the address forms, without sending: port 1234 is LM Studio's default and is never contacted here."""
+        self.configure(local="http://localhost:7001/v1", models="http://127.0.0.1:7002/v1")
+        cases = [  # url, TP_LMSTUDIO_ENDPOINT, LM Studio?
+            ("http://127.0.0.1:1234/v1/chat/completions", None, True),
+            ("http://localhost:1234/v1", None, True),
+            ("http://LOCALHOST.:1234/v1", None, True),
+            ("http://[::1]:1234/v1", None, True),
+            ("http://2130706433:1234/v1", None, True),  # 127.0.0.1 as one number
+            ("http://127.0.0.1:7001/v1", None, True),  # config/local.json followup on localhost: one host
+            ("http://localhost:7002/v1", None, True),  # agent/models.json lmstudio on 127.0.0.1: one host
+            ("http://127.0.0.1:7003/v1", "localhost:7003", True),
+            ("http://127.0.0.1:7003/v1", "http://[::1]:7003/v1", True),
+            ("http://127.0.0.1:7003/v1", None, False),  # another loopback port: a stub
+            ("http://127.0.0.1:7003/v1", "not a port", False),  # an unreadable override adds nothing, the defaults stay
+            ("http://127.0.0.1:1234/v1", "not a port", True),
+            ("http://192.0.2.7:1234/v1", None, False),  # another host on port 1234
+            ("http://127.0.0.1/v1", None, False),  # port 80
+        ]
+        for url, endpoint, expected in cases:
+            with self.subTest(url=url, endpoint=endpoint):
+                env = {k: v for k, v in os.environ.items() if k != "TP_LMSTUDIO_ENDPOINT"}
+                if endpoint is not None:
+                    env["TP_LMSTUDIO_ENDPOINT"] = endpoint
+                with mock.patch.dict(os.environ, env, clear=True):
+                    self.assertIs(router.is_lmstudio(url), expected)
+
+    def test_two_processes_share_one_counter_and_run_one_request_at_a_time(self):
+        """A's first request is held at the stub until B is seen waiting for the run's lock (a non-blocking try failed, so B
+        then blocks); only then is it released. Without the lock, B's request reaches the stub while A's is held, and the test
+        fails on that event. Each child sends two; the budget of 3 refuses one."""
+        env = dict(os.environ, **self.env("3"))
+        code = ("import fcntl, sys, urllib.request; sys.path.insert(0, {!r}); import router\n"
+                "real = fcntl.flock\n"
+                "def flock(fd, op):\n"
+                "    try:\n"
+                "        return real(fd, op | fcntl.LOCK_NB)\n"
+                "    except BlockingIOError:\n"
+                "        print('waiting', flush=True)\n"
+                "        return real(fd, op)\n"
+                "router.fcntl.flock = flock\n"
+                "for _ in range(2):\n"
+                "    try:\n"
+                "        with router.local_open(urllib.request.Request('http://127.0.0.1:{}/x', data=b'{{}}'), 30) as r: r.read()\n"
+                "        print('ok', flush=True)\n"
+                "    except router.LmStudioBudgetError: print('refused', flush=True)\n").format(str(ROOT / "lib"), self.lm)
+        while not self.events.empty():
+            self.events.get_nowait()
+        self.release.clear()
+        self.hold[0] = True
+        self.addCleanup(self.hold.__setitem__, 0, False)
+        self.addCleanup(self.release.set)
+        procs, out, pumps = {}, {"A": [], "B": []}, []
+
+        def start(name):
+            procs[name] = subprocess.Popen([sys.executable, "-c", code], env=env, stdout=subprocess.PIPE, text=True)
+            self.addCleanup(procs[name].stdout.close)  # runs after the kill below (cleanups run last first)
+            self.addCleanup(lambda p=procs[name]: p.poll() is None and p.kill())
+
+            def pump(name=name):
+                for line in procs[name].stdout:
+                    self.events.put((name, line.strip()))
+            pumps.append(threading.Thread(target=pump, daemon=True))
+            pumps[-1].start()
+
+        def next_event():
+            event = self.events.get(timeout=30)  # a bound on a hang, not a wait for time to pass
+            if event[0] in out:
+                out[event[0]].append(event[1])
+            return event
+
+        start("A")
+        while next_event() != ("hit", 1):  # A's first request is at the stub and held: A holds the run's lock
+            pass
+        start("B")
+        first = next_event()
+        self.assertEqual(first, ("B", "waiting"), "B's request must wait for A's to finish, not reach LM Studio beside it")
+        self.release.set()
+        for p in procs.values():
+            p.wait(timeout=30)
+        for t in pumps:  # EOF on each child's stdout: every line it printed is in the queue before counting
+            t.join(timeout=30)
+            self.assertFalse(t.is_alive(), "a stdout reader did not reach EOF")
+        while not self.events.empty():
+            next_event()
+        lines = [line for name in out for line in out[name] if line != "waiting"]
+        self.assertEqual((lines.count("ok"), lines.count("refused")), (3, 1))
+        self.assertEqual((self.counter.read_text(), self.hits.count(self.lm), self.peak[0]), ("3", 3, 1))
 
 
 if __name__ == "__main__":

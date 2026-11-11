@@ -24,10 +24,32 @@ def drop_caller_session():
             CALLER_SESSION[key] = os.environ.pop(key)
 
 
+LMSTUDIO_BUDGET = "TP_LMSTUDIO_BUDGET"
+LMSTUDIO_BUDGET_FILE = "TP_LMSTUDIO_BUDGET_FILE"
+
+
+def lmstudio_budget():
+    """No default test reaches LM Studio (lib/router.py local_open): a budget of 0, or 20 with TP_LIVE_LMSTUDIO=1, and a fresh
+    counter file holding 0, unless the caller already set a budget (a worker's, from bin/tp-spawn, or tests/run_parallel.py's,
+    which imports this module so every module it starts shares one counter). Subprocesses inherit both. Idempotent."""
+    if LMSTUDIO_BUDGET in os.environ:
+        return
+    import atexit
+    import tempfile
+    fd, path = tempfile.mkstemp(prefix="tp-lmstudio-budget-{}-".format(os.getpid()))
+    os.write(fd, b"0")
+    os.close(fd)
+    os.environ[LMSTUDIO_BUDGET] = "20" if os.environ.get("TP_LIVE_LMSTUDIO") == "1" else "0"
+    os.environ[LMSTUDIO_BUDGET_FILE] = path
+    atexit.register(lambda: os.path.exists(path) and os.unlink(path))
+
+
 def scrub():
     """Called when this module is first imported, so `import session_env` as the first line of a test module is the whole
-    mechanism: whichever way the suite is started, it runs before any test code or tested module. Idempotent."""
+    mechanism: whichever way the suite is started, it runs before any test code or tested module. Idempotent. It also installs
+    the LM Studio request budget (lmstudio_budget), on the same import every way of starting the suite shares."""
     drop_caller_session()
+    lmstudio_budget()
 
 
 def outside_session(env=None):

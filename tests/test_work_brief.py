@@ -364,6 +364,35 @@ class Realistic(Base):
           ("design", "global", "code-quality tools check target projects, not tmux-pi itself",
            "these tools are not for tmux-pi to check itself but for tmux-pi to check the source code that is being worked on agentically")]
 
+    def test_an_uncommitted_supersession_keeps_the_old_rule_and_lists_the_new_one_pending(self):
+        """Round 3: the old workspace's save fails after the replacement was saved. The brief keeps the old rule and lists the new one
+        as pending with the completion command; `confirm` commits it; a withdrawn pending replacement leaves the old rule in force."""
+        import errno
+        for ws in ("old", "new"):
+            self.ok("work", "new", ws.title(), "--id", ws)
+        self.ok("work", "attach", "old")
+        old = self.ok("work", "decide", "old", "old rule text", "--scope", "global", *OWNER, "yes")["record"]["id"]
+        real = work.Doc.save
+
+        def save(doc):
+            if doc.id == "old":
+                raise OSError(errno.ENOSPC, "injected disk full")
+            return real(doc)
+
+        with mock.patch.object(work.Doc, "save", save):
+            code, _, _ = self.call("work", "decide", "new", "new rule text", "--scope", "global", "--supersedes", old, *OWNER, "yes")
+        self.assertEqual(code, 1)
+        text = self.brief()
+        self.assertIn("old rule text", text)
+        self.assertNotIn("- [design global] new rule text", text)
+        self.assertIn(f"pending: new/R1 replaces {old}, not yet committed", text)
+        self.assertIn("tp-agent work decision confirm new/R1", text)
+        self.assertTrue(self.ok("work", "decision", "confirm", "new/R1", "--quote", "yes")["changed"])
+        text = self.brief()
+        self.assertNotIn("old rule text", text)
+        self.assertIn("new rule text", text)
+        self.assertNotIn("pending:", text)
+
     def test_the_audit_f6_owner_rules_as_records_make_the_brief(self):
         self.ok("work", "new", "Hub memory", "--id", "hub", "--repo", str(self.project), "--objective",
                 "Main keeps the owner's rules across compactions without being reminded")

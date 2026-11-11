@@ -351,6 +351,34 @@ class Records(unittest.TestCase):
         self.assertEqual((got["text"], got["question"], got["status"], got["scope"]), ("Yes.\nAlways.", "First?\nSecond?", "active", "global"))
         self.assertEqual(len([r for r in self.records().values() if r["workspace"] == ws]), 3)
 
+    def second_save_failed(self, path, old, got):
+        """After the old workspace's save failed: the supersession is not committed, so the old rule is in force and the new one is
+        listed pending (never hidden); `confirm` then commits it (changed:true); withdrawing the pending one leaves the old in force."""
+        import work_brief
+        new = next(r["id"] for r in got.values() if r["supersedes"] == old)
+
+        def view():
+            records = list(self.records().values())
+            return ({r["id"] for r in work_brief.in_force(records, None, [])[0]},
+                    [(n["id"], o["id"]) for n, o in work_brief.uncommitted(records, None, [])])
+        shown, pending = view()
+        self.assertIn(old, shown, "the old rule was hidden while its replacement is uncommitted")
+        self.assertNotIn(new, shown, "the uncommitted replacement is pending, not a second rule in force")
+        self.assertEqual(pending, [(new, old)])
+        if path == "decide":  # the replacement is withdrawn before it was ever committed: the old rule was never replaced
+            self.ok("decision", "withdraw", new, "--quote", "drop it")
+            shown, pending = view()
+            self.assertEqual((old in shown, new in shown, pending), (True, False, []))
+            self.assertEqual(self.records()[old]["status"], "active")
+            return
+        done = self.ok("decision", "confirm", new, "--quote", "yes, finish it")
+        self.assertTrue(done["changed"], done)
+        self.assertIn(f"{old} superseded", done["supersession"])
+        shown, pending = view()
+        self.assertEqual((old in shown, new in shown, pending), (False, True, []))
+        self.assertEqual((self.records()[old]["status"], self.records()[old]["superseded_by"]), ("superseded", new))
+        self.assertFalse(self.ok("decision", "confirm", new, "--quote", "again")["changed"])  # nothing left to finish
+
     def test_a_failed_save_never_loses_the_old_rule(self):
         """Cross-workspace supersession saves the replacement first and marks the old record second (decide, confirm and answer share the
         path). A save that fails at either step leaves the old rule active; the replacement is present only when its own save worked."""
@@ -388,6 +416,7 @@ class Records(unittest.TestCase):
                     self.assertEqual((got[old]["status"], got[old]["superseded_by"]), ("active", None), "the old rule was lost")
                     if failing == "old":  # the replacement is saved, the old rule still stands
                         self.assertTrue(any(r["supersedes"] == old for r in got.values()), "the replacement is missing")
+                        self.second_save_failed(path, old, got)
 
     def test_supersession_is_explicit_two_way_and_same_scope_only(self):
         a = self.ok("new", "A", "--id", "a")["id"]

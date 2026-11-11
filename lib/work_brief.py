@@ -81,16 +81,33 @@ def covers(record, project, attached):
 
 
 def in_force(records, project, attached):
-    """(shown, conflicts): the active records in Main's scope, newest first, that nothing active supersedes; and the groups of two or
-    more of them in one scope answering the same question (all kept: the brief never picks one)."""
-    replaced = {r["supersedes"] for r in records if r["status"] == "active" and r.get("supersedes")}
-    shown = [r for r in records if r["status"] == "active" and r["id"] not in replaced and covers(r, project, attached)]
+    """(shown, conflicts): the active records in Main's scope, newest first, that no active record has replaced; and the groups of two or
+    more of them in one scope answering the same question (all kept: the brief never picks one). A record is replaced only once the
+    supersession is committed: an active record supersedes it AND it carries `superseded_by` = that record (so its status is
+    `superseded`). A replacement whose back-link is not written yet (a failed second save) is pending: see `uncommitted`."""
+    replaced = {r["supersedes"] for r in records if r["status"] == "active" and r.get("supersedes")
+                for old in records if old["id"] == r["supersedes"] and old.get("superseded_by") == r["id"]}
+    waiting = {new["id"] for new, _ in uncommitted(records, project, attached)}  # listed as pending, not as a rule in force beside the old one
+    shown = [r for r in records if r["status"] == "active" and r["id"] not in replaced and r["id"] not in waiting and covers(r, project, attached)]
     shown.sort(key=lambda r: _stamp(_when(r["provenance"]["at"])), reverse=True)
     groups = {}
     for r in shown:
         if r.get("question"):
             groups.setdefault((work.scope_key(r), re.sub(r"\s+", " ", r["question"]).strip().lower()), []).append(r)
     return shown, [g for g in groups.values() if len(g) > 1]
+
+
+def uncommitted(records, project, attached):
+    """[(new, old)]: active records in Main's scope that name an active record they replace but whose supersession is not committed
+    (the old record is not marked superseded by them). The old rule stays in force until `decision confirm` writes the back-link."""
+    by_id = {r["id"]: r for r in records}
+    found = []
+    for r in records:
+        old = by_id.get(r.get("supersedes") or "")
+        if r["status"] == "active" and old is not None and old["status"] == "active" and old.get("superseded_by") != r["id"] \
+                and covers(r, project, attached):
+            found.append((r, old))
+    return found
 
 
 def matching(project, skipped):
@@ -299,6 +316,9 @@ def _rules(brief, project, attached, skipped):
     for group in conflicts:
         brief.add(f"CONFLICT: {', '.join(r['id'] for r in group)} are active in one scope and answer the same question; ask the owner "
                   "which stands (`work decide ... --supersedes ID --by owner --quote ...`)")
+    for new, old in uncommitted(records, project, attached):
+        brief.add(f"pending: {new['id']} replaces {old['id']}, not yet committed ({old['id']} stays in force); finish with "
+                  f"tp-agent work decision confirm {new['id']} --quote \"their exact words\"")
     waiting = [r["id"] for r in records if r["status"] == "provisional" and covers(r, project, attached)]
     if waiting:
         brief.add(f"provisional (not in force until the owner confirms): {', '.join(waiting[:8])}"

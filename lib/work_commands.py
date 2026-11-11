@@ -709,7 +709,8 @@ def _supersede_now(doc, old_doc, old, new):
 
 def _save_both(doc, old_doc):
     """Save the workspace holding the replacement first, then the other one holding the record it supersedes. A failure between the
-    two leaves the old rule still active and the new one present (never neither): the old record is marked only once the new exists."""
+    two leaves the old rule in force and the new one present but pending (never neither): the supersession is committed only when the
+    old record carries `superseded_by`; `decision confirm NEW` completes it."""
     doc.save()
     if old_doc is not None and old_doc.id != doc.id:
         old_doc.save()
@@ -746,8 +747,18 @@ def _confirm(args):
     doc, record = work.find_record(args.id)
     if record["status"] in ("superseded", "withdrawn"):
         raise WorkError(f"{record['id']} is {record['status']}; it cannot be confirmed")
-    if record["status"] == "active":
-        return {"id": record["id"], "status": "active", "changed": False}
+    if record["status"] == "active":  # already the owner's; changed only when its supersession was never committed (a failed second save)
+        old_doc = old = None
+        if record.get("supersedes"):
+            try:
+                old_doc, old = work.find_record(record["supersedes"])
+            except WorkError:
+                old = None
+        if old is None or old["status"] in ("superseded", "withdrawn"):
+            return {"id": record["id"], "status": "active", "changed": False}
+        note = _supersede_now(doc, old_doc, old, record)
+        _save_both(doc, old_doc)
+        return {"id": record["id"], "status": "active", "changed": True, "supersession": note}
     if record["status"] is None and not record["text"]:
         raise WorkError(f"{record['id']} is an open question with no answer; answer it: work decision answer {record['id']} --text ... --by user --quote ...")
     record = {**record, "status": "active", "provenance": {**record["provenance"], "by": "owner", "quote": quote, "at": work.now()}}

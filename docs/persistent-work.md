@@ -47,8 +47,12 @@ and archiving never changes a record's status. Records of scope workspace, lane,
 archived they are out of the brief and out of `work records`.
 
 **Writes that fail.** A supersession, confirm or answer that touches two workspace files saves the replacement first and marks the
-old record superseded second. A failure between the two leaves the old rule active and the new one present but pending, never
-neither.
+old record second. A supersession is **committed** only when the old record carries `superseded_by` = the new id (status
+`superseded`). Until then the old rule stays in force and the brief lists the new record as `pending: NEW replaces OLD, not yet
+committed`. A failure between the two saves leaves exactly that state, never neither rule. Finish it with
+`tp-agent work decision confirm NEW --quote "their exact words"`, which writes the missing back-link and returns `changed: true`
+with the supersession note. Withdrawing the uncommitted replacement leaves the old rule active (it was never replaced). A failure
+of the first save writes nothing. The same-workspace case is one save and is unchanged.
 
 **Multiline text is one record.** `work decide` and `decision add|answer` text with newlines is stored as one record: the visible
 `Decisions` line is flattened to one line and the `<!-- record: {...} -->` trailer carries the exact text, newlines kept, and one

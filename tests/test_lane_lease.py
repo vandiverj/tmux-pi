@@ -108,33 +108,18 @@ class SharedOccupancyTests(LeaseCase):
         run = self.run_in(self.env2, *self.lane_args(role="code-reviewer", step="s1", extra=()))
         self.refused(run, "lane alpha already has a writer", item["id"])
 
-    def test_a_holder_whose_process_is_gone_or_is_not_the_recorded_one_is_stale_and_is_dropped(self):
-        def dead_process():
-            dead = subprocess.Popen(["true"])
-            dead.wait()
-            return self.holder(pid=dead.pid, start="Mon Jan  1 00:00:00 2001")
+    def test_a_lease_left_by_a_dead_process_is_stale_and_is_dropped(self):
+        self.made_lane()
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        self.put_lease([self.holder(pid=dead.pid, start="Mon Jan  1 00:00:00 2001")])
+        item, _ = self.existing(step="s1")
+        self.assertNotIn("coder-held00001", [h["task"] for h in self.lease()])
 
-        def recycled_pid():  # a live pid (this process), but not the recorded process
-            return self.holder(start="Mon Jan  1 00:00:00 2001")
-
-        def reservation_of_a_dead_process():
-            child = subprocess.Popen(["sleep", "300"])
-            holder = self.holder(pid=child.pid)
-            child.kill()
-            child.wait()
-            return holder
-
-        rows = (("a lease left by a dead process is stale and is dropped", dead_process),
-                ("a recycled pid with another start time is not the holder", recycled_pid),
-                ("a reservation by a process that died is stale", reservation_of_a_dead_process))
-        for number, (name, make_holder) in enumerate(rows):
-            with self.subTest(name):
-                if number:
-                    self.reset_fixture()
-                self.made_lane()
-                self.put_lease([make_holder()])
-                self.existing(step="s1")
-                self.assertNotIn("coder-held00001", [h["task"] for h in self.lease()])
+    def test_a_recycled_pid_with_another_start_time_is_not_the_holder(self):
+        self.made_lane()
+        self.put_lease([self.holder(start="Mon Jan  1 00:00:00 2001")])  # a live pid (this process), but not the recorded process
+        self.existing(step="s1")
 
     def test_a_live_holder_holds_however_old_the_lease_is(self):
         self.made_lane()
@@ -187,6 +172,15 @@ class ReservationTests(LeaseCase):
         run = self.lane_dispatch()
         self.assertNotEqual(run.returncode, 0)
         self.no_lane()
+
+    def test_a_reservation_by_a_process_that_died_is_stale(self):
+        self.made_lane()
+        child = subprocess.Popen(["sleep", "300"])
+        holder = self.holder(pid=child.pid)
+        child.kill()
+        child.wait()
+        self.put_lease([holder])
+        self.existing(step="s1")
 
     def test_the_task_holds_the_lane_once(self):
         self.made_lane()

@@ -42,46 +42,29 @@ class OtherLanePathsTests(LaneCase):
     def packet(self, task):
         return (task / "packet.md").read_text()
 
-    def test_a_dispatch_lists_the_other_open_lane_and_says_when_it_has_closed_no_step(self):
-        rows = (("a dispatch lists the other open lane, its branch, its last closed step and the overlapping path", "L1",
-                 ("beta", "lane/beta", "L1", "lib/x.py", SENTENCE)),
-                ("a lane with no closed step says so", None, ("no step closed yet",)))
-        for number, (name, closed_step, words) in enumerate(rows):
-            with self.subTest(name):
-                if number:
-                    self.reset_fixture()  # each row dispatches from an empty state
-                self.make_beta(closed_step=closed_step)
-                _, task = self.lane_ok()
-                packet = self.packet(task)
-                self.assertIn(SECTION, packet)
-                section = packet.split(SECTION, 1)[1]
-                for word in words:
-                    self.assertIn(word, section)
+    def test_a_dispatch_lists_the_other_open_lane_its_branch_its_last_closed_step_and_the_overlapping_path(self):
+        self.make_beta(closed_step="L1")
+        _, task = self.lane_ok()
+        packet = self.packet(task)
+        self.assertIn(SECTION, packet)
+        section = packet.split(SECTION, 1)[1]
+        for word in ("beta", "lane/beta", "L1", "lib/x.py", SENTENCE):
+            self.assertIn(word, section)
 
-    def test_no_section_unless_an_open_lane_owns_an_overlapping_path(self):
-        def no_overlap():
-            self.make_beta(edit="docs/d.md")  # beta changes only what alpha (lib) does not touch
+    def test_a_lane_with_no_closed_step_says_so(self):
+        self.make_beta()
+        _, task = self.lane_ok()
+        self.assertIn("no step closed yet", self.packet(task).split(SECTION, 1)[1])
 
-        def alone():
-            pass  # a dispatch into the lane alone
+    def test_no_overlap_no_section(self):
+        self.make_beta(edit="docs/d.md")  # beta changes only what alpha (lib) does not touch
+        _, task = self.lane_ok()
+        self.assertNotIn(SECTION, self.packet(task))
+        self.assertNotIn("Do not edit these paths", self.packet(task))
 
-        def not_open():
-            self.make_beta()
-            common = Path(git(self.repo, "rev-parse", "--path-format=absolute", "--git-common-dir"))
-            record = lanes.read_lane(common, "beta")
-            with lanes.lane_lock(common):
-                lanes.write_lane(common, dict(record, state="abandoned"))
-
-        rows = (("no overlap, no section", no_overlap), ("a dispatch into the lane alone has no section", alone),
-                ("a lane that is not open is not listed", not_open))
-        for number, (name, prepare) in enumerate(rows):
-            with self.subTest(name):
-                if number:
-                    self.reset_fixture()  # each row dispatches from an empty state
-                prepare()
-                _, task = self.lane_ok()
-                self.assertNotIn(SECTION, self.packet(task))
-                self.assertNotIn("Do not edit these paths", self.packet(task))
+    def test_a_dispatch_into_the_lane_alone_has_no_section(self):
+        _, task = self.lane_ok()
+        self.assertNotIn(SECTION, self.packet(task))
 
     def test_a_later_task_in_the_existing_lane_and_a_retry_of_it_have_the_section(self):
         _, first = self.lane_ok()
@@ -94,6 +77,15 @@ class OtherLanePathsTests(LaneCase):
         run = self.raw("retry", second.name, "--reason", "again", "--worker", "pi", "--model", MODEL)
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertIn("lib/x.py", self.packet(self.state / "tasks" / json.loads(run.stdout)["id"]).split(SECTION, 1)[1])
+
+    def test_a_lane_that_is_not_open_is_not_listed(self):
+        self.make_beta()
+        common = Path(git(self.repo, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+        record = lanes.read_lane(common, "beta")
+        with lanes.lane_lock(common):
+            lanes.write_lane(common, dict(record, state="abandoned"))
+        _, task = self.lane_ok()
+        self.assertNotIn(SECTION, self.packet(task))
 
     def test_a_record_that_cannot_be_read_is_left_out_and_does_not_refuse(self):
         self.make_beta()

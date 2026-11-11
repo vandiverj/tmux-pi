@@ -176,22 +176,11 @@ class RoundsTests(unittest.TestCase):
     def attached(self, got):
         return [Path(p).name for p in got["contexts"][1:]]
 
-    def test_when_no_gate_window_applies_to_the_newest_task_every_round_stays_in_full(self):
-        rows = (("a gate whose trigger is the first review leaves every round in full",  # r-a (round 1) triggered it: nothing precedes it
-                 {"gates": {"w1": "design"}, "gated_author": ("w1", "design", "r-a")}),
-                ("a sweep.md on disk in the parent's directory is no gate",  # c46acbc: a sibling gated retry, or a gated dispatch that failed, leaves sweep.md in w1
-                 {"gates": {}, "on_disk": ["w1"], "gated_author": None}),
-                ("a gate value that is not a route is ignored", {"gates": {"w2": "park"}}))
-        for number, (name, kw) in enumerate(rows):
-            with self.subTest(name):
-                if number:  # a fresh state directory for each row's chain
-                    self.setUp()
-                got = self.gated_chain(kw["gates"], on_disk=kw.get("on_disk", ()))
-                self.assertEqual(self.attached(got), ["earlier-findings-01-r-a.md", "earlier-findings-02-r-b.md",
-                                                      "earlier-findings-03-r-c.md", "earlier-findings-04-r-d.md"])
-                self.assertEqual((got["rounds"], got["summarised"]), (4, []))
-                if "gated_author" in kw:
-                    self.assertEqual(review_rounds.gated_author(self.state, "w2"), kw["gated_author"])
+    def test_a_gate_whose_trigger_is_the_first_review_leaves_every_round_in_full(self):
+        got = self.gated_chain({"w1": "design"})  # r-a (round 1) triggered it: nothing precedes it
+        self.assertEqual(self.attached(got), ["earlier-findings-01-r-a.md", "earlier-findings-02-r-b.md",
+                                              "earlier-findings-03-r-c.md", "earlier-findings-04-r-d.md"])
+        self.assertEqual((got["rounds"], got["summarised"]), (4, []))
 
     def test_the_review_before_the_gate_is_the_first_one_in_full_and_older_ones_are_summarised(self):
         got = self.gated_chain({"w2": "design"})  # w2's gate was triggered by r-c (round 3)
@@ -202,14 +191,14 @@ class RoundsTests(unittest.TestCase):
 
     def test_the_gate_that_applies_to_the_newest_task_summarises_the_rounds_before_its_trigger(self):
         rows = (("two gates: the last one wins",  # w1 alone (r-a triggered it) would summarise nothing; w2's gate, triggered by r-c, wins
-                 {"gates": {"w1": "rule-first", "w2": "design"}}),
-                # c46acbc, e04cc16: w2 was dispatched with w1's sweep.md; r-c is w1's newest review made before w2
-                ("a task from before the gate field is gated by the sweep in its own dispatch record", {"gates": {}, "legacy": ["w2"]}))
-        for number, (name, kw) in enumerate(rows):
+                 {"w1": "rule-first", "w2": "design"}, ()),
+                # w2 was dispatched with w1's sweep.md; r-c is w1's newest review made before w2
+                ("a task from before the gate field is gated by the sweep in its own dispatch record", {}, ["w2"]))
+        for number, (name, gates, legacy) in enumerate(rows):
             with self.subTest(name):
                 if number:  # a fresh state directory for each row's chain
                     self.setUp()
-                got = self.gated_chain(kw["gates"], legacy=kw.get("legacy", ()))
+                got = self.gated_chain(gates, legacy=legacy)
                 self.assertEqual([s["review"] for s in got["summarised"]], ["r-a", "r-b"])
                 self.assertEqual(self.attached(got), ["earlier-summary.md", "earlier-findings-03-r-c.md", "earlier-findings-04-r-d.md"])
 
@@ -227,6 +216,12 @@ class RoundsTests(unittest.TestCase):
         got = self.gated_chain({}, legacy=["w2"], extra_review_on_w1=True)  # r-e (09Z) was made after w2 (05Z): not the trigger
         self.assertEqual([s["review"] for s in got["summarised"]], ["r-a", "r-b"])
         self.assertEqual(self.attached(got)[1], "earlier-findings-03-r-c.md")
+
+    def test_a_sweep_md_on_disk_in_the_parents_directory_is_no_gate(self):
+        # F1: a sibling gated retry, or a gated dispatch that failed, leaves sweep.md in w1; w2 (an ordinary retry of w1) is not gated by it
+        got = self.gated_chain({}, on_disk=["w1"])
+        self.assertEqual((got["summarised"], len(self.attached(got))), ([], 4))
+        self.assertEqual(review_rounds.gated_author(self.state, "w2"), None)
 
     def test_a_task_with_a_gate_null_and_no_sweep_in_its_dispatch_record_is_not_gated(self):
         self.gated_chain({})
@@ -271,6 +266,10 @@ class RoundsTests(unittest.TestCase):
         self.task("w1", parent="w0", reviews=["r-c"])
         (self.state / "tasks" / "w0" / "sweep.md").symlink_to(target)
         self.assertEqual(self.prepare("w1")["summarised"], [])
+
+    def test_a_gate_value_that_is_not_a_route_is_ignored(self):
+        got = self.gated_chain({"w2": "park"})
+        self.assertEqual((got["summarised"], len(self.attached(got))), ([], 4))
 
     def test_chain_labels_give_the_verdict_and_family_names_of_each_review_oldest_first(self):
         self.review("r-a", "REQUEST_CHANGES\nF1 x\nFamily: One\nCloses by: code\n")
@@ -539,19 +538,23 @@ class SecretsStayOutTests(RoundsTests):
                 self.assertNotIn(self.SECRET, f.read_text(), f)
         self.assertGreaterEqual(got["redactions"], 2)  # the finding and the safe file's line
 
-    def test_a_rule_or_a_redaction_pass_that_does_not_work_refuses(self):
-        rows = (("a rule that cannot be loaded refuses", lambda: mock.patch.dict(sys.modules, {"sensitive_read": None}), "sensitive-read rule"),
-                ("a rule that gives no answer refuses", lambda: mock.patch.object(sensitive_read, "classify", return_value={}), None),
-                ("a rule that raises refuses", lambda: mock.patch.object(sensitive_read, "classify", side_effect=RuntimeError("boom")), None),
-                ("a redaction pass that cannot load refuses", lambda: mock.patch.dict(sys.modules, {"redact": None}), None))
+    def test_a_rule_that_cannot_be_loaded_refuses(self):
         self.reviewed()
         (self.work / "a.txt").write_text("x\n")
-        for name, broken, said in rows:
-            with self.subTest(name), broken():
-                with self.assertRaises(review_rounds.Refused) as ctx:
-                    self.prepare("w1")
-                if said:
-                    self.assertIn(said, str(ctx.exception))
+        with mock.patch.dict(sys.modules, {"sensitive_read": None}):
+            with self.assertRaises(review_rounds.Refused) as ctx:
+                self.prepare("w1")
+        self.assertIn("sensitive-read rule", str(ctx.exception))
+
+    def test_a_rule_that_gives_no_answer_refuses(self):
+        self.reviewed()
+        (self.work / "a.txt").write_text("x\n")
+        with mock.patch.object(sensitive_read, "classify", return_value={}):
+            with self.assertRaises(review_rounds.Refused):
+                self.prepare("w1")
+        with mock.patch.object(sensitive_read, "classify", side_effect=RuntimeError("boom")):
+            with self.assertRaises(review_rounds.Refused):
+                self.prepare("w1")
 
     def test_a_path_that_cannot_be_decoded_refuses(self):
         (self.work / "a.txt").write_text("one\n")
@@ -564,6 +567,12 @@ class SecretsStayOutTests(RoundsTests):
         with self.assertRaises(review_rounds.Refused) as ctx:
             self.prepare("w1")
         self.assertIn("cannot be decoded", str(ctx.exception))
+
+    def test_a_redaction_pass_that_cannot_load_refuses(self):
+        self.reviewed()
+        with mock.patch.dict(sys.modules, {"redact": None}):
+            with self.assertRaises(review_rounds.Refused):
+                self.prepare("w1")
 
 
 def run_git(directory, *args):
@@ -1222,46 +1231,17 @@ class TimerWaitsTests(unittest.TestCase):
     def waits(self):
         return review_rounds.timer_waits(str(self.work), "")
 
-    def test_what_is_listed_and_what_is_left_out_of_the_added_lines(self):
-        """Rows: files put in a fresh repository (and whether staged), what the text names, what it must not."""
-        rows = (("an added sleep in a test file is listed with path and line", {"src/foo_test.ts": "const a = 1\nawait sleep(50)\n"}, False,
-                 ["Timer waits in added test lines", "src/foo_test.ts:2: await sleep(50)"], []),
-                ("the same line in a file that is not a test path is not listed", {"src/foo.ts": "await sleep(50)\n"}, False,
-                 ["none were found"], ["src/foo.ts"]),
-                ("a timer-ok line is listed and marked, not dropped", {"src/foo_test.ts": "setTimeout(r, 10) // timer-ok: debounce\nsleep(3)\n"}, False,
-                 ["src/foo_test.ts:1: setTimeout(r, 10) // timer-ok: debounce (timer-ok)", "src/foo_test.ts:2: sleep(3)\n"],
-                 ["sleep(3) (timer-ok)"]),
-                # sleep(1) was already there
-                ("only added lines count and a modified tracked file gets its new line numbers", {"old_test.ts": "await sleep(1)\nconst a = 1\ndelay(7)\n"}, False,
-                 ["old_test.ts:3: delay(7)"], ["old_test.ts:1:"]),
-                ("a staged new file is read too", {"new_test.py": "time.sleep(2)\n"}, True, ["new_test.py:1: time.sleep(2)"], []),
-                ("a withheld path is never read", {".env.test": "sleep(9) SECRET-VALUE\n"}, False, [], ["SECRET-VALUE", ".env.test"]),
-                ("a long matching line is cut at 400 with the mark", {"src/foo_test.ts": "sleep(1) " + "x" * 491 + "\n"}, False,
-                 ["src/foo_test.ts:1: sleep(1) " + "x" * 391 + "… (truncated, 500 chars)"], ["x" * 392]))
-        for number, (name, files, staged, present, absent) in enumerate(rows):
-            with self.subTest(name):
-                if number:
-                    self.fresh_repo()
-                for path, content in files.items():
-                    self.put(path, content)
-                if staged:
-                    run_git(self.work, "add", *files)
-                text = self.waits()
-                for expected in present:
-                    self.assertIn(expected, text + "\n")
-                for unwanted in absent:
-                    self.assertNotIn(unwanted, text)
+    def test_an_added_sleep_in_a_test_file_is_listed_with_path_and_line(self):
+        self.put("src/foo_test.ts", "const a = 1\nawait sleep(50)\n")
+        text = self.waits()
+        self.assertIn("Timer waits in added test lines", text)
+        self.assertIn("src/foo_test.ts:2: await sleep(50)", text)
 
-    def test_the_first_line_counts_the_matches_or_says_none_found(self):
-        rows = (("at or under the cap the first line says none lack text", "sleep(1)\n",
-                 "# Timer waits in added test lines: 1 matching added line(s); 0 listed as path:line without their text"),
-                ("with no match the first line says none found", "const a = 1\n", "# Timer waits in added test lines: none found"))
-        for number, (name, text, first) in enumerate(rows):
-            with self.subTest(name):
-                if number:
-                    self.fresh_repo()
-                self.put("src/foo_test.ts", text)
-                self.assertEqual(self.waits().splitlines()[0], first)
+    def test_the_same_line_in_a_file_that_is_not_a_test_path_is_not_listed(self):
+        self.put("src/foo.ts", "await sleep(50)\n")
+        text = self.waits()
+        self.assertNotIn("src/foo.ts", text)
+        self.assertIn("none were found", text)
 
     def test_every_test_path_pattern_and_every_timer_call_counts(self):
         calls = ("setTimeout(r, 5)", "sleep(2)", "delay(3)", "Deno.sleep(4)", "waitForTimeout(5)")
@@ -1272,11 +1252,35 @@ class TimerWaitsTests(unittest.TestCase):
             for number, call in enumerate(calls, 1):
                 self.assertIn(f"{path}:{number}: {call}", text)
 
+    def test_a_timer_ok_line_is_listed_and_marked_not_dropped(self):
+        self.put("src/foo_test.ts", "setTimeout(r, 10) // timer-ok: debounce\nsleep(3)\n")
+        text = self.waits()
+        self.assertIn("src/foo_test.ts:1: setTimeout(r, 10) // timer-ok: debounce (timer-ok)", text)
+        self.assertIn("src/foo_test.ts:2: sleep(3)\n", text + "\n")
+        self.assertNotIn("sleep(3) (timer-ok)", text)
+
     def test_no_timer_lines_say_so_in_one_line(self):
         self.put("src/foo_test.ts", "const a = 1\n")
         lines = [line for line in self.waits().splitlines() if line.strip() and not line.startswith("#")]
         self.assertEqual(len(lines), 1)
         self.assertIn("none were found", lines[0])
+
+    def test_only_added_lines_count_and_a_modified_tracked_file_gets_its_new_line_numbers(self):
+        self.put("old_test.ts", "await sleep(1)\nconst a = 1\ndelay(7)\n")  # sleep(1) was already there
+        text = self.waits()
+        self.assertIn("old_test.ts:3: delay(7)", text)
+        self.assertNotIn("old_test.ts:1:", text)
+
+    def test_a_staged_new_file_and_a_committed_nothing_repository_are_read_too(self):
+        self.put("new_test.py", "time.sleep(2)\n")
+        run_git(self.work, "add", "new_test.py")
+        self.assertIn("new_test.py:1: time.sleep(2)", self.waits())
+
+    def test_a_withheld_path_is_never_read(self):
+        self.put(".env.test", "sleep(9) SECRET-VALUE\n")
+        text = self.waits()
+        self.assertNotIn("SECRET-VALUE", text)
+        self.assertNotIn(".env.test", text)
 
     def test_a_secret_in_a_listed_line_is_redacted(self):
         self.put("src/foo_test.ts", "sleep(1); const API_TOKEN = 'sk-abcdefghijklmnopqrstuvwxyz0123456789ABCD'\n")
@@ -1298,10 +1302,27 @@ class TimerWaitsTests(unittest.TestCase):
         self.assertEqual(entries[cap - 1], f"src/foo_test.ts:{cap}: sleep({cap - 1})")
         self.assertEqual(text.splitlines()[0], f"# Timer waits in added test lines: {cap + 1} matching added line(s); 1 listed as path:line without their text")
 
+    def test_the_first_line_counts_the_matches_or_says_none_found(self):
+        rows = (("at or under the cap the first line says none lack text", "sleep(1)\n",
+                 "# Timer waits in added test lines: 1 matching added line(s); 0 listed as path:line without their text"),
+                ("with no match the first line says none found", "const a = 1\n", "# Timer waits in added test lines: none found"))
+        for number, (name, text, first) in enumerate(rows):
+            with self.subTest(name):
+                if number:
+                    self.fresh_repo()
+                self.put("src/foo_test.ts", text)
+                self.assertEqual(self.waits().splitlines()[0], first)
+
     def test_when_it_cannot_be_computed_the_first_line_still_starts_with_the_title(self):
         with tempfile.TemporaryDirectory() as plain:
             first = review_rounds.timer_waits(plain, "").splitlines()[0]
         self.assertTrue(first.startswith("# Timer waits in added test lines: "), first)
+
+    def test_a_long_matching_line_is_cut_at_400_with_the_mark(self):
+        self.put("src/foo_test.ts", "sleep(1) " + "x" * 491 + "\n")
+        text = self.waits()
+        self.assertIn("src/foo_test.ts:1: sleep(1) " + "x" * 391 + "… (truncated, 500 chars)", text)
+        self.assertNotIn("x" * 392, text)
 
     def test_the_command_writes_the_file(self):
         self.put("src/foo_test.ts", "await sleep(50)\n")

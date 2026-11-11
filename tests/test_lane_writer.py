@@ -364,8 +364,12 @@ class RefusalTableTests(LaneCase):
         sys.path.insert(0, str(ROOT / "lib"))
         import lanes
         limit = lanes.load_machine_config()["max_active_lanes"]
-        for index in range(limit):
-            self.lane_ok(name=f"l{index}", extra=("--repo", None, "--domain", f"d{index}", "--touches", f"area{index}"))
+        # fill the limit with `lane create` (the same check_lane_capacity), the last place through a real dispatch
+        for index in range(limit - 1):
+            run = self.raw("lane", "create", f"l{index}", "--repo", str(self.repo), "--domain", f"d{index}", "--touches", f"area{index}")
+            self.assertEqual(run.returncode, 0, run.stderr)
+        last = limit - 1
+        self.lane_ok(name=f"l{last}", extra=("--repo", None, "--domain", f"d{last}", "--touches", f"area{last}"))
         run = self.lane_dispatch(name="extra", extra=("--repo", None, "--domain", "e", "--touches", "elsewhere"))
         self.refused(run, "lane")
         self.assertFalse((self.root / "proj-wt-extra").exists())

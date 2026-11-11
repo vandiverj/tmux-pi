@@ -426,7 +426,7 @@ class PlainFileTests(KindCase):
                     if count == 1:
                         self.put(run.task_path() / "process.json", kind, b"{}")
                         self.put(run.task_path() / "dispatch.json", kind, b"{}")
-                run, done = self.run_stub(rdir, poll, clock=Clock(step=10.0))
+                run, done = self.run_stub(rdir, poll, clock=Clock(step=100.0))
                 self.assertIsNone(trial_session.named(trial_session.session_name(info["run"]), self.env))
                 self.assertFalse(self.alive(self.worker_pane))
                 self.assertEqual(done["phase"], "done")

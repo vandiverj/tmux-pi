@@ -329,6 +329,12 @@ class StopTests(ShadowCase):
         self.assertFalse(ts.pid_is_run(child.pid, rdir.with_name("sh-other")))
         for pid in (None, 0, 1, -5, "12", True, os.getpid()):
             self.assertFalse(ts.pid_is_run(pid, rdir), pid)
+        # A process whose command line is not UTF-8 (any pid may be one) is read, not a crash: it is simply not the runner.
+        other = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()", b"tp-trial-\xff"], stdin=subprocess.PIPE)
+        self.addCleanup(other.stdin.close)
+        self.addCleanup(other.wait)
+        self.addCleanup(other.kill)
+        self.assertFalse(ts.pid_is_run(other.pid, rdir))
 
     def test_stop_signals_the_runner_waits_for_it_then_cleans_and_marks_the_run(self):
         rdir, info = self.prepare()

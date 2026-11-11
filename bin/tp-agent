@@ -631,6 +631,12 @@ def repeated_family(base, task_id):
     return None
 
 
+def gate_review_of(base, task_id):
+    """The newest review of the chain of `task_id` that has a result.md: the review repeated_family judged, which a gated retry
+    records (meta.json gate_review) as the one that triggered it."""
+    return [review for _, review, _, _, number in review_rounds.chain_labels(base, task_id) if review and number][-1]
+
+
 def family_words(family, earlier, latest, given):
     """The gate's finding in words. A named family: which two reviews named it. Unnamed: the two review ids, that both asked for
     changes, and the names each gave ("no Family: line" for a review without one), whatever the label shape."""
@@ -700,6 +706,10 @@ def launch(base, item):
     args += ["--workdir", item["workdir"]]
     if item["parent"]:
         args += ["--parent", item["parent"]]
+    if "gate" in item:
+        args += ["--gate", item["gate"]]
+        if "gate_review" in item:
+            args += ["--gate-review", item["gate_review"]]
     if "lane" in item:
         args += ["--lane", item["lane"], "--lane-step", item["lane_step"], "--preamble-from", item["preamble_from"]]
         owned = other_lane_paths(item)
@@ -826,6 +836,16 @@ def queue_item(value, name=None):
         if not isinstance(value["main"], str) or not MAIN_ID.fullmatch(value["main"]):
             raise ValueError("the record's main is not a valid main id")
         clean["main"] = value["main"]
+    if "gate" in value:  # optional: the route of the gated retry this task is (meta.json gate, read by lib/review_rounds.py)
+        if value["gate"] not in review_rounds.GATES:
+            raise ValueError(f"the record's gate is not one of {', '.join(review_rounds.GATES)}")
+        clean["gate"] = value["gate"]
+    if "gate_review" in value:  # optional: the parent's review that triggered the gate (meta.json gate_review); only with a gate
+        if "gate" not in clean:
+            raise ValueError("the record's gate_review needs a gate")
+        if not isinstance(value["gate_review"], str) or not review_rounds.IDENT.fullmatch(value["gate_review"]):
+            raise ValueError("the record's gate_review is not a task id")
+        clean["gate_review"] = value["gate_review"]
     if "queue_reason" in value:  # optional (tp-agent's own note, only displayed), but a present value must be text
         if not isinstance(value["queue_reason"], str):
             raise ValueError("the record's queue_reason is not text")
@@ -1108,7 +1128,9 @@ def dispatch(args, base):
             "task": args.task, "workdir": workdir, "worker": worker, "model": model,
             "thinking": thinking, "route_info": info, "deliverable": args.deliverable or "",
             "parent": args.parent or "", "after": args.after or [], "context": args.context or [],
-            "notes": args.note or [], "tests": tests, **({"main": main_id()} if main_id() else {})})
+            "notes": args.note or [], "tests": tests, **({"main": main_id()} if main_id() else {}),
+            **({"gate": args.gate} if getattr(args, "gate", None) else {}),
+            **({"gate_review": args.gate_review} if getattr(args, "gate", None) and getattr(args, "gate_review", None) else {})})
     if plan:
         with locked(base):
             value, _, warnings = lane_admit(base, plan, item)
@@ -1608,6 +1630,8 @@ def _main(argv):
                                          workdir=meta.get("workdir"), lane_meta=lane_meta,
                                          deliverable=meta.get("deliverable", ""),
                                          parent=args.id, after=[], context=contexts,
+                                         gate=args.route if repeated and args.route in review_rounds.GATES else None,
+                                         gate_review=gate_review_of(base, args.id) if repeated and args.route in review_rounds.GATES else None,
                                          tests=tests,
                                          note=notes + [f"Retry of {args.id}: {args.reason}. Prior task: {previous}. Prior packet: {previous / 'packet.md'} (original constraints and dependency pointers; re-read as needed). Prior result: {prior['result_path'] or 'none'}. Preserve and inspect partial work before claiming completion. Capability requests and sensitive context from the prior attempt are not re-granted."
                                                       + brief_note + (f" {remark}; see the prior packet." if remark else "")]

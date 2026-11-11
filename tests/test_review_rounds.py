@@ -34,8 +34,8 @@ class RoundsTests(unittest.TestCase):
         (d / "meta.json").write_text(json.dumps({"id": ident, **meta}))
         return d
 
-    def review(self, ident, text, state=None):
-        d = self.task(ident)
+    def review(self, ident, text, state=None, **meta):
+        d = self.task(ident, **meta)
         (d / "result.md").write_text(text)
         if state:
             (d / "reviewed-state.json").write_text(json.dumps(state))
@@ -148,6 +148,126 @@ class RoundsTests(unittest.TestCase):
         self.assertEqual(names[1:], ["earlier-findings-01-r-a.md", "earlier-findings-02-r-b.md", "earlier-findings-03-r-c.md"])
         self.assertEqual([Path(p).read_text().split("]\n\n", 1)[1] for p in got["contexts"][1:]], ["FIRST", "SECOND", "THIRD"])
         self.assertEqual(got["rounds"], 3)
+        self.assertEqual(got["summarised"], [])  # no gate in the chain: nothing is summarised
+
+    def gated_chain(self, gates, legacy=(), on_disk=(), extra_review_on_w1=False, trigger="r-c"):
+        """w0 reviewed by r-a; w1 by r-b, r-c; w2 by r-d. `gates` = {author: route} written to those tasks' meta.json, with
+        gate_review `trigger`; `legacy` = authors whose own dispatch.json lists the sweep.md of their parent (a gated retry made
+        before meta.json carried `gate`); `on_disk` = authors given a sweep.md file in their own directory (a later sibling retry
+        or a failed gated dispatch writes one); `extra_review_on_w1` appends a review of w1 after w2 was made (bin/tp-review:497)."""
+        body = lambda name, head: f"REQUEST_CHANGES\nF1 — {head}\nFamily: {name}\nBODY-{name}-SECRET-TEXT\nCloses by: code\n"
+        for ident, name, head in (("r-a", "alpha", "first head"), ("r-b", "beta", "second head"), ("r-d", "delta", "fourth head")):
+            self.review(ident, body(name, head), created={"r-a": "2026-01-01T00:00:01Z", "r-b": "2026-01-01T00:00:02Z", "r-d": "2026-01-01T00:00:06Z"}[ident])
+        self.review("r-c", body("gamma", "third head") + "F2 — another heading\n", created="2026-01-01T00:00:03Z")
+        if extra_review_on_w1:
+            self.review("r-e", body("epsilon", "fifth head"), created="2026-01-01T00:00:09Z")
+        gate = lambda author: {"gate": gates[author], "gate_review": trigger} if author in gates else {}
+        self.task("w0", reviews=["r-a"], created="2026-01-01T00:00:00Z")
+        self.task("w1", parent="w0", reviews=["r-b", "r-c"] + (["r-e"] if extra_review_on_w1 else []), created="2026-01-01T00:00:04Z",
+                  **({"gate": gates["w1"], "gate_review": "r-a"} if "w1" in gates else {}))
+        self.task("w2", parent="w1", reviews=["r-d"], created="2026-01-01T00:00:05Z", **gate("w2"))
+        for author in legacy:
+            parent = {"w1": "w0", "w2": "w1"}[author]
+            (self.state / "tasks" / author / "dispatch.json").write_text(json.dumps({"context": [f"/x/tasks/{parent}/sweep.md"]}))
+        for author in on_disk:
+            (self.state / "tasks" / author / "sweep.md").write_text("# sweep\n")
+        return self.prepare("w2")
+
+    def attached(self, got):
+        return [Path(p).name for p in got["contexts"][1:]]
+
+    def test_a_gate_whose_trigger_is_the_first_review_leaves_every_round_in_full(self):
+        got = self.gated_chain({"w1": "design"})  # r-a (round 1) triggered it: nothing precedes it
+        self.assertEqual(self.attached(got), ["earlier-findings-01-r-a.md", "earlier-findings-02-r-b.md",
+                                              "earlier-findings-03-r-c.md", "earlier-findings-04-r-d.md"])
+        self.assertEqual((got["rounds"], got["summarised"]), (4, []))
+
+    def test_the_review_before_the_gate_is_the_first_one_in_full_and_older_ones_are_summarised(self):
+        got = self.gated_chain({"w2": "design"})  # w2's gate was triggered by r-c (round 3)
+        self.assertEqual(self.attached(got), ["earlier-summary.md", "earlier-findings-03-r-c.md", "earlier-findings-04-r-d.md"])
+        self.assertEqual([(s["round"], s["review"]) for s in got["summarised"]], [(1, "r-a"), (2, "r-b")])
+        self.assertEqual(got["rounds"], 4)
+        self.assertEqual(got["families"], [["alpha"], ["beta"], ["gamma"], ["delta"]])  # the family names of every round still reach the review text
+
+    def test_two_gates_the_last_one_wins(self):
+        # w1 alone (r-a triggered it) would summarise nothing; w2's gate, triggered by r-c, wins
+        two = self.gated_chain({"w1": "rule-first", "w2": "design"})
+        self.assertEqual([s["review"] for s in two["summarised"]], ["r-a", "r-b"])
+        self.assertEqual(self.attached(two), ["earlier-summary.md", "earlier-findings-03-r-c.md", "earlier-findings-04-r-d.md"])
+
+    def test_a_summary_line_keeps_the_verdict_families_and_headings_but_no_body(self):
+        got = self.gated_chain({"w2": "rule-first"})
+        text = Path(got["contexts"][1]).read_text()
+        lines = [line for line in text.splitlines() if line.startswith("round ")]
+        self.assertEqual(lines, ["round 1; review r-a; REQUEST_CHANGES; families: alpha; findings: F1 — first head",
+                                 "round 2; review r-b; REQUEST_CHANGES; families: beta; findings: F1 — second head"])
+        self.assertNotIn("SECRET-TEXT", text)
+        self.assertIn("SECRET-TEXT", Path(got["contexts"][2]).read_text())  # a round inside the window keeps its body
+        self.assertEqual(got["summarised"][0]["result"], str(self.state / "tasks" / "r-a" / "result.md"))
+
+    def test_a_task_from_before_the_gate_field_is_gated_by_the_sweep_in_its_own_dispatch_record(self):
+        got = self.gated_chain({}, legacy=["w2"])  # w2 was dispatched with w1's sweep.md; r-c is w1's newest review made before w2
+        self.assertEqual(self.attached(got), ["earlier-summary.md", "earlier-findings-03-r-c.md", "earlier-findings-04-r-d.md"])
+        self.assertEqual([s["review"] for s in got["summarised"]], ["r-a", "r-b"])
+
+    def test_a_legacy_trigger_is_the_parents_newest_review_made_before_the_child(self):
+        got = self.gated_chain({}, legacy=["w2"], extra_review_on_w1=True)  # r-e (09Z) was made after w2 (05Z): not the trigger
+        self.assertEqual([s["review"] for s in got["summarised"]], ["r-a", "r-b"])
+        self.assertEqual(self.attached(got)[1], "earlier-findings-03-r-c.md")
+
+    def test_a_sweep_md_on_disk_in_the_parents_directory_is_no_gate(self):
+        # F1: a sibling gated retry, or a gated dispatch that failed, leaves sweep.md in w1; w2 (an ordinary retry of w1) is not gated by it
+        got = self.gated_chain({}, on_disk=["w1"])
+        self.assertEqual((got["summarised"], len(self.attached(got))), ([], 4))
+        self.assertEqual(review_rounds.gated_author(self.state, "w2"), None)
+
+    def test_a_task_with_a_gate_null_and_no_sweep_in_its_dispatch_record_is_not_gated(self):
+        self.gated_chain({})
+        meta = self.state / "tasks" / "w2" / "meta.json"
+        meta.write_text(json.dumps({**json.loads(meta.read_text()), "gate": None}))
+        (self.state / "tasks" / "w2" / "dispatch.json").write_text(json.dumps({"context": ["/x/tasks/w1/sweep.md"]}))
+        self.assertEqual(review_rounds.gated_author(self.state, "w2"), None)  # a gate key, even null, says what the task is
+
+    def test_a_sibling_gated_retry_does_not_change_the_packet_of_an_ordinary_retry(self):
+        self.gated_chain({})
+        before = [(Path(p).name, Path(p).read_text()) for p in self.prepare("w2")["contexts"]]
+        self.task("w3", parent="w1", gate="design", gate_review="r-c", created="2026-01-01T00:00:07Z")  # w3 is a design retry of w1
+        (self.state / "tasks" / "w1" / "sweep.md").write_text("# sweep\n")  # which wrote w1's sweep.md
+        self.assertEqual([(Path(p).name, Path(p).read_text()) for p in self.prepare("w2")["contexts"]], before)
+
+    def test_the_window_starts_at_the_recorded_review_when_the_parent_is_reviewed_again(self):
+        got = self.gated_chain({"w2": "design"}, extra_review_on_w1=True)  # r-e was appended to w1 after w2 was made
+        self.assertEqual(self.attached(got), ["earlier-summary.md", "earlier-findings-03-r-c.md", "earlier-findings-04-r-e.md",
+                                              "earlier-findings-05-r-d.md"])
+        self.assertIn("SECRET-TEXT", Path(got["contexts"][2]).read_text())  # r-c stays in full
+
+    def test_a_gate_review_outside_the_chain_or_without_a_reply_refuses_naming_it(self):
+        with self.assertRaises(review_rounds.Refused) as caught:
+            self.gated_chain({"w2": "design"}, trigger="r-nowhere")
+        self.assertIn("r-nowhere", str(caught.exception))
+        self.task("r-silent")  # a review of w1 that never produced a reply
+        meta = self.state / "tasks" / "w1" / "meta.json"
+        meta.write_text(json.dumps({**json.loads(meta.read_text()), "reviews": ["r-b", "r-c", "r-silent"]}))
+        meta = self.state / "tasks" / "w2" / "meta.json"
+        meta.write_text(json.dumps({**json.loads(meta.read_text()), "gate_review": "r-silent"}))
+        with self.assertRaises(review_rounds.Refused) as caught:
+            self.prepare("w2")
+        self.assertIn("r-silent", str(caught.exception))
+
+    def test_a_sweep_md_that_is_a_link_is_no_gate(self):
+        target = self.state / "elsewhere.md"
+        target.write_text("x")
+        self.review("r-a", "REQUEST_CHANGES\nF1 — h\nFamily: alpha\nCloses by: code\n")
+        self.review("r-b", "REQUEST_CHANGES\nF1 — h\nFamily: alpha\nCloses by: code\n")
+        self.review("r-c", "REQUEST_CHANGES\nF1 — h\nFamily: alpha\nCloses by: code\n")
+        self.task("w0", reviews=["r-a", "r-b"])
+        self.task("w1", parent="w0", reviews=["r-c"])
+        (self.state / "tasks" / "w0" / "sweep.md").symlink_to(target)
+        self.assertEqual(self.prepare("w1")["summarised"], [])
+
+    def test_a_gate_value_that_is_not_a_route_is_ignored(self):
+        got = self.gated_chain({"w2": "park"})
+        self.assertEqual((got["summarised"], len(self.attached(got))), ([], 4))
 
     def test_chain_labels_give_the_verdict_and_family_names_of_each_review_oldest_first(self):
         self.review("r-a", "REQUEST_CHANGES\nF1 x\nFamily: One\nCloses by: code\n")

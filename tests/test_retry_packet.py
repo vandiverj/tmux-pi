@@ -346,6 +346,21 @@ class RepeatedFamilyGateTests(RetryCase):
                 self.assertIn("state-matrix", packet)
                 self.assertIn("the brief must change the rule or the design, not one more site", packet)
                 self.assertTrue(any(line.startswith(f"- Retry of {item['id']}") and f"route {route}" in line for line in packet.splitlines()))
+                new_meta = json.loads((self.state / "tasks" / json.loads(run.stdout)["id"] / "meta.json").read_text())
+                self.assertEqual(new_meta.get("gate"), route)  # the record lib/review_rounds.py reads to start a fresh findings window
+                self.assertEqual(new_meta.get("gate_review"), "review-2")  # and the parent's review that triggered it: where that window starts
+
+    def test_the_queue_record_refuses_a_gate_review_without_a_gate_or_that_is_not_a_task_id(self):
+        from importlib.machinery import SourceFileLoader
+        agent = SourceFileLoader("tp_agent_under_test", str(test_orchestration.ROOT / "bin/tp-agent")).load_module()
+        item = {"id": "coder-0000000001", "role": "coder", "worker": "claude", "model": "x/y", "thinking": "low", "task": "t",
+                "workdir": "/tmp", "tests": "affected", "route_info": {}, "created": "2026-01-01T00:00:00Z", "deliverable": "",
+                "parent": "", "after": [], "context": [], "notes": []}
+        clean = agent.queue_item({**item, "gate": "design", "gate_review": "review-2"}, item["id"])
+        self.assertEqual((clean["gate"], clean["gate_review"]), ("design", "review-2"))
+        for bad in ({"gate_review": "review-2"}, {"gate": "design", "gate_review": "../x"}, {"gate": "design", "gate_review": 7}):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                agent.queue_item({**item, **bad}, item["id"])
 
     def test_the_route_note_is_not_replayed_into_the_next_retry(self):
         item = self.chain(["state-matrix"], ["state-matrix"])
@@ -392,6 +407,8 @@ class RepeatedFamilyGateTests(RetryCase):
         (self.state / "tasks" / "review-2" / "result.md").write_text(review_text("error-path", verdict="APPROVED_WITH_NOTES"))
         run = self.plain_retry(item)
         self.assertEqual(run.returncode, 0, run.stderr)
+        new_meta = json.loads((self.state / "tasks" / json.loads(run.stdout)["id"] / "meta.json").read_text())
+        self.assertFalse({"gate", "gate_review"} & set(new_meta))  # an ungated retry
 
     def test_a_latest_review_naming_no_family_after_an_approval_allows_a_plain_retry(self):
         item = self.chain(["state-matrix"], [])

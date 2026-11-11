@@ -7,8 +7,10 @@ import importlib.machinery
 import importlib.util
 import io
 import json
+import os
 import re
 import shlex
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -351,7 +353,7 @@ class NoticeRulesTests(AgentCase):
         # Rule 6 (F7): every command a notice suggests is accepted by tp-agent's own argparse.
         commands = set()
         for text in "\n".join(t for texts in said.values() for t in texts).split("\n"):
-            commands.update(re.findall(r"(?:TP_STATE_DIR='[^']*' )?tp-agent [a-z-]+ [A-Za-z0-9._-]+(?: --resolves \S+ --text \"[^\"]*\")?", text))
+            commands.update(re.findall(r"(?:env (?:-u \S+ )+TP_STATE_DIR=(?:'[^']*'|\S+) )?tp-agent [a-z-]+ [A-Za-z0-9._-]+(?: --resolves \S+ --text \"[^\"]*\")?", text))
         self.assertTrue(any("--resolves" in c for c in commands))
         self.assertTrue(any(" inspect " in c for c in commands))
         for command in sorted(commands):
@@ -547,6 +549,83 @@ class NoticeRulesTests(AgentCase):
                 if route == "message":
                     self.assertEqual(hub_records.requests(t)[0]["status"], "resolved")  # the suggested message answered it
 
+        # Round 5 rule 3 (F3), the table's external-session row: "failed-alive" again (retry refused, so `needs` names a
+        # command), dispatched by main "sess-1" into another session of the workspace ("remote one": a path shlex must quote),
+        # with a same-named task in main's own session ("local"). Its row comes from main's own list (main_rows: state_dir).
+        # Every command the notice suggests, the notifier's (agent()) and those in `needs` (tp-agent's own refusal, printed
+        # unedited), carries the task's session in the form tp-agent's refusals print (lib/lane_lease.py in_session); run as
+        # typed in main's pane (TMUX, TMUX_PANE, TP_SESSION and main's TP_STATE_DIR set), tp-agent takes it and it acts on
+        # that task, never the local one. At b317e77 `needs` said a bare `tp-agent stop failed-alive`: main's own task.
+        import lane_lease
+        sessions = self.state.parent / "workspace" / ".tmux-pi" / "sessions"
+        local, remote = sessions / "local", sessions / "remote one"
+        made = {}
+        for session, pane, state in ((remote, "%41", "error"), (local, "%43", "working")):
+            t = session / "tasks" / "failed-alive"
+            t.mkdir(parents=True)
+            tree = sessions.parent.parent / "trees" / session.name
+            tree.mkdir(parents=True)
+            (t / "meta.json").write_text(json.dumps({"id": "failed-alive", "worker": "pi", "pane": pane, "workdir": str(tree),
+                                                     "created": "2026-01-01T00:00:00Z"}))
+            (t / "state.json").write_text(json.dumps({"state": state, "harness": "pi"}))
+            (t / "request.md").write_text("Fix the thing.\n")
+            (t / "dispatch.json").write_text(json.dumps({"context": [], "notes": [], "tests": "affected", "main": "sess-1"}))
+            made[session] = t
+        env = self.env
+        self.env = {**env, "TP_STATE_DIR": str(remote)}
+        try:
+            req = self.ask(made[remote], "browser")
+        finally:
+            self.env = env
+        rows, _ = self.tp.main_rows(local, "sess-1")
+        (row,) = [json.loads(json.dumps(r, default=str)) for r in rows if r.get("state_dir")]
+        self.assertEqual([row["id"], row["state_dir"], row["answer_route"]["by"]], ["failed-alive", str(remote), "none"])
+        prefix = lane_lease.in_session({"session": str(remote)}, local)
+        self.assertEqual(prefix, f"env -u TMUX -u TMUX_PANE -u TP_SESSION TP_STATE_DIR='{remote}' ")
+        text = self.notifier({"external": [{"start": [row], "rows": [row]}]})["external"][0]["submitted"]
+        self.assertIn(req, text)
+        self.assertIn(f"First: {row['answer_route']['needs']}", text)
+        commands = re.findall(r"(?:env (?:-u \S+ )+TP_STATE_DIR=(?:'[^']*'|\S+) )?tp-agent [a-z-]+ [A-Za-z0-9._-]+", text)
+        self.assertEqual(sorted({c.split("tp-agent ")[1].split()[0] for c in commands}), ["inspect", "stop"], text)
+        typed_in_main = {**self.env, "TP_STATE_DIR": str(local), "TMUX": "/private/tmp/tmux-0/default,1,0",
+                         "TMUX_PANE": "%1", "TP_SESSION": "main"}
+        for command in commands:
+            with self.subTest(external=command):
+                self.assertTrue(command.startswith(prefix + "tp-agent "), command)
+                self.assertEqual(self.acts_on(command, typed_in_main), made[remote].resolve())
+
+    def acts_on(self, command, env):
+        """Runs a suggested command as a shell would in a pane with environment `env` (its `env -u ... VAR=value` prefix
+        applied), in-process; returns the task directory it acted on (inspect: the row it printed; stop: the session tp-kill
+        was started in). tp-kill is recorded, not run; any other child process fails the test."""
+        words = shlex.split(command)
+        env = dict(env)
+        if words[0] == "env":
+            words = words[1:]
+            while words[0] == "-u":
+                env.pop(words[1], None)
+                words = words[2:]
+            while "=" in words[0]:
+                name, value = words[0].split("=", 1)
+                env[name] = value
+                words = words[1:]
+        self.assertEqual(words[0], "tp-agent")
+        killed = []
+
+        def run(argv, *args, **kwargs):
+            self.assertTrue(str(argv[0]).endswith("bin/tp-kill"), argv)
+            killed.append(Path(os.environ["TP_STATE_DIR"]).resolve() / "tasks" / argv[1])
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        out = io.StringIO()
+        with mock.patch.object(self.tp.subprocess, "run", side_effect=run), \
+                mock.patch.object(self.tp, "write_index", return_value=None), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            self.tp.main(words[1:], env=env)
+        if words[1] == "stop":
+            (target,) = killed
+            return target
+        return Path(json.loads(out.getvalue())["task_dir"]).resolve()
+
     def runs(self, task, command):
         """Runs a suggested command in-process against `task` (pane_send.send faked; retry's new attempt is not started:
         dispatch is replaced by a recorder; its live-process guard is the real one, over the faked pane table). None when
@@ -561,10 +640,11 @@ class NoticeRulesTests(AgentCase):
         return error
 
     def parses(self, command):
-        """The verb tp-agent's real parser makes of `command` (an env assignment in front is the shell's, not argv)."""
+        """The verb tp-agent's real parser makes of `command` (an `env -u ... VAR=value` prefix is the shell's, not argv)."""
         import argparse
         import shlex
-        argv = [w for w in shlex.split(command) if "=" not in w.split(" ")[0] or w.startswith("-")][1:]
+        words = shlex.split(command)
+        argv = words[words.index("tp-agent") + 1:]
 
         class Parsed(Exception):
             pass

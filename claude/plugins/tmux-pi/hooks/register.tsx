@@ -246,9 +246,17 @@ function awaiting(row: { permission?: unknown; capability_request?: unknown; cap
   return [pending(row.capability_request) ? 'capability request pending' : '', row.capability_pending === true ? 'capability approval pending' : '', pending(row.permission) ? 'permission prompt pending' : ''].filter(Boolean).join(', ')
 }
 
-// A task in another session's state directory is reached with that directory exported, as the main dispatched it.
+// Python's shlex.quote, so a state directory is quoted as tp-agent quotes it.
+function shellQuote(text: string): string {
+  if (text === '') return "''"
+  return /[^\w@%+=:,./-]/.test(text) ? `'${text.replace(/'/g, `'"'"'`)}'` : text
+}
+
+// A task in another session's state directory is reached in the form tp-agent's own refusals print (lib/lane_lease.py
+// in_session): the pane's own session is dropped (it would win over TP_STATE_DIR) and that directory is exported. A task in
+// main's own session (no state_dir) gets the plain command. HB4a round 5 rule 3.
 function agent(row: TaskRow, verb: string): string {
-  return `${row.state_dir === undefined ? '' : `TP_STATE_DIR='${row.state_dir.replace(/'/g, `'\\''`)}' `}tp-agent ${verb} ${row.id}`
+  return `${row.state_dir === undefined ? '' : `env -u TMUX -u TMUX_PANE -u TP_SESSION TP_STATE_DIR=${shellQuote(row.state_dir)} `}tp-agent ${verb} ${row.id}`
 }
 
 function hint(row: TaskRow): string {
@@ -278,7 +286,7 @@ function hint(row: TaskRow): string {
   if (isRefused(row)) return `${row.id} will not start (${row.reason}): fix or remove the queue file, or ${agent(row, 'stop')}`
   if (row.status === 'settled') {
     return row.failing_tests === true
-      ? `${row.id} settled and reports failing tests it does not own: ${agent(row, 'collect')}, then tp-agent dispatch --investigate-failure ${row.id}`
+      ? `${row.id} settled and reports failing tests it does not own: ${agent(row, 'collect')}, then ${agent(row, 'dispatch --investigate-failure')}`
       : `${row.id} settled: ${agent(row, 'collect')}`
   }
   if (row.status === 'paused') {

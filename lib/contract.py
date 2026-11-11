@@ -23,7 +23,6 @@ needs_input, paused, settled, completed, failed, killed or escalated.
 """
 
 import datetime
-import hashlib
 import json
 import os
 import re
@@ -52,13 +51,15 @@ DEPENDENCY_DONE = tuple(s for s in DONE if s != "paused")
 # Escape, then "pause" when a check shows the worker stopped, else "pause-unverified". An unverified pause keeps the
 # dependency hold, is not shown as paused, and is tried again at most PAUSE_RETRIES more times, PAUSE_RETRY_SECONDS
 # apart (a contract may set pause_retries); a failed send therefore never loops every few seconds. "pause-unneeded": the
-# worker finished its turn (a statused reply written after the pause began), so no pause was installed and none is held.
+# worker completed the turn the Escape was typed into (pause_void), so no pause was installed and none is held.
 PAUSE_RETRIES = 2
 PAUSE_RETRY_SECONDS = 60
 PAUSE_ATTEMPT_ACTIONS = ("pause", "pause-requested", "pause-unverified", "pause-unneeded", "extend")
-# HB4a round 4 invariant 1: a finished turn is never reported as paused. Every pause attempt event names the turn it
-# interrupted ("turn": reply_turn of result.md as it was before the worker was seen working); every reader below treats it
-# as void once a statused reply of that turn or a later one is on disk (pause_void), whenever that reply landed.
+# HB4a round 5 rule 1: a finished turn is never reported as paused, and it is told by turn numbers, never by a reply's text.
+# The reporter (report.sh, reporter.ts) counts prompts (state.json promptTurn) and keeps completedTurn, the highest promptTurn
+# whose own Stop (pi: agent_settled) wrote a reply with a RESULT_STATUS line; it only goes up, and a restored or withdrawn
+# report never moves it. Every pause attempt event names the turn it interrupts ("turn": promptTurn when it is written), and
+# every reader below treats it as void exactly when completedTurn >= turn (pause_void), whenever that completion landed.
 RATINGS = {"sources": ("ok", "weak", "missing"), "cleanup": ("none", "minor", "major"),
            "useful": ("yes", "partly", "no")}
 THINKING_RANK = {"off": 0, "minimal": 1, "low": 2, "medium": 3, "high": 4, "xhigh": 5, "max": 6}
@@ -290,7 +291,7 @@ def _epoch(stamp):
         return None
 
 
-def evaluate(meta, state, art, now, alive, events=(), reply=None):
+def evaluate(meta, state, art, now, alive, events=()):
     """Checkpoint state and the one action due now (or None) for a task with a contract.
 
     Actions while the worker is working: nudge-outline, nudge-draft, nudge-stall,
@@ -303,15 +304,15 @@ def evaluate(meta, state, art, now, alive, events=(), reply=None):
     has not moved since the pause counts as not working.
     Each is taken once (events holds the ones already taken); an `extend` event (main's
     "continue") replaces the budget and lets stop, pause and halted happen again.
-    A pause voided by a completed reply (pause_void; `reply` is result.md's text, None when the caller has none) is no
-    pause here: it neither idles the clock nor makes the task "halted ... paused". It still counts as taken.
+    A pause void by its turn's completion (pause_void, read from `state`) is no pause here: it neither idles the clock nor
+    makes the task "halted ... paused". It still counts as taken.
     """
     c = meta["contract"]
     events = [e if isinstance(e, dict) else {"action": e, "at": 0} for e in events]
     extends = [e for e in events if e["action"] == "extend"]
     since_extend = events[events.index(extends[-1]) + 1:] if extends else events
     created = _epoch(meta.get("created")) or now
-    live = live_pauses(since_extend, reply)
+    live = live_pauses(since_extend, state)
     pause = next((e for e in reversed(live) if e["action"] == "pause"), None)
     # A Claude worker reports no Stop when interrupted: paused and idle if its tool count has not moved.
     idle = bool(pause) and "tools" in pause and state.get("state") in ("working", "tool") and \
@@ -401,30 +402,30 @@ def evaluate(meta, state, art, now, alive, events=(), reply=None):
             "write_age": write_age, "over": over, "warnings": warnings, "action": action, "budget": b}
 
 
-def reply_turn(reply):
-    """The turn a pause interrupts, named by the reply on disk when the pause began: the sha256 (16 hex) of result.md's
-    stripped text, or None when there was none. A worker's next turn withdraws the last reply and writes a new one, so a
-    statused reply whose turn differs was written by the interrupted turn or a later one."""
-    reply = reply.strip() if isinstance(reply, str) else ""
-    return hashlib.sha256(reply.encode("utf-8", "surrogatepass")).hexdigest()[:16] if reply else None
+def _turn_number(value):
+    """A turn number as JSON carries it (an integral number, also written 2.0), else None; JavaScript's Number.isInteger
+    reads the same values the same way (dispatcher.ts turnNumber)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value != value or value in (float("inf"), float("-inf")):
+        return None
+    return int(value) if value == int(value) else None
 
 
-def pause_void(event, reply):
-    """Is this pause attempt void because the turn it interrupted, or a later one, completed? True when the event names its
-    turn and `reply` (result.md's text now) has a RESULT_STATUS line and is not the reply that was there when the pause began.
-    An older reply never clears a newer pause: the reply the pause was taken against has that pause's own turn. An event
-    without "turn" (written before HB4a round 4) is never void."""
-    if not isinstance(event, dict) or "turn" not in event or not isinstance(reply, str):
+def pause_void(event, state):
+    """Is this pause attempt void because the turn it interrupted, or a later one, completed on its own? Exactly when the
+    event names its turn (a turn number >= 1) and state.json's completedTurn (0 when absent) is at least that turn. Nothing
+    else decides it: a reply restored from heldReport, a withdrawn one, a new prompt, none of them moves completedTurn. An
+    event without a turn number (written before HB4a round 5, or by a reporter that counts no prompts) is never void."""
+    turn = _turn_number(event.get("turn")) if isinstance(event, dict) else None
+    if turn is None or turn < 1:
         return False
-    return bool(RESULT_STATUS_RE.search(reply)) and reply_turn(reply) != event["turn"]
+    done = _turn_number(state.get("completedTurn")) if isinstance(state, dict) else None
+    return (done or 0) >= turn
 
 
-def live_pauses(events, reply):
-    """`events` without the pause attempts pause_void voids (reply None: all kept, as before round 4)."""
-    if reply is None:
-        return list(events)
+def live_pauses(events, state):
+    """`events` without the pause attempts pause_void voids against `state` (state.json now)."""
     return [e for e in events if not (isinstance(e, dict) and e.get("action") in PAUSE_ATTEMPT_ACTIONS and
-                                      e.get("action") != "extend" and pause_void(e, reply))]
+                                      e.get("action") != "extend" and pause_void(e, state))]
 
 
 def pause_tries(events):
@@ -443,14 +444,14 @@ def pause_may_try(contract, events, now):
     return tries == 0 or _since(events, "pause-requested", now) >= PAUSE_RETRY_SECONDS
 
 
-def pause_unconfirmed(state, events=(), reply=None):
+def pause_unconfirmed(state, events=()):
     """Is an Escape requested but not confirmed, and not cleared since? The dependency hold stays then (the worker may
     still be writing), though the task is not shown as paused. Cleared by main's extend, by a confirmed pause (which is
     then the hold), by the worker settling on its own (state waiting/error, reported after the last try), or by a
-    completed reply of the turn the Escape was typed into or a later one (pause_void; `reply` is result.md's text)."""
+    completion of the turn the Escape was typed into or a later one (pause_void)."""
     state = state if isinstance(state, dict) else {}
     events = [e for e in events if isinstance(e, dict)] if isinstance(events, (list, tuple)) else []
-    events = live_pauses(events, reply)
+    events = live_pauses(events, state)
     last = next((e for e in reversed(events) if e.get("action") in PAUSE_ATTEMPT_ACTIONS), None)
     if not last or last["action"] not in ("pause-requested", "pause-unverified"):
         return False
@@ -476,7 +477,7 @@ def extension(meta, state, now, events):
                        "tokens": r["tokens"] + b["tokens"] if b["tokens"] else None}}
 
 
-def recorded_pause(state, events=(), reply=None):
+def recorded_pause(state, events=()):
     """Is a pause on record for this task and not yet cleared by a resume?
 
     `lifecycle` consults this before it looks at an exit code, a pane or a result status.
@@ -485,13 +486,13 @@ def recorded_pause(state, events=(), reply=None):
     "continue"), or by the worker visibly working again: state "working"/"tool" with a tool
     count past the one the pause recorded. Nothing else clears it, in particular not an exit
     code, a dead or missing pane, or the RESULT_STATUS line of a reply older than the pause: a paused task is not
-    finished. A pause is void (never was one) when a statused reply of the turn it interrupted or a later turn is on disk
-    (pause_void, HB4a round 4 invariant 1; `reply` is result.md's text, None for a caller that has none)."""
+    finished. A pause is void (never was one) once the turn it interrupted or a later turn completed (pause_void: state.json
+    completedTurn >= the event's turn, HB4a round 5 rule 1)."""
     state = state if isinstance(state, dict) else {}
     if state.get("state") == "paused":
         return True
     events = [e for e in events if isinstance(e, dict)] if isinstance(events, (list, tuple)) else []
-    events = live_pauses(events, reply)
+    events = live_pauses(events, state)
     last = next((e for e in reversed(events) if e.get("action") in ("pause", "extend")), None)
     if not last or last["action"] != "pause":
         return False
@@ -540,7 +541,7 @@ def satisfies_dependency(life, state=None, events=(), reply=""):
     unstatused about and keeps satisfying."""
     if life not in DEPENDENCY_DONE:
         return False
-    if recorded_pause(state, events, reply) or pause_unconfirmed(state, events, reply):
+    if recorded_pause(state, events) or pause_unconfirmed(state, events):
         return False
     reply = reply if isinstance(reply, str) else ""
     return not (reply.strip() and not RESULT_STATUS_RE.search(reply))
@@ -553,7 +554,7 @@ def _lifecycle(state, pane, events, reply, completed_at, exit_code, escalated, r
         return "stopped"
     s = state.get("state")
     live = pane not in ("dead", "gone") and exit_code is None
-    if recorded_pause(state, events, reply):
+    if recorded_pause(state, events):
         return "paused"
     statused = bool(RESULT_STATUS_RE.search(reply))
     at_work = live and s in (None, "starting", "working", "tool", "permission")
@@ -785,16 +786,12 @@ def ledger_row(task_dir, now):
     reply_only = bool(contract and contract.get("kind") == "task" and contract.get("no_edits") is True)
     alive = not (d / "exit").exists() and state.get("state") not in ("waiting", "error")
     events = read("checkpoints.json").get("events", [])
-    try:
-        reply = (d / "result.md").read_text().strip()
-    except (OSError, UnicodeDecodeError):
-        reply = ""
-    result = evaluate(meta, state, art, now, alive, events, reply) if contract else None
+    result = evaluate(meta, state, art, now, alive, events) if contract else None
     tokens = state.get("tokens") or {}
     model = state.get("model") or meta.get("model") or ""
     task = request_text(d).strip()
     decided = next((e for e in reversed(events) if e["action"] in ("discard", "narrow", "escalate", "auto-escalate")), None)
-    halted = next((e for e in reversed(live_pauses(events, reply)) if e["action"] in ("pause", "stop")), None)
+    halted = next((e for e in reversed(live_pauses(events, state)) if e["action"] in ("pause", "stop")), None)
     escalations = read_escalations(d)
     stop = "escalated" if (d / "escalated").exists() else \
         "{}{}".format(decided["action"], " to " + decided["to"] if decided.get("to") else "") if decided else \

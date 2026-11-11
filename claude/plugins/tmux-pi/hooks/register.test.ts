@@ -1455,7 +1455,7 @@ test('a task this main dispatched into a second state directory wakes it, with t
   w.rows = [{ id: 'coder-1', status: 'settled', role: 'coder', state_dir: OTHER_DIR }]
   await w.clock.advance(5000)
   expect(w.submitted.length).toBe(1)
-  expect(w.submitted[0]).toContain(`TP_STATE_DIR='${OTHER_DIR}' tp-agent collect coder-1`)
+  expect(w.submitted[0]).toContain(`env -u TMUX -u TMUX_PANE -u TP_SESSION TP_STATE_DIR=${OTHER_DIR} tp-agent collect coder-1`)
   await w.clock.advance(15000)
   expect(w.submitted.length).toBe(1)
 })

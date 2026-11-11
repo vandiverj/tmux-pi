@@ -8,6 +8,11 @@
 #                            replaces one with it (see below)
 #   $TP_TASK_DIR/results/    each reply or result.md the hook replaced or held back, never overwritten
 #
+# Turn numbers (HB4a round 5): promptTurn counts prompts (UserPromptSubmit); completedTurn is the highest promptTurn whose
+# own Stop carried a reply with a valid RESULT_STATUS line (lib/result_status.py). completedTurn only goes up: a report put
+# back from heldReport, a late or duplicate Stop, and the next prompt's withdrawal of result.md never move it. A pause names
+# the promptTurn it interrupts and is void once completedTurn reaches it (lib/contract.py pause_void).
+#
 # Does nothing outside a tp-spawn worker (no TP_TASK_DIR). Never fails the hook:
 # reporting must not block or change what Claude does.
 [[ -n "${TP_TASK_DIR:-}" && -d "$TP_TASK_DIR" ]] || exit 0
@@ -98,6 +103,7 @@ already_kept() { # already_kept FILE: FILE's bytes equal a reply already kept an
   done
   return 1
 }
+turn_done=""  # "yes" when this Stop ends an open turn with a statused reply: completedTurn becomes that turn
 later_count() { local n; n="$(jq -r '.laterReplies // 0 | if type == "number" then floor else 0 end' <<<"$prev" 2>/dev/null)"; echo "${n:-0}"; }
 ext='{}'
 if [[ "$event" == UserPromptSubmit ]]; then
@@ -123,6 +129,7 @@ elif [[ "$event" == Stop ]]; then
     fi
     rm -f "$reply_tmp"
   else
+    if has_status "$reply_tmp"; then turn_done=yes; fi  # the turn's own reply, wherever it is kept below
     held_file=""
     held_rel="$(field heldReport)"
     if [[ -n "$held_rel" && -f "$TP_TASK_DIR/$held_rel" ]]; then held_file="$TP_TASK_DIR/$held_rel"; fi
@@ -231,10 +238,11 @@ fi
 
 state_tmp="$(mktemp "$TP_TASK_DIR/.state.XXXXXXXX")" || exit 0
 jq -n --argjson prev "$prev" --argjson in "$input" --argjson usage "$usage" \
-  --arg id "${TP_TASK_ID:-}" --arg now "$now" --argjson record "$record" --argjson ext "$ext" '
+  --arg id "${TP_TASK_ID:-}" --arg now "$now" --argjson record "$record" --argjson ext "$ext" --arg done "$turn_done" '
   def turn: ($prev.promptTurn // (if $prev.state == "working" or $prev.state == "tool" or $prev.state == "permission" then 1 else 0 end));
   def settled: ($prev.settledTurn // (if $prev.state == "waiting" then turn else 0 end));
   def active: turn > settled;
+  def completed: ($prev.completedTurn // 0 | if type == "number" and . >= 0 and . == floor then . else 0 end);
   def hint: ((.tool_input.file_path // .tool_input.path // .tool_input.command // .tool_input.pattern // "") | tostring);
   def clip: gsub("\\s+"; " ") | if length > 80 then .[0:79] + "…" else . end;
   # Transcripts carry no cost. cost stays numeric 0 because lib/goal.py treats a
@@ -256,7 +264,8 @@ jq -n --argjson prev "$prev" --argjson in "$input" --argjson usage "$usage" \
         (if ($in.message // "" | test("permission"; "i")) then { state: "permission", tool: ($in.message | clip) } else {} end)
       elif $in.hook_event_name == "PermissionDenied" and active then { state: "working", tool: "" }
       elif $in.hook_event_name == "Stop" and active then
-        { state: "waiting", tool: "", promptTurn: turn, settledTurn: turn }
+        { state: "waiting", tool: "", promptTurn: turn, settledTurn: turn,
+          completedTurn: (if $done == "yes" then ([completed, turn] | max) else completed end) }
       else {} end )
   + ( if ($in.hook_event_name == "UserPromptSubmit" or ($in.hook_event_name == "Stop" and active)) and $usage != null
       then $usage | if .model == "" then del(.model) else . end else {} end )

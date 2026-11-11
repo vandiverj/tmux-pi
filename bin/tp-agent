@@ -172,7 +172,9 @@ def unlabelled_round(path, review_id):
     return None
 
 
-def record(path, include_result=False):
+def record(path, include_result=False, here=None):
+    """Task `path`'s row. `here` is the session the row is read from (main_rows: Main's own); commands the row carries
+    (answer_route's `needs`) name the task's session when it is another one (HB4a round 5 rule 3)."""
     meta = read_json(path / "meta.json")
     state = read_json(path / "state.json")
     result_path = path / "result.md"
@@ -214,7 +216,7 @@ def record(path, include_result=False):
     if asked:  # HB4a request records; a task with none has no such keys, so its row is what it was before
         result["requests"] = asked  # every open request and the 20 most recently closed: what list and inspect show
         result["request_log"] = hub_records.request_log(path)  # every transition, in order: what the notifier delivers from
-        result["answer_route"] = answer_route(path, result["status"])  # the command that can answer an open request now
+        result["answer_route"] = answer_route(path, result["status"], here)  # the command that can answer an open request now
     reported = failing_tests.read(path)
     if reported:  # a report without the block has no such key
         result["failing_tests"] = reported
@@ -351,7 +353,7 @@ def main_rows(base, ident):
         for path in sorted(tasks.iterdir()):
             if path.is_symlink() or not (path / "meta.json").is_file() or read_json(path / "dispatch.json").get("main") != ident:
                 continue
-            rows.append(dict(record(path), state_dir=str(other)))
+            rows.append(dict(record(path, here=base), state_dir=str(other)))
     return sorted(rows, key=lambda row: row.get("updated") or ""), other_main
 
 
@@ -1785,18 +1787,19 @@ def message_refusal(path, life):
     return "worker's process was ended (task collected or reviewed); retry it instead of messaging"
 
 
-def retry_admission(base, path, life, route=None, force_alive=False, warn=None):
+def retry_admission(base, path, life, route=None, force_alive=False, warn=None, prefix=""):
     """Whether `tp-agent retry` takes task `path` (lifecycle `life`) now: (refusal, repeated). `refusal` is the retry command's
     own error text, or None when it would start an attempt (or park one, for --route park); `repeated` is repeated_family's
     finding. The one admission, in the command's order: the state (RETRY_REFUSED), the repeated-family gate (a walk that cannot
     be made does not block: `warn` is told), the live-process guard on the working tree (guard_retry, unless --force-alive;
     not for --route park, which starts nothing), then the route the gate asks for. The retry command and answer_route both call
-    it (HB4a round 4 invariant 3), so a notice never suggests a retry the command refuses."""
+    it (HB4a round 4 invariant 3), so a notice never suggests a retry the command refuses. `prefix` (lib/lane_lease.py
+    in_session) goes before every command the refusal names, so a refusal shown in another session acts on this one."""
     ident = path.name
     if life in RETRY_REFUSED:
         wait = "Wait for it to settle, or end it" if finishes_alone(life) else "It will not settle by itself: end it"
         return (f"{ident} is still {state_words(life)}, so it cannot be retried yet. "
-                f"{wait} with {' or '.join(clear_commands(life, ident))}, then retry"), None
+                f"{wait} with {' or '.join(clear_commands(life, ident, prefix))}, then retry"), None
     try:
         repeated = repeated_family(base, ident)
     except review_rounds.Refused as error:  # the same walk the next review makes will refuse too; a retry is not blocked by it
@@ -1807,7 +1810,7 @@ def retry_admission(base, path, life, route=None, force_alive=False, warn=None):
         return None, repeated
     if not force_alive:
         try:
-            guard_retry(path)
+            guard_retry(path, prefix)
         except ValueError as error:
             return str(error), repeated
     if repeated and not route:
@@ -1820,17 +1823,21 @@ def retry_admission(base, path, life, route=None, force_alive=False, warn=None):
     return None, repeated
 
 
-def answer_route(path, life):
+def answer_route(path, life, here=None):
     """How main can answer an open request on this task now (HB4a round 3 rule 3), from the same checks the commands make:
     {"by": "message"} while `tp-agent message` can reach the worker (message_blocked); {"by": "retry", "why"} when it cannot
     and `tp-agent retry <id> --reason ...` would start an attempt now (retry_admission, the command's own admission); {"by":
     "none", "why", "needs"} when neither would: `needs` is the retry command's refusal text, which names what must happen first
-    (end a live process, choose a route, wait for the task to settle). `why` is a short phrase (message_blocked), never a command."""
+    (end a live process, choose a route, wait for the task to settle). `why` is a short phrase (message_blocked), never a command.
+    `here` is the session the answer is read in (default: the task's own). From another session every command in `needs` carries
+    the task's session (lib/lane_lease.py in_session, the form tp-agent's own refusals print), so the notice prints it unedited."""
     blocked = message_blocked(path, life)
     if blocked is None:
         return {"by": "message"}
     try:
-        refused, _ = retry_admission(path.parent.parent, path, life)
+        session = path.parent.parent
+        refused, _ = retry_admission(session, path, life,
+                                     prefix=lane_lease.in_session({"session": str(session)}, session if here is None else here))
     except Exception as error:  # an unreadable record: the command would refuse too; inspect says what is wrong
         refused = f"retry cannot be checked: {error}"
     if refused is None:

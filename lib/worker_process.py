@@ -232,9 +232,10 @@ def describe_state(tasks, found):
                      for ident, role, pane, pid in found)
 
 
-def _ending(tasks, found):
-    """'tp-agent collect A or tp-agent stop A' for each task of `found`: what ends each one, in the state it is in."""
-    return "; ".join(" or ".join(clear_commands(task_state(tasks, row[0]), row[0])) for row in found)
+def _ending(tasks, found, prefix=""):
+    """'tp-agent collect A or tp-agent stop A' for each task of `found`: what ends each one, in the state it is in. `prefix`
+    (lib/lane_lease.py in_session) makes each command act on the session `tasks` is in from wherever it is typed."""
+    return "; ".join(" or ".join(clear_commands(task_state(tasks, row[0]), row[0], prefix)) for row in found)
 
 
 def _lane_tagged(path):
@@ -242,12 +243,14 @@ def _lane_tagged(path):
     return bool(meta.get("lane"))
 
 
-def guard_retry(path):
+def guard_retry(path, prefix=""):
+    """Refuses a retry of task `path` while a process is alive on its working tree, naming what ends it. `prefix` goes before
+    each command named (HB4a round 5 rule 3: a notice read in another session suggests commands that act on this one)."""
     path = Path(path)
     busy = alive_on_tree(path)
     if busy:
         tasks = path.parent
-        seen = f"a process is alive on the same working tree: {describe_state(tasks, busy)}. End it with {_ending(tasks, busy)}"
+        seen = f"a process is alive on the same working tree: {describe_state(tasks, busy)}. End it with {_ending(tasks, busy, prefix)}"
         if _lane_tagged(path):  # the lane's lease refuses a second writer whatever the flag says, so the flag is not offered
             raise ValueError(f"{seen}. --force-alive does not apply to a lane's working tree; only ending it helps")
         raise ValueError(f"{seen}, or pass --force-alive to start the attempt beside it")

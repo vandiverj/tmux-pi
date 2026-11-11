@@ -293,28 +293,140 @@ def worker(facts, env=None):
     return record
 
 
-MAIN_FILE_ARGS = {"--append-system-prompt-file": "file", "--system-prompt-file": "file", "--append-system-prompt": "text",
-                  "--system-prompt": "text", "--settings": "settings", "--mcp-config": "settings", "--plugin-dir": "dir"}
-MAIN_TOOL_ARGS = {"--tools": "exposed", "--allowedTools": "allowed", "--allowed-tools": "allowed",
-                  "--disallowedTools": "denied", "--disallowed-tools": "denied"}
+def _options(arity, cls, *names):
+    return {name: (arity, cls) for name in names}
 
 
-def _caller_args(argv, known):
-    """(flag, value) for each of the `known` flags the caller passed, `--x value` and `--x=value`, repeats each, in order; scanning
-    stops at `--`. A known flag with no value is skipped. Other arguments (and their values) are not guessed at."""
-    found, i = [], 0
+# The options of each harness this record knows: name -> (arity, class). Arity: 0 a switch; 1 the next token whatever it starts with;
+# "?" the next token when it does not start with "-"; "+" the next token whatever it starts with, then each following token up to
+# one that starts with "-" (claude's `<x...>` options; their `--x=v` form is one value). Class: what the record makes of the value (None: kept in caller_args only).
+# Sources: bin/tp-main, bin/tp-claude, bin/tp-pi, bin/tp-spawn and lib/llm_router.py (the options tmux-pi itself passes), claude's
+# option definitions in its install (read, not run), and for pi the HB2b round 4 brief (pi is not started and is not installed here).
+# Any other option is unknown: its name is kept, never classified, and its value (it may be a secret) only as sha256 and length.
+HARNESS_OPTIONS = {
+    "claude": {
+        **_options(1, "instruction-file", "--append-system-prompt-file", "--system-prompt-file"),
+        **_options(1, "instruction-text", "--append-system-prompt", "--system-prompt"),
+        **_options(1, "settings", "--settings", "--agents"),
+        **_options("+", "settings", "--mcp-config"),
+        **_options(1, "dir", "--plugin-dir"),
+        **_options("+", "tools-exposed", "--tools"),
+        **_options("+", "tools-allowed", "--allowedTools", "--allowed-tools"),
+        **_options("+", "tools-denied", "--disallowedTools", "--disallowed-tools"),
+        **_options(1, "model", "--model"),
+        **_options(1, "effort", "--effort"),
+        **_options("?", "resume", "-r", "--resume"),
+        **_options(0, "resume", "-c", "--continue"),
+        **_options(1, None, "--setting-sources", "--agent", "--fallback-model", "--permission-mode", "--session-id", "-n", "--name",
+                   "--output-format", "--input-format", "--max-turns", "--max-budget-usd", "--json-schema", "--debug-file",
+                   "--permission-prompt-tool"),
+        **_options("+", None, "--add-dir", "--betas", "--file"),
+        **_options("?", None, "-d", "--debug", "--from-pr"),
+        **_options(0, None, "-p", "--print", "--strict-mcp-config", "--verbose", "--dangerously-skip-permissions",
+                   "--allow-dangerously-skip-permissions", "--no-session-persistence", "--fork-session", "--ide", "--chrome",
+                   "--no-chrome", "--bare", "--disable-slash-commands", "--include-partial-messages", "--replay-user-messages"),
+    },
+    "pi": {
+        **_options(1, "instruction-text", "--append-system-prompt", "--system-prompt"),
+        **_options(1, "extension", "-e", "--extension"),
+        **_options(1, "skill", "--skill"),
+        **_options(1, "prompt-template", "--prompt-template"),
+        **_options(1, "tools-exposed", "--tools"),
+        **_options(1, "model", "--model"),
+        **_options(1, "effort", "--thinking"),
+        **_options(0, "resume", "-r", "--resume", "-c", "--continue"),
+        **_options(1, "secret", "--api-key"),
+        **_options(1, None, "--provider", "--mode", "--session", "--session-dir", "--models", "--export", "--name", "--theme"),
+        **_options("?", None, "--list-models"),
+        **_options(0, None, "-p", "--print", "--no-session", "--no-tools", "--no-extensions", "--no-skills", "--no-prompt-templates",
+                   "--no-context-files", "--no-mcp", "--no-themes", "--verbose", "--offline"),
+    },
+}
+# Classes whose value is instruction text or a secret: never stored as given (text by sha256, a secret not at all).
+TEXT_CLASSES = ("instruction-text",)
+LONG_VALUE = 200
+
+
+def _parse_caller(argv, harness):
+    """One left-to-right pass over the caller's arguments: [(option or None for a positional, [values], known, value_guess)]. A known
+    option consumes its values (by its arity) before the next token is looked at, so a value is never read as an option; `--` ends the
+    options (what follows is positional); an unknown `--x=v` is one entry, an unknown `--x` takes the next token only when that token
+    does not start with "-", and marks it a guess."""
+    table = HARNESS_OPTIONS[harness]
+    parsed, i = [], 0
     while i < len(argv):
         arg = argv[i]
-        if arg == "--":
-            break
-        flag, eq, value = arg.partition("=")
-        if flag in known and eq:
-            found.append((flag, value))
-        elif arg in known and i + 1 < len(argv):
-            found.append((arg, argv[i + 1]))
-            i += 1
         i += 1
-    return found
+        if arg == "--":
+            parsed += [(None, [rest], True, False) for rest in argv[i:]]
+            break
+        if not arg.startswith("-") or arg == "-":
+            parsed.append((None, [arg], True, False))
+            continue
+        flag, eq, inline = arg.partition("=") if arg.startswith("--") else (arg, "", "")
+        if flag not in table:
+            if eq:
+                parsed.append((flag, [inline], False, False))
+            elif i < len(argv) and not argv[i].startswith("-"):
+                parsed.append((arg, [argv[i]], False, True))
+                i += 1
+            else:
+                parsed.append((arg, [], False, False))
+            continue
+        arity = table[flag][0]
+        if eq:
+            values = [inline]
+        elif arity == 1:
+            values = argv[i:i + 1]
+        elif arity == "?":
+            values = argv[i:i + 1] if i < len(argv) and not argv[i].startswith("-") else []
+        elif arity == "+":
+            values = argv[i:i + 1]
+            while values and i + len(values) < len(argv) and not argv[i + len(values)].startswith("-"):
+                values.append(argv[i + len(values)])
+        else:
+            values = []
+        if not eq:
+            i += len(values)
+        parsed.append((flag, values, True, False))
+    return parsed
+
+
+def _stored(value, cls):
+    """A value as caller_args keeps it. Known options: as given, or by sha256 only when it is instruction text, a positional (a prompt),
+    longer than LONG_VALUE or JSON-looking; a secret is not kept at all. An unknown option (cls "unknown"): never as given, only
+    sha256 and length."""
+    if cls == "secret":
+        return {"value": None, "redacted": True}
+    if cls == "unknown":
+        return {"value_sha256": sha256(value), "value_length": len(value)}
+    if cls in TEXT_CLASSES or cls == "positional" or len(value) > LONG_VALUE or value.lstrip().startswith(("{", "[")):
+        return {"value_sha256": sha256(value)}
+    return {"value": value}
+
+
+def main_caller_args(argv, harness):
+    """(caller_args, parsed): the record's ordered list of what the caller passed, one entry per option or positional, and the parse it
+    is made from (main_caller_inputs classifies that same parse)."""
+    table = HARNESS_OPTIONS[harness]
+    parsed = _parse_caller(argv, harness)
+    entries = []
+    for flag, values, known, guess in parsed:
+        if flag is None:
+            entries.append({"positional": True, **_stored(values[0], "positional")})
+            continue
+        cls = table[flag][1] if known else "unknown"
+        entry = {"option": flag}
+        if not known:
+            entry["known"] = False
+        if known and table[flag][0] == "+" and len(values) > 1:
+            entry["values"] = [_stored(v, cls) for v in values]
+        elif values:
+            entry.update(_stored(values[0], cls))
+        if guess:
+            entry["value_guess"] = True
+        entries.append(entry)
+    return entries, parsed
 
 
 def _sha256_file(path):
@@ -324,38 +436,55 @@ def _sha256_file(path):
         return None, f"{type(error).__name__}: cannot be read"
 
 
-def main_caller_inputs(argv, reasons):
-    """What the caller of tp-main passed that changes Main's instructions, tools, settings or plugins, read from the argv the harness
-    receives: (instruction entries, {"exposed": list|None, "allowed": [...], "denied": [...]}). Files and directories by path and sha256
-    of a file only (an mcp config or settings file is hashed, never printed); text forms by sha256 only."""
+def main_caller_inputs(argv, harness, reasons):
+    """What the caller of tp-main passed, from one parse of its arguments (main_caller_args): (caller_args, instruction entries,
+    {"exposed": list|None, "allowed": [...], "denied": [...], "model", "effort", "resume"}). Only known options are classified: files,
+    extensions, skills and prompt templates by path and sha256 of a file (an mcp config or settings file is hashed, never printed),
+    directories by path, text and inline JSON by sha256 only."""
+    table = HARNESS_OPTIONS[harness]
+    caller_args, parsed = main_caller_args(argv, harness)
     entries = []
-    for n, (flag, value) in enumerate(_caller_args(argv, MAIN_FILE_ARGS)):
-        kind, name, key = MAIN_FILE_ARGS[flag], "caller:" + flag, f"instructions[caller:{flag}#{n}]"
-        if kind == "text" or (kind == "settings" and value.lstrip().startswith("{")):
-            entries.append({"name": name, "path": None, "sha256": sha256(value), "version": None})
-            reasons[key + ".path"] = "given as text on the command line; no file holds it"
-        elif kind == "dir":
-            entries.append({"name": name, "path": value, "sha256": None, "version": None})
-            reasons[key + ".sha256"] = "a directory"
-        else:
-            digest, why = _sha256_file(value)
-            entries.append({"name": name, "path": value, "sha256": digest, "version": None})
-            if why:
-                reasons[key + ".sha256"] = why
-    tools = {"exposed": None, "allowed": [], "denied": []}
-    for flag, value in _caller_args(argv, MAIN_TOOL_ARGS):
-        kind = MAIN_TOOL_ARGS[flag]
-        if kind == "exposed":
-            tools["exposed"] = (tools["exposed"] or []) + [t for t in value.split(",") if t]
-        else:
-            tools[kind].append(value)
-    return entries, tools
+    found = {"exposed": None, "allowed": [], "denied": [], "model": None, "effort": None, "resume": False}
+    for flag, values, known, _guess in parsed:
+        if flag is None or not known:
+            continue
+        cls = table[flag][1]
+        if cls == "resume":
+            found["resume"] = True
+        for value in values:
+            name, key = "caller:" + flag, f"instructions[caller:{flag}#{len(entries)}]"
+            if cls == "model" or cls == "effort":
+                found[cls] = value   # the last one given is the one the harness keeps
+            elif cls == "tools-exposed":
+                found["exposed"] = (found["exposed"] or []) + [t for t in re.split(r"[,\s]+", value) if t]
+            elif cls in ("tools-allowed", "tools-denied"):
+                found[cls[len("tools-"):]].append(value)
+            elif cls in TEXT_CLASSES or (cls == "settings" and value.lstrip().startswith(("{", "["))):
+                entries.append({"name": name, "path": None, "sha256": sha256(value), "version": None})
+                reasons[key + ".path"] = "given as text on the command line; no file holds it"
+            elif cls == "extension" and value.startswith("builtin:"):
+                entries.append({"name": name, "path": value, "sha256": None, "version": None})
+                reasons[key + ".sha256"] = "a built-in extension of the harness, named, not a file"
+            elif cls in ("instruction-file", "settings", "dir", "extension", "skill", "prompt-template"):
+                if Path(value).is_dir():
+                    entries.append({"name": name, "path": value, "sha256": None, "version": None})
+                    reasons[key + ".sha256"] = "a directory"
+                    continue
+                digest, why = _sha256_file(value)
+                entries.append({"name": name, "path": value, "sha256": digest, "version": None})
+                if why:
+                    reasons[key + ".sha256"] = why
+    if any(not known for _flag, _values, known, _guess in parsed if _flag is not None):
+        reasons["caller_args.unknown"] = ("an option this record does not know is kept by name and not classified, its value only as sha256 and length; a value after it "
+                                          "is marked value_guess (its arity is not known)")
+    return caller_args, entries, found
 
 
 def main_record(state_dir, harness, main_id, argv, env=None, root=ROOT):
     """Main's own record (role main, route main) for bin/tp-main: the prompt files it appends, what tp-claude adds and points to
     (the Bash-suffix rule, its settings file with the hooks, the plugin directory), the harness, and the model and effort when the
     arguments name them. `start` is "resume" when the arguments resume a conversation (--resume/-r, --continue/-c), else "start".
+    `caller_args`: every argument the caller passed (main_caller_args); instructions, tools, model, effort and start come from that parse.
     `root`: the tmux-pi checkout of the tp-main that is starting (its prompt files, launchers and git state)."""
     env = os.environ if env is None else env
     root = Path(root)
@@ -383,36 +512,35 @@ def main_record(state_dir, harness, main_id, argv, env=None, root=ROOT):
         exposed = listed.split(",") if listed else None
         if exposed is None:
             reasons["tools.exposed"] = "bin/tp-pi has no one-line MAIN_TOOLS"
-    extra, caller_tools = main_caller_inputs(argv, reasons)
+    caller_args, extra, found = main_caller_inputs(argv, harness, reasons)
     instructions += extra
-    if caller_tools["exposed"] is not None:
-        exposed = caller_tools["exposed"]
+    if found["exposed"] is not None:
+        exposed = found["exposed"]
         reasons.pop("tools.exposed", None)
-    tools = {"exposed": exposed, "denied": caller_tools["denied"]}
-    if caller_tools["allowed"]:
-        tools["allowed"] = caller_tools["allowed"]
+    tools = {"exposed": exposed, "denied": found["denied"]}
+    if found["allowed"]:
+        tools["allowed"] = found["allowed"]
     binary, version, why = resolve_harness(harness, env)
     if version is None:
         reasons["harness_version"] = why
     commit, dirty, tree_reasons = tmux_pi_tree(root)
     reasons.update(tree_reasons)
-    model = _argv_value(argv, "--model")
+    model = found["model"]
     if model is None:
         reasons["model"] = "no --model on tp-main's command line: the harness's default or its own setting"
-    effort = _argv_value(argv, "--effort" if harness == "claude" else "--thinking")
+    effort = found["effort"]
     if effort is None:
         reasons["effort"] = "no effort on tp-main's command line"
     reasons["preferences"] = "HB3 records reach Main through tp-agent brief, not at launch"
     adapter = preamble.HARNESS_ADAPTER[harness]
-    resume = any(a in ("--resume", "-r", "--continue", "-c") or a.startswith("--resume=") for a in argv)
     record = {
         "schema": SCHEMA, "status": "prepared" if binary else "failed", "task": main_id, "role": "main", "harness": harness,
         "harness_version": version, "model": model, "effort": effort, "tmux_pi_commit": commit, "tmux_pi_dirty": dirty,
-        "instructions": instructions, "tools": tools,
+        "instructions": instructions, "tools": tools, "caller_args": caller_args,
         "capabilities": {"supported": list(adapter["supported"]), "unsupported": list(adapter["unsupported"])},
         "preferences": None,
         "context": {"brief": None, "parent": None, "lane": None, "step": None, "base_commit": None, "evidence": []},
-        "route": "main", "start": "resume" if resume else "start",
+        "route": "main", "start": "resume" if found["resume"] else "start",
         "recorded": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "null_reasons": reasons,
     }
     if not binary:

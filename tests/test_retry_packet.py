@@ -346,6 +346,8 @@ class RepeatedFamilyGateTests(RetryCase):
                 self.assertIn("state-matrix", packet)
                 self.assertIn("the brief must change the rule or the design, not one more site", packet)
                 self.assertTrue(any(line.startswith(f"- Retry of {item['id']}") and f"route {route}" in line for line in packet.splitlines()))
+                new_meta = json.loads((self.state / "tasks" / json.loads(run.stdout)["id"] / "meta.json").read_text())
+                self.assertEqual(new_meta.get("gate"), route)  # the record lib/review_rounds.py reads to start a fresh findings window
 
     def test_the_route_note_is_not_replayed_into_the_next_retry(self):
         item = self.chain(["state-matrix"], ["state-matrix"])
@@ -392,6 +394,7 @@ class RepeatedFamilyGateTests(RetryCase):
         (self.state / "tasks" / "review-2" / "result.md").write_text(review_text("error-path", verdict="APPROVED_WITH_NOTES"))
         run = self.plain_retry(item)
         self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertNotIn("gate", json.loads((self.state / "tasks" / json.loads(run.stdout)["id"] / "meta.json").read_text()))  # an ungated retry
 
     def test_a_latest_review_naming_no_family_after_an_approval_allows_a_plain_retry(self):
         item = self.chain(["state-matrix"], [])

@@ -17,6 +17,7 @@
 #   -r, --role <role>        repository role in agent/roles/
 #   --task-id <id>           stable id reserved by the shared queue
 #   --parent <id>            parent task id, if any
+#   --gate <rule-first|design>  this task is a gated retry (tp-agent retry --route); recorded as meta.json gate, read by lib/review_rounds.py
 #   --deliverable <text>     expected result or artifact
 #   --route-json <json>      routing recommendation and actual selection
 #   -f, --file <path>        read the task from a file
@@ -95,7 +96,7 @@ source "$ROOT/lib/tp.sh"
 usage() { sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit "${1:-0}"; }
 
 worker=pi model="" thinking="" name="" file="" view=0 conversation="" requested_workdir="" explicit_workdir=0
-role="" reserved_id="" parent="" deliverable="" route_json="null"
+role="" reserved_id="" parent="" gate="" deliverable="" route_json="null"
 kind="" artifact="" budget="" checkpoints="" preflight_file="" main_contract_file="" policy_decision_file="" context_manifest_file="" decision_json="" tests="" preamble_role="" review_of="" check=0 lane="" lane_step="" preamble_from="" lane_replaces="" other_lane_paths="" lane_facts_file=""
 words=() contexts=() notes=() worker_env=()
 # Options may appear before or after the task words; "--" ends option parsing.
@@ -109,6 +110,7 @@ while [[ $# -gt 0 ]]; do
     -r|--role)     role="${2:?}"; shift 2 ;;
     --task-id)     reserved_id="${2:?}"; shift 2 ;;
     --parent)      parent="${2:?}"; shift 2 ;;
+    --gate)        gate="${2:?}"; shift 2 ;;
     --deliverable) deliverable="${2:?}"; shift 2 ;;
     --route-json) route_json="${2:?}"; shift 2 ;;
     -f|--file)     file="${2:?}"; shift 2 ;;
@@ -152,6 +154,7 @@ if [[ -n "$preamble_role" ]]; then
   [[ "$preamble_role" =~ ^[a-z][a-z0-9-]*$ && -f "$ROOT/agent/roles/$preamble_role.md" ]] || die "unknown --preamble-role: $preamble_role"
 fi
 [[ -z "$lane" || "$lane" =~ ^[a-z0-9][a-z0-9-]{0,23}$ ]] || die "bad --lane: $lane"
+[[ -z "$gate" || "$gate" == rule-first || "$gate" == design ]] || die "bad --gate: $gate (rule-first or design)"
 [[ -z "$lane_step" || "$lane_step" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$ ]] || die "bad --lane-step: $lane_step"
 [[ -n "$lane" || -z "$lane_step" ]] || die "--lane-step needs --lane"
 [[ -z "$lane" || -n "$lane_step" ]] || die "--lane needs --lane-step"
@@ -800,7 +803,7 @@ tmux set-option -p -t "$pane" remain-on-exit on
 tmux select-pane -t "$pane" -T "$id"
 
 jq -n --arg id "$id" --arg worker "$worker" --arg model "$model" --arg thinking "$thinking" \
-  --arg role "$role" --arg parent "$parent" --arg deliverable "$deliverable" --argjson route_info "$route_json" \
+  --arg role "$role" --arg parent "$parent" --arg gate "$gate" --arg deliverable "$deliverable" --argjson route_info "$route_json" \
   --arg lane "$lane" --arg lane_step "$lane_step" --arg preamble_from "$preamble_from" \
   --arg pane "$pane" --arg workdir "$workdir" --arg created "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   --argjson contract "$contract" --argjson preflight "$preflight" --argjson main_contract "$main_contract" \
@@ -809,6 +812,7 @@ jq -n --arg id "$id" --arg worker "$worker" --arg model "$model" --arg thinking 
   '{id:$id, worker:$worker, model:$model, thinking:$thinking, pane:$pane, workdir:$workdir, created:$created}
    + (if $role == "" then {} else {role:$role} end)
    + (if $parent == "" then {} else {parent:$parent} end)
+   + (if $gate == "" then {} else {gate:$gate} end)
    + (if $lane == "" then {} else {lane:$lane, lane_step:$lane_step} end)
    + (if $preamble_from == "" then {} else {preamble_from:$preamble_from} end)
    + (if $deliverable == "" then {} else {deliverable:$deliverable} end)

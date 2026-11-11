@@ -29,6 +29,9 @@ next round is the change from that tree to the tree now.
       writes the diff and the earlier findings files into out-dir and prints
       {"contexts": [paths, in the order a reviewer reads them: the diff first, then the earlier findings oldest first], "rounds": N, "families": [the Family: names of each attached round, [] for none], "snapshot": {...} | null}
       exits 1 and says why when recorded state exists but cannot be used (nothing is guessed)
+      A retry made with --route rule-first or --route design (meta.json `gate` of the new task) starts a fresh findings window: only
+      the reviews from the one that triggered the newest such retry on are attached in full; the older ones are one line each in
+      earlier-summary.md (round, review id, verdict, families, finding headings) and listed in "summarised" with their result.md paths.
       The diff is always of the tree now: from the last reviewed state when a round recorded one, else (round 1, or a round with
       no usable state) against the review base (diff_now: a lane's last closed step, else the lane base, else HEAD for a task
       outside a lane); it gets the same sensitive-path and redaction checks either way. <lane> is the author's lane ("" for none).
@@ -92,8 +95,16 @@ def review_ids(meta):
     return ids
 
 
+GATES = ("rule-first", "design")  # the routes of a gated retry (tp-agent retry --route); bin/tp-agent writes it as meta.json `gate`
+
+
 def lineage(state_dir, task_id):
     """[(author, [review ids])] for the task and its retry ancestors, oldest first; an author with no review has an empty list."""
+    return [(author, review_ids(meta)) for author, meta in lineage_meta(state_dir, task_id)]
+
+
+def lineage_meta(state_dir, task_id):
+    """[(author, meta)] for the task and its retry ancestors, oldest first (the walk lineage and gated_author share)."""
     chain, seen, current = [], set(), task_id
     while True:
         if current in seen:
@@ -107,12 +118,23 @@ def lineage(state_dir, task_id):
             if current == task_id:
                 raise Refused(f"cannot read the record of '{task_id}'")
             raise Refused(f"cannot read the record of retry ancestor '{current}'")
-        chain.append((current, review_ids(meta)))
+        review_ids(meta)  # a record that lists reviews that are not task ids refuses here, as before
+        chain.append((current, meta))
         parent = meta.get("parent")
         if not parent:
             break
         current = parent
     return list(reversed(chain))
+
+
+def gated_author(state_dir, task_id):
+    """The newest author in the chain of `task_id` whose meta.json says it was started by a gated retry (`gate` is rule-first or
+    design), else None. A task without the field, or with any other value, is not gated."""
+    found = None
+    for author, meta in lineage_meta(state_dir, task_id):
+        if meta.get("gate") in GATES:
+            found = (author, meta["gate"])
+    return found
 
 
 def earlier_reviews(state_dir, task_id):
@@ -945,6 +967,51 @@ def reviewed_history(top, state, lane):
         return None
 
 
+def findings_window(state_dir, task_id, rows):
+    """The round number the attached findings start at: the review that triggered the newest gated retry of the chain (the last
+    review with a reply before the gated author's own rows), so a round before it is an older window (summary_line); 0 (all rounds
+    in full) when no author of the chain is gated or nothing was reviewed before the gate."""
+    gated = gated_author(state_dir, task_id)
+    if gated is None:
+        return 0
+    start = 0
+    for author, _, _, _, number in rows:
+        if author == gated[0]:
+            break
+        if number:
+            start = number
+    return start
+
+
+FINDING_HEADING = re.compile(r"^[ \t]{0,3}(?:#{1,6}[ \t]+)?(?:[-*+][ \t]+)?(?:\*\*|__)?(F\d+)\b[^\n]*")
+
+
+def finding_headings(text):
+    """The heading line of each finding of a reply (`F1 — ...`), outside fenced code, cut at 160 characters."""
+    found, fence = [], None
+    for line in text.replace("\r\n", "\n").split("\n"):
+        match = review_verdict.FENCE.match(line)
+        if fence is None:
+            if match and not (match.group(1)[0] == "`" and "`" in match.group(2)):
+                fence = match.group(1)
+                continue
+        else:
+            if match and match.group(1)[0] == fence[0] and len(match.group(1)) >= len(fence) and not match.group(2).strip():
+                fence = None
+            continue
+        heading = FINDING_HEADING.match(line)
+        if heading:
+            line = heading.group(0).strip()
+            found.append(line if len(line) <= 160 else line[:157] + "...")
+    return found
+
+
+def summary_line(number, review, verdict, families, headings):
+    """One line for an older round: round, review task id, verdict, the family names and the finding headings; no bodies."""
+    return (f"round {number}; review {review}; {verdict or 'no verdict'}; families: {', '.join(families) or 'none named'}; "
+            f"findings: {' | '.join(headings) or 'none found'}")
+
+
 def prepare(state_dir, task_id, workdir, out_dir, lane=""):
     """Writes the diff then the earlier findings into out_dir; `contexts` lists them in the order a reviewer reads them: the diff
     of the tree against the review base first (diff_now; from the last reviewed state instead when an earlier round recorded one),
@@ -964,7 +1031,23 @@ def prepare(state_dir, task_id, workdir, out_dir, lane=""):
             raise Refused(f"review '{review}' of '{author}' has an unreadable result.md")
         (reviews if number else skipped).append((author, review, names, number))
     earlier = reviews
+    window = findings_window(state_dir, task_id, rows)
+    older = [item for item in earlier if item[3] < window]
+    labels = {row[1]: row[2] for row in rows}
+    if older:
+        lines = []
+        for author, review, names, number in older:
+            raw = (task_path(state_dir, review) / "result.md").read_text(encoding="utf-8", errors="surrogateescape")
+            lines.append(summary_line(number, review, labels.get(review), names, finding_headings(raw)))
+        summary, count = redact_text(red, "\n".join(lines) + "\n", "summary of older review rounds")
+        redactions += count
+        head = (f"[Older review rounds {older[0][3]}-{older[-1][3]}, one line each (round, review task, verdict, families, finding headings; no bodies): "
+                "a retry made with a gated route changed the rule or the design after them, so only the findings from the review that triggered it on are attached "
+                "in full. The full text of each is its review task's result.md.]\n\n")
+        contexts.append(write(out / "earlier-summary.md", head + summary))
     for author, review, _, number in earlier:
+        if number < window:
+            continue
         directory = task_path(state_dir, review)
         text = (directory / "result.md").read_text(encoding="utf-8", errors="surrogateescape")
         text, count = redact_text(red, text, f"earlier findings of {review}")
@@ -1016,7 +1099,9 @@ def prepare(state_dir, task_id, workdir, out_dir, lane=""):
         diff_file = write(out / "diff-now.md", body)
     # the scope's input, written beside the diffs it was computed with (scope and timers read it with --input)
     scope_input = write(out / "scope-input.json", json.dumps(plan)) if plan else None
-    return {"contexts": ([diff_file] if diff_file else []) + contexts, "rounds": len(earlier), "families": [names for _, _, names, _ in earlier], "snapshot": now, "scope_input": scope_input,
+    return {"contexts": ([diff_file] if diff_file else []) + contexts, "rounds": len(earlier), "families": [names for _, _, names, _ in earlier],
+            "summarised": [{"round": number, "review": review, "result": str(task_path(state_dir, review) / "result.md")} for _, review, _, number in older],
+            "snapshot": now, "scope_input": scope_input,
             "skipped": [review for _, review, _, _ in skipped], "withheld": withheld, "redactions": redactions}
 
 

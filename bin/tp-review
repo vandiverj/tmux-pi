@@ -460,6 +460,10 @@ if (( round_count > 0 )); then
   else
     review_task="$review_task No earlier round named a finding family. If a finding repeats an earlier one, name the family with 'Family: <short-kebab-name>'; if every finding is new, say so."
   fi
+  summarised="$(jq -r '.summarised | if length > 0 then "rounds \(.[0].round) to \(.[-1].round) (full text: \([.[] | .result] | join(", ")))" else empty end' <<<"$rounds")"
+  if [[ -n "$summarised" ]]; then
+    review_task="$review_task Review $summarised are summarised on one line each, without finding bodies, on purpose: a retry made with a gated route changed the rule or the design after them, and the findings from the review that triggered it on are attached in full; name a family that recurs from a summarised round when a finding repeats it."
+  fi
   if (( round_count >= 2 )); then
     review_task="$review_task From round 3 on, a REQUEST_CHANGES reply with no 'Family:' line is flagged in the verdict summary."
   fi

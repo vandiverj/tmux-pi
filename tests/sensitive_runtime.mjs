@@ -253,6 +253,11 @@ assert.equal((await diff(repo))?.block, true, 'diff touching config/local.json m
     ["printf ignored | cat <<< 'f=config/local.json; cat \"$f\"' | bash -s", ASK_MAIN],
     ["printf '%s\\n' 'bash tools/x.sh config/local.json' 'f=config/local.json; cat \"$f\"' | bash -s", ASK_MAIN],
     ["bash <(printf '%s\\n' 'bash tools/x.sh config/local.json' 'f=config/local.json; cat \"$f\"')", ASK_MAIN],
+    // sg1 round 11: in every directory the line moves to (F1), through a local runner (F2), from an expanding heredoc (F3)
+    ["cd config; printf '%s\\n' 'f=local.json' 'cat \"$f\"' | bash -eu", ASK_MAIN],
+    ["(cd config; printf '%s\\n' 'f=local.json' 'cat \"$f\"' | bash -eu)", ASK_MAIN],
+    ["uv run --offline --no-project bash -eu <<< 'f=config/local.json; cat \"$f\"'", ASK_MAIN],
+    ["cat <<EOF\n$(printf '%s\\n' 'f=config/local.json' 'cat \"$f\"' | bash -eu)\nEOF", ASK_MAIN],
   ];
   for (const [command, named] of rows) {
     prompts.length = 0;

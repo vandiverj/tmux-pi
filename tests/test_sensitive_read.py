@@ -210,6 +210,13 @@ MUST_PASS = [
     "printf '%s\\n' 'f=README.md' 'cat \"$f\"' | bash -eu", "{ printf '%s\\n' 'f=README.md'; printf '%s\\n' 'cat \"$f\"'; } | bash -s",
     "( printf '%s\\n' 'f=README.md'; printf '%s\\n' 'cat \"$f\"' ) | sh -se",
     "find tools -name x.sh -exec bash -s \\; <<< 'f=README.md; cat \"$f\"'", "bash -s < tools/x.sh", "cat README.md | grep x",
+    # ... in whatever directory the line moves to, through a local runner, or from an expanding heredoc's substitution; and a
+    # quoted-delimiter heredoc's body, which nothing runs (sg1 round 11)
+    "cd docs && cat README.md", "cd config; printf '%s\\n' 'f=README.md' 'cat \"$f\"' | bash -eu",
+    "cd \"$x\"; printf '%s\\n' 'f=README.md' 'cat \"$f\"' | bash -eu", "uv run pytest",
+    "uv run --offline --no-project bash -eu <<< 'f=README.md; cat \"$f\"'",
+    "cat <<EOF\n$(printf '%s\\n' 'f=README.md' 'cat \"$f\"' | bash -eu)\nEOF",
+    "cat <<'EOF'\n$(printf '%s\\n' 'f=config/local.json' 'cat \"$f\"' | bash -eu)\nEOF",
     "rg handler src",
     "rg -t py handler src",
     "rg --sort path handler src",
@@ -1024,7 +1031,11 @@ class SensitiveReadTableTests(unittest.TestCase):
                 (f"printf '%s\\n' 'f={LOCAL}' 'cat \"$f\"' | bash -eu", ask_main),
                 (f"find tools -name x.sh -exec bash -s \\; <<< 'f={LOCAL}; cat \"$f\"'", ask_main),
                 (f"{{ printf '%s\\n' 'f={LOCAL}'; printf '%s\\n' 'cat \"$f\"'; }} | bash -s", ask_main),
-                (f"printf '%s\\n' 'bash tools/x.sh {LOCAL}' 'f={LOCAL}; cat \"$f\"' | bash -s", ask_main)]
+                (f"printf '%s\\n' 'bash tools/x.sh {LOCAL}' 'f={LOCAL}; cat \"$f\"' | bash -s", ask_main),
+                # sg1 round 11: `cd` (F1), a local runner (F2), an expanding heredoc's substitution (F3)
+                ("cd config; printf '%s\\n' 'f=local.json' 'cat \"$f\"' | bash -eu", ask_main),
+                (f"uv run --offline --no-project bash -eu <<< 'f={LOCAL}; cat \"$f\"'", ask_main),
+                (f"cat <<EOF\n$(printf '%s\\n' 'f={LOCAL}' 'cat \"$f\"' | bash -eu)\nEOF", ask_main)]
         with tempfile.TemporaryDirectory() as task:
             record = Path(task) / "permission-request.json"
             for command, named in rows:
@@ -1353,6 +1364,15 @@ class SensitiveReadTableTests(unittest.TestCase):
             f"bash <(printf '%s\\n' 'bash tools/x.sh {LOCAL}' 'f={LOCAL}; cat \"$f\"')",
             # ... and a script call the shell does not itself receive as its whole text is not exempt
             f"echo 'bash tools/x.sh {LOCAL}' | find tools -name x.sh -exec bash -s \\;",
+            # sg1 round 11: each name is judged in every directory the line moves to (F1: `cd`, a `( cd ...; )` subshell; a
+            # directory known only at run time judges a bare name as if under any), through the routes of a local runner or
+            # front end (F2), and in an expanding heredoc's substitutions (F3)
+            "cd config; printf '%s\\n' 'f=local.json' 'cat \"$f\"' | bash -eu",
+            "(cd config; printf '%s\\n' 'f=local.json' 'cat \"$f\"' | bash -eu)",
+            "cd \"$x\"; printf '%s\\n' 'f=local.json' 'cat \"$f\"' | bash -eu",
+            f"uv run --offline --no-project bash -eu <<< 'f={LOCAL}; cat \"$f\"'",
+            f"poetry run bash -eu <<< 'f={LOCAL}; cat \"$f\"'", f"strace bash -eu <<< 'f={LOCAL}; cat \"$f\"'",
+            f"cat <<EOF\n$(printf '%s\\n' 'f={LOCAL}' 'cat \"$f\"' | bash -eu)\nEOF",
         ]
         kept = [  # each non-search cause, from the site that decides it
             (f"sh tools/x.sh {ENV}", sr.RUNS_CODE), (f"python3 tools/x.py {ENV}; grep -n x README.md", sr.RUNS_CODE),

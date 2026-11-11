@@ -2244,6 +2244,8 @@ def _all_hits(hits):
 _LINE_DEPTH = 8
 _LINE_PIECES = 20000
 _STDIN_SOURCES = (".", "source")
+_LINE_DIRS = 64
+_LINE_DIR_WORD = re.compile(r"\b(?:cd|pushd|popd)\b")
 
 
 def _runs_stdin_source(prog, args, base):
@@ -2264,11 +2266,22 @@ def _has_stdin_shell(command, base, depth=0):
     for cmd in _commands(command):
         if not isinstance(cmd, dict):
             continue
-        if any(_has_stdin_shell(sub, base, depth + 1) for sub in cmd["subs"]):
+        # substitutions in words and here-strings, and in the body of a here-document that expands (`cat <<EOF` with
+        # `$(... | bash)` in it: it runs; a quoted delimiter's body is text), as _document_hit reads them (sg1 round 11)
+        subs = list(cmd["subs"]) + [inner for holder, expands in cmd["heredocs"] if expands
+                                    for inner in _substitutions("".join(holder))]
+        if any(_has_stdin_shell(sub, base, depth + 1) for sub in subs):
             return True
         words = cmd["words"]
         prog, args = _runs(words) if _program(words)[0] == "xargs" else _program(words)
         candidates = [(prog, list(args))]
+        # A local front end or task runner runs the command after it (`strace bash`, `uv run bash`, `poetry run bash`): the
+        # route _other_command_hit follows, every position tried. A container or VM's shell runs elsewhere (ELSEWHERE).
+        if prog not in _ELSEWHERE:
+            candidates += [(_ALIASES.get(name, name), list(args[i + 1:])) for i, name in enumerate(
+                posixpath.basename(arg).lower() if isinstance(arg, str) else "" for arg in args)
+                if (prog in _FRONT_ENDS or any(word in _RUN_WORDS for word in args[:i]))
+                and _ALIASES.get(name, name) in _INNER]
         wrapped = command_wrappers.starts_with_wrapper(words, _ASSIGN, _KEYWORDS)
         tail = wrapped[1] if wrapped else list(args) if prog in ("find", "fd", "fdfind", "xargs", _OPAQUE) else None
         if tail is not None:
@@ -2353,12 +2366,36 @@ def _whole_script_text(command, base):
     return text, call["words"][:len(call["words"]) - len(rest)] + call["outputs"]
 
 
-def _line_pieces(text, out, exempt=None, depth=0):
+def _line_dirs(text, starts, dirs):
+    """Add to `dirs` every directory `text`'s commands move to (`cd`, `pushd`, `popd`, a `( ... )` subshell restoring it)
+    from each of `starts`, by the step _commands_hit takes (_dir_step)."""
+    if not _LINE_DIR_WORD.search(text):
+        return
+    for start in list(starts):
+        base, previous, pushed, scopes = start, "$OLDPWD", [], []
+        for cmd in _commands(text):
+            if cmd == "(":
+                scopes.append((base, previous, list(pushed)))
+            elif cmd == ")":
+                if scopes:
+                    base, previous, pushed = scopes.pop()
+            elif isinstance(cmd, dict):
+                prog, args = _program(cmd["words"])
+                if prog in _DIR_STEPS:
+                    base, previous = _dir_step(prog, args, base, previous, pushed)
+                    dirs.add(base)
+
+
+def _line_pieces(text, out, exempt=None, depth=0, dirs=None):
     """Every word of `text` (quotes removed), each piece of it split at blanks and shell operators, and the same for the
     text inside every word, substitution and here-document body, to any depth: process substitutions and groups are words
-    of the line too. The `exempt` text, once, adds only its checked words. False when the line is too deep or too large."""
+    of the line too. The `exempt` text, once, adds only its checked words. False when the line is too deep or too large.
+    `dirs`: the directories the line's commands may run in, each text read as shell text adding the ones its `cd`s reach
+    from those found so far (_line_dirs)."""
     if depth > _LINE_DEPTH:
         return False
+    if dirs is not None:
+        _line_dirs(text, dirs, dirs)
     for token in _tokens(text):
         if token[0] == "op":
             continue
@@ -2378,7 +2415,7 @@ def _line_pieces(text, out, exempt=None, depth=0):
                 return False
             # the word read as shell text once more (quotes, escapes, `$'...'`), unless that reads it as itself
             if (token[0] == "heredoc" or [t[:2] for t in _tokens(word)] != [("word", word)]) and not _line_pieces(
-                    word, out, None, depth + 1):
+                    word, out, None, depth + 1, dirs):
                 return False
     return True
 
@@ -2389,10 +2426,14 @@ def _stdin_line_hit(command, base=""):
     if not _has_stdin_shell(command, base):
         return None
     whole = _whole_script_text(command, base)
-    pieces = []
-    if not _line_pieces(command, pieces, list(whole) if whole else None):
+    pieces, dirs = [], {base}
+    if not _line_pieces(command, pieces, list(whole) if whole else None, dirs=dirs) or len(dirs) > _LINE_DIRS:
         return "stdin shell line", "the line is too deep or too large to check"
-    hit = _words_hit(pieces, base)
+    # Each name is judged in every directory the line may run it in (sg1 round 11: `cd config; ... local.json`). Where a
+    # directory is known only at run time (`cd "$x"`, `cd -`), a name is judged as if under any directory, by the rule for an
+    # unknown working directory (_pair_tail: a bare `local.json` or `sessions` hits).
+    known = sorted(d for d in dirs if "$" not in d and "`" not in d)
+    hit = _first(_words_hit(pieces, d) for d in known) or (len(known) < len(dirs) and _anywhere_hit(pieces))
     if hit:
         _prompts_now()
         return _because(None, hit)
@@ -2438,6 +2479,17 @@ def _words_hit(words, base):
     """A sensitive name among `words`, each looked at alone: what follows inline code is the program's own arguments, so no
     word is skipped as an option's text (`node -e CODE -e FILE`: FILE is process.argv's, sg1 round 7 attack)."""
     return _first(_other_hit([word], base, True) for word in words if isinstance(word, str))
+
+
+def _anywhere_hit(words):
+    """A name among `words` that is a credential file under some directory the call may be in, when that directory is
+    known only at run time: the unknown-working-directory rule of _sensitive (_pair_tail), with _other_hit's strength."""
+    for word in words:
+        for piece in _PIECES.split(word) if isinstance(word, str) else ():
+            piece = piece.lstrip("@")
+            if piece and _PLAIN.match(piece) and _pair_tail(_expand(piece), False):
+                return piece, _NAME_REASON
+    return None
 
 
 def _before_program(cmd, prog, args):
@@ -2839,6 +2891,24 @@ def _prompts_now():
     _SHELL.update(trust=None)
 
 
+_DIR_STEPS = ("cd", "pushd", "popd")
+
+
+def _dir_step(prog, args, base, previous, pushed):
+    """(base, previous) after `cd`/`pushd`/`popd` ARGS run in `base`; `pushed` is the pushd stack, changed in place. A
+    directory known only at run time (`cd "$x"`, `cd -` with no earlier cd, an empty stack) is a `$` text."""
+    if prog == "cd":
+        target = next((arg for arg in args if arg == "-" or not arg.startswith("-")), "~")
+        flags = args[:args.index(target)] if target in args else args
+        physical = any(flag.startswith("-") and "P" in flag for flag in flags)
+        return (previous if target == "-" else _cd(base, target, physical)), base
+    if prog == "pushd":
+        target = next((arg for arg in args if not arg.startswith(("-", "+"))), None)
+        pushed.append(base)
+        return (_cd(base, target) if target else "$DIRSTACK"), previous
+    return (pushed.pop() if pushed else "$DIRSTACK"), previous
+
+
 def _commands_hit(command, base, depth, named=False, source=False):
     """The first hit in the commands of a line, with a non-search cause only when every hit the look finds has one.
 
@@ -2921,17 +2991,8 @@ def _commands_hit(command, base, depth, named=False, source=False):
                 fed = _first(_listing_hit(command[match.end():_close_paren(command, match.end()) - 1], base)
                              for match in _PROCESS_SUB.finditer(command))
             loops.append((_read_names(args) if fed else (), fed, True))
-        if prog == "cd":
-            target = next((arg for arg in args if arg == "-" or not arg.startswith("-")), "~")
-            flags = args[:args.index(target)] if target in args else args
-            physical = any(flag.startswith("-") and "P" in flag for flag in flags)
-            base, previous = previous if target == "-" else _cd(base, target, physical), base
-        elif prog == "pushd":
-            target = next((arg for arg in args if not arg.startswith(("-", "+"))), None)
-            pushed.append(base)
-            base = _cd(base, target) if target else "$DIRSTACK"
-        elif prog == "popd":
-            base = pushed.pop() if pushed else "$DIRSTACK"
+        if prog in _DIR_STEPS:
+            base, previous = _dir_step(prog, args, base, previous, pushed)
         elif prog == "for":
             words = args[args.index("in") + 1:] if "in" in args else []
             loops.append((tuple(arg for arg in args[:1] if arg), listed or _first(_read_hit(word, base) for word in words), False))

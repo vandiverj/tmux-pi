@@ -4,7 +4,7 @@ export PATH=@ROOT@/bin:"$PATH"
 cd @WORKDIR@
 export TP_TASK_ID=gold-1 TP_TASK_DIR=@TASK_DIR@
 unset TP_CTX_TOOLS
-@ROOT@/bin/tp-claude --name gold-1 --tools Agent\,Bash\,Edit\,Glob\,Grep\,ListAgents\,Read\,ReportFindings\,ScheduleWakeup\,Skill\,ToolSearch\,Workflow\,Write -- "$(cat @TASK_DIR@/packet.md)"
+@ROOT@/bin/tp-claude --name gold-1 --tools Agent\,Bash\,Edit\,Glob\,Grep\,ListAgents\,Read\,ReportFindings\,ScheduleWakeup\,Skill\,ToolSearch\,Workflow\,Write --append-system-prompt $'# Searching and Reading Files\n\nSearch file contents with mcp__tmux-pi-safe__safe_grep (pattern, path). Read a file with mcp__tmux-pi-safe__safe_read or the Read tool on an exact path. Use grep, rg, cat, head, tail or sed -n through Bash only on exact paths in the working tree that are known not to be sensitive (no .env files, keys or credentials, nothing under agent/, config/ or claude/): in a worker task a shell search or read that may reach a sensitive file is refused.' -- "$(cat @TASK_DIR@/packet.md)"
 status=$?
 echo "$status" | python3 @ROOT@/lib/safe_write.py write @TASK_DIR@/exit --root @STATE@
 echo; echo "[gold-1 exited with status $status]"

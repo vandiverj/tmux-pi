@@ -34,6 +34,7 @@ from pathlib import Path
 import posixpath
 import re
 import select
+import shlex
 import signal
 import stat
 import subprocess
@@ -160,6 +161,8 @@ _INNER = _BULK - {".", "source"}
 _FRONT_ENDS = {"docker", "podman", "nerdctl", "kubectl", "oc", "npx", "bunx", "pnpx", "uvx",
                "entr", "strace", "dtruss", "xcrun", "lima", "vagrant"}
 _RUN_WORDS = {"run", "exec", "--"}
+# The front ends whose command runs in a container or VM, not on this host's files (sg1 round 4: ELSEWHERE).
+_ELSEWHERE = {"docker", "podman", "nerdctl", "kubectl", "oc", "lima", "vagrant"}
 _FIND_EXEC = {"-exec", "-execdir", "-ok", "-okdir"}
 _FD_EXEC = {"-x", "-X", "--exec", "--exec-batch"}
 _CURL_FILES = {"-T", "--upload-file", "-K", "--config", "-E", "--cert", "--key", "--cacert", "--netrc-file",
@@ -272,6 +275,8 @@ _INCLUDE_FILTERS = {"grep", "egrep", "fgrep", "ugrep", "ug"}
 _PRINTERS = {"echo", "printf"}
 _READ_VALUES = "dnNptuik"
 _PROCESS_SUB = re.compile(r"<\s*<\(")
+_INPUT_SUB = re.compile(r"<\(")  # any process substitution read as a file
+_SOURCE_SPLIT = re.compile(r"[\s;|&()<>`\"']+")  # blanks and shell operators inside one word of shell source
 # (options taking a value, short letters taking a value, options naming the pattern, their short letters)
 _GREP_ARGS = ({"-A", "-B", "-C", "-m", "-d", "-D", "--include", "--exclude", "--exclude-dir", "--exclude-from",
                "--max-count", "--after-context", "--before-context", "--context", "--label", "--binary-files",
@@ -373,6 +378,74 @@ class _Refused(str):
         self = super().__new__(cls, text)
         self.detail = detail
         return self
+
+
+# Why a shell call's ask is not a search or read (sg1 round 4). A worker's Bash ask is refused unless the classifier gives one of
+# these: the list is closed, and each is set only at the site that decides it, a `_because(CAUSE, hit)` call (the sites are
+# enumerated from this source by tests/test_sensitive_read.py test_non_search_sites). A hit any other path makes is a plain
+# tuple, and a plain tuple refuses: a new path with no cause here refuses by default.
+RUNS_CODE = "runs code"                      # an interpreter or shell given a script file or code, `source`/`.`
+# (RUNS_CODE: only from _runs_code, for a script file _code_run's positive parse shows, not itself sensitive, given the
+# file. Inline code never has it, sg1 round 7. Each site that gives it says SCRIPT FILE, _command_hit.)
+ELSEWHERE = "runs on a remote host or in a container"           # ssh, docker/kubectl/... and what they run
+TRANSFORM = "encodes or transforms a file"   # base64, xxd, gzip, openssl, ... on a file operand or `<` input
+GIT_OUTPUT = "git output, not a search"     # git diff/show/log/blame/cat-file/archive/stash: history and patches
+NAMES_ONLY = "names or changes files without reading them"      # ls, stat, wc, rm, echo, ... given a sensitive name
+NON_SEARCH_CAUSES = (RUNS_CODE, ELSEWHERE, TRANSFORM, GIT_OUTPUT, NAMES_ONLY)
+# xargs, find -exec, fd -x, a loop or a substituted listing handing a program file names: the program's own cause, judged by
+# _program_cause as if it were given a sensitive file; none when it searches or reads them, or does nothing the list names.
+# Encoders, compressors and crypto tools: what they print is not the file's text (round 1 kept base64's ask).
+_TRANSFORMS = {"base64", "base32", "xxd", "hexdump", "od", "gzip", "bzip2", "xz", "openssl", "gpg"}
+
+
+class _NonSearch(tuple):
+    """A hit (target, reason) with the non-search cause (one of NON_SEARCH_CAUSES) that keeps a worker's ask an ask."""
+
+    def __new__(cls, hit, cause):
+        self = super().__new__(cls, hit)
+        self.cause = cause
+        return self
+
+
+def _because(cause, hit):
+    """`hit` with non-search cause `cause`; a falsy hit as it is, and with no cause (None) a plain hit, which refuses."""
+    if not hit:
+        return hit
+    return _NonSearch(hit, cause) if cause else tuple(hit)
+
+
+def _cause(hit):
+    return getattr(hit, "cause", None)
+
+
+# The shell reads the safe tools replace (safe_read); with the grep family and `git grep` (safe_grep) they are the shell
+# searches and reads of _search_read. Every other reader (an editor, a copier, base64, ...) does something the safe tools do not.
+_ROUTE_READERS = {"cat", "tac", "nl", "head", "tail", "less", "more", "bat", "batcat"}
+
+
+def _sed_prints(args):
+    """Whether `sed ARGS` only prints (`-n`, `--quiet`, `--silent`) and edits no file in place (`-i`, `--in-place`)."""
+    quiet = False
+    for arg in args:
+        if arg == "--":
+            break
+        if arg.startswith("--"):
+            if arg.startswith("--in-place"):
+                return False
+            quiet = quiet or arg in ("--quiet", "--silent")
+        elif arg.startswith("-") and len(arg) > 1:
+            letters = re.split(r"[efl]", arg[1:], maxsplit=1)[0]  # -e, -f and -l take the rest of the word as their value
+            if "i" in letters:
+                return False  # -i takes the rest of the word as its suffix: it writes the file
+            quiet = quiet or "n" in letters
+    return quiet
+
+
+def _search_read(prog, args):
+    """Whether program `prog` with `args` is a shell search or read: the safe calls _route_parts names, and a program
+    `_program_cause` never gives a non-search cause."""
+    return (prog in _GREPS or prog in _ROUTE_READERS or (prog in ("sed", "gsed") and _sed_prints(args)) or
+            (prog == "git" and _git_sub(args, "")[0] == "grep"))
 
 
 def _said(why):
@@ -1974,13 +2047,77 @@ def _floor_hit(words, cmd, base, depth):
     if command_wrappers.floor_uncertain(*wrapped):  # text a wrapper hands on that cannot be read for certain, found by name
         return wrapped[0], "the command it runs is chosen by the shell at run time and cannot be checked"
     unplaced = dict(cmd, settled=False)
+    runs = _runs(words)
     for name, rest in entries:
         name = _ALIASES.get(name, name)
         if name in _FLOOR:
+            # Any word of the tail is tried as the program, so a hit keeps its non-search cause only when the word tried
+            # is the program the wrapper's table (`_program`, xargs' own table) says runs, with the same arguments
+            # (`timeout 5 python3 x.py`). Any other word's hit is a guess at what runs: it has no cause, and refuses.
             hit = _command_hit(name, rest, unplaced, base, depth)
-            if hit:
+            if hit and (name, list(rest)) == runs:
                 return hit
+            if hit:
+                # ssh's remote command line runs on the remote host: when ssh's own branch finds it runs there (a
+                # ProxyCommand or LocalCommand runs here and is not that), the floor's guess at it does too.
+                remote = wrapped[0] == "ssh" and _cause(_command_hit("ssh", wrapped[1], unplaced, base, depth)) == ELSEWHERE
+                return _because(ELSEWHERE if remote else None, hit)
     return None
+
+
+def _runs(words):
+    """The program and arguments a command line runs by the wrappers' tables, through xargs too; (None, []) when unknown."""
+    prog, args = _program(words)
+    if prog == "xargs":
+        found = command_wrappers.unwrap("xargs", args)
+        prog, args = _program(found[1]) if isinstance(found, tuple) and found[0] == "words" else (None, [])
+    return _ALIASES.get(prog, prog), list(args)
+
+
+_PROBE = ".env"  # a file name the classifier finds sensitive in any directory
+_FD_TOKENS = ("{}", "{/}", "{//}", "{.}", "{/.}")
+
+
+_NAMES_ONLY_WORDS = {"cd", "pushd", "popd", "for", "while", "until", "select", "case", "read"}
+
+
+def _program_cause(words, base, depth, tokens=("{}",), stdin=False):
+    """The non-search cause of the program in `words` when a command hands it file names (xargs, find -exec, fd -x, a loop
+    variable, a substituted listing) or, with `stdin`, a file on its standard input; None when it searches or reads them.
+
+    The program is judged by this classifier as if it were given a sensitive file: each placeholder in `tokens` (xargs -I,
+    find's {}, a loop variable) and one more operand at the end are that file. A shell search or read (_search_read), and any
+    hit with no cause (`sh -c 'grep TOKEN {}'`), is None, and so is no hit at all: what the program does with the file is not
+    known. On standard input a program that only names files (NAMES_ONLY) is None too: `done < .env` feeds the loop's
+    commands, `while read l; do echo $l; done` prints it."""
+    prog, args = _program(words)
+    if prog is not None and _search_read(prog, args):
+        return None
+    probe = [word for word in words]
+    for token in tokens:
+        probe = [word.replace(token, _PROBE) for word in probe]
+    saved = _SHELL.get("trust")
+    _SHELL["trust"] = None  # what the program does, not what the owner vouched for
+    try:
+        hit = _shell_hit(" ".join(shlex.quote(word) for word in probe + [_PROBE]), base, depth + 1)
+    except Exception:  # a program that cannot be judged is not known to be no search
+        return None
+    finally:
+        _SHELL["trust"] = saved
+    return None if stdin and _cause(hit) == NAMES_ONLY else _cause(hit)
+
+
+def _xargs_tokens(args):
+    """The strings xargs replaces with each name it reads (-I, -J, -i, --replace), with find's `{}`."""
+    tokens = ["{}"]
+    for i, arg in enumerate(args):
+        if arg in ("-I", "-J") and i + 1 < len(args):
+            tokens.append(args[i + 1])
+        elif re.fullmatch(r"-[IJ].+", arg):
+            tokens.append(arg[2:])
+        elif arg.startswith("--replace="):
+            tokens.append(arg.partition("=")[2])
+    return tuple(token for token in tokens if token)
 
 
 def _command_hit(prog, args, cmd, base, depth, bulk=False):
@@ -1995,7 +2132,13 @@ def _command_hit(prog, args, cmd, base, depth, bulk=False):
         sub, rest = _program(found[1])
         if sub is None:
             return None
-        return (_producer_hit(cmd, base) if sub in _BULK else None) or _command_hit(sub, rest, cmd, base, depth, True)
+        # The names it is fed are judged for every bulk program, and for `git grep` too: they are the files it searches.
+        # The hit is a non-search's only when the program it runs is one (_program_cause: `xargs python3`, `xargs git diff`);
+        # `xargs grep`, `xargs sed -n`, `xargs git grep`, `xargs sh -c 'grep TOKEN {}'` are searches and refuse.
+        hit = (_producer_hit(cmd, base) if sub in _BULK or _search_read(sub, rest) else None) or _command_hit(
+            sub, rest, cmd, base, depth, True)
+        # xargs' own options name its replace strings; the command's (`ruby -I lib`) do not (sg1 round 6 attack)
+        return _because(_program_cause(found[1], base, depth, _xargs_tokens(args[:len(args) - len(found[1])])), hit)
     if prog == "find":
         roots = _find_roots(args)
         for i, arg in enumerate(args):
@@ -2004,73 +2147,587 @@ def _command_hit(prog, args, cmd, base, depth, bulk=False):
                 sub, rest = _program(args[i + 1:end])
                 hit = _floor_hit(args[i + 1:end], cmd, base, depth) or (_roots_hit("bulk read", roots, base, _BULK_REASON) if sub in _BULK else None) or (
                     _command_hit(sub, rest, cmd, base, depth, True) if sub else None)
-                if hit:
-                    return hit
+                if hit:  # run once per file find selects: a non-search when the program is one (_program_cause)
+                    return _because(_program_cause(args[i + 1:end], base, depth), hit)
         return None
     if prog in ("fd", "fdfind"):
         for i, arg in enumerate(args):
             if arg in _FD_EXEC:
-                if _program(args[i + 1:])[0] in _BULK:
-                    return "bulk shell read", _BULK_REASON
-                hit = _floor_hit(args[i + 1:], cmd, base, depth)
-                if hit:
-                    return hit
+                hit = ("bulk shell read", _BULK_REASON) if _program(args[i + 1:])[0] in _BULK else _floor_hit(
+                    args[i + 1:], cmd, base, depth)
+                if hit:  # run once per file fd finds, as find -exec
+                    return _because(_program_cause(args[i + 1:], base, depth, _FD_TOKENS), hit)
         return None
     if prog == "git":
         sub, rest, base = _git_sub(args, base)
         if sub == "grep":
             return _search_hit(prog, rest, cmd, base, bulk, git=True, queried=_queried(args, rest, cmd, depth, bulk))
-        opts, before, after, values, _ = _split_args(rest, _GIT_VALUES)
-        operands = before + (after or [])
-        if sub == "diff" and "--no-index" in opts:
-            return _first(_read_hit(word, base) for word in operands) or _roots_hit(
-                "recursive diff", operands, base, _BULK_REASON)
-        if sub == "archive":
-            return _git_archive_hit(rest, cmd, base)
-        if sub == "stash":
-            if before[:1] in (["show"], ["list"]) and _git_patch("log", opts):
-                unproven = "git stash patch output", _STASH_REASON
-                if rest[:1] != ["show"] or not _queried(args, rest, cmd, depth, bulk):
-                    return unproven
-                return _listed_hit("git stash show", _patch_query(sub, rest[1:], base), base, unproven)
-            return None
-        if sub in _GIT_READ:
-            hit = _first(_read_hit(word, base) for word in operands)
-        elif sub in _GIT_HISTORY:
-            hit = _first(_read_hit(word, base) for word in after or [])
-        else:
-            return None
-        if hit or sub not in _GIT_HISTORY | _GIT_DIFFS or not _git_patch(sub, opts):
-            return hit
-        hit = _git_patch_hit(sub, before, after, base)
-        if hit and sub in ("diff", "log") and _queried(args, rest, cmd, depth, bulk):
-            return _patch_listing(sub, rest, before, after, base, hit)
-        return hit
+        return _because(GIT_OUTPUT, _git_output_hit(args, sub, rest, cmd, base, depth, bulk))
     if prog in _GREPS:
         return _search_hit(prog, args, cmd, base, bulk)
+    # RUNS_CODE claims the command runs code and not a search or read of the file. Only _runs_code gives it, and only for
+    # SCRIPT FILE: a script file _code_run's positive parse shows (a script file given the file as an argument is project
+    # code; a known limit). INLINE CODE (code in any spelling, any count, on stdin, in a here-string or heredoc, or no parse)
+    # never has it: inline code that touches a sensitive name anywhere is a read, and refuses in a worker (sg1 round 7).
     if prog in _SHELLS:
-        for i, arg in enumerate(args[:-1]):
-            if re.fullmatch(r"-[A-Za-z]*c", arg):
-                return (_unresolved(args[i + 1]) if isinstance(args[i + 1], _Line) else None) or _shell_hit(
-                    args[i + 1], base, depth + 1)
-        return _other_hit(args, base, True)
+        form, _, _ = _code_run(prog, args, base)
+        env = _before_program(cmd, prog, args)
+        startup = _startup_hit(env, base)  # BASH_ENV=/ENV= naming a sensitive file: the shell sources it first
+        at = _dash_c_at(args)
+        if at is not None:  # INLINE CODE: the line it runs is judged as SHELL SOURCE (_commands_hit `source`)
+            line = args[at]
+            hit = (_unresolved(line) if isinstance(line, _Line) else None) or _shell_hit(line, base, depth + 1, source=True)
+            given = (startup or _words_hit(args[:at], base) or _words_hit(args[at + 1:], base) or _env_hit(env, base) or
+                     _input_text_hit(cmd, base))
+            # A sensitive name reaching the line another way (an operand, an option value such as `--rcfile .env`, an env
+            # value, stdin text), or options the parse does not show (`form` is not _INLINE): no cause.
+            return _because(None, hit or given) if given or form != _INLINE else hit
+        if startup:  # the shell runs the sensitive file before any script: not a script file the parse shows
+            return _because(None, startup)
+        # Every word alone: no shell option takes text, and the words after a script or `-s` are its data, so none is
+        # skipped as an option's (`bash -s -- -e FILE <<EOF`, sg1 round 8).
+        given = _words_hit(args, base) or (_env_hit(env, base) if form != _SCRIPT else None)
+        if given or form != _STDIN:
+            return _because(_runs_code(form), given)  # SCRIPT FILE; anything else: INLINE CODE, no cause
+        return _piped_source_hit(cmd, base, depth)  # code on stdin from a pipe: the text printed into it is SHELL SOURCE
     if prog == "eval":
-        return _shell_hit(" ".join(args), base, depth + 1)
+        return _shell_hit(" ".join(args), base, depth + 1, source=True)
     if prog in _INTERPRETERS:
-        rest, skip = [], False
-        for i, arg in enumerate(args):
-            if skip:
-                skip = False
-            elif arg in ("--eval", "--print") or re.fullmatch(r"-[A-Za-z]*[cep]", arg):
-                hit = _literal_hit(args[i + 1], base) if i + 1 < len(args) else None
-                if hit:
-                    return hit
-                skip = True
-            elif arg == "-m":
-                skip = True
-            else:
-                rest.append(arg)
-        return _other_hit(rest, base, True)
+        form, codes, rest = _code_run(prog, args, base)
+        if form == _SCRIPT:  # options from the closed list take no text; the script's arguments are its data (sg1 round 8)
+            return _because(_runs_code(form), _words_hit(args, base))  # SCRIPT FILE
+        given = _other_hit(args, base, True)
+        # INLINE CODE, or no parse: no cause, whatever hands it the name (a literal in any code or word after it, an
+        # operand, an env value, here-string or heredoc text).
+        literal = _first(_literal_hit(word, base) for word in codes + rest if isinstance(word, str) and word)
+        return _because(None, given or _words_hit(rest, base) or literal or
+                        _env_hit(_before_program(cmd, prog, args), base) or _input_text_hit(cmd, base))
+    return _other_command_hit(prog, args, cmd, base, depth, bulk)
+
+
+def _piped_source_hit(cmd, base, depth):
+    """The hit in the SHELL SOURCE a pipeline prints into a shell reading code on stdin (`printf '%s\\n' LINE ... | bash -s`,
+    `echo LINE | sh`, `cat <<'SH' | bash`): the arguments of echo or printf, and the here-document and here-string text of
+    the pipeline's first command, judged as shell source (sg1 round 9). What any other program prints is not visible."""
+    first = cmd.get("first") if isinstance(cmd, dict) and cmd.get("piped") else None
+    if not isinstance(first, dict) or first is cmd:
+        return None
+    return _printed_source_hit(first, base, depth)
+
+
+def _printed_source_hit(first, base, depth):
+    """The hit in the text the command `first` prints for a shell to run: echo or printf arguments, here-document and
+    here-string text, each judged as SHELL SOURCE (sg1 round 9)."""
+    prog, args = _program(first["words"])
+    texts = (list(args) if prog in _PRINTERS else []) + list(first["strings"]) + [
+        "".join(holder) for holder, _ in first["heredocs"]]
+    # every text is judged: one with a cause (a script line) never exempts a later one (sg1 round 10 F4)
+    return _all_hits(_shell_hit(text, base, depth + 1, source=True) for text in texts if isinstance(text, str) and text)
+
+
+def _all_hits(hits):
+    """The first hit, with no cause when any hit has none: no first-hit stop (as _commands_hit aggregates)."""
+    found = None
+    for hit in hits:
+        if hit:
+            found = found or hit
+            if _cause(hit) is None:
+                return _because(None, found)
+    return found
+
+
+# A LINE THAT RUNS A STDIN SHELL (sg1 round 10). Enumerating how text reaches a shell that reads code from stdin does not
+# converge (option clusters, wrappers' stdin, groups, later stages), so the decision fails closed: in a line that runs one,
+# every word anywhere in the line is checked for a sensitive name, and a hit has no cause. The one exemption is per
+# occurrence: a name that is an operand of a project script call that is the whole text the shell receives
+# (_whole_script_text). Lines without a stdin shell keep their decisions.
+_LINE_DEPTH = 8
+_LINE_PIECES = 20000
+_STDIN_SOURCES = (".", "source")
+_LINE_DIRS = 64
+_LINE_DIR_WORD = re.compile(r"\b(?:cd|pushd|popd)\b")
+
+
+def _runs_stdin_source(prog, args, base):
+    """Whether `prog args` is a shell (any options, `-s` or not; `-c` excluded: its line is judged as source) or
+    `.`/`source` that is not shown to run a script file (_code_run): /dev/stdin, /dev/fd/N, a process substitution, no
+    operand, or options the parse does not know. Not shown is a stdin shell."""
+    if prog in _SHELLS:
+        return _dash_c_at(args) is None and _code_run(prog, args, base)[0] != _SCRIPT
+    return prog in _STDIN_SOURCES and _code_run(prog, args, base)[0] != _SCRIPT
+
+
+def _has_stdin_shell(command, base, depth=0):
+    """Whether any command of the line, of its substitutions, or of a `-c` line in it runs a stdin shell, directly, through
+    xargs, or anywhere in the tail of a wrapper, `find -exec` or `fd -x` (every word of the tail tried as the program, as the
+    floor does: command_wrappers.bag). A wrapper whose command cannot be found counts when its tail names a shell."""
+    if depth > _LINE_DEPTH:
+        return False
+    for cmd in _commands(command):
+        if not isinstance(cmd, dict):
+            continue
+        # substitutions in words and here-strings, and in the body of a here-document that expands (`cat <<EOF` with
+        # `$(... | bash)` in it: it runs; a quoted delimiter's body is text), as _document_hit reads them (sg1 round 11)
+        subs = list(cmd["subs"]) + [inner for holder, expands in cmd["heredocs"] if expands
+                                    for inner in _substitutions("".join(holder))]
+        if any(_has_stdin_shell(sub, base, depth + 1) for sub in subs):
+            return True
+        words = cmd["words"]
+        prog, args = _runs(words) if _program(words)[0] == "xargs" else _program(words)
+        candidates = [(prog, list(args))]
+        # A local front end or task runner runs the command after it (`strace bash`, `uv run bash`, `poetry run bash`): the
+        # route _other_command_hit follows, every position tried, and only for the programs that reach it (_dispatches): a
+        # project script's arguments (`python3 tools/run.py -- bash ...`) and a git pathspec are not a command (sg1 round
+        # 12). A container or VM's shell runs elsewhere (ELSEWHERE).
+        if prog not in _ELSEWHERE and _dispatches(prog):
+            candidates += [(_ALIASES.get(name, name), list(args[i + 1:])) for i, name in enumerate(
+                posixpath.basename(arg).lower() if isinstance(arg, str) else "" for arg in args)
+                if (prog in _FRONT_ENDS or any(word in _RUN_WORDS for word in args[:i]))
+                and _ALIASES.get(name, name) in _INNER]
+        wrapped = command_wrappers.starts_with_wrapper(words, _ASSIGN, _KEYWORDS)
+        tail = wrapped[1] if wrapped else list(args) if prog in ("find", "fd", "fdfind", "xargs", _OPAQUE) else None
+        if tail is not None:
+            entries, _ = command_wrappers.bag(tail)
+            # A bare `.` in a tail is most often a path (`find . -name x`), so it counts only when it sources /dev/stdin or
+            # /dev/fd/N; `source` and the shells count as named.
+            candidates += [(name, [w for w in rest if w != command_wrappers.SEP]) for name, rest in entries
+                           if name in _SHELLS or name == "source"
+                           or name == "." and rest[:1] and isinstance(rest[0], str)
+                           and (rest[0] == "/dev/stdin" or rest[0].startswith("/dev/fd/"))]
+        for name, rest in candidates:
+            if name == _OPAQUE and any(posixpath.basename(w).lower() in _SHELLS for w in rest if isinstance(w, str)):
+                return True
+            if name in _SHELLS and _dash_c_at(rest) is not None:
+                if _has_stdin_shell(rest[_dash_c_at(rest)], base, depth + 1):
+                    return True
+            elif _runs_stdin_source(name, rest, base):
+                return True
+    return False
+
+
+def _printed_text(cmd):
+    """The one text a command prints as is (`echo TEXT`, `printf TEXT` with no format, `printf '%s\\n' TEXT`, `cat <<<
+    TEXT`, `cat <<'EOF'` TEXT with nothing expanded), or None."""
+    prog, args = _program(cmd["words"])
+    if cmd["words"][:1] != [prog] or cmd["subs"] or cmd["inputs"]:
+        return None
+    if prog == "cat" and not args:
+        bodies = list(cmd["strings"]) + ["".join(holder) for holder, expands in cmd["heredocs"]
+                                         if not expands or not re.search(r"[$`]", "".join(holder))]
+        return bodies[0] if len(bodies) == 1 == len(cmd["strings"]) + len(cmd["heredocs"]) else None
+    if cmd["strings"] or cmd["heredocs"]:
+        return None
+    if prog == "echo" and len(args) == 1 and not args[0].startswith("-"):
+        return args[0]
+    if prog == "printf" and len(args) == 1 and not re.search(r"[%\\]", args[0]):
+        return args[0]
+    if prog == "printf" and len(args) == 2 and args[0] in ("%s\\n", "%s\n", "%s"):
+        return args[1]
+    return None
+
+
+def _whole_script_text(command, base):
+    """(TEXT, words) when the stdin shell of the line receives exactly one TEXT, and TEXT is exactly one project script call
+    (`bash tools/x.sh FILE`, `python3 tools/x.py FILE`: _code_run shows a script file): `echo TEXT | SHELL`, `SHELL <<< TEXT`,
+    `SHELL <<EOF` TEXT, `SHELL <(echo TEXT)`. `words` are the call's words that are not the script's operands: they are still
+    checked. Any other line shape: None, and every occurrence is checked (sg1 round 10)."""
+    items = _commands(command)
+    shapes = [x if isinstance(x, str) else "c" for x in items]
+    text = None
+    if shapes == ["c", "c"] and items[0]["feeds"] and items[1]["piped"]:
+        shell, text = items[1], _printed_text(items[0])
+        received = not (shell["strings"] or shell["heredocs"] or shell["inputs"])
+    elif shapes == ["c"]:
+        shell = items[0]
+        bodies = list(shell["strings"]) + ["".join(holder) for holder, expands in shell["heredocs"]]
+        quiet = all(not expands or not re.search(r"[$`]", "".join(holder)) for holder, expands in shell["heredocs"])
+        text = bodies[0] if len(bodies) == 1 else None
+        received = quiet and not shell["inputs"]
+    elif shapes == ["c", "(", "c", ")"] and len(_INPUT_SUB.findall(command)) == 1:
+        shell, text = items[0], _printed_text(items[2])
+        received = not (shell["strings"] or shell["heredocs"] or shell["inputs"])
+    else:
+        return None
+    if not isinstance(text, str) or not received or shell["subs"]:
+        return None
+    prog, args = _program(shell["words"])
+    if not _runs_stdin_source(prog, args, base):
+        return None
+    calls = _commands(text)
+    if len(calls) != 1 or not isinstance(calls[0], dict):
+        return None
+    call = calls[0]
+    if call["subs"] or call["strings"] or call["heredocs"] or call["inputs"]:
+        return None
+    sub, sub_args = _program(call["words"])
+    if sub not in _SHELLS and sub not in _INTERPRETERS:
+        return None
+    form, _, rest = _code_run(sub, sub_args, base)
+    if form != _SCRIPT:
+        return None
+    return text, call["words"][:len(call["words"]) - len(rest)] + call["outputs"]
+
+
+def _line_dirs(text, starts, dirs):
+    """Add to `dirs` every directory `text`'s commands move to (`cd`, `pushd`, `popd`, a `( ... )` subshell restoring it)
+    from each of `starts`, by the step _commands_hit takes (_dir_step)."""
+    if not _LINE_DIR_WORD.search(text):
+        return
+    for start in list(starts):
+        base, previous, pushed, scopes = start, "$OLDPWD", [], []
+        for cmd in _commands(text):
+            if cmd == "(":
+                scopes.append((base, previous, list(pushed)))
+            elif cmd == ")":
+                if scopes:
+                    base, previous, pushed = scopes.pop()
+            elif isinstance(cmd, dict):
+                prog, args = _program(cmd["words"])
+                if prog in _DIR_STEPS:
+                    base, previous = _dir_step(prog, args, base, previous, pushed)
+                    if _dir_expands(prog, args):  # known only at run time; so is every directory reached from it
+                        base = "$" + base
+                    dirs.add(base)
+
+
+_DIR_EXPANDS = re.compile(r"[*?\[{~$`]")
+
+
+def _dir_expands(prog, args):
+    """Whether the directory `cd`/`pushd` ARGS moves to is one the shell expands: an operand with a glob, brace, tilde,
+    variable or command substitution (`cd conf*`, `cd ~x`), or `cd` alone (`cd ~`). The parser cannot know it (sg1 round
+    12)."""
+    if prog == "popd":
+        return False
+    operands = [arg for arg in args if isinstance(arg, str) and arg != "-" and not arg.startswith(("-", "+"))]
+    if prog == "cd" and not operands and "-" not in args:
+        return True
+    return any(_DIR_EXPANDS.search(arg) for arg in operands)
+
+
+def _line_pieces(text, out, exempt=None, depth=0, dirs=None):
+    """Every word of `text` (quotes removed), each piece of it split at blanks and shell operators, and the same for the
+    text inside every word, substitution and here-document body, to any depth: process substitutions and groups are words
+    of the line too. The `exempt` text, once, adds only its checked words. False when the line is too deep or too large.
+    `dirs`: the directories the line's commands may run in, each text read as shell text adding the ones its `cd`s reach
+    from those found so far (_line_dirs)."""
+    if depth > _LINE_DEPTH:
+        return False
+    if dirs is not None:
+        _line_dirs(text, dirs, dirs)
+    for token in _tokens(text):
+        if token[0] == "op":
+            continue
+        inner = ["".join(token[1])] if token[0] == "heredoc" else [token[1]]
+        if token[0] == "word":
+            inner += token[2]  # its substitutions
+        for word in inner:
+            if not isinstance(word, str) or not word:
+                continue
+            if exempt and exempt[0] is not None and word == exempt[0]:
+                out.extend(exempt[1])
+                exempt[0] = None  # the exemption is for that one occurrence
+                continue
+            out.append(word)
+            out.extend(piece for piece in _SOURCE_SPLIT.split(word) if piece and piece != word)
+            if len(out) > _LINE_PIECES:
+                return False
+            # the word read as shell text once more (quotes, escapes, `$'...'`), unless that reads it as itself
+            if (token[0] == "heredoc" or [t[:2] for t in _tokens(word)] != [("word", word)]) and not _line_pieces(
+                    word, out, None, depth + 1, dirs):
+                return False
+    return True
+
+
+def _stdin_line_hit(command, base=""):
+    """The first sensitive name anywhere in a line that runs a stdin shell (_has_stdin_shell), with no cause; None for any
+    other line. When every name is a whole script text's operand (_whole_script_text), that script call's own hit."""
+    if not _has_stdin_shell(command, base):
+        return None
+    whole = _whole_script_text(command, base)
+    pieces, dirs = [], {base}
+    if not _line_pieces(command, pieces, list(whole) if whole else None, dirs=dirs) or len(dirs) > _LINE_DIRS:
+        return "stdin shell line", "the line is too deep or too large to check"
+    # Each name is judged in every directory the line may run it in (sg1 round 11: `cd config; ... local.json`). Where a
+    # directory is known only at run time (`cd "$x"`, `cd -`, `cd conf*`: _dir_expands), a name is judged as if under any
+    # directory, by the rule for an
+    # unknown working directory (_pair_tail: a bare `local.json` or `sessions` hits).
+    known = sorted(d for d in dirs if "$" not in d and "`" not in d)
+    hit = _first(_words_hit(pieces, d) for d in known) or (len(known) < len(dirs) and _anywhere_hit(pieces))
+    if hit:
+        _prompts_now()
+        return _because(None, hit)
+    # Every name was the operand of the whole text's script call: that call is judged as itself (its RUNS_CODE comes from
+    # the round-6 sites), whatever the receiving shell's options, so `echo 'bash tools/x.sh NAME' | bash -eu` is kept as
+    # `| bash -s` is.
+    return _shell_hit(whole[0], base) if whole else None
+
+
+def _process_source_hit(body, base, depth):
+    """The hit in a process substitution a shell or `.`/`source` runs as a script (`bash <(echo LINE)`): when its one
+    command prints text (echo, printf, a here-document to cat), that text is SHELL SOURCE; any other body is judged as
+    shell source itself, so a name in it has no cause (sg1 round 9)."""
+    cmds = [c for c in _commands(body) if isinstance(c, dict)]
+    if len(cmds) == 1 and (_program(cmds[0]["words"])[0] in _PRINTERS or cmds[0]["heredocs"] or cmds[0]["strings"]):
+        printed = _printed_source_hit(cmds[0], base, depth)
+        return printed or _because(None, _shell_hit(body, base, depth + 1))
+    return _because(None, _shell_hit(body, base, depth + 1, source=True))
+
+
+def _source_words_hit(cmd, base):
+    """A sensitive name among the words of one command of SHELL SOURCE (sg1 round 9): its words (a `NAME=value` assignment's
+    value, the operands of set, export, local, declare, echo), here-strings and redirect targets, each looked at alone. A word
+    is also split at blanks and shell operators, so printed source in one word (`echo 'f=FILE; cat "$f"'`, `-c "$(echo
+    ...)"`) has its words looked at too."""
+    words = [w for w in cmd["words"] + cmd["strings"] + cmd["inputs"] + cmd["outputs"] if isinstance(w, str)]
+    return _words_hit(words + [piece for w in words for piece in _SOURCE_SPLIT.split(w) if piece and piece != w], base)
+
+
+def _reads_source(prog, args, base):
+    """Whether `prog args` runs SHELL SOURCE from its standard input or a process substitution: a shell, or `.`/`source`
+    reading /dev/stdin (sg1 round 9)."""
+    return prog in _SHELLS or (prog in (".", "source") and _code_run(prog, args, base)[0] == _STDIN)
+
+
+def _runs_code(form):
+    """RUNS_CODE for a script file _code_run's positive parse shows (_SCRIPT); None for every other form: inline code in any
+    spelling, code on stdin, or no parse (sg1 round 7). The one place the cause is given."""
+    return RUNS_CODE if form == _SCRIPT else None
+
+
+def _words_hit(words, base):
+    """A sensitive name among `words`, each looked at alone: what follows inline code is the program's own arguments, so no
+    word is skipped as an option's text (`node -e CODE -e FILE`: FILE is process.argv's, sg1 round 7 attack)."""
+    return _first(_other_hit([word], base, True) for word in words if isinstance(word, str))
+
+
+def _anywhere_hit(words):
+    """A name among `words` that is a credential file under some directory the call may be in, when that directory is
+    known only at run time: the unknown-working-directory rule of _sensitive (_pair_tail), with _other_hit's strength."""
+    for word in words:
+        for piece in _PIECES.split(word) if isinstance(word, str) else ():
+            piece = piece.lstrip("@")
+            if piece and _PLAIN.match(piece) and _pair_tail(_expand(piece), False):
+                return piece, _NAME_REASON
+    return None
+
+
+def _before_program(cmd, prog, args):
+    """The words of `cmd` before the program that runs `args`: its assignments and wrappers (`F=x env G=y bash`), where
+    startup env and an env value are set. A `NAME=value` after the program is its argument, not its environment (sg1
+    round 8). When `args` is not found among the words (a line a wrapper hands a shell), every word, as before."""
+    words = cmd.get("words", []) if isinstance(cmd, dict) else []
+    args = list(args)
+    for k in range(len(words) - len(args), 0, -1):
+        name = posixpath.basename(words[k - 1]).lower() if isinstance(words[k - 1], str) else None
+        if words[k:k + len(args)] == args and _ALIASES.get(name, name) == prog:
+            return words[:k - 1]
+    return words
+
+
+def _startup_hit(words, base):
+    """A sensitive file a shell sources before it runs anything, named by `BASH_ENV=` or `ENV=` before it (_before_program)."""
+    for word in words:
+        name, equals, value = word.partition("=")
+        if equals and name in ("BASH_ENV", "ENV") and value:
+            hit = _other_hit([value], base, True) or _read_hit(value, base, False)
+            if hit:
+                return hit
+    return None
+
+
+def _input_text_hit(cmd, base):
+    """A sensitive name in the text a command gets on standard input (a here-string, a here-document body): a quoted
+    literal or a bare word. Inline code given it may read the file it names (sg1 round 7)."""
+    if not isinstance(cmd, dict):
+        return None
+    texts = list(cmd.get("strings", ())) + ["".join(holder) for holder, _ in cmd.get("heredocs", ())]
+    # every word alone: stdin text is data, so no word is skipped after `-e`, `-f` or `--` (sg1 round 8)
+    return _first(_literal_hit(text, base) or _words_hit(text.split(), base) for text in texts if isinstance(text, str))
+
+
+def _env_hit(words, base):
+    """A sensitive path that an assignment before the program (`F=config/local.json python3 -c ...`, `env F=... node -e
+    ...`; `words` from _before_program) hands the code it runs in its environment, whatever the variable is called."""
+    for word in words:
+        if isinstance(word, str) and _ASSIGN.match(word):
+            value = word.partition("=")[2]
+            hit = _other_hit([value], base, True) or _read_hit(value, base, False)
+            if hit:
+                return hit
+    return None
+
+
+# _code_run: how an interpreter or shell is shown to run a script file (sg1 round 6). Each program has a closed list of the
+# options that take no code: `flags` alone, `values` with one value after them, `forms` whole-word patterns (an attached or
+# `=` value); `code` are its inline-code options (a value after them, or `--eval=CODE`); `attached` the code letters that take
+# their code in the same word (`-c'CODE'`, `-ne'CODE'`) after any of the no-value letters of `cluster`; `sub` a subcommand
+# that may (or with `need`, must) come first; `script` an option whose value is the script (php -f). Anything else ends the
+# parse with no form: a list cannot hold every spelling of code, so what it does not hold is never shown to be a script.
+_SCRIPT, _STDIN, _INLINE = "script file", "code on stdin", "inline code"
+_SHELL_RUN = dict(flags={"-" + c for c in "euxvnfabhmpCETBHPilr"} | {"+" + c for c in "euxvnfabhmpCETBHP"} | {
+    "--login", "--norc", "--noprofile", "--posix", "--verbose", "--noediting", "--restricted", "--no-config"},
+    values={"-o", "+o", "-O", "+O", "--rcfile", "--init-file"}, stdin={"-s"}, dash_c="euxvnfabhmpCETBHPilr")
+_NODE_FORMS = r"--(?:max-old-space-size|max-semi-space-size|stack-size)=\d+|--unhandled-rejections=[\w-]+|--title=[\w.-]+"
+_RUN_TABLE = {
+    "python": dict(flags={"-b", "-bb", "-B", "-d", "-E", "-i", "-I", "-O", "-OO", "-P", "-q", "-s", "-S", "-u", "-v", "-vv",
+                          "-x", "-R"}, values={"-W", "-X", "--check-hash-based-pycs"}, code={"-c"}, attached="c",
+                   cluster="bBdEiIOPqRsSuvx"),
+    "node": dict(flags={"--no-warnings", "--no-deprecation", "--trace-warnings", "--trace-deprecation", "--trace-uncaught",
+                        "--enable-source-maps", "--preserve-symlinks", "--preserve-symlinks-main", "--expose-gc",
+                        "--experimental-vm-modules", "--experimental-strip-types", "--experimental-transform-types",
+                        "--abort-on-uncaught-exception", "--pending-deprecation", "--throw-deprecation", "--inspect",
+                        "--inspect-brk", "--watch"},
+                 values={"-r", "--require", "--import"}, forms=_NODE_FORMS, code={"-e", "--eval", "-p", "--print"}),
+    "bun": dict(flags={"--bun", "--smol", "--hot", "--watch", "--silent"}, code={"-e", "--eval", "-p", "--print"}, sub="run"),
+    "deno": dict(flags={"-A", "--allow-all", "-q", "--quiet", "--no-check", "--no-prompt", "--reload"},
+                 forms=r"--(?:allow|deny)-(?:read|write|net|env|run|sys|ffi|hrtime|import)(?:=\S*)?|--unstable(?:-[\w-]+)?",
+                 sub="run", need=True),
+    "ruby": dict(flags={"-w", "-W", "-W0", "-W1", "-W2", "-d", "-v", "--verbose", "-U", "--disable-gems", "--jit", "--yjit"},
+                 values={"-I", "-r"}, forms=r"-I[\w./-]+|-r[\w./-]+", code={"-e"}, attached="e", cluster="nplawdv"),
+    "perl": dict(flags={"-w", "-W", "-X", "-T", "-t", "-s"}, forms=r"-I[\w./-]+|-[Mm][\w:]+", code={"-e", "-E"},
+                 attached="eE", cluster="nplaswWTtX"),
+    "php": dict(flags={"-n", "-q", "-H", "-C", "-e"}, values={"-d", "-c"}, code={"-r", "-B", "-R", "-E"}, attached="rBRE",
+                script="-f"),
+    "osascript": dict(flags={"-i"}, values={"-l", "-s"}, code={"-e"}),
+    ".": dict(), "source": dict(),
+}
+_RUN_TABLE["python3"] = _RUN_TABLE["python"]
+for _shell in _SHELLS:
+    _RUN_TABLE[_shell] = _SHELL_RUN
+
+
+def _code_run(prog, args, base=""):
+    """What an interpreter or shell given `args` runs, by a positive parse (sg1 round 6): (form, codes, rest).
+
+    _SCRIPT: a script file (the operand, after options on the program's closed list and at most one `--`) that is not
+    `-`, /dev/stdin, /dev/fd/N or a sensitive file, `rest` its arguments, never read as options. _STDIN: the code is read
+    from standard input (`-`, /dev/stdin, no operand, a shell's -s), `rest` its arguments. _INLINE: the parse ended at an
+    inline-code option in a spelling the table knows, `codes` the code, `rest` what follows it. None: anything else (an
+    unknown option, a cluster, an attached value, a code option in another spelling, an option value or operand that is
+    sensitive): nothing shows a script file runs."""
+    table = _RUN_TABLE.get(prog)
+    if table is None:
+        return None, [], list(args)
+    flags, values, code = table.get("flags", set()), table.get("values", set()), table.get("code", set())
+    forms = re.compile(table["forms"]) if table.get("forms") else None
+    i, dashed = 0, False
+    if table.get("sub"):
+        if args[:1] == [table["sub"]]:
+            i = 1
+        elif prog == "deno" and args[:1] == ["eval"]:
+            return _deno_eval(args[1:])
+        elif table.get("need"):
+            return None, [], list(args)
+    while i < len(args):
+        arg = args[i]
+        if dashed or arg in ("-", "/dev/stdin", "/dev/fd/0") or not arg.startswith(("-", "+")) or arg == "+":
+            break
+        if arg == "--":
+            dashed, i = True, i + 1
+            continue
+        if arg in flags:
+            i += 1
+        elif forms and forms.fullmatch(arg):  # an attached or `=` value: a sensitive one is not a script's option
+            if _other_hit([arg.partition("=")[2] if "=" in arg else arg[2:]], base, True):
+                return None, [], list(args)
+            i += 1
+        elif arg in values or arg == table.get("script"):
+            if i + 1 >= len(args) or _other_hit([args[i + 1]], base, True):
+                return None, [], list(args)
+            if arg == table.get("script"):
+                return _script_operand(args[i + 1], args[i + 2:], base)
+            i += 2
+        elif arg in table.get("stdin", ()):
+            return _STDIN, [], list(args[i + 1:])
+        elif table.get("dash_c") and re.fullmatch(r"-[%s]*c[%s]*" % (table["dash_c"], table["dash_c"]), arg):
+            # a shell's -c alone or in a cluster of its no-value letters (`-lc`, `-cx`): the next word is the line
+            return (_INLINE, [args[i + 1]], list(args[i + 2:])) if i + 1 < len(args) else (None, [], list(args))
+        else:
+            return _inline(arg, args[i + 1:], table)
+    if i >= len(args):
+        return (_STDIN, [], []) if prog not in (".", "source") else (None, [], [])
+    return _script_operand(args[i], args[i + 1:], base)
+
+
+def _script_operand(operand, rest, base):
+    if operand in ("-", "/dev/stdin", "/dev/fd/0"):
+        return _STDIN, [], list(rest)
+    if operand.startswith(("/dev/fd/", "<(", "=(")) or _other_hit([operand], base, True) or _read_hit(operand, base, False):
+        return None, [], [operand, *rest]
+    return _SCRIPT, [], list(rest)
+
+
+def _inline(arg, rest, table):
+    """The parse ended at `arg`: inline code when it is a code option in a spelling the table knows, else no form."""
+    code, attached, cluster = table.get("code", set()), table.get("attached", ""), table.get("cluster", "")
+    name, equals, value = arg.partition("=")
+    if arg in code:
+        codes, rest = [rest[0] if rest else ""], rest[1:]
+    elif equals and name.startswith("--") and name in code:
+        codes = [value]
+    else:
+        letters = arg[1:] if arg.startswith("-") and not arg.startswith("--") else ""
+        at = next((j for j, letter in enumerate(letters) if letter not in cluster), len(letters))
+        if at >= len(letters) or letters[at] not in attached:
+            return None, [], [arg, *rest]
+        tail = letters[at + 1:]
+        codes, rest = ([tail], rest) if tail else ([rest[0] if rest else ""], rest[1:])
+    # What follows is left as it is (perl's further -e, a program argument that looks like an option): inline code has no
+    # cause whatever it holds, and every word of it is looked at for a sensitive name (sg1 round 7).
+    return _INLINE, codes, list(rest)
+
+
+def _deno_eval(args):
+    for i, arg in enumerate(args):
+        if arg in ("-p", "--print", "-q", "--quiet"):
+            continue
+        if arg.startswith("-"):
+            return None, [], list(args)
+        return _INLINE, [arg], list(args[i + 1:])
+    return _INLINE, [""], []
+
+
+def _git_output_hit(args, sub, rest, cmd, base, depth, bulk):
+    """A git subcommand other than grep: what it prints is history, a patch or an object (GIT_OUTPUT)."""
+    opts, before, after, values, _ = _split_args(rest, _GIT_VALUES)
+    operands = before + (after or [])
+    if sub == "diff" and "--no-index" in opts:
+        return _first(_read_hit(word, base) for word in operands) or _roots_hit(
+            "recursive diff", operands, base, _BULK_REASON)
+    if sub == "archive":
+        return _git_archive_hit(rest, cmd, base)
+    if sub == "stash":
+        if before[:1] in (["show"], ["list"]) and _git_patch("log", opts):
+            unproven = "git stash patch output", _STASH_REASON
+            if rest[:1] != ["show"] or not _queried(args, rest, cmd, depth, bulk):
+                return unproven
+            return _listed_hit("git stash show", _patch_query(sub, rest[1:], base), base, unproven)
+        return None
+    if sub in _GIT_READ:
+        hit = _first(_read_hit(word, base) for word in operands)
+    elif sub in _GIT_HISTORY:
+        hit = _first(_read_hit(word, base) for word in after or [])
+    else:
+        return None
+    if hit or sub not in _GIT_HISTORY | _GIT_DIFFS or not _git_patch(sub, opts):
+        return hit
+    hit = _git_patch_hit(sub, before, after, base)
+    if hit and sub in ("diff", "log") and _queried(args, rest, cmd, depth, bulk):
+        return _patch_listing(sub, rest, before, after, base, hit)
+    return hit
+
+
+def _dispatches(prog):
+    """Whether _command_hit hands `prog` to the dispatch loop at the end of _other_command_hit (a front end or task runner
+    running a program after it): no branch before that loop judges the program itself. Kept in step with those branches."""
+    return not (prog in (_OPAQUE, "xargs", "find", "fd", "fdfind", "git", "eval", "curl", "wget", "ssh", "tar")
+                or prog in _GREPS or prog in _SHELLS or prog in _INTERPRETERS or prog in _SCRIPT_FIRST
+                or prog in _READERS or prog in _LISTERS or prog in _SYNTAX)
+
+
+def _other_command_hit(prog, args, cmd, base, depth, bulk):
+    """Every program _command_hit does not judge itself."""
     if prog in ("curl", "wget"):
         files = [name for arg in args for name in re.findall(r"@([^;,\s]+)", arg)]
         for i, arg in enumerate(args):
@@ -2083,8 +2740,11 @@ def _command_hit(prog, args, cmd, base, depth, bulk=False):
         remote = command_wrappers.unwrap("ssh", args)  # what follows the host, options included, is the remote command line
         if remote is command_wrappers.UNKNOWN:
             return _command_hit(_OPAQUE, args, cmd, base, depth)
-        return _first(_read_hit(word, base) for word in values) or (
-            (_unresolved(remote[1]) or _shell_hit(remote[1], "", depth + 1)) if remote else None)
+        # The key files ssh reads to log in, and the remote host's files: no local safe tool reads them. A command ssh runs
+        # here (ProxyCommand, LocalCommand, KnownHostsCommand) is not elsewhere: with one, the hit has no cause.
+        here = re.search(r"(?i)(?:proxy|local|knownhosts)command", " ".join(args))
+        return _because(None if here else ELSEWHERE, _first(_read_hit(word, base) for word in values) or (
+            _unresolved(remote[1]) or _shell_hit(remote[1], "", depth + 1) if remote else None))
     if prog in _SCRIPT_FIRST:
         _, before, after, values, has_script = _split_args(args, *_SCRIPT_ARGS)
         operands = before + (after or [])
@@ -2116,32 +2776,55 @@ def _command_hit(prog, args, cmd, base, depth, bulk=False):
             hit = _roots_hit("recursive read", operands[1:] if prog == "zip" else operands, base, _BULK_REASON)
             if hit:
                 return hit
-        return _first(_read_hit(word, base) for word in operands + values)
+        hit = _first(_read_hit(word, base) for word in operands + values)
+        script = _code_run(prog, args, base)[0] if prog in (".", "source") else None
+        if script == _STDIN and not hit:  # `... | source /dev/stdin`: what the pipe prints is SHELL SOURCE, its hit the
+            return _piped_source_hit(cmd, base, depth)  # cause of what that source runs, as for a shell (sg1 round 9)
+        # `. FILE ARGS` / `source FILE ARGS`: SCRIPT FILE when _code_run shows FILE is a script; a sensitive FILE is not one.
+        return _because(TRANSFORM if prog in _TRANSFORMS else _runs_code(script), hit)
     if prog in _LISTERS or prog in _SYNTAX:
         return None
     hit = _other_hit(args, base)
-    if hit:
-        return hit
+    if hit:  # a container's own operands (`docker run --env-file .env`) go into it; any other program's have no cause
+        return _because(ELSEWHERE if prog in _ELSEWHERE else None, hit)
     # A container, remote or task runner may still run a reader.
     for i, arg in enumerate(args):
         name = posixpath.basename(arg).lower()
         name = _ALIASES.get(name, name)
         if name in _INNER and (prog in _FRONT_ENDS or any(word in _RUN_WORDS for word in args[:i])):
-            return _command_hit(name, args[i + 1:], cmd, base, depth, bulk)
+            inner = _command_hit(name, args[i + 1:], cmd, base, depth, bulk)
+            # In a container or VM it runs elsewhere; through a local runner (npx, strace, `poetry run`) it is what it is.
+            return _because(ELSEWHERE, inner) if prog in _ELSEWHERE else inner
     return None
 
 
 def _document_hit(prog, cmd, base, depth):
-    """Here-documents and here-strings: path literals always, commands when a shell receives them."""
+    """Here-documents and here-strings: path literals always, commands when a shell (or `.`/`source` of /dev/stdin) receives
+    them."""
+    shell = _reads_source(prog, _program(cmd["words"])[1], base)
     for holder, expands in cmd["heredocs"]:
         body = "".join(holder)
-        hit = _literal_hit(body, base) or (
-            _first(_shell_hit(inner, base, depth + 1) for inner in _substitutions(body)) if expands else None) or (
-            _shell_hit(body, base, depth + 1) if prog in _SHELLS else None)
+        subs = [_shell_hit(inner, base, depth + 1) for inner in _substitutions(body)] if expands else []
+        hit = _literal_hit(body, base) or _first(subs)
+        if shell:  # a shell runs the body: SHELL SOURCE (_commands_hit `source`)
+            if hit:
+                _prompts_now()  # the cause is that of what it runs, none when it runs nothing found
+                ran = _shell_hit(body, base, depth + 1, source=True)
+                return _because(_cause(ran) if ran else None, hit)
+            hit = _shell_hit(body, base, depth + 1, source=True)
+            if hit:
+                return hit
+            continue
         if hit:
-            return hit
-    if prog in _SHELLS:
-        return _first(_shell_hit(text, base, depth + 1) for text in cmd["strings"])
+            # Text on a program's standard input. A script file's input is project code's (RUNS_CODE); the code itself on
+            # stdin, or inline code's input, is inline code, which has no cause (sg1 round 7); a substitution the shell runs
+            # in it is judged as any command, and one with no cause is that hit's. Any other program reads it as text
+            # (`cat <<EOF`): no cause.
+            unsearched = all(_cause(sub) for sub in subs if sub)
+            form = _code_run(prog, _program(cmd["words"])[1], base)[0] if prog in _INTERPRETERS else None
+            return _because(_runs_code(form) if unsearched else None, hit)  # SCRIPT FILE; anything else: no cause
+    if shell:
+        return _first(_shell_hit(text, base, depth + 1, source=True) for text in cmd["strings"])
     return None
 
 
@@ -2206,17 +2889,91 @@ def _keeps_state(prog, args, cmd):
     return prog in _QUIET
 
 
-def _shell_hit(command, base="", depth=0):
+def _shell_hit(command, base="", depth=0, source=False):
+    """The first hit in a shell command line, or None. It has a non-search cause (_NonSearch) only when every hit in the line
+    has one: a hit with none anywhere (`python3 -c ...; grep TOKEN config/`) takes it away, though the target stays the first
+    hit's, so the prompt reads as it did, and the line refuses in a worker (sg1). `source`: the line is SHELL SOURCE another
+    shell runs (_commands_hit)."""
     inline = INLINE_NAME.search(command)
     if inline and not _only_printed(command):
-        return inline.group(0), _NAME_REASON
+        named = inline.group(0), _NAME_REASON
+        if depth > 4:
+            return named
+        # The name may be in any command. Its cause is the one the commands, judged one by one, give: none when any hit has
+        # none, or when a command names it and no look accounts for it (`grep -f .env x`, _commands_hit `named`).
+        # The call prompts whatever that finds, so the owner's trust has nothing left to lift.
+        _prompts_now()
+        try:
+            found = _commands_hit(command, base, depth, named=True, source=source)
+        except Exception:  # what the name alone found stands, with no cause
+            found = None
+        return _because(_cause(found), named)
     if depth > 4:
         return "nested shell command", "command nesting is too deep to verify"
+    return _commands_hit(command, base, depth, source=source)
+
+
+def _prompts_now():
+    """The call has a hit, so it prompts whatever else is found: the owner's trust has nothing left to lift, and the rest of
+    the look (for a search or read, _shell_hit) notes no lift. classify puts the resolver back when the call is judged."""
+    _SHELL.update(trust=None)
+
+
+_DIR_STEPS = ("cd", "pushd", "popd")
+
+
+def _dir_step(prog, args, base, previous, pushed):
+    """(base, previous) after `cd`/`pushd`/`popd` ARGS run in `base`; `pushed` is the pushd stack, changed in place. A
+    directory known only at run time (`cd "$x"`, `cd -` with no earlier cd, an empty stack) is a `$` text."""
+    if prog == "cd":
+        target = next((arg for arg in args if arg == "-" or not arg.startswith("-")), "~")
+        flags = args[:args.index(target)] if target in args else args
+        physical = any(flag.startswith("-") and "P" in flag for flag in flags)
+        return (previous if target == "-" else _cd(base, target, physical)), base
+    if prog == "pushd":
+        target = next((arg for arg in args if not arg.startswith(("-", "+"))), None)
+        pushed.append(base)
+        return (_cd(base, target) if target else "$DIRSTACK"), previous
+    return (pushed.pop() if pushed else "$DIRSTACK"), previous
+
+
+def _commands_hit(command, base, depth, named=False, source=False):
+    """The first hit in the commands of a line, with a non-search cause only when every hit the look finds has one.
+
+    `named`: the line names a sensitive file (_shell_hit). A command that names one where no look below finds a hit is a
+    hit too, so the name is never left without a cause decided for it: one that only names or prints files (a lister, a
+    printer, cd, a loop's word list) has NAMES_ONLY; any other (`grep -f .env x`, whose pattern file no look reads) none.
+
+    `source`: the line is SHELL SOURCE another shell runs (a shell's -c line, eval, a here-document, here-string or pipe a
+    shell reads as code, under any wrapper). Every command is judged as above, and a command whose look finds no hit is then
+    checked word by word (_source_words_hit): a sensitive name in it (`set -- -e FILE`, `f=FILE`, `export F=FILE`,
+    `echo FILE`) may reach a later command through a variable no look follows, so it has no cause and refuses in a worker,
+    and so do names in command substitutions inside it (sg1 round 9). A look that finds a hit keeps its decision (round 6's
+    script file: `bash -c 'python3 tools/x.py FILE'`)."""
     # Directory context: `cd -` target, pushd stack, enclosing subshells, and open loops with the
     # hit their word list or their file-name producer would cause once a command reads the loop
     # variable (any command but a lister for a word list, a reader for a `while read` loop).
     # `settled` holds while every command so far leaves the repository as a git query finds it now.
     previous, pushed, scopes, loops, settled = "$OLDPWD", [], [], [], True
+    first, seen = None, False  # the first hit; whether the command being judged had one
+
+    def stop(hit):
+        """Whether `hit` ends the look: one with no non-search cause does, the line refuses in a worker whatever else it
+        holds; one with a cause is kept (the first as `first`) and the look goes on for one with none."""
+        nonlocal first, seen
+        if not hit:
+            return False
+        seen = True
+        if first is None:
+            first = hit
+        if _cause(hit) is None:
+            return True
+        _prompts_now()
+        return False
+
+    def tokens():
+        return tuple(f"{form}" for names, _, _ in loops for name in names for form in (f"${{{name}}}", f"${name}"))
+
     for cmd in _commands(command):
         if cmd == "(":
             scopes.append((base, previous, list(pushed)))
@@ -2225,25 +2982,35 @@ def _shell_hit(command, base="", depth=0):
             if scopes:
                 base, previous, pushed = scopes.pop()
             continue
+        seen = False
         prog, args = _program(cmd["words"])
         listed = None
+        if (prog in _SHELLS or prog in (".", "source")) and _code_run(prog, args, base)[0] != _SCRIPT:
+            # `bash <(echo LINE)`, `source <(printf ...)`: the process substitution's text is SHELL SOURCE (sg1 round 9)
+            for match in _INPUT_SUB.finditer(command):
+                body = command[match.end():_close_paren(command, match.end()) - 1]
+                if stop(_process_source_hit(body, base, depth)):  # the cause is what that source runs
+                    return _because(None, first)
         for inner in cmd["subs"]:
-            hit = _shell_hit(inner, base, depth + 1)
-            if hit:
-                return hit
+            if stop(_shell_hit(inner, base, depth + 1, source=source)):
+                return _because(None, first)
             for item in _commands(inner) if any(pending for _, pending, _ in loops) else []:
                 name, rest = _program(item["words"]) if isinstance(item, dict) else (None, [])
                 hit = _loop_hit(loops, name, rest + item["inputs"]) if name else None
-                if hit:
-                    return hit
+                if stop(_because(_program_cause(item["words"], base, depth, tokens()), hit)):
+                    return _because(None, first)
             if prog in _BULK or prog == "for":
                 listed = listed or _listing_hit(inner, base)
-        if listed and prog != "for":
-            return listed
-        hit = _first(_read_hit(word, base) for word in cmd["inputs"]) or _document_hit(prog, cmd, base, depth) or _floor_hit(
-            cmd["words"], cmd, base, depth)
-        if hit:
-            return hit
+        # Names a listing produced reach the command as its words: its cause is what it does with such a file.
+        if listed and prog != "for" and stop(_because(_program_cause(cmd["words"], base, depth), listed)):
+            return _because(None, first)
+        # What `< FILE` feeds a command is what it searches, reads or runs: its cause is the command's own with the file
+        # given to it. A here-document is text, not a file (_document_hit judges it), nor is it the floor's (_floor_hit).
+        fed = _first(_read_hit(word, base) for word in cmd["inputs"])
+        fed = _because(_program_cause(cmd["words"], base, depth, stdin=True), fed)
+        for hit in (fed, _document_hit(prog, cmd, base, depth), _floor_hit(cmd["words"], cmd, base, depth)):
+            if stop(hit):
+                return _because(None, first)
         if cmd["words"][:1] in (["while"], ["until"]):
             fed = None
             if prog == "read" and cmd["piped"]:
@@ -2252,17 +3019,8 @@ def _shell_hit(command, base="", depth=0):
                 fed = _first(_listing_hit(command[match.end():_close_paren(command, match.end()) - 1], base)
                              for match in _PROCESS_SUB.finditer(command))
             loops.append((_read_names(args) if fed else (), fed, True))
-        if prog == "cd":
-            target = next((arg for arg in args if arg == "-" or not arg.startswith("-")), "~")
-            flags = args[:args.index(target)] if target in args else args
-            physical = any(flag.startswith("-") and "P" in flag for flag in flags)
-            base, previous = previous if target == "-" else _cd(base, target, physical), base
-        elif prog == "pushd":
-            target = next((arg for arg in args if not arg.startswith(("-", "+"))), None)
-            pushed.append(base)
-            base = _cd(base, target) if target else "$DIRSTACK"
-        elif prog == "popd":
-            base = pushed.pop() if pushed else "$DIRSTACK"
+        if prog in _DIR_STEPS:
+            base, previous = _dir_step(prog, args, base, previous, pushed)
         elif prog == "for":
             words = args[args.index("in") + 1:] if "in" in args else []
             loops.append((tuple(arg for arg in args[:1] if arg), listed or _first(_read_hit(word, base) for word in words), False))
@@ -2271,11 +3029,22 @@ def _shell_hit(command, base="", depth=0):
                 loops.pop()
         elif prog:
             cmd["settled"] = settled and not loops
-            hit = _loop_hit(loops, prog, args + cmd["inputs"]) or _command_hit(prog, args, cmd, base, depth)
-            if hit:
-                return hit
+            looped = _loop_hit(loops, prog, args + cmd["inputs"])
+            if stop(_because(_program_cause(cmd["words"], base, depth, tokens()), looped)):
+                return _because(None, first)
+            if stop(_command_hit(prog, args, cmd, base, depth)):
+                return _because(None, first)
+        if source and not seen and stop(_because(None, _source_words_hit(cmd, base))):
+            return _because(None, first)  # SHELL SOURCE: a name no look accounts for has no cause (sg1 round 9)
+        if named and not seen and any(INLINE_NAME.search(word) for word in cmd["words"] + cmd["inputs"]):
+            # A name no look above accounts for. Only a command that names or prints files without opening them gives a
+            # cause; any other (`grep -f .env README.md`: the pattern file is read) refuses in a worker.
+            names_only = prog in _LISTERS | _PRINTERS | _SYNTAX | _NAMES_ONLY_WORDS or prog is None
+            hit = INLINE_NAME.search(" ".join(cmd["words"] + cmd["inputs"])).group(0), _NAME_REASON
+            if stop(_because(NAMES_ONLY if names_only else None, hit)):
+                return _because(None, first)
         settled = settled and bool(prog) and _keeps_state(prog, args, cmd)
-    return None
+    return first
 
 
 def _glob_can_match(glob):
@@ -2358,7 +3127,13 @@ def classify(tool, params, cwd=None, trust=None):
             hit = _tool_hit(tool, params)
         elif tool in _SHELL_TOOLS:
             command = str(params.get("command") or "")
-            hit = _shell_hit(command.replace("\\", "/") if tool.lower() == "powershell" else command)
+            command = command.replace("\\", "/") if tool.lower() == "powershell" else command
+            hit = _shell_hit(command)
+            line = _stdin_line_hit(command)  # a line that runs a stdin shell fails closed (sg1 round 10)
+            if line and _cause(line) is None:
+                hit = _because(None, hit or line)
+            elif line and not hit:  # its names are only a whole script text's operands
+                hit = line
     except Exception:  # a guard that cannot parse the call must not wave it through
         hit = "unparsed tool call", "the call could not be analysed"
     finally:
@@ -2371,7 +3146,11 @@ def classify(tool, params, cwd=None, trust=None):
         except Exception:       # a log that cannot be written changes nothing
             pass
     if hit:
-        return {"sensitive": True, "target": hit[0], "reason": hit[1]}
+        # "non_search": the closed-list cause (NON_SEARCH_CAUSES) the classifier gave a shell hit, or None. A worker's shell
+        # call with none is refused (sg1 round 4): "worker_refuse". Read and Grep tool asks keep their ask.
+        cause = _cause(hit) if tool in _SHELL_TOOLS else None
+        return {"sensitive": True, "target": hit[0], "reason": hit[1], "non_search": cause,
+                "worker_refuse": tool in _SHELL_TOOLS and cause is None}
     return {"sensitive": False}
 
 
@@ -2379,11 +3158,414 @@ def hook_response(event, cwd=None, trust=None):
     return response_for(classify(event.get("tool_name", ""), event.get("tool_input", {}), cwd or event.get("cwd"), trust))
 
 
-def response_for(result):
-    """The PreToolUse `ask` for a classification, or None when it is not sensitive."""
+# The safe tools by harness: (search, read). Claude's come from the tmux-pi-safe MCP server (claude/mcp/safe.mjs), pi's from
+# agent/extensions/safe.ts. Both redact what they return and never ask.
+SAFE_TOOL_NAMES = {"claude": ("mcp__tmux-pi-safe__safe_grep", "mcp__tmux-pi-safe__safe_read"),
+                   "pi": ("safe_grep", "safe_read")}
+# The shell searches and reads are _search_read's. Moving between directories, printing and the filters output is piped
+# through are neither, and are no other command either. Anything else (an interpreter, `ls`, base64, find -exec, git show)
+# is another command: the safe tools do not replace it, and the guidance says to run it separately (_route_parts).
+_ROUTE_FILTERS = {"sort", "uniq", "cut", "wc", "tr", "column", "fold", "fmt"}
+_ROUTE_QUIET = (_QUIET - {"cd", "pushd", "popd"}) | {":", "exit", "sleep"}
+_ROUTE_READ_ARGS = ({"-n", "-c", "--lines", "--bytes"}, "nc")
+# A word the shell still expands ($VAR, ${..}, $(..), `..`): what it stands for is not known here, so nothing is named from it.
+_UNKNOWN_WORD = re.compile(r"\$[\w{(@*#?!$-]|`")
+# git options before `grep` that change nothing about what it searches (-C and -c are read on their own).
+_GIT_PLAIN = {"--no-pager", "-P", "--paginate"}
+
+
+_REGEX_SPECIAL = set("\\.^$|?*+()[]{}")
+_BRE_SWAPPED = set("|(){}+?")  # escaped in a basic regex to be special, bare in an extended one
+
+
+def _as_safe_regex(pattern, syntax):
+    """`pattern` as the extended (ripgrep) regex safe_grep runs: a basic regex (grep's and git grep's default) has its
+    `\\|`, `\\(`, ... made bare and its bare `|`, `(`, ... escaped; fixed strings have every special character escaped."""
+    if syntax == "extended":
+        return pattern
+    out, i = [], 0
+    while i < len(pattern):
+        char = pattern[i]
+        if syntax == "fixed":
+            out.append("\\" + char if char in _REGEX_SPECIAL else char)
+        elif char == "\\" and i + 1 < len(pattern):
+            nxt = pattern[i + 1]
+            out.append(nxt if nxt in _BRE_SWAPPED else char + nxt)
+            i += 1
+        else:
+            out.append("\\" + char if char in _BRE_SWAPPED else char)
+        i += 1
+    return "".join(out)
+
+
+def _route_grep(prog, args):
+    """(pattern, paths, ignore_case, recursive) of one grep-family or `git grep` command, or None when there is no one
+    pattern to name (patterns from a file, a pattern the shell still expands) or, for git grep, when it searches a revision.
+
+    Short options are read as a cluster (`-rni`, `-A3`, `-efoo`): a letter that takes a value takes the rest of the word,
+    or the next word. Several patterns (`-e a -e b`) are named as one alternation."""
+    git = prog == "git"
+    spec = _GIT_GREP_ARGS if git else _RG_ARGS if prog in _ALWAYS_RECURSIVE else _GREP_ARGS
+    value_opts, value_letters, pattern_opts, pattern_letters = spec
+    syntax = "extended" if prog in _ALWAYS_RECURSIVE or prog == "egrep" else "fixed" if prog == "fgrep" else "basic"
+    modes = {"E": "extended", "P": "extended", "F": "fixed", "G": "basic"}
+    if prog in _ALWAYS_RECURSIVE:
+        modes = {"F": "fixed"}
+    longs = {"--extended-regexp": "extended", "--perl-regexp": "extended", "--fixed-strings": "fixed",
+             "--basic-regexp": "basic"}
+    patterns, operands, ignore, i, after, recursive, dash = [], [], False, 0, False, False, None
+    while i < len(args):
+        arg = args[i]
+        i += 1
+        if after or arg == "-" or not arg.startswith("-"):
+            operands.append(arg)
+        elif arg == "--":
+            after, dash = True, len(operands)
+        elif arg.startswith("--"):
+            name, equals, value = arg.partition("=")
+            ignore = ignore or name == "--ignore-case"
+            recursive = recursive or name in ("--recursive", "--dereference-recursive") or (
+                name == "--directories" and (value if equals else args[i] if i < len(args) else "") == "recurse")
+            syntax = longs.get(name, syntax) if not (prog in _ALWAYS_RECURSIVE and name != "--fixed-strings") else syntax
+            if name in pattern_opts:
+                if name == "--file":
+                    return None  # patterns from a file: there is no one pattern to name
+                patterns.append(value if equals else args[i] if i < len(args) else "")
+                i += 0 if equals else 1
+            elif name in value_opts and not equals:
+                i += 1
+        else:
+            for at in range(1, len(arg)):
+                letter, rest = arg[at], arg[at + 1:]
+                if letter in pattern_letters:
+                    if letter == "f":
+                        return None
+                    patterns.append(rest if rest else args[i] if i < len(args) else "")
+                    i += 0 if rest else 1
+                    break
+                if letter in value_letters:
+                    recursive = recursive or (letter == "d" and not git and prog not in _ALWAYS_RECURSIVE and
+                                              (rest or (args[i] if i < len(args) else "")) == "recurse")
+                    i += 0 if rest else 1
+                    break
+                ignore = ignore or letter == "i"
+                recursive = recursive or (letter in "rR" and not git and prog not in _ALWAYS_RECURSIVE)
+                syntax = modes.get(letter, syntax)
+    if not patterns:
+        if not operands:
+            return None
+        patterns, operands = [operands[0]], operands[1:]
+        dash = None if dash is None else dash - 1
+    if git and dash:
+        return None  # `git grep x REV -- path`: the words before `--` are revisions, a tree the safe tools cannot search
+    if any(_UNKNOWN_WORD.search(p) for p in patterns):
+        return None
+    if any("\n" in p for p in patterns):
+        patterns = [part for p in patterns for part in p.split("\n")]  # grep reads each line as its own pattern
+    pattern = "|".join(_as_safe_regex(p, syntax) for p in patterns)
+    return pattern, operands, ignore, recursive or git or prog in _ALWAYS_RECURSIVE
+
+
+def _moved(base, target):
+    """Where `target` is from directory `base` (relative to the call's directory, "" for it), or None when unknown."""
+    if base is None or target is None or target == "-" or _UNKNOWN_WORD.search(target):
+        return None
+    if target == "~" or target.startswith(("/", "~/")):
+        return target
+    if target.startswith("~"):
+        return None  # ~user: whose home is not known here
+    return posixpath.join(base, target) if base else target
+
+
+def _place(path, base, cwd):
+    """`path` as the shell opens it from `base`, named so both safe tools open the same file: absolute from the call's
+    directory when it is known (the safe tools resolve a relative path from their own directory, which a worker's shell
+    may have left), as given otherwise. None when it is not known.
+
+    The kernel resolves `..` against the directory reached so far, a symlink's target and not the link (`link/../x` is
+    x beside the link's target): such a path is named by resolving its part up to the last `..` (realpath), never by
+    dropping `link/..` as text, which would name a different file. One that cannot be resolved here (relative with the
+    call's directory unknown, or under `~`) is None: the guidance is then generic."""
+    where = _moved(base, path)
+    dotted = where is not None and ".." in where.split("/")
+    if where is None or where.startswith("~"):
+        return None if dotted else where  # the safe tools expand `~/` as the shell does
+    if not where.startswith("/") and cwd:
+        where = posixpath.join(cwd, where)
+    if not dotted:
+        return posixpath.normpath(where)
+    if not where.startswith("/"):
+        return None
+    parts = where.split("/")
+    last = len(parts) - 1 - parts[::-1].index("..")
+    return posixpath.normpath(posixpath.join(os.path.realpath("/".join(parts[:last + 1]) or "/"), *parts[last + 1:]))
+
+
+def _search_targets(words, base, cwd, globs=True):
+    """[(path, glob)] for the file operands of a search, after the shell's brace and glob expansion: a glob in the last
+    part becomes safe_grep's `glob` under its directory; one anywhere else, or (for a read, `globs` false) at all, cannot
+    be named, nor can a word the shell still expands. None when any operand cannot be named."""
+    out = []
+    for word in words:
+        for choice in _brace_expand(word):
+            if choice == "-":
+                return None  # standard input among the files
+            head, tail = posixpath.split(choice)
+            if _GLOB.search(head) or (_GLOB.search(tail) and (not globs or "{" in tail)):
+                return None
+            where = _place((head or ".") if _GLOB.search(tail) else choice, base, cwd)
+            if where is None:
+                return None
+            out.append((where, tail if _GLOB.search(tail) else None))
+    return out
+
+
+def _dash_c(args):
+    """The command line a shell's `-c` (alone or in a cluster: `-lc`, `-ec`) hands it, or None when it has none."""
+    at = _dash_c_at(args)
+    return None if at is None else args[at]
+
+
+def _dash_c_at(args):
+    """The index in `args` of the command line a shell's `-c` hands it (the words after it are $0, $1, ...), or None.
+
+    Only the shell's own options are read: the first operand (a script file) or `--` ends them, and what follows belongs to
+    the script (`bash tools/x.sh -c x`: the script's -c, sg1 round 6)."""
+    skip = False
+    for i, arg in enumerate(args[:-1]):
+        if skip:
+            skip = False
+        elif arg == "--" or not arg.startswith(("-", "+")) or arg in ("-", "+"):
+            return None
+        elif re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", arg):  # `-c`, `-lc`, `-cx`: the first word after it is the line
+            return i + 1
+        elif arg in _SHELL_RUN["values"]:
+            skip = True
+    return None
+
+
+def _git_worktree(args):
+    """Whether `git grep ARGS` searches the work tree's files: not the index (`--cached`), nor files git does not track as
+    a filesystem walk the safe tools match one to one (`--no-index`). A revision among its operands is _route_parts'."""
+    for arg in args:
+        if arg == "--":
+            return True
+        if arg in ("--cached", "--no-index"):
+            return False
+    return True
+
+
+def _route_parts(command, cwd=None, base=""):
+    """The shell searches and reads in a command (_search_read), and whether it holds any other command.
+
+    This only decides which safe calls the guidance names; whether the call is refused is the classifier's (classify's
+    "worker_refuse": no non-search cause, sg1 round 4). Each search or read is {"calls": [...]}: the safe calls that do what it does, ("grep", pattern, path,
+    glob, ignore_case) or ("read", path); None when it cannot be named faithfully (patterns from a file, a revision or the
+    index, a target the shell computes, xargs, a search inside a substitution). `base` is where the command starts,
+    relative to the call's directory ("" for it, None when unknown): a `sh -c` script starts where its shell does."""
+    parts, other, stack, scopes, before = [], False, [], [], None
+    for item in _commands(command):
+        if item in ("(", ")"):
+            if item == "(":
+                scopes.append((base, list(stack)))
+            elif scopes:
+                base, stack = scopes.pop()
+            before = None
+            continue
+        words = item["words"]
+        prog, args = _program(words)
+        fed, before = (before if item["piped"] else None), None
+        heredoc_subs = [inner for holder, expands in item["heredocs"] if expands for inner in _substitutions("".join(holder))]
+        for inner in item["subs"] + heredoc_subs:
+            if _route_parts(inner, cwd, None)[0]:
+                parts.append({"calls": None})  # a search in `$(...)` runs too, in a word or an expanding here-document
+        if prog is None:
+            other = other or bool(words or item["inputs"] or item["outputs"])
+            continue
+        dynamic = bool(item["subs"] or item["heredocs"])
+        script = " ".join(args) if prog == "eval" else _dash_c(args) if prog in _SHELLS else None
+        if script is not None:
+            # `sh -c LINE` / `eval WORDS` run LINE as this shell would: its searches are named as if typed here.
+            inner, more = _route_parts(script, cwd, base)
+            parts += inner
+            other = other or more or not inner
+        elif prog == "xargs":
+            found = command_wrappers.unwrap("xargs", args)
+            sub, rest = _program(found[1]) if isinstance(found, tuple) and found[0] == "words" else (None, [])
+            if _search_read(sub, rest) or (sub and _route_parts(" ".join(map(shlex.quote, found[1])), cwd, None)[0]):
+                parts.append({"calls": None})  # it searches or reads files its input names (`xargs sh -c 'grep ...'` too)
+            else:
+                other = True
+        elif prog == "git":
+            rest, where, plain = list(args), base, True
+            while rest and rest[0].startswith("-"):
+                option = rest.pop(0)
+                if option == "-C" and rest:
+                    where = _moved(where, rest.pop(0))
+                elif option == "-c" and rest:
+                    rest.pop(0)
+                elif option not in _GIT_PLAIN:
+                    plain = False  # --git-dir, --work-tree, ...: what it searches is not read here
+            if not rest or rest[0] != "grep":
+                other = True
+                continue
+            found = _route_grep("git", rest[1:]) if plain and not dynamic and _git_worktree(rest[1:]) else None
+            targets = None
+            if found and not any(_GLOB.search(p) or p.startswith(":") for p in found[1]):
+                # pathspecs are relative to where git runs; a glob or magic pathspec is git's own matching, not the shell's
+                targets = _search_targets(found[1], where, cwd, globs=False) if found[1] else (
+                    None if where is None else [(_place(".", where, cwd), None)])
+            if targets and not all(os.path.exists(os.path.expanduser(path)) for path, _ in targets):
+                targets = None  # an operand that is no file here is a revision (`git grep x HEAD`): a tree, not a file
+            parts.append({"calls": [("grep", found[0], path, None, found[2]) for path, _ in targets] if targets else None})
+        elif prog in _GREPS:
+            found = None if dynamic else _route_grep(prog, args)
+            if found is None:
+                parts.append({"calls": None})
+                continue
+            pattern, operands, ignore, recursive = found
+            if operands:
+                targets = _search_targets(operands, base, cwd)
+            elif recursive and prog not in _ALWAYS_RECURSIVE:
+                targets = [(_place(".", base, cwd), None)]  # grep -r with no file searches its directory, whatever stdin is
+            elif item["inputs"]:
+                targets = _search_targets(item["inputs"][-1:], base, cwd, globs=False)  # the last `<` is what it reads
+            elif item["piped"]:
+                if not fed:
+                    continue  # it filters another command's output: no file is searched
+                targets = None if fed["calls"] is None else [(call[1], None) for call in fed["calls"]]
+                fed["calls"] = None if targets is None else []  # the file it reads is searched here, not read
+            elif item["strings"] or prog not in _ALWAYS_RECURSIVE:
+                continue  # it searches a here-string or the terminal
+            else:
+                targets = [(_place(".", base, cwd), None)]  # rg, ag, ... with no path search their directory
+            if targets and any(path is None for path, _ in targets):
+                targets = None
+            parts.append({"calls": [("grep", pattern, path, glob, ignore) for path, glob in targets] if targets is not None
+                          else None})
+        elif _search_read(prog, args):  # one of _ROUTE_READERS, or `sed -n`
+            if prog in ("sed", "gsed"):
+                _, before_dash, after_dash, _, has_script = _split_args(args, *_SCRIPT_ARGS)
+                files = (before_dash if has_script else before_dash[1:]) + (after_dash or [])
+            else:
+                # head and tail take a count after -n / -c; cat -n, nl and the rest take no value
+                _, before_dash, after_dash, _, _ = _split_args(args, *(_ROUTE_READ_ARGS if prog in ("head", "tail") else ()))
+                files = before_dash + (after_dash or [])
+            files = [f for f in files if f != "-"] or list(item["inputs"][-1:])
+            if not files:
+                continue  # it reads its standard input: a filter
+            targets = None if dynamic else _search_targets(files, base, cwd, globs=False)
+            entry = {"calls": None if targets is None else [("read", path) for path, _ in targets]}
+            parts.append(entry)
+            before = entry
+        elif prog in ("cd", "pushd", "popd"):
+            if prog == "popd":
+                base = stack.pop() if stack else None
+                continue
+            target = [a for a in args if a == "-" or not a.startswith("-")]
+            if prog == "pushd":
+                stack.append(base)
+            # The shell's `cd` is logical: `cd link/..` is back where it started, as text. Its later relative paths are
+            # opened from there by the kernel (_place resolves their own `..`). `-P` is physical: not named here.
+            flags = args[:args.index(target[0])] if target else args
+            physical = any(a.startswith("-") and a != "-" and "P" in a for a in flags)
+            base = None if dynamic or physical else _moved(base, target[0] if target else ("~" if prog == "cd" else None))
+            if base and ".." in base.split("/"):
+                base = None if base.startswith("~") else posixpath.normpath(base)
+        elif prog in ("find", "fd", "fdfind") and any(_route_parts(run, cwd, None)[0] for run in _execs(prog, args)):
+            parts.append({"calls": None})  # it searches or reads each file it finds (find -exec grep, fd -x cat)
+        elif prog not in _ROUTE_FILTERS and prog not in _ROUTE_QUIET:
+            other = True
+    return parts, other
+
+
+def _execs(prog, args):
+    """The commands `find -exec ...` / `fd -x ...` run, as shell lines, for _route_parts."""
+    runs, i = [], 0
+    while i < len(args):
+        if args[i] in (_FIND_EXEC if prog == "find" else _FD_EXEC):
+            end = next((j for j in range(i + 1, len(args)) if args[j] in (";", "+")), len(args)) if prog == "find" else len(args)
+            runs.append(" ".join(shlex.quote(word) for word in args[i + 1:end]))
+            i = end
+        i += 1
+    return runs
+
+
+def _generic(harness):
+    grep, read = SAFE_TOOL_NAMES.get(harness, SAFE_TOOL_NAMES["pi"])
+    return f"Search with {grep} and read with {read} instead of a shell search or read."
+
+
+def safe_route(tool, params, harness, cwd=None, refused=False):
+    """What to use instead of a shell call a worker is refused (classify's "worker_refuse"), as one instruction; None when
+    `tool` is not a shell tool. It only names calls: it never decides whether the call is refused.
+
+    Each search and read the shell would run is named with the safe call that searches or reads the same files (one call
+    per path); when one cannot be named faithfully the safe tools are named generically, and when none can, that is all it
+    says. Any other command in the call is to be run separately. `harness` is "claude" or "pi"; `cwd`, the call's
+    directory, makes the named paths absolute. `refused`: the text is a worker's refusal; when the command holds no search
+    or read (a copy, an edit, an upload, a code run) it also says to ask Main instead of retrying (NOT_A_SEARCH).
+
+    Never raises: a hook that crashed would answer nothing, and Claude runs a call its hook did not answer. A command it
+    cannot read gets the generic guidance."""
+    if tool not in _SHELL_TOOLS:
+        return None
+    try:
+        return _safe_route(params, harness, cwd if isinstance(cwd, str) and cwd.startswith("/") else None, refused)
+    except Exception:
+        return _generic(harness)
+
+
+def _safe_route(params, harness, cwd, refused=False):
+    grep, read = SAFE_TOOL_NAMES.get(harness, SAFE_TOOL_NAMES["pi"])
+    parts, other = _route_parts(str((params or {}).get("command") or ""), cwd)
+    calls = []
+    for part in parts:
+        for call in part["calls"] or []:
+            if call[0] == "grep":
+                _, pattern, path, glob, ignore = call
+                named = (f"{grep} with pattern {json.dumps(pattern)}" + (f" and path {json.dumps(path)}" if path else "")
+                         + (f" and glob {json.dumps(glob)}" if glob else "") + (" and ignore_case true" if ignore else ""))
+            else:
+                named = f"{read} with path {json.dumps(call[1])}"
+            if named not in calls:
+                calls.append(named)
+    unnamed = any(part["calls"] is None for part in parts)
+    if calls:
+        text = "Use " + "; ".join(calls) + (" (one call each)" if len(calls) > 1 else "") + " instead of the shell."
+        text += (f" For the searches and reads it does not name, search with {grep} and read with {read}." if unnamed
+                 else f" Search with {grep}, read with {read}.")
+    else:
+        text = _generic(harness)
+    if not parts:  # no shell search or read in it: a copy, move, edit, upload or code run the safe tools do not do (round 5)
+        return text + (" " + NOT_A_SEARCH if refused else "")
+    return text + (" Run the other commands in a call of their own, without the search or read." if other else "")
+
+
+# What a worker refused on a command that is not a search or read is told to do instead (sg1 round 5, F3).
+NOT_A_SEARCH = "If it is not a search or read, ask Main for it (tp-agent request) instead of retrying the command."
+
+
+def worker_task(env=None):
+    """Whether this process runs in a worker task: bin/tp-spawn exports TP_TASK_DIR to workers only, never to main."""
+    return bool((os.environ if env is None else env).get("TP_TASK_DIR"))
+
+
+def response_for(result, route=None, refuse=False):
+    """The PreToolUse `ask` for a classification, or None when it is not sensitive.
+
+    `route` (safe_route) is the safe call to use instead; it is named in the reason. With `refuse` (a worker task) a
+    shell classification with no non-search cause ("worker_refuse", sg1 round 4) is a deny instead, naming `route` or the
+    safe tools: nobody answers a worker's prompt. An ask with a cause, and a Read or Grep tool ask, stays an ask."""
     if not result["sensitive"]:
         return None
-    reason = f"Read may expose {result['target']}. Authorize this specific tool call only if its scope is needed."
+    if refuse and result.get("worker_refuse"):
+        decision = "deny"
+        reason = f"tmux-pi refuses this shell read in a worker task: it may expose {result['target']}. {route or _generic('claude')}"
+    else:
+        decision = "ask"
+        reason = f"Read may expose {result['target']}. Authorize this specific tool call only if its scope is needed."
+        reason += f" {route}" if route else ""
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse",
-                                   "permissionDecision": "ask",
+                                   "permissionDecision": decision,
                                    "permissionDecisionReason": reason}}

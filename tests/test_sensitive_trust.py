@@ -1663,19 +1663,28 @@ class CommandLineTests(World):
             self.assertTrue(kept["sensitive"], flags)
             self.assertEqual(kept, self.plain(command))
 
+    @staticmethod
+    def main_hook_answer(event):
+        """What the hook answers main (no TP_TASK_DIR) without lifts: the classifier's ask, naming the safe tool when the
+        classifier gives a shell ask no non-search cause (sg1 round 4: "worker_refuse")."""
+        result = sr.classify(event["tool_name"], event["tool_input"], event.get("cwd"))
+        route = result.get("worker_refuse") and sr.safe_route(event["tool_name"], event["tool_input"], "claude", event.get("cwd"))
+        return sr.response_for(result, route or None)
+
     def test_hook_mode_lifts_only_with_the_flag(self):
         command = "cat " + MLPACKAGE
         event = self.event(command, hook_event_name="PreToolUse")
         self.assertEqual(self.run_tool(event, "--claude-hook", *self.trusted_flags()), "")
         shown = json.loads(self.run_tool(event, "--claude-hook"))
         self.assertEqual(shown["hookSpecificOutput"]["permissionDecision"], "ask")
-        self.assertEqual(shown, sr.hook_response(event))
+        self.assertEqual(shown, self.main_hook_answer(event))
+        self.assertIn("mcp__tmux-pi-safe__safe_read", shown["hookSpecificOutput"]["permissionDecisionReason"])
 
     def test_hook_mode_still_asks_for_what_is_not_lifted(self):
         event = self.event("cat %s %s" % (MLPACKAGE, ENV), hook_event_name="PreToolUse")
         shown = json.loads(self.run_tool(event, "--claude-hook", *self.trusted_flags()))
         self.assertEqual(shown["hookSpecificOutput"]["permissionDecision"], "ask")
-        self.assertEqual(shown, sr.hook_response(event))
+        self.assertEqual(shown, self.main_hook_answer(event))
         self.assertEqual(self.skip_lines(), [])
 
     def skip_lines(self):
@@ -1716,7 +1725,11 @@ class CommandLineTests(World):
         env = clean_env(TP_TASK_DIR=task)
         self.run_tool(self.event("cat " + MLPACKAGE, hook_event_name="PreToolUse"), "--claude-hook", *self.trusted_flags(), env=env)
         self.assertFalse(os.path.exists(os.path.join(task, "permission-request.json")))
+        # In a worker task a plain shell read is refused (sg1), and the refusal is recorded where the ask was.
         self.run_tool(self.event("cat " + ENV, hook_event_name="PreToolUse"), "--claude-hook", *self.trusted_flags(), env=env)
+        self.assertEqual(json.loads(Path(task, "permission-request.json").read_text())["status"], "refused")
+        # A call no safe tool replaces still asks there, and is recorded as pending.
+        self.run_tool(self.event("base64 " + ENV, hook_event_name="PreToolUse"), "--claude-hook", *self.trusted_flags(), env=env)
         self.assertEqual(json.loads(Path(task, "permission-request.json").read_text())["status"], "pending")
 
 
@@ -1729,7 +1742,7 @@ class WiringTests(unittest.TestCase):
 
     def test_pi_extension_passes_the_flag(self):
         text = (ROOT / "agent/extensions/sensitive.ts").read_text()
-        self.assertIn('execFileSync(classifier, ["--trusted"]', text)
+        self.assertIn('execFileSync(classifier, ["--trusted", "--route", "pi", ...(taskDir ? ["--worker"] : [])]', text)
         self.assertNotIn('execFileSync(classifier, []', text)
 
     def test_offload_does_not(self):

@@ -13,6 +13,14 @@ import sys
 ROOT = Path(__file__).resolve().parent.parent
 MODEL = "openai/gpt-6.1-sol"
 WAITING = '{"state":"waiting"}'
+_SAFE_SEARCH_RULE = ("# Searching and Reading Files\n\nSearch file contents with {grep} (pattern, path). Read a file with {read} or "
+                     "{tool} on an exact path. Use grep, rg, cat, head, tail or sed -n through {shell} only on exact paths in "
+                     "the working tree that are known not to be sensitive (no .env files, keys or credentials, nothing under "
+                     "agent/, config/ or claude/): in a worker task a shell search or read that may reach a sensitive file is "
+                     "refused.")
+SAFE_SEARCH_RULE_PI = _SAFE_SEARCH_RULE.format(grep="safe_grep", read="safe_read", tool="the read tool", shell="bash")
+SAFE_SEARCH_RULE_CLAUDE = _SAFE_SEARCH_RULE.format(grep="mcp__tmux-pi-safe__safe_grep", read="mcp__tmux-pi-safe__safe_read",
+                                                   tool="the Read tool", shell="Bash")
 sys.path.insert(0, str(ROOT / "lib"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from fake_tools import fake_tmux  # noqa: E402
@@ -145,7 +153,8 @@ esac
             self.assertTrue(prompt.startswith(head), prompt)
         self.assertTrue(a.startswith(head + "\n\nCoder-only rule."))
         self.assertTrue(b.startswith(head + "\n\nTester-only rule."))
-        self.assertEqual(c, head)  # no role section: nothing follows the general part
+        self.assertEqual(c, head + "\n\n" + SAFE_SEARCH_RULE_PI)  # no role section: the standing search rule follows the general part
+        self.assertTrue(a.endswith("Coder-only rule.\n\n" + SAFE_SEARCH_RULE_PI), a)
         # nothing per task inside the prompt
         for prompt in (a, b, c):
             for word in ("Fix the parser", "Check the importer", "coder-", "tester-", "researcher-", str(self.project), "20"):
@@ -441,11 +450,29 @@ esac
                                       "route_info", "deliverable", "parent", "after", "context", "notes", "tests",
                                       "queue_reason"})
 
-    def test_missing_preamble_changes_nothing(self):
+    def test_missing_preamble_adds_only_the_search_rule(self):
         item = self.dispatch()
         self.assertNotIn("Repository Instructions", self.packet(item))
-        self.assertFalse((self.task_dir(item) / "system-prompt.md").exists())
-        self.assertNotIn("--append-system-prompt", (self.task_dir(item) / "run.sh").read_text())
+        # Every worker gets the standing search rule, with or without a preamble or a tools manifest, through the system prompt.
+        self.assertEqual(self.system_prompt(item), SAFE_SEARCH_RULE_PI)
+        self.assertIn("--append-system-prompt", (self.task_dir(item) / "run.sh").read_text())
+        self.assertNotIn("Searching and Reading Files", self.packet(item))
+
+    def test_search_rule_names_each_harness_tools(self):
+        for worker, model, rule in (("pi", MODEL, SAFE_SEARCH_RULE_PI), ("claude", "sonnet", SAFE_SEARCH_RULE_CLAUDE)):
+            with self.subTest(worker):
+                spawned = subprocess.run([str(ROOT / "bin/tp-spawn"), "--worker", worker, "--model", model, "--workdir",
+                                          str(self.project), "--", "t"], env=self.env, text=True, capture_output=True)
+                self.assertEqual(spawned.returncode, 0, spawned.stderr)
+                prompt = self.system_prompt(self.state / "tasks" / spawned.stdout.strip())
+                self.assertTrue(prompt.startswith(rule), prompt)
+                self.assertNotIn("grep -rn", prompt)
+        self.assertNotIn("mcp__", SAFE_SEARCH_RULE_PI)
+
+    def test_coder_role_searches_through_safe_grep(self):
+        text = (ROOT / "agent/roles/coder.md").read_text()
+        self.assertNotIn("grep -rn", text)
+        self.assertIn("safe_grep", text)
 
     def test_unusable_preamble_refuses_at_dispatch_and_spawn(self):
         for label, content in (("oversize", "x" * 8001), ("unknown role", "## Role: wizard\nHi\n"),

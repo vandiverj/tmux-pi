@@ -743,6 +743,14 @@ system_prompt=""
 if [[ -n "$preamble" ]]; then
   system_prompt="# Repository Instructions"$'\n\n'"$preamble"
 fi
+# Every worker, with or without a preamble or tools manifest: search and read through the safe tools. A shell search or read
+# that would ask for a sensitive read is refused in a worker task (lib/sensitive_read.py safe_route), so it would only fail.
+if [[ "$worker" == pi ]]; then
+  safe_grep=safe_grep safe_read=safe_read read_tool="the read tool" shell=bash
+else
+  safe_grep=mcp__tmux-pi-safe__safe_grep safe_read=mcp__tmux-pi-safe__safe_read read_tool="the Read tool" shell=Bash
+fi
+system_prompt+="${system_prompt:+$'\n\n'}# Searching and Reading Files"$'\n\n'"Search file contents with $safe_grep (pattern, path). Read a file with $safe_read or $read_tool on an exact path. Use grep, rg, cat, head, tail or sed -n through $shell only on exact paths in the working tree that are known not to be sensitive (no .env files, keys or credentials, nothing under agent/, config/ or claude/): in a worker task a shell search or read that may reach a sensitive file is refused."
 if [[ -n "$model" ]]; then
   prompt="$(python3 - "$ROOT" "$model" <<'EOF'
 import sys

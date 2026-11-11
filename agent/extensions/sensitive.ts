@@ -81,7 +81,9 @@ export default function (pi: ExtensionAPI) {
 		try {
 			// `--trusted`: this caller prompts the owner, so a name or directory guess in a tree the owner vouched for is lifted.
 			// offload.ts asks the same classifier whether to send text to a model and does not pass it.
-			decision = JSON.parse(execFileSync(classifier, ["--trusted"], {
+			// `--route pi`: a shell search or read also gets "safe", the safe_grep / safe_read call that replaces it.
+			// `--worker`: a worker's refusal ("worker_refuse") of a command with no search or read also says to ask Main.
+			decision = JSON.parse(execFileSync(classifier, ["--trusted", "--route", "pi", ...(taskDir ? ["--worker"] : [])], {
 				input: JSON.stringify({ tool_name: event.toolName, tool_input: event.input ?? {}, ...(cwd ? { cwd } : {}) }),
 				encoding: "utf8", timeout: 5000,
 			}));
@@ -89,16 +91,24 @@ export default function (pi: ExtensionAPI) {
 			return { block: true, reason: "Sensitive-read classifier unavailable; the worker cannot verify this read." };
 		}
 		if (!decision.sensitive) return;
-		const base = { target: decision.target, reason: decision.reason, updated: new Date().toISOString() };
+		const safe = typeof decision.safe === "string" && decision.safe ? ` ${decision.safe}` : "";
+		const base = { target: decision.target, reason: decision.reason + safe, updated: new Date().toISOString() };
+		// A worker task (TP_TASK_DIR, set by bin/tp-spawn for workers only) is refused when the classifier gives a shell ask
+		// no non-search cause ("worker_refuse", sg1 round 4): nobody answers its prompt. An ask with a cause, a read or grep
+		// tool ask, and main keep the prompt.
+		if (taskDir && decision.worker_refuse === true) {
+			save({ ...base, status: "refused" });
+			return { block: true, reason: `tmux-pi refuses this shell read in a worker task: it may expose ${decision.target}.${safe}` };
+		}
 		save({ ...base, status: "pending" });
 		if (!ctx.hasUI) {
-			return { block: true, reason: `Reading ${decision.target} needs user authorization in the active tmux pane.` };
+			return { block: true, reason: `Reading ${decision.target} needs user authorization in the active tmux pane.${safe}` };
 		}
 		const allowed = await ctx.ui.confirm(
 			"Authorize sensitive read?",
 			`This tool call may expose ${decision.target}. Approve only if the requested information is needed for this task.`,
 		);
 		save({ ...base, status: allowed ? "authorized" : "denied", updated: new Date().toISOString() });
-		if (!allowed) return { block: true, reason: `User denied access to ${decision.target}.` };
+		if (!allowed) return { block: true, reason: `User denied access to ${decision.target}.${safe}` };
 	});
 }

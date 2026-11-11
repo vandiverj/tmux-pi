@@ -107,7 +107,39 @@ def _target(value, config):
     return validate_decision(value, config)
 
 
-LOCAL_KEYS = {"routes", "escalation", "mlx", "rules", "prompts", "followup", "packet_files", "redaction", "summarize_structured"}
+LOCAL_KEYS = {"routes", "escalation", "mlx", "rules", "prompts", "followup", "packet_files", "redaction", "summarize_structured",
+              "provider_aliases"}
+# A pi provider name as used before the "/" of a provider/model id: lowercase letters, digits, ".", "_" and "-".
+PROVIDER_NAME = re.compile(r"[a-z0-9][a-z0-9._-]*")
+
+
+def check_provider_aliases(aliases):
+    """Validate local "provider_aliases": shared provider prefix -> the pi provider this machine launches it with.
+
+    Both sides are provider names; no alias names itself and no alias target is itself aliased (no chains), so one
+    rewrite is final. Returns the mapping."""
+    if not isinstance(aliases, dict):
+        raise RouterError("provider_aliases must map a shared provider name to this machine's pi provider name")
+    for shared, launched in aliases.items():
+        if not isinstance(launched, str) or not PROVIDER_NAME.fullmatch(shared) or not PROVIDER_NAME.fullmatch(launched):
+            raise RouterError("provider_aliases {!r}: names must be provider names (lowercase letters, digits, '.', '_', '-')"
+                              .format(shared))
+        if shared == launched:
+            raise RouterError("provider_aliases {!r} aliases itself".format(shared))
+        if launched in aliases:
+            raise RouterError("provider_aliases {!r} -> {!r} is a chain: {!r} is aliased too".format(shared, launched, launched))
+    return aliases
+
+
+def launch_model(model, config):
+    """The model id to hand to pi on this machine: provider/model with the provider rewritten by the local
+    provider_aliases (config as load_config returns it; None or no aliases leaves the id as it is). The shared id
+    (roster, catalog, routes, records, review checks) is never rewritten; only the pi launch uses this."""
+    aliases = ((config or {}).get("local") or {}).get("provider_aliases") or {}
+    provider, slash, rest = (model or "").partition("/")
+    if slash and provider in aliases:
+        return aliases[provider] + "/" + rest
+    return model
 
 
 def load_local(path, config):
@@ -223,6 +255,8 @@ def load_local(path, config):
         budget = structured.get("budget_chars", 1000)
         if isinstance(budget, bool) or not isinstance(budget, int) or not 1000 <= budget <= 2000000:
             raise RouterError("summarize_structured budget_chars must be an integer from 1000 to 2000000")
+    if "provider_aliases" in local:
+        check_provider_aliases(local["provider_aliases"])
     return local
 
 

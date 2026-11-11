@@ -101,6 +101,10 @@ def main():
             catalog = router_catalog.load_catalog(args.catalog)
             print("router config valid: {} models; catalog valid: {} levels ({} shown)".format(
                 len(config["models"]), len(catalog["levels"]), len(router_catalog.shown_keys(catalog))))
+            aliases = config["local"].get("provider_aliases") or {}
+            if aliases:  # pi is launched with the local name; every record keeps the shared one
+                print("provider aliases (pi launch only): {}".format(
+                    ", ".join("{} -> {}".format(k, v) for k, v in sorted(aliases.items()))))
             return 0
         if args.review_plan:
             if args.same_provider != (args.approved_by_user is not None):

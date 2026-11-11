@@ -331,6 +331,16 @@ credentials. Every key is optional:
   workdir's file list (`claude -p`, no tools; file names only, credentials
   names left out). Qwen3.6-35B-A3B passed 56 of 60 chores with picked files
   and 52 without; stronger workers gain nothing, so leave them out.
+- `provider_aliases` maps a shared provider name to the pi provider this
+  machine is logged in with, for example `{"openai": "openai-codex"}` on a Mac
+  where pi signs in to OpenAI through `openai-codex`. Only the `--model` handed
+  to pi is rewritten (`tp-spawn` workers and pi router calls): the roster,
+  catalog, routes, review provider checks and `meta.json` `model` keep the
+  shared `openai/...` id, and `meta.json` adds `launch_model` with the name pi
+  was started with. Both sides are provider names; an alias to itself or to
+  another aliased name (a chain) is refused. `bin/tp-route --check` lists the
+  active aliases. pi's own usage records (`state.json` `model`, `byModel`) name
+  the provider pi ran.
 
 On a machine without Slotstream or MLX, leave those out and point `routes` at
 models it does have. `bin/tp-route --check` validates the result;

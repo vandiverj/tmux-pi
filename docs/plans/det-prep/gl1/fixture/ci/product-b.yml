@@ -1,0 +1,10 @@
+product-b-test:
+  stage: test
+  extends: .product-b-rules
+  script: [echo product b test]
+
+product-b-build:
+  stage: build
+  extends: .product-b-rules
+  needs: [product-b-test]
+  script: [echo product b build]

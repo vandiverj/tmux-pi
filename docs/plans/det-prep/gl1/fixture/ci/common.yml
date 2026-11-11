@@ -1,0 +1,9 @@
+common-lint:
+  stage: lint
+  extends: .common-rules
+  script: [echo common lint]
+
+common-test:
+  stage: test
+  extends: .common-rules
+  script: [echo common test]

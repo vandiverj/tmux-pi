@@ -31,3 +31,16 @@ So the eval cannot run here, and GitLab-specific conclusions need the work insta
 ## Preparation that can happen here (reported as preparation only)
 A local fixture `.gitlab-ci.yml` with includes and the product/common/unmarked rules, checked for YAML structure and with the
 expected job lists written per ref. It cannot show what GitLab's lint does, so it proves nothing GitLab-specific.
+
+## Preparation done (Main, 2026-11-10; simulated, proves nothing GitLab-specific)
+`gl1/`: `fixture/.gitlab-ci.yml` (stages; workflow rules for merge requests, the default branch and `release/*`; four local
+includes), `fixture/ci/rules.yml` (the unmarked-paths list and product-a / product-b / common rule templates),
+`fixture/ci/{common,product-a,product-b}.yml` (6 jobs), `scenarios.json` (9 hand-written ref + changed-files cases with the
+expected job list), and `check.py` (run with `/usr/bin/python3 check.py` from `gl1/`, PyYAML needed):
+- validates structure: includes resolve, `extends` / `needs` / `stages` consistent;
+- evaluates the rules locally (an approximation of `rules: if / changes`, enough for these patterns only) and scores each
+  scenario: 8 of 8 local cases agree; `nested-unmarked-dir` is marked `gitlab_only` (glob depth semantics differ by version);
+- `--lint RESPONSE.json SCENARIO` compares a saved CI Lint `dry_run` + `include_jobs` response with the expected list, so the
+  work-instance step 3 is one command per ref.
+The product/common/unmarked layout is Main's assumption of the work pattern; replace the fixture with the real config's shape
+(no product names in tracked files) before the work run.

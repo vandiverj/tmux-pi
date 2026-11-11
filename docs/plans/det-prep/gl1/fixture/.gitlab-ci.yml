@@ -1,0 +1,16 @@
+# GL1 fixture (preparation only): stands in for the work config's shape. The product/common/unmarked rule below is
+# Main's assumption of the pattern; replace it with the work config's real mechanism before drawing conclusions.
+stages: [lint, test, build]
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_BRANCH =~ /^release\//
+    - when: never
+
+include:
+  - local: ci/rules.yml
+  - local: ci/common.yml
+  - local: ci/product-a.yml
+  - local: ci/product-b.yml

@@ -1,0 +1,27 @@
+# Shared rule sets. Unmarked = any path that is neither products/<p>/ nor common/: the fallback runs every product's jobs.
+.unmarked-paths: &unmarked
+  - .gitlab-ci.yml
+  - ci/**/*
+  - scripts/**/*
+  - "*"
+
+.product-a-rules:
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_BRANCH =~ /^release\//
+    - changes: [products/a/**/*, common/**/*]
+    - changes: *unmarked
+
+.product-b-rules:
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_BRANCH =~ /^release\//
+    - changes: [products/b/**/*, common/**/*]
+    - changes: *unmarked
+
+.common-rules:
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_BRANCH =~ /^release\//
+    - changes: [common/**/*]
+    - changes: *unmarked

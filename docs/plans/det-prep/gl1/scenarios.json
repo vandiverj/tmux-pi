@@ -1,0 +1,24 @@
+{
+  "_note": "Expected job lists written by hand from the rules, before any tool ran. 'gitlab_only' marks behaviour the local checker cannot decide (GitLab's own semantics); those rows are settled only by the work instance.",
+  "scenarios": [
+    {"id": "mr-product-a", "source": "merge_request_event", "branch": "feat/a-fix", "changes": ["products/a/src/x.ts"],
+     "expect": ["product-a-test", "product-a-build"]},
+    {"id": "mr-common", "source": "merge_request_event", "branch": "feat/common", "changes": ["common/util.ts"],
+     "expect": ["common-lint", "common-test", "product-a-test", "product-a-build", "product-b-test", "product-b-build"]},
+    {"id": "mr-unmarked", "source": "merge_request_event", "branch": "feat/scripts", "changes": ["scripts/release.sh"],
+     "expect": ["common-lint", "common-test", "product-a-test", "product-a-build", "product-b-test", "product-b-build"]},
+    {"id": "mr-root-file", "source": "merge_request_event", "branch": "feat/readme", "changes": ["README.md"],
+     "expect": ["common-lint", "common-test", "product-a-test", "product-a-build", "product-b-test", "product-b-build"]},
+    {"id": "mr-two-products", "source": "merge_request_event", "branch": "feat/ab", "changes": ["products/a/x.ts", "products/b/y.ts"],
+     "expect": ["product-a-test", "product-a-build", "product-b-test", "product-b-build"]},
+    {"id": "default-branch", "source": "push", "branch": "main", "default": "main", "changes": ["products/b/y.ts"],
+     "expect": ["common-lint", "common-test", "product-a-test", "product-a-build", "product-b-test", "product-b-build"]},
+    {"id": "release-branch", "source": "push", "branch": "release/1.2", "default": "main", "changes": ["products/a/x.ts"],
+     "expect": ["common-lint", "common-test", "product-a-test", "product-a-build", "product-b-test", "product-b-build"]},
+    {"id": "feature-push-no-mr", "source": "push", "branch": "feat/a-fix", "default": "main", "changes": ["products/a/x.ts"],
+     "expect": [], "why": "workflow rules: a plain branch push without an MR creates no pipeline"},
+    {"id": "nested-unmarked-dir", "source": "merge_request_event", "branch": "feat/docs", "changes": ["docs/guide.md"],
+     "expect": [], "gitlab_only": true,
+     "why": "docs/ is neither product, common nor listed as unmarked: the assumed fallback misses it. Shows why the fallback list must match the work config; GitLab's result decides."}
+  ]
+}

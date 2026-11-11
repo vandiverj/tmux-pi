@@ -319,7 +319,8 @@ class RunParallelTests(unittest.TestCase):
         self.write("test_rp_exit", "import os, unittest\nclass T(unittest.TestCase):\n    def test_a(self): os._exit(3)\n")
         self.write("test_rp_hang", "import time, unittest\nclass T(unittest.TestCase):\n"
                                    "    def test_a(self): time.sleep(60)\n")
-        code, out = self.main("-j", "4", "--timeout", "3")
+        with mock.patch.object(run_parallel, "max_jobs", return_value=4):  # four jobs on any host, two-core included
+            code, out = self.main("-j", "4", "--timeout", "3")
         self.assertEqual(code, 1, out)
         self.assertFalse(os.path.exists((self.dir / "caller-tmp" / "tmux_tmpdir").read_text()))  # removed afterwards
         lines = out.rstrip().splitlines()

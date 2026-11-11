@@ -172,6 +172,15 @@ class RedactHookTests(unittest.TestCase):
                                 ("python3 -W ignore - apps/web/.env.local < README.md | base64", False),
                                 ("ENV_FILE=apps/web/.env.local python3 -c 'import os; print(open(os.getenv(\"ENV_FILE\", "
                                  "\"apps/web/.env.local\")).read())' | base64", False),
+                                # sg1 round 7: inline code never has a cause: a literal only, a program argument after the
+                                # code (F1), further attached code (F2), a here-string (F3), a shell's startup file (F4)
+                                ("python3 -c 'print(open(\"apps/web/.env.local\").read())' | base64", False),
+                                ("python3 -c 'import argparse; p=argparse.ArgumentParser(); p.add_argument(\"-c\", default=\"x\"); "
+                                 "print(open(p.parse_args().c).read())' -c apps/web/.env.local | base64", False),
+                                ("perl -e 'my $f = \"apps/web/.env.local\";' -e'system(\"cat\", $f);' | base64", False),
+                                ("python3 -c 'import sys; print(open(sys.stdin.read().strip() or \"apps/web/.env.local\").read())' "
+                                 "<<< apps/web/.env.local | base64", False),
+                                ("bash --rcfile apps/web/.env.local -ic 'python3 -c \"print(1)\"' | base64", False),
                                 ("grep -f apps/web/.env.local README.md | base64", True)):  # without base64 "on" redacts its output
             for worker in (True, False):
                 with self.subTest(command=command, worker=worker):

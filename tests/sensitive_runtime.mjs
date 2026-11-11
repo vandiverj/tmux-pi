@@ -222,6 +222,15 @@ assert.equal((await diff(repo))?.block, true, 'diff touching config/local.json m
     ["perl -ne'print' config/local.json", ASK_MAIN],
     ["sh -- /dev/stdin config/local.json < README.md", ASK_MAIN],
     ["ENV_FILE=.env.local python3 -c 'import os; print(open(os.getenv(\"ENV_FILE\", \".env\")).read())'", ASK_MAIN],
+    // sg1 round 7: inline code never has a cause: a literal only (deno's too), a shell's -c around one, a program argument
+    // after the code (F1), further attached code (F2), a here-string (F3), a shell's startup file (F4)
+    ["python3 -c 'print(open(\".env\").read())'", ASK_MAIN],
+    ["bash -c 'python3 -c \"open(\\\".env\\\")\"'", ASK_MAIN],
+    ["deno eval 'Deno.readTextFileSync(\".env\")'", ASK_MAIN],
+    ["node -e 'console.log(require(\"fs\").readFileSync(process.argv[2] || \".env\", \"utf8\"))' -- -e config/local.json", ASK_MAIN],
+    ["perl -e 'my $f = \".env\";' -e'system(\"cat\", $f);'", ASK_MAIN],
+    ["python3 -c 'import sys; print(open(sys.stdin.read().strip() or \".env\").read())' <<< config/local.json", ASK_MAIN],
+    ["bash --rcfile .env -ic 'python3 -c \"print(1)\"'", ASK_MAIN],
   ];
   for (const [command, named] of rows) {
     prompts.length = 0;
@@ -251,7 +260,7 @@ assert.equal((await diff(repo))?.block, true, 'diff touching config/local.json m
   assert.equal(await hm.tool_call(call('bash', { command: 'grep -n one README.md' }), ui), undefined);
   // sg1 round 3: so does a shell wrapper around a non-search, and xargs git diff (a patch, not a search). Round 4: each has a
   // non-search cause from the classifier's closed list, as do an encoding and a remote command.
-  for (const command of ["python3 -c 'print(open(\".env\").read())'", "bash -c 'python3 -c \"open(\\\".env\\\")\"'",
+  for (const command of ["python3 tools/x.py .env", "bash -c 'python3 tools/x.py config/local.json'",
                          "printf '%s\\n' config/local.json | xargs git diff --", 'base64 .env', 'ssh host cat .env',
                          'python3 tools/check.py -c dev config/local.json']) {  // round 6 F4: the script's own -c
     prompts.length = 0;

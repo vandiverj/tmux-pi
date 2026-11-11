@@ -996,7 +996,12 @@ class SensitiveReadTableTests(unittest.TestCase):
                 # sg1 round 5: inline code given the file as an argument has no cause (F1); a refusal of a command with no
                 # search or read in it (a copy, an upload, a code run) says to ask Main instead of retrying it (F3).
                 (f"python3 -c 'import subprocess,sys; subprocess.run([\"grep\", \"TOKEN\", sys.argv[1]])' {LOCAL}", ask_main),
-                (f"cp {ENV} /tmp/x", ask_main)]
+                (f"cp {ENV} /tmp/x", ask_main),
+                # sg1 round 7: inline code never has a cause, so a literal in it is refused too (was kept, rounds 3-6).
+                (f"python3 -c 'open(\"{ENV}\").read()'", ask_main),
+                (f"python3 -c 'open(\"{ENV}\").read()'; grep -n x README.md",  # names the batched search, as round 2
+                 f'mcp__tmux-pi-safe__safe_grep with pattern "x" and path "{CWD}/README.md"'),
+                (f"bash -c 'python3 -c \"open(\\\"{ENV}\\\")\"'", ask_main)]
         with tempfile.TemporaryDirectory() as task:
             record = Path(task) / "permission-request.json"
             for command, named in rows:
@@ -1021,8 +1026,8 @@ class SensitiveReadTableTests(unittest.TestCase):
             self.assertIsNone(run("grep -n x README.md", task))
             # sg1 round 3: a shell wrapper around a non-search, and xargs git diff (a patch, not a search), keep their ask.
             # Round 4: each has a non-search cause the classifier gives (test_search_read_cause), as do these.
-            for command in (f"python3 -c 'open(\"{ENV}\").read()'", f"python3 -c 'open(\"{ENV}\").read()'; grep -n x README.md",
-                            f"bash -c 'python3 -c \"open(\\\"{ENV}\\\")\"'", "bash -c 'git diff -- config/'",
+            for command in (f"python3 tools/x.py {ENV}", f"python3 tools/x.py {ENV}; grep -n x README.md",
+                            f"bash -c 'python3 tools/x.py {ENV}'", "bash -c 'git diff -- config/'",
                             f"printf '%s\\n' {LOCAL} | xargs git diff --", f"base64 {ENV}", f"ssh host cat {ENV}"):
                 with self.subTest(command=command):  # the ask is the program's, not the harmless search's
                     decision, reason = run(command, task)
@@ -1255,11 +1260,43 @@ class SensitiveReadTableTests(unittest.TestCase):
             f"printf '%s\\n' {LOCAL} | xargs python3 -c'import sys'", "find . -name x -exec perl -ne'print' {} \\;",
             f"fd -g '{ENV}' -x node --eval='x'", f"for f in {LOCAL}; do bash -cx 'cat \"$1\"' sh $f; done",
             f"printf '%s\\n' {LOCAL} | xargs python3 -- -",
+            # sg1 round 7: inline code never has RUNS_CODE (round 4's literal rule is gone). The input space, per interpreter:
+            # a literal only, in each spelling (separate, attached, `--eval=`, cluster, stdin code, deno eval: Main's earlier
+            # accept of the deno literal is superseded) ...
+            f"python3 -c 'open(\"{ENV}\").read()'", f"python3 -c 'open(\"{ENV}\").read()'; grep -n x README.md",
+            f"bash -c 'python3 -c \"open(\\\"{ENV}\\\")\"'", f"python3 -c'open(\"{ENV}\").read()'",
+            f"node --eval='require(\"fs\").readFileSync(\"{ENV}\")'", f"node -e 'require(\"fs\").readFileSync(\"{ENV}\")'",
+            f"bun -e 'require(\"fs\").readFileSync(\"{ENV}\")'", f"perl -e'open(F, \"{ENV}\")'", f"perl -ne 'open(F, \"{ENV}\")'",
+            f"ruby -e 'File.read(\"{ENV}\")'", f"php -r 'file_get_contents(\"{ENV}\");'", f"osascript -e 'read POSIX file \"{ENV}\"'",
+            f"deno eval 'Deno.readTextFileSync(\"{ENV}\")'", f"python3 - <<'EOF'\nprint(open(\"{ENV}\").read())\nEOF",
+            f"python3 <<< 'print(open(\"{ENV}\").read())'",
+            # ... a repeated code option after the code, separate, attached or in a cluster (F1, F2): the program's argument
+            # or more code, never a way past the name ...
+            f"python3 -c 'import argparse; p=argparse.ArgumentParser(); p.add_argument(\"-c\", default=\"{ENV}\"); "
+            f"print(open(p.parse_args().c).read())' -c {LOCAL}",
+            f"node -e 'console.log(require(\"fs\").readFileSync(process.argv[2] || \"{ENV}\", \"utf8\"))' -- -e {LOCAL}",
+            f"ruby -e 'puts File.read(ARGV[1] || \"{ENV}\")' -- -e {LOCAL}", f"perl -e 'my $f = \"{ENV}\";' -e'system(\"cat\", $f);'",
+            f"perl -ne 'print' -e 'print' {LOCAL}", f"ruby -e'x' -e'y' {LOCAL}", f"php -r 'x;' -r 'y;' {LOCAL}",
+            f"node -e 'x' -e {LOCAL}", f"perl -e 'x' -- -e {LOCAL}",  # a word after the code is never skipped as -e's text
+            # ... a here-string or heredoc naming the file, quoted or bare (F3) ...
+            f"python3 -c 'import sys; print(open(sys.stdin.read().strip() or \"{ENV}\").read())' <<< {LOCAL}",
+            f"python3 -c 'import sys; print(open(sys.stdin.read().strip() or \"{ENV}\").read())' <<'EOF'\n{LOCAL}\nEOF",
+            f"python3 -c 'print(open(input()).read())' <<< {LOCAL}", f"node -e 'x' <<< {LOCAL}", f"ruby -e 'x' <<< {LOCAL}",
+            f"perl -ne 'print' <<'EOF'\n{LOCAL}\nEOF", f"bash -c 'cat \"$(cat)\"' <<< {LOCAL}",
+            f"bash -c 'python3 tools/x.py \"$(cat)\"' <<< {LOCAL}",
+            # ... and a shell's startup file or option value (F4): the shell runs it before the -c line or the script
+            f"bash --rcfile {ENV} -ic 'python3 -c \"import os; print(os.getenv(\\\"X\\\", \\\"{ENV}\\\"))\"'",
+            f"bash --init-file {ENV} -c 'python3 tools/x.py {LOCAL}'", f"bash --rcfile {ENV} tools/x.sh",
+            f"BASH_ENV={ENV} bash tools/x.sh", f"BASH_ENV={ENV} bash -c 'python3 tools/x.py'", f"ENV={ENV} sh -c true",
+            f"bash -k -c 'python3 tools/x.py {LOCAL}'",  # an option not on the shell's list: no parse shows what runs
+            # ... through xargs, find -exec, fd -x and a loop
+            f"printf '%s\\n' {LOCAL} | xargs python3 -c 'open(\"{ENV}\")'", f"find . -name x -exec perl -e'1' -e'2' {{}} \\;",
+            f"fd -g '{ENV}' -x ruby -e 'x' -e 'y'", f"for f in {LOCAL}; do python3 -c 'x' -c $f; done",
         ]
         kept = [  # each non-search cause, from the site that decides it
-            (f"python3 -c 'open(\"{ENV}\").read()'", sr.RUNS_CODE), (f"sh tools/x.sh {ENV}", sr.RUNS_CODE),
-            (f"python3 -c 'open(\"{ENV}\").read()'; grep -n x README.md", sr.RUNS_CODE),
-            (f"bash -c 'python3 -c \"open(\\\"{ENV}\\\")\"'", sr.RUNS_CODE), (f". tools/x.sh {ENV}", sr.RUNS_CODE),
+            (f"sh tools/x.sh {ENV}", sr.RUNS_CODE), (f"python3 tools/x.py {ENV}; grep -n x README.md", sr.RUNS_CODE),
+            (f"bash -c 'python3 tools/x.py {LOCAL}'", sr.RUNS_CODE), (f". tools/x.sh {ENV}", sr.RUNS_CODE),
+            (f"bash -lc 'python3 tools/x.py {LOCAL}'", sr.RUNS_CODE),  # a shell's -c line: the cause of what it runs
             (f"xargs python3 tools/x.py < {LOCAL}", sr.RUNS_CODE), ("find . -name x -exec python3 tools/x.py {} \\;", sr.RUNS_CODE),
             (f"printf '%s\\n' {LOCAL} | xargs python3 tools/x.py", sr.RUNS_CODE), (f"fd -g '{ENV}' -x node tools/x.js", sr.RUNS_CODE),
             (f"for f in {LOCAL}; do python3 tools/x.py $f; done", sr.RUNS_CODE),
@@ -1278,11 +1315,6 @@ class SensitiveReadTableTests(unittest.TestCase):
             (f"bun run tools/x.ts {LOCAL}", sr.RUNS_CODE), (f"php -f tools/x.php {LOCAL}", sr.RUNS_CODE),
             (f"osascript tools/x.scpt {LOCAL}", sr.RUNS_CODE), (f"bash -e tools/x.sh {LOCAL}", sr.RUNS_CODE),
             (f"source tools/x.sh {LOCAL}", sr.RUNS_CODE),
-            # ... and inline code naming the file as a literal, in any spelling the parse knows (round 4's rule); `deno eval`
-            # is inline code as `node -e` is (round 5, accepted by Main)
-            (f"python3 -c'open(\"{ENV}\").read()'", sr.RUNS_CODE), (f"node --eval='require(\"fs\").readFileSync(\"{ENV}\")'", sr.RUNS_CODE),
-            (f"perl -e'open(F, \"{ENV}\")'", sr.RUNS_CODE), (f"deno eval 'Deno.readTextFileSync(\"{ENV}\")'", sr.RUNS_CODE),
-            (f"python3 - <<'EOF'\nprint(open(\"{ENV}\").read())\nEOF", sr.RUNS_CODE),
             (f"ssh host cat {ENV}", sr.ELSEWHERE), (f"docker exec c cat {ENV}", sr.ELSEWHERE),
             (f"docker run --env-file {ENV} image", sr.ELSEWHERE), (f"kubectl exec pod -- cat {ENV}", sr.ELSEWHERE),
             (f"base64 {ENV}", sr.TRANSFORM), (f"base64 < {ENV}", sr.TRANSFORM), (f"xxd {LOCAL}", sr.TRANSFORM),
@@ -1344,35 +1376,46 @@ class SensitiveReadTableTests(unittest.TestCase):
                 return node.id in names
             if isinstance(node, ast.IfExp):
                 return given(node.body) and given(node.orelse)
-            return isinstance(node, ast.Call) and getattr(node.func, "id", "") in ("_cause", "_program_cause")
+            return isinstance(node, ast.Call) and getattr(node.func, "id", "") in ("_cause", "_program_cause", "_runs_code")
         sites = [node for node in ast.walk(tree) if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "_because"]
         self.assertGreaterEqual(len(sites), 20)
-        # sg1 round 5: RUNS_CODE is a claim that the command runs code, not a search or read of the file. A site that can
-        # give it states, on its line or the line above, which of the three forms it covers: SCRIPT FILE or INLINE LITERAL
-        # (which have it), INLINE ARGUMENT (which has none: the code is given the file as an argument).
+        # sg1 round 7: RUNS_CODE is a claim that the command runs a script file, not a search or read of the file. The name is
+        # used in one function only, _runs_code, which gives it for _SCRIPT alone; every site that can give it calls
+        # _runs_code with a form _code_run's positive parse returned, and only _script_operand returns _SCRIPT. So no site
+        # gives inline code (any spelling, stdin, here-string, heredoc, a shell's -c) the cause. Round 4's literal rule is gone.
         lines = (ROOT / "lib/sensitive_read.py").read_text().splitlines()
-        forms = ("SCRIPT FILE", "INLINE LITERAL", "INLINE ARGUMENT")
-        runs_code = [site for site in sites if any(isinstance(node, ast.Name) and node.id == "RUNS_CODE"
+        functions = [fn for fn in ast.walk(tree) if isinstance(fn, ast.FunctionDef)]
+        using = {fn.name for fn in functions if any(isinstance(node, ast.Name) and node.id == "RUNS_CODE" for node in ast.walk(fn))}
+        self.assertEqual(using, {"_runs_code"})
+        for form in (sensitive_read._STDIN, sensitive_read._INLINE, None):
+            self.assertIsNone(sensitive_read._runs_code(form))
+        self.assertEqual(sensitive_read._runs_code(sensitive_read._SCRIPT), sensitive_read.RUNS_CODE)
+        compared = {id(leaf) for node in ast.walk(tree) if isinstance(node, ast.Compare) for leaf in ast.walk(node)}
+        scripted = {fn.name for fn in functions if any(isinstance(node, ast.Return) and any(
+            isinstance(leaf, ast.Name) and leaf.id == "_SCRIPT" and id(leaf) not in compared for leaf in ast.walk(node))
+            for node in ast.walk(fn))}
+        self.assertEqual(scripted, {"_script_operand"})
+        self.assertNotIn("INLINE LITERAL", "\n".join(lines))
+        runs_code = [site for site in sites if any(isinstance(node, ast.Call) and getattr(node.func, "id", "") == "_runs_code"
                                                    for node in ast.walk(site.args[0]))]
-        self.assertGreaterEqual(len(runs_code), 5)
+        self.assertEqual(len(runs_code), 4)  # shell, interpreter, `.`/source, heredoc input (round 7: the literal site gone)
         for site in sites:
             with self.subTest(line=site.lineno):
                 self.assertTrue(given(site.args[0]), ast.unparse(site.args[0]) if hasattr(ast, "unparse") else site.lineno)
         for site in runs_code:
             with self.subTest(line=site.lineno, form="stated"):
-                near = " ".join(lines[site.lineno - 2:site.lineno])
-                self.assertTrue(any(form in near for form in forms[:2]), lines[site.lineno - 1])
-        for form in forms:  # each form is stated at a site
-            self.assertTrue(any(form in " ".join(lines[s.lineno - 2:s.lineno]) for s in sites), form)
-        # sg1 round 6: RUNS_CODE comes from one positive parse (_code_run): every function with a site that can give it
-        # calls it, so no site decides "runs code" by a list of its own.
-        holders = [fn for fn in ast.walk(tree) if isinstance(fn, ast.FunctionDef) and any(site in list(ast.walk(fn))
-                                                                                          for site in runs_code)]
+                self.assertIn("SCRIPT FILE", " ".join(lines[site.lineno - 2:site.lineno]), lines[site.lineno - 1])
+        holders = [fn for fn in functions if fn.name != "_runs_code" and any(site in list(ast.walk(fn)) for site in runs_code)]
         self.assertEqual({fn.name for fn in holders}, {"_command_hit", "_other_command_hit", "_document_hit"})
-        for fn in holders:
-            with self.subTest(function=fn.name):
-                self.assertTrue(any(isinstance(node, ast.Call) and getattr(node.func, "id", "") == "_code_run"
-                                    for node in ast.walk(fn)), fn.name)
+        for fn in holders:  # the form each site gives _runs_code is one _code_run returned in that function
+            bound = {target.elts[0].id if isinstance(target, ast.Tuple) else target.id
+                     for node in ast.walk(fn) if isinstance(node, ast.Assign) and any(
+                         isinstance(call, ast.Call) and getattr(call.func, "id", "") == "_code_run" for call in ast.walk(node.value))
+                     for target in node.targets}
+            for call in ast.walk(fn):
+                if isinstance(call, ast.Call) and getattr(call.func, "id", "") == "_runs_code":
+                    with self.subTest(function=fn.name, line=call.lineno):
+                        self.assertTrue(isinstance(call.args[0], ast.Name) and call.args[0].id in bound, call.lineno)
         made = [node.lineno for node in ast.walk(tree) if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "_NonSearch"]
         self.assertEqual(len(made), 1)  # in _because alone
         returns = [node.value for fn in ast.walk(tree) if isinstance(fn, ast.FunctionDef) and fn.name == "_program_cause"

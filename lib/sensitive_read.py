@@ -383,9 +383,8 @@ class _Refused(str):
 # enumerated from this source by tests/test_sensitive_read.py test_non_search_sites). A hit any other path makes is a plain
 # tuple, and a plain tuple refuses: a new path with no cause here refuses by default.
 RUNS_CODE = "runs code"                      # an interpreter or shell given a script file or code, `source`/`.`
-# (RUNS_CODE: only where _code_run's positive parse shows it, round 6: a script file, not itself sensitive, given the file;
-# or inline code naming it as a literal, starting no program, that no operand, stdin or environment value hands a sensitive
-# name. Each site that gives it says which form, _command_hit.)
+# (RUNS_CODE: only from _runs_code, for a script file _code_run's positive parse shows, not itself sensitive, given the
+# file. Inline code never has it, sg1 round 7. Each site that gives it says SCRIPT FILE, _command_hit.)
 ELSEWHERE = "runs on a remote host or in a container"           # ssh, docker/kubectl/... and what they run
 TRANSFORM = "encodes or transforms a file"   # base64, xxd, gzip, openssl, ... on a file operand or `<` input
 GIT_OUTPUT = "git output, not a search"     # git diff/show/log/blame/cat-file/archive/stash: history and patches
@@ -395,11 +394,6 @@ NON_SEARCH_CAUSES = (RUNS_CODE, ELSEWHERE, TRANSFORM, GIT_OUTPUT, NAMES_ONLY)
 # _program_cause as if it were given a sensitive file; none when it searches or reads them, or does nothing the list names.
 # Encoders, compressors and crypto tools: what they print is not the file's text (round 1 kept base64's ask).
 _TRANSFORMS = {"base64", "base32", "xxd", "hexdump", "od", "gzip", "bzip2", "xz", "openssl", "gpg"}
-# Inline code that starts another program can run a search: it is not "code that runs no search or read". `exec(` is Perl's
-# and Ruby's way to run a program too (Python's runs code): matching it refuses more, never less.
-_SHELLS_OUT = re.compile(r"subprocess|\bos\.(?:system|popen|exec\w*|spawn\w*)|\bpopen\b|child_process|exec(?:Sync|File)|"
-                         r"spawn(?:Sync)?\b|\bsystem\s*\(|\bexec\s*\(|`|%x|\bqx\b|Deno\.(?:run|Command)|\bBun\.spawn|"
-                         r"do shell script")
 
 
 class _NonSearch(tuple):
@@ -2169,34 +2163,70 @@ def _command_hit(prog, args, cmd, base, depth, bulk=False):
         return _because(GIT_OUTPUT, _git_output_hit(args, sub, rest, cmd, base, depth, bulk))
     if prog in _GREPS:
         return _search_hit(prog, args, cmd, base, bulk)
-    # RUNS_CODE claims the command runs code and not a search or read of the file. It is given only where _code_run, one
-    # positive parse for every site, shows what runs (sg1 round 6). Each form says which it is: SCRIPT FILE, a script file
-    # given the file as an argument (project code; a known limit); INLINE LITERAL, inline code naming the file as a literal
-    # that nothing else hands a sensitive name, which has the cause unless it starts another program (round 4); INLINE
-    # ARGUMENT, inline code a sensitive name reaches another way (an operand, stdin, an environment value), which has none.
-    if prog in _SHELLS:  # the hit of the command line it runs, with its cause, as it is
+    # RUNS_CODE claims the command runs code and not a search or read of the file. Only _runs_code gives it, and only for
+    # SCRIPT FILE: a script file _code_run's positive parse shows (a script file given the file as an argument is project
+    # code; a known limit). INLINE CODE (code in any spelling, any count, on stdin, in a here-string or heredoc, or no parse)
+    # never has it: inline code that touches a sensitive name anywhere is a read, and refuses in a worker (sg1 round 7).
+    if prog in _SHELLS:
+        form, _, _ = _code_run(prog, args, base)
+        startup = _startup_hit(cmd, base)  # BASH_ENV=/ENV= naming a sensitive file: the shell sources it first
         at = _dash_c_at(args)
-        if at is not None:
+        if at is not None:  # INLINE CODE: the line it runs is judged as any command line, its hit's cause as it is
             line = args[at]
             hit = (_unresolved(line) if isinstance(line, _Line) else None) or _shell_hit(line, base, depth + 1)
-            given = _other_hit(args[at + 1:], base, True) or _env_hit(cmd, base)
-            return _because(None, hit or given) if given else hit  # INLINE ARGUMENT: `sh -c 'grep x "$1"' sh FILE`
-        form = _code_run(prog, args, base)[0]
+            given = (startup or _words_hit(args[:at], base) or _words_hit(args[at + 1:], base) or _env_hit(cmd, base) or
+                     _input_text_hit(cmd, base))
+            # A sensitive name reaching the line another way (an operand, an option value such as `--rcfile .env`, an env
+            # value, stdin text), or options the parse does not show (`form` is not _INLINE): no cause.
+            return _because(None, hit or given) if given or form != _INLINE else hit
+        if startup:  # the shell runs the sensitive file before any script: not a script file the parse shows
+            return _because(None, startup)
         given = _other_hit(args, base, True) or (_env_hit(cmd, base) if form != _SCRIPT else None)
-        return _because(RUNS_CODE if form == _SCRIPT else None, given)  # SCRIPT FILE; anything else: INLINE ARGUMENT
+        return _because(_runs_code(form), given)  # SCRIPT FILE; anything else: INLINE CODE, no cause
     if prog == "eval":
         return _shell_hit(" ".join(args), base, depth + 1)
     if prog in _INTERPRETERS:
         form, codes, rest = _code_run(prog, args, base)
         given = _other_hit(args, base, True)
         if form == _SCRIPT:
-            return _because(RUNS_CODE, given)  # SCRIPT FILE
-        literal = _first(_literal_hit(code, base) for code in codes if code)
-        reached = _other_hit(rest, base, True) or _env_hit(cmd, base)
-        if form == _INLINE and literal and not reached:  # INLINE LITERAL: code that starts another program may search
-            return _because(None if any(_SHELLS_OUT.search(code) for code in codes) else RUNS_CODE, literal)
-        return _because(None, literal or reached or given)  # INLINE ARGUMENT, or no parse: no cause
+            return _because(_runs_code(form), given)  # SCRIPT FILE
+        # INLINE CODE, or no parse: no cause, whatever hands it the name (a literal in any code or word after it, an
+        # operand, an env value, here-string or heredoc text).
+        literal = _first(_literal_hit(word, base) for word in codes + rest if isinstance(word, str) and word)
+        return _because(None, given or _words_hit(rest, base) or literal or _env_hit(cmd, base) or _input_text_hit(cmd, base))
     return _other_command_hit(prog, args, cmd, base, depth, bulk)
+
+
+def _runs_code(form):
+    """RUNS_CODE for a script file _code_run's positive parse shows (_SCRIPT); None for every other form: inline code in any
+    spelling, code on stdin, or no parse (sg1 round 7). The one place the cause is given."""
+    return RUNS_CODE if form == _SCRIPT else None
+
+
+def _words_hit(words, base):
+    """A sensitive name among `words`, each looked at alone: what follows inline code is the program's own arguments, so no
+    word is skipped as an option's text (`node -e CODE -e FILE`: FILE is process.argv's, sg1 round 7 attack)."""
+    return _first(_other_hit([word], base, True) for word in words if isinstance(word, str))
+
+
+def _startup_hit(cmd, base):
+    """A sensitive file a shell sources before it runs anything, named by `BASH_ENV=` or `ENV=` on the command."""
+    for word in cmd.get("words", ()) if isinstance(cmd, dict) else ():
+        name, equals, value = word.partition("=")
+        if equals and name in ("BASH_ENV", "ENV") and value:
+            hit = _other_hit([value], base, True) or _read_hit(value, base, False)
+            if hit:
+                return hit
+    return None
+
+
+def _input_text_hit(cmd, base):
+    """A sensitive name in the text a command gets on standard input (a here-string, a here-document body): a quoted
+    literal or a bare word. Inline code given it may read the file it names (sg1 round 7)."""
+    if not isinstance(cmd, dict):
+        return None
+    texts = list(cmd.get("strings", ())) + ["".join(holder) for holder, _ in cmd.get("heredocs", ())]
+    return _first(_literal_hit(text, base) or _other_hit(text.split(), base, True) for text in texts if isinstance(text, str))
 
 
 def _env_hit(cmd, base):
@@ -2220,7 +2250,7 @@ def _env_hit(cmd, base):
 _SCRIPT, _STDIN, _INLINE = "script file", "code on stdin", "inline code"
 _SHELL_RUN = dict(flags={"-" + c for c in "euxvnfabhmpCETBHPilr"} | {"+" + c for c in "euxvnfabhmpCETBHP"} | {
     "--login", "--norc", "--noprofile", "--posix", "--verbose", "--noediting", "--restricted", "--no-config"},
-    values={"-o", "+o", "-O", "+O", "--rcfile", "--init-file"}, stdin={"-s"})
+    values={"-o", "+o", "-O", "+O", "--rcfile", "--init-file"}, stdin={"-s"}, dash_c="euxvnfabhmpCETBHPilr")
 _NODE_FORMS = r"--(?:max-old-space-size|max-semi-space-size|stack-size)=\d+|--unhandled-rejections=[\w-]+|--title=[\w.-]+"
 _RUN_TABLE = {
     "python": dict(flags={"-b", "-bb", "-B", "-d", "-E", "-i", "-I", "-O", "-OO", "-P", "-q", "-s", "-S", "-u", "-v", "-vv",
@@ -2293,6 +2323,9 @@ def _code_run(prog, args, base=""):
             i += 2
         elif arg in table.get("stdin", ()):
             return _STDIN, [], list(args[i + 1:])
+        elif table.get("dash_c") and re.fullmatch(r"-[%s]*c[%s]*" % (table["dash_c"], table["dash_c"]), arg):
+            # a shell's -c alone or in a cluster of its no-value letters (`-lc`, `-cx`): the next word is the line
+            return (_INLINE, [args[i + 1]], list(args[i + 2:])) if i + 1 < len(args) else (None, [], list(args))
         else:
             return _inline(arg, args[i + 1:], table)
     if i >= len(args):
@@ -2323,16 +2356,9 @@ def _inline(arg, rest, table):
             return None, [], [arg, *rest]
         tail = letters[at + 1:]
         codes, rest = ([tail], rest) if tail else ([rest[0] if rest else ""], rest[1:])
-    others, skip = [], False
-    for j, word in enumerate(rest):  # perl's and ruby's further -e: more code, not an argument
-        if skip:
-            skip = False
-        elif word in code and j + 1 < len(rest):
-            codes.append(rest[j + 1])
-            skip = True
-        else:
-            others.append(word)
-    return _INLINE, codes, others
+    # What follows is left as it is (perl's further -e, a program argument that looks like an option): inline code has no
+    # cause whatever it holds, and every word of it is looked at for a sensitive name (sg1 round 7).
+    return _INLINE, codes, list(rest)
 
 
 def _deno_eval(args):
@@ -2426,9 +2452,9 @@ def _other_command_hit(prog, args, cmd, base, depth, bulk):
             if hit:
                 return hit
         hit = _first(_read_hit(word, base) for word in operands + values)
-        script = prog in (".", "source") and _code_run(prog, args, base)[0] == _SCRIPT
+        script = _code_run(prog, args, base)[0] if prog in (".", "source") else None
         # `. FILE ARGS` / `source FILE ARGS`: SCRIPT FILE when _code_run shows FILE is a script; a sensitive FILE is not one.
-        return _because(TRANSFORM if prog in _TRANSFORMS else RUNS_CODE if script else None, hit)
+        return _because(TRANSFORM if prog in _TRANSFORMS else _runs_code(script), hit)
     if prog in _LISTERS or prog in _SYNTAX:
         return None
     hit = _other_hit(args, base)
@@ -2461,17 +2487,13 @@ def _document_hit(prog, cmd, base, depth):
                 return hit
             continue
         if hit:
-            # Text on a program's standard input. An interpreter runs it as code (RUNS_CODE), unless it starts another
-            # program; a substitution the shell runs in it is judged as any command, and one with no cause is that hit's.
-            # Any other program reads it as text (`cat <<EOF`): no cause.
+            # Text on a program's standard input. A script file's input is project code's (RUNS_CODE); the code itself on
+            # stdin, or inline code's input, is inline code, which has no cause (sg1 round 7); a substitution the shell runs
+            # in it is judged as any command, and one with no cause is that hit's. Any other program reads it as text
+            # (`cat <<EOF`): no cause.
             unsearched = all(_cause(sub) for sub in subs if sub)
-            form, _, rest = _code_run(prog, _program(cmd["words"])[1], base) if prog in _INTERPRETERS else (None, [], [])
-            reached = _other_hit(rest, base, True) or _env_hit(cmd, base)
-            # The body is the code (_STDIN), naming it, and nothing else hands the code a sensitive name; or it is a script
-            # file's input. Inline code given another way (`python3 -c CODE <<EOF`, an operand, an env value) has none.
-            code = form == _STDIN and not reached and not _SHELLS_OUT.search(body)
-            # INLINE LITERAL (code) / SCRIPT FILE (form == _SCRIPT)
-            return _because(RUNS_CODE if (code or form == _SCRIPT) and unsearched else None, hit)
+            form = _code_run(prog, _program(cmd["words"])[1], base)[0] if prog in _INTERPRETERS else None
+            return _because(_runs_code(form) if unsearched else None, hit)  # SCRIPT FILE; anything else: no cause
     if prog in _SHELLS:
         return _first(_shell_hit(text, base, depth + 1) for text in cmd["strings"])
     return None

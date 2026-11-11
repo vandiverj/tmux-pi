@@ -26,6 +26,8 @@ type State = {
 	state: "starting" | "working" | "tool" | "waiting" | "error";
 	tool: string;
 	model: string;
+	// The name pi ran the model under when this machine aliases its provider (meta.json launch_model); absent otherwise.
+	launched_model?: string;
 	turns: number;
 	tools: number;
 	toolErrors: number;
@@ -133,13 +135,35 @@ export default function (pi: ExtensionAPI) {
 		} catch {}
 	};
 
+	// A machine-local provider alias (config/local.json provider_aliases) changes only the name pi is launched with. meta.json keeps
+	// the shared id in model and the launched one in launch_model; every name this reporter records (state model, byModel keys)
+	// is the shared id, and the launched name is kept beside it in launched_model.
+	let shared = "", launched = "";
+	const readAlias = () => {
+		try {
+			const meta = JSON.parse(readFileSync(join(dir, "meta.json"), "utf8"));
+			if (typeof meta?.model === "string" && typeof meta?.launch_model === "string" && meta.launch_model !== meta.model) {
+				shared = meta.model;
+				launched = meta.launch_model;
+			}
+		} catch {}
+	};
+	const sharedName = (name: string) => {
+		if (launched && name === launched) {
+			s.launched_model = launched;
+			return shared;
+		}
+		return name;
+	};
+
 	pi.on("session_start", (_event, ctx) => {
 		restore();
-		s.model = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "";
+		readAlias();
+		s.model = ctx.model ? sharedName(`${ctx.model.provider}/${ctx.model.id}`) : "";
 		save();
 	});
 	pi.on("model_select", (event) => {
-		s.model = `${event.model.provider}/${event.model.id}`;
+		s.model = sharedName(`${event.model.provider}/${event.model.id}`);
 		save();
 	});
 	pi.on("agent_start", () => {
@@ -175,7 +199,7 @@ export default function (pi: ExtensionAPI) {
 			s.tokens.cacheWrite += d.cacheWrite;
 			s.cost += d.cost;
 			// The message names the model that produced it; the selected model is only a fallback.
-			const name = m.model ? `${m.provider ? `${m.provider}/` : ""}${m.model}` : s.model;
+			const name = m.model ? sharedName(`${m.provider ? `${m.provider}/` : ""}${m.model}`) : s.model;
 			if (name) {
 				const b = (s.byModel[name] ??= { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 });
 				b.input += d.input;

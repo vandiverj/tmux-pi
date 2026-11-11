@@ -113,21 +113,25 @@ LOCAL_KEYS = {"routes", "escalation", "mlx", "rules", "prompts", "followup", "pa
 PROVIDER_NAME = re.compile(r"[a-z0-9][a-z0-9._-]*")
 
 
+class ProviderAliasError(RouterError):
+    """A bad local provider_aliases: every route that would start pi refuses with this text."""
+
+
 def check_provider_aliases(aliases):
     """Validate local "provider_aliases": shared provider prefix -> the pi provider this machine launches it with.
 
     Both sides are provider names; no alias names itself and no alias target is itself aliased (no chains), so one
     rewrite is final. Returns the mapping."""
     if not isinstance(aliases, dict):
-        raise RouterError("provider_aliases must map a shared provider name to this machine's pi provider name")
+        raise ProviderAliasError("provider_aliases must map a shared provider name to this machine's pi provider name")
     for shared, launched in aliases.items():
         if not isinstance(launched, str) or not PROVIDER_NAME.fullmatch(shared) or not PROVIDER_NAME.fullmatch(launched):
-            raise RouterError("provider_aliases {!r}: names must be provider names (lowercase letters, digits, '.', '_', '-')"
+            raise ProviderAliasError("provider_aliases {!r}: names must be provider names (lowercase letters, digits, '.', '_', '-')"
                               .format(shared))
         if shared == launched:
-            raise RouterError("provider_aliases {!r} aliases itself".format(shared))
+            raise ProviderAliasError("provider_aliases {!r} aliases itself".format(shared))
         if launched in aliases:
-            raise RouterError("provider_aliases {!r} -> {!r} is a chain: {!r} is aliased too".format(shared, launched, launched))
+            raise ProviderAliasError("provider_aliases {!r} -> {!r} is a chain: {!r} is aliased too".format(shared, launched, launched))
     return aliases
 
 
@@ -140,6 +144,25 @@ def launch_model(model, config):
     if slash and provider in aliases:
         return aliases[provider] + "/" + rest
     return model
+
+
+def launch_argv(argv, config):
+    """argv for pi with every --model value (--model X or --model=X) launched under this machine's provider alias; an
+    already-local name is left alone. The one rewrite shared by bin/tp-pi (so tp-spawn, tp-main, the qualification runners
+    and ask_local all pass through it)."""
+    out, i = [], 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--":  # the rest is the task text, not options
+            out += argv[i:]
+            break
+        if arg == "--model" and i + 1 < len(argv):
+            out += [arg, launch_model(argv[i + 1], config)]
+            i += 2
+            continue
+        out.append("--model=" + launch_model(arg[8:], config) if arg.startswith("--model=") else arg)
+        i += 1
+    return out
 
 
 def load_local(path, config):

@@ -4,6 +4,7 @@ The shared id (roster, catalog, routes, meta.json model, review provider checks)
 pi is the local provider's name. Real tp-spawn launches run once for the class on a private tmux server whose new-window does
 not start the worker (tests/lane_fixture.py); each launch's run.sh is then run with fake tp-pi / tp-claude that log their argv."""
 import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -12,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from session_env import outside_session  # noqa: E402
@@ -31,6 +33,10 @@ TASK = "coder-lp1launch01"
 # The launches' machine config also gives each model a standing prompt, as "prompts" does: tp-spawn reads both in one start.
 PROMPTS = {SOL: "SOL PROMPT line 1\n  line 2 {\"x\": 1}", SONNET: "SONNET PROMPT", SLOT: "SLOT PROMPT"}
 LOCAL = dict(ALIAS, prompts=PROMPTS)
+
+
+BAD = {"provider_aliases": {"openai": "openai"}}  # the review's probe: an alias to itself
+MESSAGE = "provider_aliases 'openai' aliases itself"
 
 
 def shared_config():
@@ -197,6 +203,20 @@ class SpawnLaunchTests(unittest.TestCase):
                 self.assertNotIn("launch_model", self.out[name]["meta"])
                 self.assertEqual(self.out[name]["meta"]["model"], self.LAUNCHES[name][1])
 
+    def test_a_bad_alias_refuses_the_spawn_before_a_task_is_launched(self):
+        root = self.base / "bad"
+        project, state = root / "project", root / "project" / ".tmux-pi"
+        (state / "tasks").mkdir(parents=True)
+        (root / "local.json").write_text(json.dumps(BAD))
+        env = {**outside_session(), "TP_STATE_DIR": str(state), "TP_SESSION": "fixture",
+               "TP_LOCAL_CONFIG": str(root / "local.json"), "PATH": self.path}
+        run = subprocess.run([str(ROOT / "bin/tp-spawn"), "--task-id", TASK, "--role", "coder", "--worker", "pi", "--model", SOL,
+                              "--thinking", "medium", "--tests", "none", "--workdir", str(project), "--", "do it"],
+                             env=env, text=True, capture_output=True, timeout=60)
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn(MESSAGE, run.stderr)
+        self.assertFalse((state / "tasks" / TASK / "run.sh").exists())
+
     def test_claude_workers_and_other_providers_are_untouched(self):
         self.assertEqual(self.model(self.out["claude"]["argv"]), SONNET)
         self.assertEqual(self.model(self.out["other"]["argv"]), SLOT)
@@ -212,6 +232,189 @@ class SpawnLaunchTests(unittest.TestCase):
         self.assertEqual(plans["alias"], plans["none"])
         self.assertEqual(plans["alias"]["author"]["model"], SOL)
         self.assertEqual(plans["alias"]["reviewer"]["worker"], "claude")
+
+
+class BadAliasRefusesOnEveryRouteTests(unittest.TestCase):
+    """Rule 1: a bad provider_aliases refuses, with the loader's text, before any pi is started, on every entry that can start pi."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.base = Path(temp.name).resolve()
+        self.local = self.base / "local.json"
+        self.local.write_text(json.dumps(BAD))
+        fake = self.base / "bin"
+        fake.mkdir()
+        self.log = self.base / "pi-started"
+        pi = fake / "pi"
+        pi.write_text('#!/bin/sh\necho "$@" >> "{}"\n'.format(self.log))
+        pi.chmod(0o755)
+        self.env = {**outside_session(), "TP_LOCAL_CONFIG": str(self.local), "TP_PI_NODE": "",
+                    "PATH": str(fake) + os.pathsep + os.environ["PATH"]}
+
+    def test_the_loader_text_is_the_reference(self):
+        with mock.patch.dict(os.environ, {"TP_LOCAL_CONFIG": str(self.local)}):
+            with self.assertRaises(router.RouterError) as caught:
+                router.load_config(ROOT / "config" / "router.json", laya_model=False)
+        self.assertEqual(str(caught.exception), MESSAGE)
+
+    def test_model_router_select_stops_before_any_launch(self):
+        import route_fixture as fx
+        started = []
+        runner = lambda argv, **kw: started.append(argv) or subprocess.CompletedProcess(argv, 1, "", "no")
+        requests = [("router chain", {"task": "Add pagination with tests", "role": "coder"}),
+                    ("explicit model", {"task": "Add pagination", "role": "coder", "model": fx.LUNA})]
+        with mock.patch.dict(os.environ, {"TP_LOCAL_CONFIG": str(self.local)}):
+            for name, request in requests:
+                with self.subTest(name):
+                    with self.assertRaises(model_router.RouteStop) as caught:
+                        model_router.select(request, runner=runner, log=False, catalog=fx.fixture_catalog(order=(fx.LUNA, fx.QWEN)))
+                    self.assertEqual(str(caught.exception), MESSAGE)
+        self.assertEqual(started, [])
+
+    def test_tp_route_cli_stops_with_the_text(self):
+        run = subprocess.run([str(ROOT / "bin/tp-route"), "--no-log", "--model", SOL, "do the thing"], env=self.env,
+                             text=True, capture_output=True, timeout=60)
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn(MESSAGE, run.stderr)
+        self.assertFalse(self.log.exists())
+
+    def test_tp_pi_refuses_before_starting_pi(self):
+        run = subprocess.run([str(ROOT / "bin/tp-pi"), "--model", SOL, "-p", "x"], env=self.env, text=True,
+                             capture_output=True, timeout=30)
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn(MESSAGE, run.stderr)
+        self.assertFalse(self.log.exists())
+
+
+class PiLauncherAliasTests(unittest.TestCase):
+    """Rule 3: bin/tp-pi is the common boundary of every pi start with a model: tp-main, the qualification runners (tools/qual),
+    ask_local (agent/extensions/assistant.ts runs bin/tp-pi) and tp-spawn's run.sh. A fake pi logs its argv."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.base = Path(temp.name).resolve()
+        fake = self.base / "bin"
+        fake.mkdir()
+        self.record = self.base / "argv.json"
+        pi = fake / "pi"
+        pi.write_text('#!/usr/bin/env python3\nimport json, os, sys\n'
+                      'open(os.environ["TEST_PI_ARGV"], "w").write(json.dumps(sys.argv[1:]))\nprint("stub reply")\n')
+        pi.chmod(0o755)
+        self.local = self.base / "local.json"
+        self.local.write_text(json.dumps(ALIAS))
+        self.env = {**outside_session(), "PATH": str(fake) + os.pathsep + os.environ["PATH"], "TEST_PI_ARGV": str(self.record),
+                    "TP_PI_NODE": "", "TP_LOCAL_CONFIG": str(self.local), "TP_STATE_DIR": str(self.base / "state")}
+
+    def argv(self, command, args, **env):
+        run = subprocess.run([*command, *args], env={**self.env, **env}, text=True, capture_output=True, timeout=30,
+                             cwd=str(self.base))
+        self.assertEqual(run.returncode, 0, run.stderr)
+        return json.loads(self.record.read_text())
+
+    @staticmethod
+    def models(argv):
+        """Every model value before any "--"."""
+        head = argv[:argv.index("--")] if "--" in argv else argv
+        return [a for i, a in enumerate(head) if i and head[i - 1] == "--model"] + [a for a in head if a.startswith("--model=")]
+
+    def test_tp_pi_rewrites_each_model_form_once(self):
+        tp_pi = [str(ROOT / "bin/tp-pi")]
+        rows = [("separate value", ["--model", SOL, "-p", "x"], [CODEX_SOL]),
+                ("equals form", ["--model=" + SOL, "-p", "x"], ["--model=" + CODEX_SOL]),
+                ("already local", ["--model", CODEX_SOL], [CODEX_SOL]),
+                ("other provider", ["--model", SLOT], [SLOT]),
+                ("task text after --", ["--model", SOL, "--", "--model", SOL], [CODEX_SOL]),
+                ("no model", ["-p", "x"], [])]
+        for name, args, expected in rows:
+            with self.subTest(name):
+                argv = self.argv(tp_pi, args)
+                self.assertEqual(self.models(argv), expected)
+                if "--" in args:
+                    self.assertEqual(argv[argv.index("--"):], args[args.index("--"):])
+
+    def test_no_alias_leaves_the_model_as_it_was(self):
+        self.local.write_text("{}")
+        self.assertEqual(self.models(self.argv([str(ROOT / "bin/tp-pi")], ["--model", SOL])), [SOL])
+
+    def test_tp_main_pi_launch(self):
+        self.assertEqual(self.models(self.argv([str(ROOT / "bin/tp-main")], ["--model", SOL], TP_MAIN_HARNESS="pi")), [CODEX_SOL])
+
+    def test_qualification_runners_pass_through_tp_pi(self):
+        qual = str(ROOT / "tools" / "qual")
+        sys.path.insert(0, qual)
+        self.addCleanup(sys.path.remove, qual)
+        for name in ("summarize_run", "summarize_meaning"):
+            spec = importlib.util.spec_from_file_location(name, ROOT / "tools" / "qual" / (name + ".py"))
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            with self.subTest(name):
+                self.record.unlink(missing_ok=True)
+                if name == "summarize_run":
+                    module.run_pi("task", str(self.base), SOL, "", "medium", 20, str(ROOT / "bin/tp-pi"), self.env)
+                else:
+                    module.judge_once("p", {}, [], [], model=SOL, timeout=20, pi_command=str(ROOT / "bin/tp-pi"), env=self.env)
+                self.assertEqual(self.models(json.loads(self.record.read_text())), [CODEX_SOL])
+
+
+@unittest.skipUnless(shutil.which("node"), "node not installed")
+class ReporterSharedNameTests(unittest.TestCase):
+    """Rule 2: with the alias, state.json model and byModel carry the shared name; the launched name sits in launched_model.
+    The real reporter code runs on synthetic pi events (no model); it learns the shared name from the task's meta.json."""
+
+    SCRIPT = r"""
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
+const [root, meta] = process.argv.slice(1);
+const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'lp1-rep-'));
+try {
+  fs.writeFileSync(path.join(tmp, 'package.json'), '{"type":"module"}');
+  fs.copyFileSync(path.join(root, 'agent/extensions/reporter.ts'), path.join(tmp, 'reporter.ts'));
+  fs.cpSync(path.join(root, 'agent/extensions/lib'), path.join(tmp, 'lib'), { recursive: true });
+  const mod = await import(pathToFileURL(path.join(tmp, 'reporter.ts')).href);
+  const task = path.join(tmp, 'tasks', 'coder-lp1rep');
+  fs.mkdirSync(task, { recursive: true });
+  fs.writeFileSync(path.join(task, 'meta.json'), meta);
+  process.env.TP_TASK_DIR = task;
+  process.env.TP_TASK_ID = 'coder-lp1rep';
+  const h = {};
+  mod.default({ on(n, f) { h[n] = f; } });
+  h.session_start({}, { model: { provider: 'openai-codex', id: 'gpt-6.1-sol' } });
+  const use = { input: 10, output: 2, cost: { total: 0.1 } };
+  h.message_end({ message: { role: 'assistant', provider: 'openai-codex', model: 'gpt-6.1-sol', content: [], usage: use } });
+  h.message_end({ message: { role: 'assistant', provider: 'other', model: 'm', content: [], usage: use } });
+  console.log(fs.readFileSync(path.join(task, 'state.json'), 'utf8'));
+} finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+"""
+
+    def state(self, meta):
+        run = subprocess.run(["node", "--input-type=module", "-e", self.SCRIPT, str(ROOT), json.dumps(meta)], text=True,
+                             capture_output=True, timeout=60, cwd=str(ROOT))
+        self.assertEqual(run.returncode, 0, run.stderr)
+        return json.loads(run.stdout)
+
+    def test_aliased_task_records_the_shared_name_and_keeps_the_launched_one_beside_it(self):
+        state = self.state({"model": SOL, "launch_model": CODEX_SOL})
+        self.assertEqual(state["model"], SOL)
+        self.assertEqual(set(state["byModel"]), {SOL, "other/m"})
+        self.assertEqual(state["byModel"][SOL]["cost"], 0.1)
+        self.assertEqual(state["launched_model"], CODEX_SOL)
+
+    def test_no_alias_records_are_as_before(self):
+        state = self.state({"model": CODEX_SOL})
+        self.assertEqual(state["model"], CODEX_SOL)
+        self.assertEqual(set(state["byModel"]), {CODEX_SOL, "other/m"})
+        self.assertNotIn("launched_model", state)
+
+    def test_usage_buckets_follow_the_shared_name(self):
+        import tp_usage
+        state = self.state({"model": SOL, "launch_model": CODEX_SOL})
+        text = "\n".join(tp_usage.lines([(False, tp_usage.contribution([state])[0])], 1))
+        self.assertIn(SOL, text.splitlines())
+        self.assertNotIn(CODEX_SOL, text)
 
 
 class DiagnosticsTests(unittest.TestCase):

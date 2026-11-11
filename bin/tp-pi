@@ -31,6 +31,25 @@ ROOT="$(cd "$(dirname "$src")/.." && pwd)"
 # PATH: a repo pinned to Node 22.14 lacks zlib zstd and pi crashes reading responses.
 # Only pi's process uses it; PATH is unchanged, so commands pi runs keep the project's
 # Node. TP_PI_NODE overrides the interpreter; set it empty to run `pi` from PATH.
+# A machine-local provider alias (config/local.json "provider_aliases", lib/router.py launch_argv) rewrites the --model handed to
+# pi here, so every pi start with a model (tp-spawn, tp-main, tools/qual, ask_local) gets it once. A name already local is left
+# alone and a bad alias refuses before pi starts. Claude launches do not pass here.
+case " $* " in
+  *" --model"*)
+    rewritten="$(python3 -c '
+import shlex, sys
+sys.path.insert(0, sys.argv[1] + "/lib")
+from router import RouterError, launch_argv, load_config
+try:
+    config = load_config(sys.argv[1] + "/config/router.json", laya_model=False)
+except RouterError as exc:
+    sys.exit("tp-pi: {}".format(exc))
+print(" ".join(shlex.quote(a) for a in launch_argv(sys.argv[2:], config)))
+' "$ROOT" "$@")" || exit 1
+    eval "set -- $rewritten"
+    ;;
+esac
+
 PI_NODE="${TP_PI_NODE-$HOME/.nvm/versions/node/v24.16.0/bin/node}"
 pi() {
   [[ -n "$PI_NODE" ]] || exec pi "$@"

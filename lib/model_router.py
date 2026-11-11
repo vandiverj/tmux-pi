@@ -54,6 +54,8 @@ def load_roster_config(root=ROOT, config_path=None):
     """(config, error): config/router.json with this machine's local overrides, without the learned head."""
     try:
         return router.load_config(config_path or Path(root) / "config" / "router.json", laya_model=False), None
+    except router.ProviderAliasError as exc:
+        raise RouteStop(str(exc)) from exc  # a bad alias refuses: no route may start pi with the shared name
     except (router.RouterError, OSError) as exc:
         return None, str(exc)[:200]
 

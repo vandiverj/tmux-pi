@@ -150,8 +150,9 @@ class RoundsTests(unittest.TestCase):
         self.assertEqual(got["rounds"], 3)
         self.assertEqual(got["summarised"], [])  # no gate in the chain: nothing is summarised
 
-    def gated_chain(self, gates):
-        """w0 reviewed by r-a; w1 by r-b, r-c; w2 by r-d. `gates` = {author: route} written to those tasks' meta.json."""
+    def gated_chain(self, gates, sweeps=()):
+        """w0 reviewed by r-a; w1 by r-b, r-c; w2 by r-d. `gates` = {author: route} written to those tasks' meta.json; `sweeps` =
+        authors given the sweep.md a gated retry of them writes (the only record of a gate before meta.json carried one)."""
         body = lambda name, head: f"REQUEST_CHANGES\nF1 — {head}\nFamily: {name}\nBODY-{name}-SECRET-TEXT\nCloses by: code\n"
         self.review("r-a", body("alpha", "first head"))
         self.review("r-b", body("beta", "second head"))
@@ -160,6 +161,8 @@ class RoundsTests(unittest.TestCase):
         self.task("w0", reviews=["r-a"])
         self.task("w1", parent="w0", reviews=["r-b", "r-c"], **({"gate": gates["w1"]} if "w1" in gates else {}))
         self.task("w2", parent="w1", reviews=["r-d"], **({"gate": gates["w2"]} if "w2" in gates else {}))
+        for author in sweeps:
+            (self.state / "tasks" / author / "sweep.md").write_text("# sweep\n")
         return self.prepare("w2")
 
     def attached(self, got):
@@ -193,6 +196,22 @@ class RoundsTests(unittest.TestCase):
         self.assertNotIn("SECRET-TEXT", text)
         self.assertIn("SECRET-TEXT", Path(got["contexts"][2]).read_text())  # a round inside the window keeps its body
         self.assertEqual(got["summarised"][0]["result"], str(self.state / "tasks" / "r-a" / "result.md"))
+
+    def test_a_task_from_before_the_gate_field_is_gated_by_the_sweep_md_of_the_author_it_replaced(self):
+        got = self.gated_chain({}, sweeps=["w1"])  # w1 was retried by a gated route (into w2) before retry wrote `gate`
+        self.assertEqual(self.attached(got), ["earlier-summary.md", "earlier-findings-03-r-c.md", "earlier-findings-04-r-d.md"])
+        self.assertEqual([s["review"] for s in got["summarised"]], ["r-a", "r-b"])
+
+    def test_a_sweep_md_that_is_a_link_is_no_gate(self):
+        target = self.state / "elsewhere.md"
+        target.write_text("x")
+        self.review("r-a", "REQUEST_CHANGES\nF1 — h\nFamily: alpha\nCloses by: code\n")
+        self.review("r-b", "REQUEST_CHANGES\nF1 — h\nFamily: alpha\nCloses by: code\n")
+        self.review("r-c", "REQUEST_CHANGES\nF1 — h\nFamily: alpha\nCloses by: code\n")
+        self.task("w0", reviews=["r-a", "r-b"])
+        self.task("w1", parent="w0", reviews=["r-c"])
+        (self.state / "tasks" / "w0" / "sweep.md").symlink_to(target)
+        self.assertEqual(self.prepare("w1")["summarised"], [])
 
     def test_a_gate_value_that_is_not_a_route_is_ignored(self):
         got = self.gated_chain({"w2": "park"})

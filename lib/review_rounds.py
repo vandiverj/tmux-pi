@@ -128,12 +128,18 @@ def lineage_meta(state_dir, task_id):
 
 
 def gated_author(state_dir, task_id):
-    """The newest author in the chain of `task_id` whose meta.json says it was started by a gated retry (`gate` is rule-first or
-    design), else None. A task without the field, or with any other value, is not gated."""
-    found = None
+    """The newest author in the chain of `task_id` that a gated retry started, else None. Gated: its meta.json `gate` is rule-first
+    or design, or (a task started before retry wrote `gate`) the author it replaced holds the sweep.md that only a gated retry
+    writes there (a regular file, not a link). A task without either is not gated."""
+    found, before = None, None
     for author, meta in lineage_meta(state_dir, task_id):
         if meta.get("gate") in GATES:
             found = (author, meta["gate"])
+        elif "gate" not in meta and before is not None:
+            sweep = task_path(state_dir, before) / "sweep.md"
+            if sweep.is_file() and not sweep.is_symlink():
+                found = (author, "sweep.md")
+        before = author
     return found
 
 

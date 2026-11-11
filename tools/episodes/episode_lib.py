@@ -10,7 +10,6 @@ Records read (all optional; a missing record is reported as missing, never as ze
   Claude transcripts (JSONL, `message.content[]` tool_use / text parts) and pi transcripts (`toolCall` parts).
 """
 import json
-import itertools
 import os
 import re
 import shlex
@@ -592,9 +591,21 @@ def _operands(program, words):
 
 class Word(str):
     """A shell word with its quotes removed (round 6 rule 2). op: a redirect operator with its fd prefix (`2>`, `>>`,
-    `&>`, `<<`), never a quoted word. bare: the word's unquoted characters (a glob or a brace expansion is only there)."""
+    `&>`, `<<`), never a quoted word. bare: the word's unquoted characters (a glob or a brace expansion is only there).
+    expand (round 7 rule 2): the word holds an expansion the shell resolves at run time (`$VAR`, `${…}`, a substitution,
+    a leading `~`), unquoted or inside double quotes; a `$` inside single quotes or escaped is literal."""
     op = False
     bare = ""
+    expand = False
+
+
+EXPANDS = re.compile(r"\$[A-Za-z_{(0-9@*#?!$-]")
+
+
+def unresolved(word):
+    """Whether a word's value is not its text (round 7 rule 2): it holds an expansion or an unquoted glob. A plain string
+    (a test-run record's argv, exec'd with no shell) is always its own value."""
+    return bool(getattr(word, "expand", False) or re.search(r"[*?]|\[.*\]", getattr(word, "bare", "") or ""))
 
 
 REDIRECT_OPS = ("&>>", "&>", "<<<", "<<-", "<<", ">>", ">|", ">&", "<&", "<>", ">", "<")
@@ -605,12 +616,15 @@ def _tokens(text):
     is `changed`, `>`, `a.txt`; `2>&1` is `2>&`, `1`; a quoted `'>'` is a plain word. Digits directly before an operator
     are its fd only when they make the whole word so far, unquoted. ValueError on an unbalanced quote."""
     out, buf, bare, quoted, i, n = [], [], [], False, 0, len(text)
+    expand = [False]
 
     def flush():
         if buf or quoted:
             word = Word("".join(buf))
             word.bare = "".join(bare)
+            word.expand = expand[0]
             out.append(word)
+        expand[0] = False
 
     while i < n:
         c = text[i]
@@ -631,6 +645,8 @@ def _tokens(text):
                     buf.append(text[j + 1] if text[j + 1] != "\n" else "")
                     j += 2
                     continue
+                if EXPANDS.match(text, j) or text[j] == "`":
+                    expand[0] = True
                 buf.append(text[j])
                 j += 1
             if j >= n:
@@ -653,6 +669,8 @@ def _tokens(text):
             out.append(word)
             i += len(op)
         else:
+            if EXPANDS.match(text, i) or c == "`" or (c == "~" and not buf and not quoted):
+                expand[0] = True
             buf.append(c)
             bare.append(c)
             i += 1
@@ -691,11 +709,6 @@ def _redirect_scan(words):
             if op == "<>":
                 inputs.append(target)
     return kept, inputs, outputs, reasons
-
-
-def _redirects(words):
-    """(words without redirections, input-redirect targets, output-redirect targets): _redirect_scan without its reasons."""
-    return _redirect_scan(words)[:3]
 
 
 # ---- shell command lines: stages, executions, writes (round 3 rule 4) -------------------------------------------------------
@@ -744,142 +757,149 @@ def _segments(command):
     return out
 
 
-def _words(text):
-    try:
-        return _tokens(text)
-    except ValueError:
-        return text.split()
-
-
 ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\+?=")
 SHELLS = ("sh", "bash", "zsh", "dash")
 SHELL_KEYWORDS = ("for", "while", "until", "if", "then", "do", "else", "elif", "case", "function", "done", "fi")
-OPAQUE_PROGRAMS = ("xargs", "eval", "source", ".", "parallel")     # run text the scorer does not parse
+OPAQUE_PROGRAMS = ("xargs", "parallel")     # run words the scorer reads only through _runs_something
 
 
-def _unwrap(words):
-    """(words of the program that really runs, nested command text for `sh -c TEXT` or None): _unwrap_chain without its
-    wrappers."""
-    return _unwrap_chain(words)[:2]
+# ---- the wrapper table (round 7 rule 1): recognise, never strip -------------------------------------------------------------
+# A stage is read only when every word is matched by an entry: leading NAME=value assignments, then any chain of the
+# wrappers below, each with exactly the options it lists (an option word and the number of operand words it takes), then
+# the program and its arguments. Any other option of a wrapper, a wrapper at another path, a launcher, or a wrapper with
+# nothing to run makes the WHOLE call uncertain. The table is the grammar: WRAPPER_TABLE renders it, and score.py's header
+# holds the same text (a test keeps them equal).
+TEST_RUN = "tools/agent/test-run.sh"
+DURATION = re.compile(r"^\d+(\.\d+)?[smhd]?$")
+WRAPPERS = {
+    # name: (options {word: operand words}, NAME=value words allowed, operand ("duration" after the options, "worktree"
+    #        before them, or None), end word that must close the wrapper's own words, or None)
+    "env": ({"-i": 0, "-u": 1}, True, None, None),
+    "command": ({}, False, None, None),
+    "timeout": ({"-s": 1, "-k": 1}, False, "duration", None),
+    "nice": ({"-n": 1}, False, None, None),
+    "time": ({"-p": 0}, False, None, None),
+    "npx": ({"--yes": 0, "-y": 0, "--no-install": 0}, False, None, None),
+    TEST_RUN: ({"--timeout": 1, "--label": 1}, False, "worktree", "--"),
+}
+# Programs that run another command in a way the table does not read: always uncertain.
+LAUNCHERS = ("exec", "builtin", "nohup", "sudo", "doas", "stdbuf", "xvfb-run", "caffeinate", "unbuffer", "script", "watch",
+             "strace", "ionice", "chrt", "taskset", "setsid", "flock", "cross-env", "dotenv", "bunx", "pnpx", "eval",
+             "source", ".")
+LAUNCHER_SUBCOMMANDS = {"npm": ("exec", "x"), "pnpm": ("exec", "dlx"), "yarn": ("exec", "dlx"), "uv": ("run",),
+                        "poetry": ("run",), "bundle": ("exec",)}
+RUNNER_PROGRAMS = ("npm", "pnpm", "yarn", "vitest", "jest", "tsc", "pytest", "eslint", "mypy", "go", "cargo", "make")
 
 
-def _unwrap_chain(words):
-    """(words of the program that really runs, nested command text for `sh -c TEXT` or None, [(wrapper, worktree)]).
-    Strips env assignments and `env`/`timeout`/`nice`/`time`/`command`/`exec`/`nohup`/`npx`, and `tools/agent/test-run.sh
-    WORKTREE [--timeout S] [--label N] --`, in any combination (round 6 rule 3: `env CI=1 timeout 60 test-run.sh . -- CMD`
-    is a test-run.sh call). Each stripped wrapper is listed in order; test-run.sh's entry carries its WORKTREE operand."""
-    words, wrappers = list(words), []
-    while words:
-        while words and ASSIGN.match(words[0]):
-            words = words[1:]
-        if not words:
+def _wrapper_rows():
+    rows = []
+    for name, (options, assigns, operand, end) in WRAPPERS.items():
+        parts = [name] + (["WORKTREE"] if operand == "worktree" else [])
+        parts += ["[%s%s]" % (o, " X" * k) for o, k in options.items()] + (["[NAME=value …]"] if assigns else [])
+        parts += (["DURATION"] if operand == "duration" else []) + ([end] if end else [])
+        rows.append("      " + " ".join(parts) + " CMD …")
+    return rows
+
+
+WRAPPER_TABLE = "\n".join(
+    ["  The wrapper table (round 7 rule 1; episode_lib.WRAPPERS). A stage is read only when every word is matched:",
+     "    [NAME=value …] then any chain of"] + _wrapper_rows() + [
+     "    then the program and its arguments. A wrapper matches only as NAME, /usr/bin/NAME or /bin/NAME (test-run.sh:",
+     "    tools/agent/test-run.sh with nothing, ./ or …/ before it); test-run.sh inside test-run.sh is not read; DURATION",
+     "    is digits with an optional s, m, h or d. Uncertain (the WHOLE call, and the cwd after it in that shell): any other",
+     "    option of a wrapper (`command -v`, `env -S`, `time -o`, `timeout --signal=K`), a wrapper at another path or with",
+     "    nothing to run, a launcher (exec, builtin, nohup, sudo, stdbuf, cross-env, bunx …: LAUNCHERS), a launcher",
+     "    subcommand (npm exec, pnpm dlx, uv run …), cd/pushd under a wrapper, an assignment-only stage, `$?`, `$(( ))`,",
+     "    eval, source and `.`. A word holding an unresolved expansion or glob ($VAR, ${…}, a substitution, a leading ~,",
+     "    *.ts) is read but has no known value: a check with one has no identity (rule 2). A check's identity is its argv",
+     "    after the wrappers and assignments, as a JSON array, with its cwd."])
+
+
+def _wrapper_name(word):
+    """The WRAPPERS key a program word names, None when it names none; "" when its basename is a wrapper's at a path the
+    table does not hold (then the stage is uncertain)."""
+    for name in WRAPPERS:
+        if name == TEST_RUN:
+            if word in (TEST_RUN, "./" + TEST_RUN) or word.endswith("/" + TEST_RUN):
+                return name
+            if os.path.basename(word) == "test-run.sh":
+                return ""
+        elif word in (name, "/usr/bin/" + name, "/bin/" + name):
+            return name
+        elif os.path.basename(word) == name and "/" in word:
+            return ""
+    return None
+
+
+def classify(words, literal=False):
+    """({words: [program by basename, args…], program, via: "test-run.sh" or None, wt: its WORKTREE, chain: [wrappers]},
+    None) when every word of one simple command (redirects removed) is matched by the wrapper table (WRAPPER_TABLE);
+    (None, reason) otherwise. literal: a record's argv, exec'd with no shell: a NAME=value word is no assignment."""
+    i, n, chain, via, worktree = 0, len(words), [], None, None
+    while i < n and ASSIGN.match(words[i]):
+        if literal:
+            return None, "an assignment word as the program of an exec'd argv"
+        i += 1
+    if i == n:
+        return None, "an assignment-only stage"
+    while i < n:
+        name = _wrapper_name(words[i])
+        if name == "":
+            return None, "`%s` (a wrapper at a path the table does not hold)" % words[i]
+        if name is None:
             break
-        program = os.path.basename(words[0])
-        if program == "env":
-            words = words[1:]
-            while words and (words[0].startswith("-") or ASSIGN.match(words[0])):
-                words = words[2:] if words[0] in ("-u", "-C", "-S") else words[1:]
-        elif program == "timeout":
-            words = words[1:]
-            while words and words[0].startswith("-"):
-                words = words[2:] if words[0] in ("-s", "-k", "--signal", "--kill-after") else words[1:]
-            words = words[1:]                      # the duration
-        elif program in ("nice", "time", "command", "exec", "nohup", "builtin"):
-            words = words[1:]
-            while words and words[0].startswith("-"):
-                words = words[2:] if program == "nice" and words[0] == "-n" else words[1:]
-        elif program == "npx":
-            words = words[1:]
-            while words and words[0].startswith("-"):
-                words = words[1:]
-        elif program == "test-run.sh":
-            wrappers.append((program, words[1] if len(words) > 1 and words[1] != "--" else None))
-            words = words[words.index("--") + 1:] if "--" in words else []
-            continue
-        elif program in SHELLS and len(words) > 2 and words[1].startswith("-") and "c" in words[1]:
-            return [], words[2], wrappers
-        else:
-            break
-        wrappers.append((program, None))
-    return words, None, wrappers
-
-
-def shell_stages(command, _piped=False):
-    """The simple commands a Bash command line runs, in order, `sh -c TEXT` expanded in place. Each:
-    {words (program first, wrappers and redirections removed), inputs, outputs, piped (stdin from a pipe), cd (target or
-    None), opaque (text the scorer cannot follow: $(...), backticks, $VAR, xargs, eval, loops), sep (the separator before it:
-    None, ; & | && ||), cond (inside if/case/a loop/a function body: it may not run)}. A list of words (a test-run record's
-    cmd) is one simple command. `sh -c TEXT` is expanded in place: its first stage takes the outer separator; the rest run
-    only if that stage does, so after an outer && or || (or inside a condition) they are cond."""
-    if isinstance(command, (list, tuple)):
-        parts = [(list(command), None)]
-    elif isinstance(command, str):
-        parts = [(_words(text), ";" if sep == ";;" else sep) for text, sep in _segments(strip_heredocs(command)[0])]
-    else:
-        return []
-    out = []
-    depth, in_case, body, sub = 0, 0, False, 0
-    for raw, sep in parts:
-        # `( ... )` runs in a subshell: a cd inside it ends with it (round 4 rule 4). Each stage carries its subshell depth.
-        opens = sum(1 for w in raw[:len(raw) - len(list(itertools.dropwhile(lambda w: w == "(", raw)))]) + (
-            len(raw[0]) - len(raw[0].lstrip("(")) if raw and raw[0] != "(" and not raw[0].startswith("$(") else 0)
-        tail = list(itertools.dropwhile(lambda w: w == ")", reversed(raw)))
-        closes = len(raw) - len(tail) + (len(tail[0]) - len(tail[0].rstrip(")")) if tail and "$(" not in tail[0]
-                                         and not (in_case and len(raw) == 1) and "(" not in tail[0] else 0)
-        sub += opens
-        stage_sub = sub
-        sub = max(0, sub - closes)
-        raw = [w for w in raw if w not in ("(", ")", "{", "}")]
-        if raw and raw[0].startswith("("):
-            raw[0] = raw[0].lstrip("(")
-        if raw and raw[-1].endswith(")") and "$(" not in raw[-1]:
-            raw[-1] = raw[-1].rstrip(")")
-        raw = [w for w in raw if w]
-        keyword = False
-        while raw and raw[0] in ("if", "then", "else", "elif", "do", "while", "until", "!", "fi", "done", "esac", "for", "case"):
-            word = raw.pop(0)
-            keyword = True
-            if word in ("if", "while", "until"):
-                depth += 1
-            elif word in ("fi", "done", "esac"):
-                depth = max(0, depth - 1)
-                in_case = max(0, in_case - 1) if word == "esac" else in_case
-            elif word in ("for", "case"):
-                depth += 1
-                in_case += word == "case"
-                if word == "case" and "in" in raw:
-                    raw = raw[raw.index("in") + 1:]
-                else:
-                    raw = []                    # `for x in a b`: no command in this part
-        if in_case and raw and raw[0].endswith(")") and "$(" not in raw[0]:
-            raw = raw[1:]                       # a case arm's pattern
-        if raw and (raw[0] == "function" or (raw[0].endswith("()") and len(raw[0]) > 2)):
-            body = True                         # a function body runs only when called: everything after is uncertain
-            continue
-        if not raw:
-            continue
-        cond = body or keyword or depth > 0
-        kept, inputs, outputs = _redirects(raw)
-        words, nested = _unwrap(kept)
-        if nested is not None:
-            inner = shell_stages(nested, _piped=sep == "|")
-            for n, stage in enumerate(inner):
-                stage["sub"] = stage.get("sub", 0) + stage_sub
-                stage["sep"] = sep if n == 0 else stage["sep"]
-                stage["cond"] = stage["cond"] or cond or (n > 0 and sep in ("&&", "||"))
-            out.extend(inner)
-            continue
-        if not words:
-            continue
-        program = os.path.basename(words[0])
-        text = " ".join(raw)
-        opaque = ("$(" in text or "`" in text or program in OPAQUE_PROGRAMS or program in SHELL_KEYWORDS
-                  or any("$" in w for w in words[1:] + inputs))
-        out.append({"words": [program] + words[1:], "inputs": inputs, "outputs": outputs,
-                    "piped": sep == "|" or (_piped and not out), "sep": sep, "cond": cond,
-                    "cd": (words[1] if len(words) > 1 else "~") if program == "cd" else None, "opaque": opaque,
-                    "sub": stage_sub})
-    return out
+        if name == TEST_RUN and via:
+            return None, "test-run.sh inside test-run.sh"
+        label = "test-run.sh" if name == TEST_RUN else name
+        options, assigns, operand, end = WRAPPERS[name]
+        start, i = i, i + 1
+        if operand == "worktree":
+            if i >= n or words[i].startswith("-"):
+                return None, "test-run.sh with no WORKTREE"
+            worktree, i = words[i], i + 1
+        closed = False
+        while i < n:
+            word = words[i]
+            if assigns and ASSIGN.match(word):
+                i += 1
+            elif word in options:
+                if i + options[word] >= n:
+                    return None, "`%s %s` with no operand" % (label, word)
+                i += 1 + options[word]
+            elif end and word == end:
+                i, closed = i + 1, True
+                break
+            elif word.startswith("-") and word != "-":
+                return None, "`%s %s` (an option the wrapper table does not hold)" % (label, word)
+            else:
+                break
+        if end and not closed:
+            return None, "%s with no `%s` before its command" % (label, end)
+        if operand == "duration":
+            if i >= n or not DURATION.match(words[i]):
+                return None, "timeout with no duration"
+            i += 1
+        chain.append(label)
+        via = via or ("test-run.sh" if name == TEST_RUN else None)
+        if i >= n:
+            if end or operand == "duration" or len(chain) > 1:
+                return None, "%s with nothing to run" % label
+            # a wrapper alone (`env`, `time`): it runs nothing else
+            return {"words": [label] + list(words[start + 1:]), "program": words[start], "via": None, "wt": None,
+                    "chain": []}, None
+    program, args = words[i], list(words[i + 1:])
+    base = os.path.basename(program)
+    if base in ("eval", "source", "."):
+        return None, base
+    if base in LAUNCHERS:
+        return None, "`%s` (a launcher the table does not read)" % base
+    if args and args[0] in LAUNCHER_SUBCOMMANDS.get(base, ()):
+        return None, "`%s %s` (a launcher the table does not read)" % (base, args[0])
+    if chain and base in ("cd", "pushd", "popd"):
+        return None, "%s under a wrapper" % base
+    if chain and ASSIGN.match(program):
+        return None, "an assignment word after a wrapper"
+    return {"words": [base] + args, "program": program, "via": via, "wt": worktree, "chain": chain}, None
 
 
 def stage_runs(stages, exit=None, blocked=False):
@@ -924,33 +944,64 @@ GIT_WRITES = ("checkout", "switch", "merge", "rebase", "reset", "apply", "stash"
 FILE_WRITERS = ("mv", "cp", "rm", "touch", "tee", "patch", "truncate", "ln", "rsync", "dd")
 
 
+def _argv(words):
+    return json.dumps([str(w) for w in words])
+
+
 def check_identity(words):
-    """The verification command a simple command runs, with its arguments (distinct targets are distinct commands), or None.
-    `npm run test` and `npm t` are `npm test`; `python -m pytest` is `pytest`."""
+    """The verification command a simple command runs, as a JSON array of its words (round 7 rule 2: `npm test -- "a b"`
+    is ["npm","test","--","a b"], never the same check as `npm test -- a b`), or None. Distinct targets are distinct
+    commands. `npm run test` and `npm t` are `npm test`; `python -m pytest` is `pytest`. The caller decides whether the
+    words have known values (stage_check)."""
     if not words:
         return None
     program, args = os.path.basename(words[0]), list(words[1:])
     if program in ("npm", "pnpm", "yarn"):
         if args[:1] in (["test"], ["t"], ["tst"]):
-            return " ".join(["npm", "test"] + args[1:])
+            return _argv(["npm", "test"] + args[1:])
         if program == "yarn" and args[:1] and args[0] in ("build", "typecheck", "lint"):
             args = ["run"] + args
         if args[:2] == ["run", "test"]:
-            return " ".join(["npm", "test"] + args[2:])
+            return _argv(["npm", "test"] + args[2:])
         if args[:1] == ["run"] and len(args) > 1 and re.match(r"^(build|typecheck|type-check|lint|check|test:.*|e2e)$", args[1]):
-            return " ".join(["npm"] + args)
+            return _argv(["npm"] + args)
         return None
     if program in ("vitest", "jest", "tsc", "pytest", "eslint", "mypy"):
-        return " ".join([program] + args)
+        return _argv([program] + args)
     if re.match(r"^python[0-9.]*$", program) and args[:1] == ["-m"] and len(args) > 1 and args[1] in ("unittest", "pytest"):
-        return " ".join(["pytest" if args[1] == "pytest" else "python -m unittest"] + args[2:])
+        return _argv((["pytest"] if args[1] == "pytest" else ["python", "-m", "unittest"]) + args[2:])
     if program in ("go", "cargo") and args[:1] in (["test"], ["build"], ["vet"]):
-        return " ".join([program] + args)
+        return _argv([program] + args)
     if program == "make" and args[:1] and args[0] in ("test", "check", "build"):
-        return " ".join([program] + args)
+        return _argv([program] + args)
     if program == "git" and "diff" in args and "--check" in args:
-        return " ".join([program] + args)
+        return _argv([program] + args)
     return None
+
+
+def show_identity(identity):
+    """A check identity as display text (its words shell-quoted, so `"a b"` and `a b` read differently); text that is not a
+    JSON array is shown as it is."""
+    try:
+        words = json.loads(identity)
+    except (TypeError, ValueError):
+        return identity
+    return shlex.join(str(w) for w in words) if isinstance(words, list) else identity
+
+
+def stage_check(stage):
+    """(identity, doubt) of one read stage (round 7 rule 2). identity: check_identity of its argv when every word has a
+    known value. doubt: why the stage may be a check whose identity is unknown: a word holds an unresolved expansion or
+    glob and the program is a runner (or the words already make a check). Such a run never clears or repeats another."""
+    words = stage["words"]
+    identity = check_identity(words)
+    if not stage.get("opaque"):
+        return identity, None
+    program = words[0]
+    if (identity or program in RUNNER_PROGRAMS or re.match(r"^python[0-9.]*$", program)
+            or (program == "git" and ("diff" in words or any(unresolved(w) for w in words[1:2])))):
+        return None, "a check whose words hold an unresolved expansion or glob (%s)" % " ".join(words)[:60]
+    return None, None
 
 
 def _git_sub(args):
@@ -980,25 +1031,35 @@ def stage_writes(stage):
 
 
 def command_events(command):
-    """[(kind, text)] in execution order for one Bash call (or one test-run record's cmd list): ("write", stage text) for a
-    stage that changes files, ("check", identity) for a verification runner. A stage that both writes and checks records the
-    write first. Text inside arguments (`grep 'npm run build' README.md`) is never an execution."""
+    """[(kind, text)] in execution order for one Bash call (or one test-run record's cmd list), read by grammar_call:
+    ("write", stage text) for a stage that changes files (a redirect is a write whatever the command, `cd . > a.txt`
+    included), ("check", display text of its identity) for a verification runner, ("doubt", why) for a check whose
+    identity is unknown, and one ("uncertain", reason) for a call outside the grammar. A stage that both writes and checks
+    records the write first. Text inside arguments (`grep 'npm run build' README.md`) is never an execution."""
+    stages, why = grammar_call(command)
+    if why:
+        return [("uncertain", why)]
     out = []
-    for stage in shell_stages(command):
-        if stage["cd"] is not None:
-            continue
+    for stage in stages:
         if stage_writes(stage):
             out.append(("write", " ".join(stage["words"])))
-        identity = check_identity(stage["words"])
+        if stage["cd"] is not None:
+            continue
+        identity, doubt = stage_check(stage)
         if identity:
-            out.append(("check", identity))
+            out.append(("check", show_identity(identity)))
+        elif doubt:
+            out.append(("doubt", doubt))
     return out
 
 
 def executions(command):
-    """The executed commands of a Bash call (or a cmd list), one text per stage: the check identity for a verification
-    runner, else the program and its arguments (wrappers, env assignments and redirections removed). `cd` is not one."""
-    return [check_identity(s["words"]) or " ".join(s["words"]) for s in shell_stages(command) if s["cd"] is None]
+    """The executed commands of a Bash call (or a cmd list) inside the grammar, one text per stage: the check identity's
+    display text for a verification runner, else the program and its arguments (wrappers, env assignments and redirections
+    are not part of it). `cd` is not one. An uncertain call has none it can name: []."""
+    stages, why = grammar_call(command)
+    return [] if why else [show_identity(check_identity(s["words"])) if check_identity(s["words"]) and not s["opaque"]
+                           else " ".join(s["words"]) for s in stages if s["cd"] is None]
 
 
 def record_command(record):
@@ -1017,31 +1078,28 @@ Words are split quote-aware and every redirect operator is its own token (`chang
 file (`>`, `>>`, `>|`, `&>`, `&>>`, `>& f`, `<>`, `2> f`, a bare `> f`, `X=1 > f`) is a write at its target, resolved
 against the stage's cwd; `2>&1`, `>&2`, `>&-` and a target under /dev (`>/dev/null`) are not writes; `< f` is a read; a
 heredoc delimiter and a `<<<` word are data. A heredoc body is data only when its delimiter is quoted (`<<'EOF'`, `<<\EOF`)
-or it holds no `$` or backtick. The wrappers env, timeout, nice, time, command, nohup, npx and `tools/agent/test-run.sh
-WORKTREE [--timeout S] [--label N] --` are stripped from a command in any combination; a test-run.sh call under any of
-them is counted and runs in its WORKTREE. `cd DIR` as its own command (not in a pipeline) changes the cwd of the following
-commands of that call only when it ran and its exit is known to be 0: a known nonzero exit leaves the cwd where it was,
-an unknown exit leaves it unknown. Anything else makes the WHOLE call uncertain: `||`, background `&`, `;;` outside a
-case, a list ending in `&&` or `|`, if/case/loops/select/functions/`!`/`[[`, `( … )`, `{ … }`, process substitution,
-`sh -c`/`bash -c`/`eval`/`source`/`.`/`exec`, a shell reading its stdin (`bash`, `sh -s`, `… | sh`), `$( … )` or
-backticks containing a runner or a write, an unquoted heredoc body holding `$` or a backtick, xargs/parallel/`find -exec`
-running a runner, a write or a shell (or `find -delete`), a program word that is a variable or a glob, a brace expansion,
-a redirect with no target or `<&` to a file, pushd/popd, cd in a pipeline, unbalanced quotes or parentheses. An uncertain
-call may have run any command and written anything: every execution in it may not have run (no exit), it holds a write
-of unknown place that may have run, and when it holds a cd the cwd after it is unknown; a check or measure over an
-interval that holds one is unknown (score.py, round 6 rule 1). Known limit: a program outside the writer list (stage_writes)
-is taken not to write."""
+or it holds no `$` or backtick. Each simple command is classified word by word against the wrapper table (WRAPPER_TABLE,
+round 7 rule 1): it is read only when every word is matched; a test-run.sh call under any chain of table wrappers is
+counted and runs in its WORKTREE (resolved against the stage's cwd), and a redirect on it writes at the outer cwd. `cd
+DIR` as its own command (not in a pipeline, not under a wrapper) changes the cwd of the following commands of that call
+only when it ran and its exit is known to be 0: a known nonzero exit leaves the cwd where it was, an unknown exit leaves it
+unknown; a redirect on it is a write at the cwd before it. Anything else makes the WHOLE call uncertain: what the table
+does not match, `||`, background `&`, `;;` outside a case, a list ending in `&&` or `|`, if/case/loops/select/functions/
+`!`/`[[`, `( … )`, `{ … }`, process substitution, `sh -c`/`bash -c`, a shell reading its stdin (`bash`, `sh -s`,
+`… | sh`), `$( … )` or backticks containing a runner or a write, `$(( ))`, `$?`, an unquoted heredoc body holding `$` or
+a backtick, xargs/parallel/`find -exec` running a runner, a write or a shell (or `find -delete`), a program word that is
+a variable or a glob, a brace expansion, a redirect with no target or `<&` to a file, pushd/popd, cd in a pipeline,
+unbalanced quotes or parentheses. An uncertain call is never read in part: it may have run any command and written
+anything, so it is one marker (a write of unknown place that may have run, no execution of its own), and the cwd after
+it in the same shell is unknown; a check or measure over an interval that holds one is unknown (score.py's gate). A word
+holding an unresolved expansion or glob has no known value: a check whose words hold one has no identity and is a doubt
+(round 7 rule 2). Known limit: a program outside the writer list (stage_writes) is taken not to write."""
 GRAMMAR_KEYWORDS = ("if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done", "case", "esac", "select",
                     "function", "!", "[[", "]]", "in", "coproc")
 SUB = "$__SUB"                     # a $( … ) or backtick substitution, replaced before the call is split
 
 
 HEREDOC_OP = re.compile(r"(?<!<)<<(-?)[ \t]*(\\?)(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\3")
-
-
-def strip_heredocs(text):
-    """(text without heredoc bodies, unterminated): _heredocs without its expanding flag."""
-    return _heredocs(text)[:2]
 
 
 def _heredocs(text):
@@ -1108,12 +1166,15 @@ def _structure(text):
             out.append(text[i:i + 2])
             i += 2
             continue
+        if c == "$" and (text.startswith("$?", i) or text.startswith("${?}", i)):
+            reasons.append("`$?`")                    # round 7 rule 1: an exit status read back
         if c == "$" and text.startswith("$((", i):
             end = _close_paren(text, i + 1)
             if end is None:
                 reasons.append("unbalanced parentheses")
                 break
-            out.append("$__ARITH")                    # arithmetic: no command runs in it
+            reasons.append("`$(( ))` arithmetic")     # round 7 rule 1: it may hold a substitution, and its value is not read
+            out.append(SUB)
             i = end + 1
             continue
         if c == "$" and text.startswith("$(", i):
@@ -1178,19 +1239,23 @@ def _program_args(words, takes=()):
 
 
 def _runs_something(words):
-    """Whether a word list runs a verification runner, writes, or starts a shell (xargs/find -exec targets)."""
+    """Whether a word list (an xargs/parallel/find -exec target) may run a verification runner, write, or start a shell:
+    read by the wrapper table (round 7 rule 1). Words the table does not match may run anything: True."""
     if not words:
         return False
-    inner, nested = _unwrap(words)
-    if nested is not None or (inner and os.path.basename(inner[0]) in SHELLS + ("eval", "source", ".")):
+    info, why = classify(words)
+    if why:
         return True
-    return bool(inner and (check_identity([os.path.basename(inner[0])] + inner[1:])
-                           or stage_writes({"words": [os.path.basename(inner[0])] + inner[1:], "outputs": []})))
+    inner = info["words"]
+    stage = {"words": inner, "outputs": [], "opaque": any(unresolved(w) for w in words)}
+    return bool(inner[0] in SHELLS or any(stage_check(stage)) or inner[0] in RUNNER_PROGRAMS or stage_writes(stage))
 
 
-def _grammar_stage(words, sep, next_sep):
-    """(stage or None, reason or None) for one simple command of a call inside the grammar. A stage of only assignments
-    and redirects (`> a.txt`, `X=1 > a.txt`) runs `:` with those redirects: its output target is a write (round 6 rule 2)."""
+def _grammar_stage(words, sep, next_sep, literal=False):
+    """(stage or None, reason or None) for one simple command of a call inside the grammar, its words classified by the
+    wrapper table (round 7 rule 1). A stage of only redirects (`> a.txt`) runs `:` with them: its output target is a
+    write; a stage of only assignments (`X=1`, `X=1 > a.txt`) is uncertain. stage["opaque"]: a word of its argv holds an
+    unresolved expansion or glob (round 7 rule 2)."""
     if words[0] in GRAMMAR_KEYWORDS:
         return None, "if/case/loop/function/`!`/`[[` (%s)" % words[0]
     kept, inputs, outputs, bad = _redirect_scan(words)
@@ -1199,28 +1264,19 @@ def _grammar_stage(words, sep, next_sep):
     unquoted = " ".join(getattr(w, "bare", "") for w in kept)
     if re.search(r"\{[^{}\s]*(,|\.\.)[^{}\s]*\}", unquoted):
         return None, "a brace expansion"
-    inner, nested, wrappers = _unwrap_chain(kept)
-    names = [name for name, _wt in wrappers]
-    # Round 6 rule 3: test-run.sh under env/timeout/nice/time/command is still a test-run.sh call, run in its WORKTREE.
-    via = "test-run.sh" if "test-run.sh" in names else None
-    worktree = next((wt for name, wt in wrappers if name == "test-run.sh"), None)
-    if nested is not None:
-        return None, "sh -c"
-    if "exec" in names:
-        return None, "exec"
-    if not inner:
-        if via:
-            return None, "test-run.sh with no `--` command"
-        if not (inputs or outputs):
-            return None, None                                   # assignments only: nothing runs
-        inner = [":"]
-    program, args = os.path.basename(inner[0]), inner[1:]
-    if "$" in inner[0]:
-        return None, "a program word that is a variable"
-    if any(ch in getattr(inner[0], "bare", "") for ch in "*?["):
-        return None, "a glob in the program word"
-    if program in ("eval", "source", "."):
-        return None, program
+    if not kept:
+        info = {"words": [":"], "program": ":", "via": None, "wt": None, "chain": []}
+    else:
+        if unresolved(kept[0]) and not ASSIGN.match(kept[0]):
+            return None, ("a program word that is a variable" if getattr(kept[0], "expand", False)
+                          else "a glob in the program word")
+        info, why = classify(kept, literal)
+        if why:
+            return None, why
+    program, args = info["words"][0], info["words"][1:]
+    if unresolved(info["program"]):
+        return None, ("a program word that is a variable" if getattr(info["program"], "expand", False)
+                      else "a glob in the program word")
     if program in SHELLS and any(re.match(r"^-[a-zA-Z]*c", a) for a in args if a.startswith("-") and not a.startswith("--")):
         return None, "sh -c"
     if program in SHELLS and (all(a.startswith("-") for a in args) or "-s" in args):
@@ -1237,23 +1293,22 @@ def _grammar_stage(words, sep, next_sep):
         return None, program
     if program == "cd" and "|" in (sep, next_sep):
         return None, "cd in a pipeline"
-    text = " ".join([program] + args)
     return {"words": [program] + args, "inputs": inputs, "outputs": outputs, "piped": sep == "|", "sep": sep, "cond": False,
-            "cd": (args[0] if args else "~") if program == "cd" else None, "sub": 0, "via": via, "wt": worktree,
-            "opaque": SUB in text or any("$" in w for w in args + inputs) or program in OPAQUE_PROGRAMS}, None
+            "cd": (args[0] if args else "~") if program == "cd" else None, "sub": 0, "via": info["via"], "wt": info["wt"],
+            "chain": info["chain"], "opaque": any(unresolved(w) for w in args)}, None
 
 
 def grammar_call(command):
-    """(stages, reason) for one Bash call (round 5 rule 1, round 6 rule 2). reason None: the call is inside the grammar
-    (GRAMMAR) and stages are its simple commands in order (sep: None ; && |). reason text: the whole call is uncertain;
-    stages are then shell_stages' best-effort parse, candidates only (each may not have run). A list of words (a record's
-    cmd) is one simple command."""
+    """(stages, reason) for one Bash call (round 5 rule 1, round 6 rule 2, round 7 rule 1). reason None: the call is inside
+    the grammar (GRAMMAR, WRAPPER_TABLE) and stages are its simple commands in order (sep: None ; && |). reason text: the
+    whole call is uncertain and stages is [] (round 7: recognise, never strip; an uncertain call is never read in part). A
+    list of words (a record's cmd, exec'd with no shell) is one simple command whose words are literal."""
     if isinstance(command, (list, tuple)):
         words = [str(w) for w in command]
         if not words:
             return [], None
-        stage, why = _grammar_stage(words, None, None)
-        return ([stage] if stage else [], None) if why is None else (shell_stages(words), why)
+        stage, why = _grammar_stage(words, None, None, literal=True)
+        return ([stage] if stage else [], None) if why is None else ([], why)
     if not isinstance(command, str):
         return [], None
     text, unterminated, expanding = _heredocs(command)
@@ -1264,7 +1319,7 @@ def grammar_call(command):
         reasons.append("an unquoted heredoc whose body holds $ or a backtick")
     for inner in subs:
         inner_stages, inner_why = grammar_call(inner)
-        if inner_why or any(check_identity(s["words"]) or stage_writes(s) for s in inner_stages):
+        if inner_why or any(any(stage_check(s)) or stage_writes(s) for s in inner_stages):
             reasons.append("$( … ) containing a runner or a write")
     stages, segments, pending = [], _segments(flat) if not reasons else [], None
     for k, (text, sep) in enumerate(segments):
@@ -1290,27 +1345,24 @@ def grammar_call(command):
     if pending:
         reasons.append("a list ending in %s" % pending)
     if reasons:
-        seen = []
-        for r in reasons:
-            if r not in seen:
-                seen.append(r)
-        return shell_stages(command), "; ".join(seen)
+        return [], "; ".join(dict.fromkeys(reasons))
     return stages, None
 
 
 def call_stages(command, exit=None, blocked=False):
-    """(stages, [(ran, exit)] per stage, reason) for one Bash call under the grammar: an uncertain call (reason set) gives
-    every stage (None, None): it may not have run and its exit is unknown."""
+    """(stages, [(ran, exit)] per stage, reason) for one Bash call under the grammar: an uncertain call (reason set) has no
+    stages."""
     stages, reason = grammar_call(command)
     if reason:
-        return stages, [(None, None)] * len(stages), reason
+        return [], [], reason
     return stages, stage_runs(stages, exit, blocked), None
 
 
 def record_shape(record):
     """(stage, identity, reason) of a tp-test-run:v1 record (round 5 rule 3): its exit backs a verification only when its
-    cmd is one simple command inside the grammar, with no shell wrapper; identity is its check identity, else its own text.
-    A shell (`sh -c …`), a compound list, a cd, or nothing to run: (None, None, reason): an uncertain execution."""
+    cmd is one simple command inside the grammar, with no shell wrapper; identity is its check identity, else its argv as
+    a JSON array (round 7 rule 2: a record's cmd is literal argv, exec'd with no shell). A shell (`sh -c …`), a compound
+    list, a cd, or nothing to run: (None, None, reason): an uncertain execution."""
     stages, why = grammar_call(record_command(record))
     if why:
         return None, None, "the record's cmd is outside the grammar (%s): its exit is the shell's" % why
@@ -1320,7 +1372,10 @@ def record_shape(record):
     stage = stages[0]
     if stage["cd"] is not None:
         return None, None, "the record's cmd is a cd"
-    return stage, check_identity(stage["words"]) or " ".join(stage["words"]), None
+    return stage, check_identity(stage["words"]) or _argv(stage["words"]), None
+
+
+READ_WORD = re.compile(r"[A-Za-z0-9_./-]+")
 
 
 def shell_read_scan(command, cwd=None, project_dirs=(), private_dirs=()):
@@ -1328,14 +1383,18 @@ def shell_read_scan(command, cwd=None, project_dirs=(), private_dirs=()):
     that reads a file path operand (or a -f/--file operand, or an input redirect) inside a project dir and outside the
     private dirs, resolved against the cwd as `cd` stages change it. With no path operand rg and grep -r search the cwd unless
     their stdin is a pipe (then they read the pipe, not a file), find searches the cwd, the others read stdin. uncounted:
-    reader stages the scorer cannot follow ($(...), backticks, $VAR operands, xargs/eval/loops, a relative path after a cd
-    it cannot resolve)."""
+    reader stages the scorer cannot follow: every reader word of an uncertain call (loops, eval, a substitution running a
+    runner), a reader whose words hold $VAR or a substitution, xargs/parallel running a reader, a relative path after a cd
+    it cannot resolve. Read by grammar_call (round 7 rule 1)."""
     if not isinstance(command, str):
         return [], 0
+    stages, why = grammar_call(command)
+    if why:
+        return [], sum(1 for w in READ_WORD.findall(command) if os.path.basename(w) in SHELL_READERS)
     projects = [_norm(d) for d in project_dirs if d]
     here = _norm(cwd) if cwd else (projects[0] if projects else None)
     found, uncounted = [], 0
-    for stage in shell_stages(command):
+    for stage in stages:
         words = stage["words"]
         if stage["cd"] is not None:
             target = stage["cd"]
@@ -1348,10 +1407,10 @@ def shell_read_scan(command, cwd=None, project_dirs=(), private_dirs=()):
             continue
         program = words[0]
         if program not in SHELL_READERS:
-            if stage["opaque"] and any(os.path.basename(w) in SHELL_READERS for w in words):
-                uncounted += 1                     # e.g. `xargs grep x`, `for f in ...; do cat $f`
+            if program in OPAQUE_PROGRAMS + ("find",) and any(os.path.basename(w) in SHELL_READERS for w in words[1:]):
+                uncounted += 1                     # e.g. `xargs grep x`, `find . -exec cat {} ;`
             continue
-        if stage["opaque"]:
+        if stage["opaque"] or any(unresolved(t) for t in stage["inputs"]):
             uncounted += 1
             continue
         paths, recursive, files = _operands(program, words[1:])

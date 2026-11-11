@@ -43,9 +43,12 @@ newest review that asked for changes) and the Family: names of that review's cod
 clean HEAD tree asked for changes (the override's checks); the closing review's author is the retry whose meta.json gate_review is
 the authorization's; every code finding of each review of this tree that asked for changes has a family the authorization lists;
 and PATH is committed at the main repository's or the lane's HEAD and names each such review and its code findings (the reviewer's
-own F<n> ids). The findings are counted from every line of a review that starts one (review_findings), never taken from a
-quoting splitter; a review whose findings cannot all be counted and classified refuses (authorize and close alike), and the owner
-uses --override-review. The entry is an OWNER_OVERRIDE with the authorization's reason and a stop_rule object; the authorization
+own F<n> ids). One function reads a review for the stop rule (stop_review; stop_judge adds its lifecycle): the choice of which
+reviews count (authorize's gate, close's reviews of the tree), authorize's families and every close check all go through it, and a
+review is left out only when it proves the review approves. The findings are counted from every line of a review that starts one,
+never taken from a quoting splitter; a finding's Family: and Closes by: are the ones in its own section (to the next Markdown
+heading or finding). A review whose findings cannot all be counted and classified refuses (authorize and close alike, by the same
+function), and the owner uses --override-review. The entry is an OWNER_OVERRIDE with the authorization's reason and a stop_rule object; the authorization
 leaves the record in the same write (any close of the step removes it).
 
 Reading chosen on purpose (it is the least strict one that keeps the rule): a review that FINISHED without a usable verdict
@@ -311,11 +314,15 @@ def _new_task(name, step, writers):
     return f"`tp-agent dispatch --lane {name} --step {step} --role {role} --task \"...\"`"
 
 
-def evaluate(session, record, step, override=False):
+def evaluate(session, record, step, override=False, stop=False):
     """The facts of the review gate for `step` of `record`'s lane: {ok, why, wait, review, verdict, tree, dirty, head}.
     `wait` is who the step is waiting for (the `lanes` column waiting_on): worker | review | orchestrator-dispatch |
     orchestrator-commit | orchestrator-close. `why` is empty when ok. `override` is the owner's override of a review that asked
-    for changes (close_step checks who asked); it lifts that refusal and nothing else. Reads only; raises ValueError when git cannot say."""
+    for changes (close_step checks who asked); it lifts that refusal and nothing else. `stop` (the stop rule; implies `override`)
+    judges every review of the tree with stop_judge instead of _judge: one it cannot account for refuses, only one it proves to
+    approve is left out, and the facts carry `findings` ({review id: stop_review findings}) of the rest. Reads only; raises
+    ValueError when git cannot say."""
+    override = override or stop
     name, worktree = record["name"], record["worktree"]
     writers, queued = session.writers(name, step), session.queued_for(name, step)
     facts = {"ok": False, "why": "", "wait": None, "review": None, "verdict": None, "tree": None, "dirty": None, "head": None}
@@ -355,7 +362,7 @@ def evaluate(session, record, step, override=False):
             counting.append(review)
         else:
             stale.append((review, f"it reviewed tree {state['tree'][:12]}"))
-    judged = [(review, *_judge(review)) for review in counting]
+    judged = [(review, *(stop_judge if stop else _judge)(review)) for review in counting]
     where = f"{dirty} uncommitted path(s) in {worktree}" if dirty else f"HEAD {_short(head)}"
     do_review = (f"Start one with `tp-agent review {author['id']} --force` (--force reviews even when the policy says none is needed)"
                  if author else f"No writer of the step can be reviewed (none is settled in this session's active tasks). Dispatch a task into "
@@ -372,12 +379,19 @@ def evaluate(session, record, step, override=False):
         review, life = running[0][0], running[0][2]
         how = "Wait for it to finish, or end it" if finishes_alone(life) else _answer(review["id"]) + ", or end it"
         return refuse("review", f"{review['id']} is reviewing this tree and is {state_words(life)}. {how} with {_stop(review['id'])}")
+    refused = [j for j in judged if j[1] == "refuses"]  # stop_judge only
+    if refused:
+        review, why = refused[0][0], refused[0][2]
+        return refuse("orchestrator-close", f"the findings of {review['id']}, a review of this tree ({where}), cannot all be accounted for "
+                                            f"under the stop rule ({why}). {INCOMPLETE.format(name=name, step=step)}")
     if override:
         if not rejecting:
             return refuse(owner, f"no review of this tree ({where}) asked for changes, so there is nothing to override; "
                                  f"close the step without --override-review or --stop-rule once a review of it approves")
         facts.update(review=max(rejecting, key=lambda j: j[0]["when"])[0]["id"], verdict=lanes.OWNER_OVERRIDE,
                      rejecting=[j[0]["id"] for j in rejecting])
+        if stop:
+            facts["findings"] = {j[0]["id"]: j[2] for j in rejecting}
         return _committed(facts, refuse, where, worktree, name, step)
     approving = [j for j in judged if j[1] == "approves"]
     if not approving:
@@ -467,7 +481,7 @@ def close_step(state, common, name, step, override_reason=None, known_limits=Non
                                  f"{f' (the lane holds one for step(s) {held} only)' if held else ''}. Only the owner gives one, at a terminal: "
                                  f"`tp-agent lane authorize-stop {name} {step} --reason \"...\"`")
         override = override_reason is not None or stop is not None
-        facts = evaluate(session, record, step, override=override)
+        facts = evaluate(session, record, step, override=override, stop=stop is not None)
         if not facts["ok"]:
             raise ValueError(f"step {step} of lane {name} cannot be closed: {facts['why']}")
         if override and facts["verdict"] != lanes.OWNER_OVERRIDE:
@@ -507,6 +521,11 @@ def _without_authorization(record, step):
 FINDING_LEAD = re.compile(r"^[ \t]{0,3}(?:(?:[-*+]|\d{1,3}[.)])[ \t]+)?(?P<heading>#{1,6}[ \t]+)?(?P<em>(?:\*\*|__|\*|_)[ \t]*)?\[?"
                           r"F(?P<n>\d{1,4})(?![A-Za-z0-9'’]|_[A-Za-z0-9])(?P<rest>.*)$")
 BARE_LEAD_REST = re.compile(r"^\]?(?:[ \t]*$|[ \t]*[—–]|[ \t]+(?:-|\*\*|__|\[|\())")
+# Any Markdown (ATX) heading, `#` to `######`, empty or not: it ends the section of the finding above it.
+ANY_HEADING = re.compile(r"^[ \t]{0,3}#{1,6}(?:[ \t]|$)")
+# A line that starts a bold lead paragraph (`**Owed before close:** ...`, `__Cause__`), or a thematic break (`---`, `***`, `___`):
+# it ends the section too (fail closed), unless it is itself a `Closes by:` or `Family:` label line (`**Closes by:** code`).
+SECTION_BREAK = re.compile(r"^[ \t]{0,3}(?:(?P<b>\*\*|__)[^ \t].*?(?P=b)|(?:-[ \t]*){3,}$|(?:\*[ \t]*){3,}$|(?:_[ \t]*){3,}$)")
 
 
 def finding_lead(line):
@@ -517,65 +536,107 @@ def finding_lead(line):
     return f"F{int(match.group('n'))}"
 
 
-def review_findings(text):
-    """[(id, closes, [families])] of every finding of a REQUEST_CHANGES reply, in order, or ValueError naming what cannot be
-    accounted for. Completeness is proved, not taken from the quoting splitter (family_sweep.findings stops at a Coverage or
-    Verification heading and yields nothing for a malformed reply): every line of the whole reply that starts a finding
-    (finding_lead) is counted, wherever it is, and its section runs to the next one. Each section must hold exactly one `Closes by:`
-    label and its own `Family:` lines (both read by review_verdict's label patterns from the lines family_sweep.visible_lines shows:
-    outside fenced code and comments, not quoted, not in a `>` quote). The first `Closes by:` of a section is the finding's; its
-    `Family:` names are the ones above it. After it, and before the first finding, only items that close by something other than
-    code may follow (the `Closes by: check` lines of an "Owed before close" list): a `Closes by: code` or a `Family:` label there is
-    a finding with no lead line and refuses. Refused too: a reply that is not a REQUEST_CHANGES verdict, a fence or comment never
-    closed, no counted finding (a reason-only REQUEST_CHANGES), two findings with one id, and a finding with no `Closes by:` label."""
-    if review_verdict.parse(text)[0] != "REQUEST_CHANGES":
-        raise ValueError("it is not a REQUEST_CHANGES reply")
+def stop_review(text):
+    """(verdict, findings, refusal) of a review's reply: the stop rule's one reading of a review. Authorize (stop_plan), every check
+    of `lane close --stop-rule` (stop_rule_checks) and the choice of which reviews count (stop_judge, through evaluate and
+    stop_plan) read a review only through it. `verdict` is review_verdict.assess's, or None when the reply is no verdict;
+    `findings` is [(id, closes, family or None)] of every finding of a REQUEST_CHANGES reply, in order ([] for an approval);
+    `refusal` is None, or why the stop rule cannot act on the review (findings is then []).
+
+    An approval counts as one only when assess finds it complete. In a REQUEST_CHANGES reply the findings are counted, not taken
+    from the quoting splitter (family_sweep.findings stops at a Coverage or Verification heading): every line of the whole reply
+    that starts one (finding_lead) is a finding, wherever it is. A finding's section starts at its lead line and ends before the
+    next line that is any Markdown heading (ANY_HEADING, outside fenced code), a bold lead paragraph or thematic break
+    (SECTION_BREAK, unless the line is itself a label) or another finding's lead (a counted bold lead starts one), or at the end. The
+    `Closes by:` and `Family:` labels (review_verdict's label patterns, read on the lines family_sweep.visible_lines shows: outside
+    fenced code and comments, not quoted, not in a `>` quote) belong only to the section they are in. Each section must hold exactly
+    one `Closes by:` and at most one `Family:`, and one that closes by code must name its family. A label outside every section
+    belongs to no finding: a `Closes by:` other than code there is an owed item (an "Owed before close" list) and is passed over; a
+    `Closes by: code` or a `Family:` there is a finding with no lead line, which cannot be counted, and refuses. Refused too: a reply
+    that is no verdict, an incomplete approval, a fence or comment never closed, a REQUEST_CHANGES with no counted finding (a
+    reason-only one), and two findings with one id."""
+    try:
+        verdict, _, incomplete = review_verdict.assess(text)
+    except ValueError as error:
+        return None, [], str(error)
+    if verdict != "REQUEST_CHANGES":
+        return verdict, [], (f"it reads {verdict} but is incomplete ({incomplete}), so it cannot be shown to approve" if incomplete else None)
+    try:
+        return verdict, _counted_findings(text), None
+    except ValueError as error:
+        return verdict, [], str(error)
+
+
+def _counted_findings(text):
+    """stop_review's findings of a REQUEST_CHANGES reply, or ValueError naming what cannot be accounted for."""
     review_verdict.normalise(text.strip())  # raises for a fence or comment never closed: the lines after it cannot be told
     raw, visible = family_sweep.visible_lines(text)
-    leads = [(index, finding_lead(line)) for index, line in enumerate(raw) if index and finding_lead(line)]
+    leads = {index: finding_lead(line) for index, line in enumerate(raw) if index and finding_lead(line)}
     if not leads:
         raise ValueError("no line starts a finding (a heading or bold lead `F<n>`, or a line `F<n> — ...`), so its findings cannot be "
                          "counted (a reason-only REQUEST_CHANGES)")
-    ids = [ident for _, ident in leads]
+    ids = list(leads.values())
     twice = sorted({ident for ident in ids if ids.count(ident) > 1}, key=ids.index)
     if twice:
-        raise ValueError(f"two findings have the id {', '.join(twice)} (lines {', '.join(str(i + 1) for i, ident in leads if ident in twice)})")
-
-    def labels(start, end, pattern):
-        found = []
-        for index in range(start, end):
-            shown = visible[index]
-            if shown is None or shown.lstrip().startswith(">"):
-                continue
+        raise ValueError(f"two findings have the id {', '.join(twice)} (lines {', '.join(str(i + 1) for i, ident in leads.items() if ident in twice)})")
+    owner, sections = None, {index: {"closes": [], "family": []} for index in leads}
+    for index in range(1, len(raw)):
+        shown = visible[index]
+        if index in leads:
+            owner = index
+        elif shown is not None and (ANY_HEADING.match(shown) or SECTION_BREAK.match(shown) and not any(
+                pattern.search(shown.rstrip()) for pattern in (review_verdict.CLOSES_BY, review_verdict.FAMILY))):
+            owner = None
+        if shown is None or shown.lstrip().startswith(">"):
+            continue
+        for kind, pattern in (("closes", review_verdict.CLOSES_BY), ("family", review_verdict.FAMILY)):
             match = pattern.search(shown.rstrip())
-            if match and not review_verdict._quoted(shown[:match.start()]):
-                found.append(((match.group(1) or match.group(2)).lower(), index + 1))
-        return found
-    def unled(start, end, where):
-        stray = sorted([(line, f"Closes by: {value}") for value, line in labels(start, end, review_verdict.CLOSES_BY) if value == "code"]
-                       + [(line, f"Family: {value}") for value, line in labels(start, end, review_verdict.FAMILY)])
-        if stray:
-            raise ValueError(f"line {stray[0][0]} ({stray[0][1]}) is {where}: a finding with no `F<n>` lead line, which cannot be counted")
-    unled(1, leads[0][0], f"before the first finding ({leads[0][1]}, line {leads[0][0] + 1})")
+            if not match or review_verdict._quoted(shown[:match.start()]):
+                continue
+            value, line = (match.group(1) or match.group(2)).lower(), index + 1
+            if owner is not None:
+                sections[owner][kind].append((value, line))
+            elif kind == "family" or value == "code":
+                label = "Family" if kind == "family" else "Closes by"
+                raise ValueError(f"line {line} ({label}: {value}) is outside every finding's section: a finding with no `F<n>` lead "
+                                 f"line, which cannot be counted")
     out = []
-    for number, (start, ident) in enumerate(leads):
-        end = leads[number + 1][0] if number + 1 < len(leads) else len(raw)
-        closes = labels(start, end, review_verdict.CLOSES_BY)
+    for start, ident in leads.items():
+        closes, family = sections[start]["closes"], sections[start]["family"]
+        where = f"finding {ident} (line {start + 1})"
         if not closes:
-            raise ValueError(f"finding {ident} (line {start + 1}) has no Closes by: line, so it cannot be classified")
-        own = closes[0][1]  # 1-based line of the finding's own label
-        families = list(dict.fromkeys(name for name, _ in labels(start, own, review_verdict.FAMILY)))
-        unled(own, end, f"after finding {ident}'s own Closes by: (line {own})")
-        out.append((ident, closes[0][0], families))
+            raise ValueError(f"{where} has no Closes by: line in its section, so it cannot be classified")
+        if len(closes) > 1:
+            raise ValueError(f"{where} has {len(closes)} Closes by: lines in its section (lines {', '.join(str(n) for _, n in closes)}), "
+                             f"so which one is its own cannot be told")
+        if len(family) > 1:
+            raise ValueError(f"{where} has {len(family)} Family: lines in its section (lines {', '.join(str(n) for _, n in family)}), "
+                             f"so which one is its own cannot be told")
+        if closes[0][0] == "code" and not family:
+            raise ValueError(f"{where} closes by code and names no Family:, so it cannot be shown to be one the owner authorized")
+        out.append((ident, closes[0][0], family[0][0] if family else None))
     return out
 
 
-def code_findings(task):
-    """[(finding id, [Family: names])] of the findings of review `task` that close by code, in order, from review_findings (the
-    complete count; the id is the reviewer's own `F<n>`). Raises ValueError when the reply cannot be read or not every finding of it
-    can be accounted for."""
-    text = review_verdict.read_review(task["path"] / "result.md")
-    return [(ident, families) for ident, closes, families in review_findings(text) if closes == "code"]
+def stop_judge(task):
+    """The stop rule's judgement of review `task`: ('running', life) while it has no result; ('approves', []) when stop_review
+    proves it approves; ('rejects', findings) for a REQUEST_CHANGES whose every finding stop_review accounts for; else
+    ('refuses', why): it ended without a result, its reply cannot be read, or stop_review refuses it. Only an approval is left out."""
+    life = life_of(task)
+    if life in AT_WORK:
+        return "running", life
+    if life not in FINISHED_REVIEW:
+        return "refuses", f"it ended {life}, so it cannot be shown to approve"
+    try:
+        text = review_verdict.read_review(task["path"] / "result.md")
+    except review_verdict.ReviewMissing:
+        return "refuses", "it has no result, so it cannot be shown to approve"
+    except ValueError as error:
+        return "refuses", str(error)
+    verdict, findings, refusal = stop_review(text)
+    if refusal:
+        return "refuses", refusal
+    return ("rejects", findings) if verdict == "REQUEST_CHANGES" else ("approves", [])
 
 
 INCOMPLETE = ("The stop rule acts only on a review whose every finding it can count and classify; the owner closes this one with "
@@ -588,22 +649,30 @@ def _task(session, ident):
 
 def stop_plan(session, record, step, state="this session"):
     """What `lane authorize-stop` binds to: {step, gate_review, families, replaces}. The gate review is the newest review of the
-    step (of any tree) that asks for changes (_judge: rejects); families are the Family: names of its code findings. Reads only;
-    refuses a closed step, a step this session has no task of, and a step no review of which asked for changes."""
+    step (of any tree) that asks for changes; families are the Family: names of its code findings. Every review of the step from
+    the newest down to the gate is judged by stop_judge (stop_review) and passed over only when it is proved to approve: one still
+    running, or one stop_review refuses, refuses the authorization, so the owner is never asked to confirm a review that close would
+    refuse. Reads only; refuses a closed step, a step this session has no task of, and a step no review of which asked for changes."""
     name = record["name"]
     _step_here(session, record, step, state, f"lane authorize-stop {name} {step} --reason \"...\"")
     writer_ids = {w["id"] for w in session.writers(name, step)}
-    rejecting = [t for t in session.tasks if t["review_of"] in writer_ids and _judge(t)[0] == "rejects"]
-    if not rejecting:
+    gate = found = None
+    for review in sorted((t for t in session.tasks if t["review_of"] in writer_ids), key=lambda t: t["when"], reverse=True):
+        kind, detail = stop_judge(review)
+        if kind == "approves":
+            continue
+        if kind == "rejects":
+            gate, found = review, detail
+            break
+        if kind == "running":
+            raise ValueError(f"step {step} of lane {name} cannot be authorized under the stop rule: review {review['id']} is "
+                             f"{state_words(detail)}, so whether it asks for changes is not known. Wait for it, or end it with {_stop(review['id'])}")
+        raise ValueError(f"step {step} of lane {name} cannot be authorized under the stop rule: the findings of review {review['id']} "
+                         f"cannot all be accounted for ({detail}). {INCOMPLETE.format(name=name, step=step)}")
+    if gate is None:
         raise ValueError(f"step {step} of lane {name} has no review that asked for changes, so there is no last round to authorize; "
                          f"a step whose review approves closes with `tp-agent lane close {name} {step}`")
-    gate = max(rejecting, key=lambda t: t["when"])
-    try:
-        found = code_findings(gate)
-    except ValueError as error:
-        raise ValueError(f"step {step} of lane {name} cannot be authorized under the stop rule: the findings of gate review {gate['id']} "
-                         f"cannot all be accounted for ({error}). {INCOMPLETE.format(name=name, step=step)}")
-    families = list(dict.fromkeys(family for _, names in found for family in names))
+    families = list(dict.fromkeys(family for _, closes, family in found if closes == "code"))
     held = _authorization(record, step)
     return {"step": step, "gate_review": gate["id"], "families": families, "replaces": held["id"] if held else None}
 
@@ -671,22 +740,14 @@ def stop_rule_checks(session, record, step, facts, stop, known_limits):
                          f"work that is not the last round the owner authorized ({whose}; the authorization {stop['id']} is for the retry of "
                          f"gate review {stop['gate_review']}). An authorization covers one last round. {back}")
     needed = {}
-    for ident in facts["rejecting"]:
-        try:
-            found = code_findings(_task(session, ident))
-        except ValueError as error:
-            raise ValueError(f"step {step} of lane {name} cannot be closed under the stop rule (d): the findings of {ident} cannot all be "
-                             f"accounted for ({error}). {INCOMPLETE.format(name=name, step=step)}")
-        for finding, names in found:  # (d)
-            if not names:
-                raise ValueError(f"step {step} of lane {name} cannot be closed under the stop rule (d): finding {finding} of {ident} closes by code "
-                                 f"and names no Family:, so it cannot be shown to be one the owner authorized. {back}")
-            new = [family for family in names if family not in stop["families"]]
-            if new:
+    for ident, found in facts["findings"].items():  # every review of this tree that is not proved to approve (evaluate, stop_judge)
+        code = [(finding, family) for finding, closes, family in found if closes == "code"]
+        for finding, family in code:  # (d): stop_review has refused a code finding with no family
+            if family not in stop["families"]:
                 raise ValueError(f"step {step} of lane {name} cannot be closed under the stop rule (d): finding {finding} of {ident} is in "
-                                 f"famil{'ies' if len(new) > 1 else 'y'} {', '.join(new)}, which the authorization {stop['id']} does not list "
+                                 f"family {family}, which the authorization {stop['id']} does not list "
                                  f"({', '.join(stop['families']) or 'none'}). {back}")
-        needed[ident] = [finding for finding, _ in found]
+        needed[ident] = [finding for finding, _ in code]
     path, blob = _known_limits(record, known_limits, needed, step)
     return {"id": stop["id"], "authorized_at": stop["authorized_at"], "gate_review": stop["gate_review"], "families": stop["families"],
             "known_limits": path, "known_limits_blob": blob}

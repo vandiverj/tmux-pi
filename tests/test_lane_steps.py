@@ -1118,6 +1118,10 @@ class StopRuleTests(StepCase):
             path.write_text("F1 F3\n")
             return path.unlink
 
+        def another_review(text=None, life="settled"):  # a second review of the closed tree, newer than the closing one
+            _, task = self.review(case["retry"], text, life=life)
+            return lambda: shutil.rmtree(task)
+
         rows = [
             ("no authorization", lambda: self.set_authorizations([]) or (lambda: self.set_authorizations([auth])), {}, "(a): it has no authorization"),
             ("authorization for another step", lambda: self.set_authorizations([dict(auth, step="s0")]) or (lambda: self.set_authorizations([auth])),
@@ -1130,8 +1134,31 @@ class StopRuleTests(StepCase):
              {}, "no gate_review"),
             ("finding with a new family", lambda: rewrite(closing, LAST.replace("a third stale read.\nFamily: stale-cache", "a third stale read.\nFamily: path-form")),
              {}, "(d): finding F7"),
+            # one reading decides a review for authorize and close alike (round 3): a code finding with no family beside an authorized one
             ("code finding with no family", lambda: rewrite(closing, LAST.replace("another stale read.\nFamily: stale-cache\n", "another stale read.\n")),
-             {}, "(d): finding F3"),
+             {}, "finding F3 (line 3) closes by code and names no Family:", REFUSES),
+            # a section ends at the next Markdown heading: the last finding never takes the Owed item's `Closes by: check` (review F1)
+            ("last code finding with no Closes by: above an Owed heading", lambda: rewrite(closing, LAST.replace(
+                "a third stale read.\nFamily: stale-cache\nCloses by: code\n", "a third stale read.\nFamily: new-security\n")),
+             {}, "finding F7 (line 8) has no Closes by: line", REFUSES),
+            # a bold lead paragraph ends a section too (Main, round 3): the owed item's `Closes by: check` below it is not F7's
+            ("last code finding with no Closes by: above a bold Owed paragraph", lambda: rewrite(closing, LAST.replace(
+                "a third stale read.\nFamily: stale-cache\nCloses by: code\n",
+                "a third stale read.\nFamily: new-security\n\n**Owed before close:** Main owes the log of the full run.\nCloses by: check\n")),
+             {}, "finding F7 (line 8) has no Closes by: line", REFUSES),
+            ("two Closes by: in one finding", lambda: rewrite(closing, LAST.replace("another stale read.\nFamily: stale-cache\nCloses by: code\n",
+                                                                     "another stale read.\nFamily: stale-cache\nCloses by: code\nCloses by: check\n")),
+             {}, "finding F3 (line 3) has 2 Closes by: lines", REFUSES),
+            ("two Family: in one finding", lambda: rewrite(closing, LAST.replace("another stale read.\nFamily: stale-cache\n",
+                                                                  "another stale read.\nFamily: stale-cache\nFamily: stale-cache\n")),
+             {}, "finding F3 (line 3) has 2 Family: lines", REFUSES),
+            # every review of the tree is read by the one function before any is left out (review F2): the older label reader calls
+            # this one check-only, and it holds a bold F9 code finding in a new family after its Verification heading
+            ("a second review: check finding, Verification, bold F9", lambda: another_review(
+                "REQUEST_CHANGES\n\n" + finding(4, "no log", None, "check") + "\n## Verification\nI ran the tests.\n\n"
+                "**F9 — a query is built from user text.**\nFamily: new-security\nCloses by: code\n" + COVERAGE),
+             {}, "(d): finding F9 of review-fabricated", ("newest", ["new-security"])),
+            ("a second review that ended failed", lambda: another_review(life="failed"), {}, "(it ended failed", REFUSES),
             # the extraction is complete or refuses (round 2): the count reads the whole reply, the quoting splitter does not
             ("new family after a Verification section", lambda: rewrite(closing, "REQUEST_CHANGES\n\n" + LAST_FINDINGS + "\n## Verification\n"
                                                                          "I ran the tests.\n\n" + NEW + COVERAGE), {}, "(d): finding F9", NEW_FAMILY),
@@ -1143,11 +1170,14 @@ class StopRuleTests(StepCase):
              {}, "no line starts a finding", REFUSES),
             ("an unled code finding before the first counted one", lambda: rewrite(closing, "REQUEST_CHANGES: stale\n\nA query is built from "
                                                                      "user text.\nFamily: new-security\nCloses by: code\n" + LAST_FINDINGS + COVERAGE), {},
-             "before the first finding", REFUSES),
+             "line 4 (Family: new-security) is outside every finding's section", REFUSES),
+            ("an unled code finding below a heading after the findings", lambda: rewrite(closing, LAST.replace(OWED, OWED + "\n## More\n\nAlso a "
+                                                                                 "query is built from user text.\nFamily: new-security\nCloses by: code\n")),
+             {}, "(Family: new-security) is outside every finding's section", REFUSES),
             ("a counted finding with no Closes by:", lambda: rewrite(closing, LAST.replace("no log.\nCloses by: check\n", "no log.\n")), {},
              "finding F4 (line 6) has no Closes by: line", REFUSES),
             ("an unled code finding after a counted one", lambda: rewrite(closing, LAST.replace(OWED, "Also a query is built from user text.\n"
-                                                                          "Family: new-security\nCloses by: code\n")), {}, "after finding F7's own Closes by:", REFUSES),
+                                                                          "Family: new-security\nCloses by: code\n")), {}, "finding F7 (line 8) has 2 Closes by: lines", REFUSES),
             ("duplicate id", lambda: rewrite(closing, LAST.replace("F7 [defect]", "F3 [defect]")), {}, "two findings have the id F3", REFUSES),
             ("known-limits file missing", lambda: None, {"path": "docs/none.md"}, "(e): docs/none.md is not a file committed"),
             ("known-limits file uncommitted", lambda: scratch(self.repo / "docs" / "draft.md"), {"path": "docs/draft.md"}, "is not a file committed"),
@@ -1191,9 +1221,11 @@ class StopRuleTests(StepCase):
                         self.assertIn("--override-review", str(refused.exception))
                         self.assertEqual((asked, self.snap()), ([], before))
                     elif authorize:  # a complete review: the plan the owner would confirm shows the new family
+                        gate, families = authorize[0] if isinstance(authorize[0], tuple) else (case["closing"], authorize[0])
+                        gate = f"review-fabricated{self.made:02d}" if gate == "newest" else gate
                         plan = lane_steps.stop_plan(lane_steps.Session(self.state), self.record(), "s1")
-                        table.append((f"{name} (authorize plan)", authorize[0], plan["families"]))
-                        self.assertEqual((plan["gate_review"], plan["families"]), (case["closing"], authorize[0]))
+                        table.append((f"{name} (authorize plan)", (gate, families), (plan["gate_review"], plan["families"])))
+                        self.assertEqual((plan["gate_review"], plan["families"]), (gate, families))
                 finally:
                     if undo:
                         undo()

@@ -432,6 +432,19 @@ class Evidence(RunnerCase):
                     self.assertNotIn(("tp-agent", "stop"), shell.names())  # it had finished: collected, not stopped
                     self.assertIn(("tp-agent", "collect"), shell.names())
 
+    def test_a_result_that_is_not_utf8_or_is_empty_or_missing_is_scored_and_the_run_goes_on(self):
+        # result.md as written by a worker x the two readers of it (local answer, review findings)
+        good, find = f"ANSWER: {fx.EXPECTED}\n".encode(), fx.FINDINGS.encode()
+        rows = [("local-q", good, "pass"), ("local-q", b"caf\xe9\n" + good, "pass"), ("local-q", b"\x80\xff\n" + good, "pass"),
+                ("local-q", b"", "fail"), ("local-q", fx.MISSING, "fail"),
+                ("review-r", find, "scored"), ("review-r", b"caf\xe9\n" + find, "scored"), ("review-r", b"\x80\n" + find, "scored"),
+                ("review-r", b"", "scored"), ("review-r", fx.MISSING, "scored")]
+        for task, data, expect in rows:
+            with self.subTest(task=task, data=data):
+                shell, work, _ = self.build(result_bytes=data)
+                record = json.loads(work.run(self.only(task), 1)[0].read_text())
+                self.assertEqual(record["tasks"][0]["status"], expect)
+
     def test_a_review_that_times_out_or_errors_still_counts_its_planted_defects(self):
         shell, work, _ = self.build(running=True)
         metrics = json.loads(work.run(self.only("review-r"), 1)[0].read_text())["metrics"]

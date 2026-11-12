@@ -32,3 +32,18 @@ not find the gap. Round 5's oracle is independent of score.py, but shares a rest
 - **C. Stop HB8b's claim scoring**: keep HB8b's other measures and score claims only from polls (old behaviour).
 
 Main's cells for cb7e57f on main c42bc97: 314 tests x 4, 0 failures. Nothing from this lane is in main.
+
+## Round 6 (owner chose A) -> stop again, owner decision (2026-11-11 22:3x CST)
+Worker coder-892f06e323 (Sonnet), lane commit ef6babe; cells 314 x 4 OK; review review-coder-892f06e323-221438
+REQUEST_CHANGES. Round 5's F1-F3 are fixed (both probes pass, numbered Reads and record: pointers parsed, capped Read partial).
+The two new findings come only from rules the worker added **beyond the brief** (Main flagged them for the reviewer):
+- F1: "result.md holds its result from its mtime on" is wrong because report.sh archives/restores with `cp -p` (old mtime kept).
+- F2: "a stopped poll's whole-second stamp starts a stable window" is wrong for sub-second withdraw/restore.
+Notes: F3 (E2 changed paths are 10 pass / 9 fail, not 10 each), F4 (notifier lookalikes, a known limit by the brief).
+
+Options (Main recommends A2):
+- **A2. Revert the two additions** (mechanical, Sonnet): drop the mtime window and the stable-window rule from score.py and
+  the oracle; add the review's two probes as table rows (expected unknown). Effect: some claims the additions turned backed
+  (the E2n-no-prompt fail run) go back to unknown, which is the honest answer. No new rule enters.
+- **B. Close with known limits** (your `--override-review`): F1/F2 go to hb8b-known-limits.md.
+- **C. Stop claim scoring** as before.

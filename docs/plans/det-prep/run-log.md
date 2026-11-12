@@ -1113,3 +1113,10 @@ Each lane: checkpoint, Main's evidence, openai-codex review, notes closed, `lane
     recognition (round 4's gap was Main's brief wording). Full run on the merged tree 8d4af09: 5535 OK (skipped 78), 546 s.
     Real session: 7 duplicates + 2 covered = 92.5 s (0.5%); Main's reruns invisible. Stopped before merge for the owner
     (hub/hb5/hb5a-decision.md). HB7 waits on HB8 (hb8b-decision), so the HUB queue now waits on the owner.
+
+## 2026-11-12 (morning): owner "use recommendations"
+- HB6b1 (A, adopt) and HB5a (A, adopt): `tp-agent lane close hub-waits-b HB6b1` and `tp-agent lane close hub-verify HB5a`
+  passed (approved reviews of the exact trees); merged into main 278cfdd and 84b54ed. Full run on main 84b54ed (tree
+  10ff356): 5535 tests OK (skipped 78), 568 s. To answer a worker on the owner's behalf: `tp-agent message ID --resolves R
+  --by owner --quote "..."`. Report: `python3 tools/checks/repeats.py .tmux-pi/sessions/<id>/tasks`.
+- HB8b (A2): round 7 (Sonnet, rule-first, coder-c1a7ce3072) reverts round 6's two additions (mtime window, stable window).

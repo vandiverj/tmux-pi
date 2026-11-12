@@ -229,17 +229,89 @@ def _shell_opaque(args, words, why):
     return "quoted word in a program" if why == "quoting" else "shell expansion in a program"
 
 
-def _top(arg, cwd):
-    """N1: an argument naming the worktree or a path in it, spelt relative to the top. A word with a `..` component is left
-    as written (it is checked, never resolved)."""
-    if not cwd or not arg.startswith("/") or ".." in arg.split("/"):
-        return arg
-    norm = os.path.normpath(arg)
-    if norm == cwd:
-        return "<top>"
-    if norm.startswith(cwd + "/"):
-        return "<top>/" + norm[len(cwd) + 1:]
-    return arg
+OPTION = re.compile(r"--?[A-Za-z0-9][A-Za-z0-9_-]*")  # a bare option word (an option with a value is not understood)
+ABS_EXEC = re.compile(r"/[A-Za-z0-9_][A-Za-z0-9_.,:/+-]*")  # the only absolute word: an interpreter, shell, env or perl
+EXEC_NAMES = ("env", "perl")
+
+
+def _word_reason(word, cwd):
+    """R5: why one ORIGINAL word (as written, before any recognition, stripping or normalisation) is outside the grammar, or
+    None. A word is a plain relative path or name (WORD), a bare option, a NAME=VALUE whose value is a plain word, or an
+    absolute path whose basename is an interpreter, shell, env or perl (an executable word, never an operand). Nothing is
+    resolved: `~`, `$`, backtick, quotes, escapes, globs, braces, `..`, a leading `.` or `/` are each not understood."""
+    if "=" in word and not word.startswith("-") and ENV_NAME.fullmatch(word.split("=", 1)[0]):
+        return None if _assign_ok(word) else "not understood: an environment value outside the grammar"
+    if WORD.fullmatch(word):
+        return "not understood: a .. component in a path" if ".." in word.split("/") else None
+    if OPTION.fullmatch(word):
+        return None
+    if word.startswith("/"):
+        base = os.path.basename(word)
+        if ABS_EXEC.fullmatch(word) and ".." not in word.split("/") and (INTERP.fullmatch(base) or base in SHELLS + EXEC_NAMES):
+            return None
+        if cwd and (word == cwd or word.startswith(cwd + "/")):
+            return "not understood: an absolute path in the worktree (not normalised)"
+        if ABS_EXEC.fullmatch(word) or word.startswith("/dev/"):
+            return "input outside the tree: " + (base or word)
+    if word.startswith("."):
+        return "not understood: a word with a leading dot"
+    if re.search(r"[\"'\\]", word):
+        return "not understood: quoted word"
+    if re.search(r"[$`]", word):
+        return "not understood: shell expansion in a word"
+    if "~" in word:
+        return "not understood: a tilde word"
+    if re.search(r"[*?\[\]{}]", word):
+        return "not understood: a glob or brace word"
+    if "=" in word:
+        return "not understood: an option with a value"
+    return "not understood: a word outside the grammar"
+
+
+def _words_reason(words, cwd, depth, text):
+    """The first word of `words` outside the grammar, else None. Every role is the same check: interpreter, wrapper, the
+    executable inside `-c` text, script, operand, option. The program text of a shell `-c` is read again as words (nested);
+    in shell text (`text`) an operator is syntax and a redirection target is an output."""
+    i = 0
+    while i < len(words):
+        w = words[i]
+        if text and w and all(c in "();<>|&" for c in w):
+            i += 2 if ">" in w else 1
+            continue
+        if not text and os.path.basename(w) == "perl" and i + 2 < len(words) and words[i + 1] == "-e" and ALARM.fullmatch(words[i + 2]):
+            i += 3
+            continue
+        why = _word_reason(w, cwd)
+        if why:
+            return why
+        if os.path.basename(w) in SHELLS and i + 2 < len(words) and SHELL_C.fullmatch(words[i + 1]):
+            prog = words[i + 2]
+            if text and len(prog) >= 2 and prog[0] in "'\"" and prog[-1] == prog[0] and prog[0] not in prog[1:-1]:
+                prog = prog[1:-1]
+            why = _text_reason(prog, cwd, depth + 1)
+            if why:
+                return why
+            i += 3
+            continue
+        i += 1
+    return None
+
+
+def _text_reason(text, cwd, depth):
+    if depth > 4:
+        return "not understood: shell programs nested too deep"
+    try:
+        lexer = shlex.shlex(text, posix=False, punctuation_chars=True)
+        lexer.whitespace_split = True
+        words = list(lexer)
+    except ValueError:
+        return "not understood: quoted word"
+    return _words_reason(words, cwd, depth, True)
+
+
+def grammar_reason(cmd, cwd):
+    """R5: the one validation boundary, run once on the recorded argv before anything is recognised."""
+    return _words_reason([str(a) for a in cmd], cwd, 0, False)
 
 
 def _test_name(arg):
@@ -255,7 +327,8 @@ def canonical(cmd, cwd):
     runner is the key without the test list (D3); tests is the sorted test list, or None when the cmd is not a recognised
     test runner; tokens are every token seen (D4); no_interp is the key with the interpreter left out (N2 count only)."""
     cwd = os.path.normpath(cwd) if isinstance(cwd, str) and cwd.startswith("/") else ""
-    args = [_top(a, cwd) for a in cmd]
+    grammar = grammar_reason(cmd, cwd)  # R5: every original word, before any recognition or normalisation
+    args = list(cmd)
     rel, wrappers, env = ".", [], []
     tokens, shell_texts, opaque, unread = list(args), [], None, None
     while args:
@@ -284,10 +357,10 @@ def canonical(cmd, cwd):
             words, texts = _scan_shell(text)
             shell_texts += texts
             if inner is None:  # opaque: kept as written; its words still count for D4
-                tokens += [_top(w, cwd) for w in words]
+                tokens += words
                 opaque = _shell_opaque(args, words, why)
                 break
-            args = [_top(a, cwd) for a in inner]
+            args = list(inner)
             tokens += args
         else:
             break
@@ -301,10 +374,8 @@ def canonical(cmd, cwd):
     for tok in [t for t in tokens if re.search(r"\s", t) and t not in shell_texts]:  # text a wrapper passes on (timeout, eval, env -S)
         words, texts = _scan_shell(tok)
         if len(words) > 1:
-            tokens += [_top(w, cwd) for w in words]
+            tokens += words
             shell_texts += texts
-    # N1: a path in the worktree, absolute or relative, is spelt relative to the worktree top.
-    args = ["." if a == "<top>" else a[len("<top>/"):] if a.startswith("<top>/") else a for a in args]
     interp = ""
     if args and INTERP.fullmatch(os.path.basename(args[0])):
         interp = os.path.normpath(args[0]) if args[0].startswith("/") else args[0]  # N2
@@ -314,7 +385,7 @@ def canonical(cmd, cwd):
     body = list(args) if tests is None else opts + [tests]
     return {"key": json.dumps([head, body]), "runner": json.dumps([head, opts]) if tests is not None else None,
             "tests": tests, "interp": interp, "env": env, "tokens": tokens, "shell_texts": shell_texts, "cwd": cwd,
-            "argv": args, "opaque": opaque, "unread": unread,
+            "argv": args, "opaque": opaque, "unread": unread, "grammar": grammar,
             "no_interp": json.dumps([head, (["<py>"] + body[1:]) if interp else body])}
 
 
@@ -450,14 +521,10 @@ def outside_reason(canon):
     else (cd, an operator, an unknown env option, an unknown wrapper, python -c, a runner such as node or deno, git, whose
     output reads refs and the index the record does not hold) is `not understood: WHAT`. The never-reused scan runs before
     this, over every word, so a live or network run is `never` even when not understood."""
-    for tok in canon["tokens"]:
-        if tok.startswith("/") and not tok.startswith("/dev/") and os.path.basename(os.path.dirname(tok)) != "bin":
-            return "input outside the tree: " + os.path.basename(tok)
+    if canon["grammar"]:  # R5: the one boundary; the checks below are asserts on what it already passed
+        return canon["grammar"]
     if canon["opaque"]:
         return "not understood: " + canon["opaque"]
-    for tok in canon["tokens"]:
-        if any(".." in part.split("/") for part in (tok, tok.split("=", 1)[1] if "=" in tok else "")):
-            return "not understood: a .. component in a path"
     if canon["unread"]:
         return "not understood: " + canon["unread"]
     args = canon["argv"]
@@ -573,7 +640,7 @@ def load(tasks_dir, lane=None):
                     continue  # missing / not_applicable: the check did not run
                 key, outside = _gate_key(check["name"], record)
                 canon = {"key": key, "runner": None, "tests": None, "interp": "", "env": [], "tokens": [], "no_interp": key,
-                         "shell_texts": [], "cwd": "", "argv": [], "opaque": None, "unread": None}
+                         "shell_texts": [], "cwd": "", "argv": [], "opaque": None, "unread": None, "grammar": None}
                 runs.append(dict(info, kind="gate", label=check["name"], cmd=["<gate>", check["name"]] + record["files"],
                                  tree=record["tree"], exit=check["exit"], timed_out=False, seconds=float(check["seconds"]),
                                  end=_iso_epoch(record["finished"]), path=str(path), n=0, canon=canon, never=None,

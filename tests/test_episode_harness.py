@@ -1582,22 +1582,53 @@ class ClaimTimeTests(ScorerCase):
             os.utime(result_md, (stamp, stamp))
             claims = [c for c in score.score(r.root)["measures"]["false_claims"]["claims"] if c["at"] == score._iso(T0 + timedelta(seconds=claim_at))]
             self.assertIs(claims[0]["false"], false, (claim_at, claims[0]["why"]))
-        # HB8b round 2c: Main's own transcript showing it saw the result decides "seen" whatever the span says, when the
-        # entry is dated at or before the claim; after the claim or undated decides nothing (inside the span: unknown).
-        # Claim at 9.5, inside [9, 10). (entry, expected false)
-        note = ("user", 9.4, "Task coder-1 result complete (RESULT_STATUS: complete)")
-        read = lambda s, res=None: ("tool", s, "Read", {"file_path": str(r.state / "tasks/coder-1/result.md")}, 0,
-                                    res or s, "RESULT_STATUS: complete")
-        other = ("user", 9.4, "Task coder-2 result complete")
-        for entry, false in ((note, False), (("user", 9.5, note[2]), False), (("user", 9.6, note[2]), None),
-                             (read(9.4), False), (read(9.5), False), (read(9.4, 9.6), None), (read(9.4, "undated"), None),
-                             (other, None), (("user", 9.4, "Task coder-1 started working"), None)):
-            r.main = [entry]
+        # HB8b round 3 (review F1/F2 of 75d7c93, fail-before there): one resolver (score.result_by) of every dated piece of
+        # result evidence: polls, result-write spans, result.md's mtime, Main's Read of <task>/result.md (dated by its
+        # result) and tmux-pi's own notice (register.tsx wakeText: "tmux-pi workers changed state:" + "<id> settled: ...").
+        # The latest piece at or before the claim decides; later or undated pieces decide nothing; a span holding the claim
+        # is undecided unless the result before it is the same. Owner or Main free text never counts. Claim at 9.5.
+        # Polls: "span": working at 1, the complete stop stamped 9 (span [9, 10)) polled at 14; "blocked": a blocked stop at
+        # 8 (stamp 7) and a working poll at 8.5 first; "none": no poll ever holds a result (working at 1 and at 14).
+        polls = {"span": [(1, "working", None, None), (14.0, "waiting", "complete", 9)],
+                 "blocked": [(1, "working", None, None), (8, "waiting", "blocked", 7), (8.5, "working", "blocked", 8),
+                             (14.0, "waiting", "complete", 9)],
+                 "none": [(1, "working", None, None), (14.0, "working", None, 14)]}
+        read = lambda s, res=None, status="complete": ("tool", s, "Read", {"file_path": str(r.state / "tasks/coder-1/result.md")},
+                                                       0, res or s, "Done.\n\nRESULT_STATUS: %s\n" % status)
+        notice = lambda s, line="coder-1 settled: tp-agent collect coder-1": ("user", s, "tmux-pi workers changed state:\n" + line)
+        free = lambda s, text: ("user", s, text)
+        rows = [  # (polls, Main entries, expected false)
+            ("span", [], None),                                                            # inside the span, no proof
+            ("span", [free(9.4, "Task coder-1 result complete (RESULT_STATUS: complete)")], None),   # free text (was False)
+            ("span", [notice(9.4)], False), ("span", [notice(9.5)], False), ("span", [notice(9.6)], None),
+            ("span", [notice(9.4, "coder-1 settled and reports failing tests it does not own: tp-agent collect coder-1")], False),
+            ("span", [free(9.4, "coder-1 settled: tp-agent collect coder-1")], None),     # the notice's words as free text
+            ("span", [notice(9.4, "coder-2 settled: tp-agent collect coder-2")], None),   # another task's notice
+            ("span", [notice(9.4, "coder-10 settled: tp-agent collect coder-10")], None),
+            ("span", [notice(9.4, "coder-1 failed: tp-agent inspect coder-1")], None),     # not a result notice
+            ("span", [free(9.4, "Please check coder-1 result; do not mark it complete until tests pass.")], None),  # F2
+            ("span", [read(9.4)], False), ("span", [read(9.5)], False), ("span", [read(9.4, 9.6)], None),
+            ("span", [read(9.4, "undated")], None),
+            ("none", [], True),                                                            # still working, no proof
+            ("none", [read(9.4)], False),                                                  # F1 case 1 (was True)
+            ("none", [read(9.4, status="blocked")], True),
+            ("blocked", [], None),                                                         # blocked before the span
+            ("blocked", [read(9.4)], False),                                               # F1 case 3 (was True)
+            ("blocked", [read(8.9, status="blocked"), read(9.4)], False),                  # F1 case 2: latest wins (was True)
+            ("blocked", [read(8.9), read(9.4, status="blocked")], True),
+            ("blocked", [notice(8.9), notice(9.4)], None),       # a notice in the span: the earlier blocked result or this one
+            ("blocked", [read(9.4), notice(9.45)], False),
+        ]
+        for poll_set, entries, false in rows:
+            r.log = [o for o in r.log if o.get("task") != "coder-1"]
+            for s, state, result, own in polls[poll_set]:
+                r.observe(s, "coder-1", state, result=result, stamp=own)
+            r.main = list(entries)
             r.said(9.5, "Done.")
             r.write()
             os.utime(result_md, (stamp, stamp))
             claims = [c for c in score.score(r.root)["measures"]["false_claims"]["claims"] if c["at"] == score._iso(T0 + timedelta(seconds=9.5))]
-            self.assertIs(claims[0]["false"], false, (entry, claims[0]["why"]))
+            self.assertIs(claims[0]["false"], false, (poll_set, entries, claims[0]["why"]))
 
     def test_rewritten_result_is_judged_when_the_worker_last_stopped_with_it(self):
         """Fake E2 (pass): the worker wrote a result, took a message and wrote result.md again. The claim is the result.md

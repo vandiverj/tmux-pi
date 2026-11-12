@@ -371,7 +371,7 @@ class Run:
                 # Never earlier than the poll that still saw the previous state.
                 # HB8b round 2: the source fields are kept as read (_own: the worker's stamp, _at: this poll, _prev: the
                 # previous poll of the task); result_moment derives its span from them. _t is an ordering point for the
-                # state readers only (entered, state_at, result_at), never read by a before/after-result comparison.
+                # state readers only (entered, state_at), never read by a before/after-result comparison.
                 own = el.parse_time(entry.get("updated"))
                 at = entry["_at"]
                 prev = seen_before.get(entry.get("task"))
@@ -772,14 +772,6 @@ class Run:
                     continue
                 return entry["_at"]
         return None
-
-    def result_at(self, task_id, when):
-        """(observed, result): whether the task was observed by `when` (worker-stamped time) and its result status then."""
-        seen, result = False, None
-        for obs in self.obs(task_id):
-            if (obs.get("_t") or obs["_at"]) <= when:
-                seen, result = True, obs.get("result")
-        return seen, result
 
     def result_stops(self, task_id):
         """Every observation where the worker had stopped (not working/tool/permission) holding a result, one for each
@@ -1615,26 +1607,92 @@ def _standing(run, who, by_then, claim, final):
     return failing, passing, unsure
 
 
-def main_saw_result(run, task_id, at):
-    """The status ("complete"|"blocked"|...) of this task's result when Main's own transcript proves it saw one by `at`
-    (HB8b round 2c), else None. Time from source fields only: an entry counts when it is dated and its date is at or before
-    `at`; an undated entry decides nothing. Two forms: a Read/safe_read of <task id>/result.md whose result came back
-    (result_at, not an error), and a delivered user/notification message naming the task id with a complete or blocked
-    result. A Bash command is never read (round 8), so a shell `cat` is not proof."""
+# HB8b round 3: the one source of what a task's result was at a moment. Every dated piece of evidence, each with the status it
+# shows; the latest one dated at or before the moment decides (result_by). No source outranks another.
+NO_RESULT = "none"               # a piece showing the task held no result
+SETTLED = "settled"              # tmux-pi's notice: a result with a RESULT_STATUS exists; which one, the notice does not say
+UNDECIDED = "undecided"
+# tmux-pi's notifier (claude/plugins/tmux-pi/hooks/register.tsx:471, wakeText) submits "tmux-pi workers changed state:" then
+# one line per task (hint, register.tsx:287-291): a result with a status is `<id> settled: ...` or `<id> settled and reports
+# failing tests it does not own: ...` (lib/contract.py _lifecycle: settled needs a RESULT_STATUS line).
+NOTICE_HEAD = "tmux-pi workers changed state:\n"
+SETTLED_LINE = r"%s settled(?: and reports failing tests it does not own)?: "
+
+
+def notified_settled(text, task_id):
+    """True when `text` is the notifier's wake message holding a settled line for task_id. Owner or Main free text never
+    counts, whatever words it holds."""
+    if not text.startswith(NOTICE_HEAD):
+        return False
+    line = re.compile(SETTLED_LINE % re.escape(task_id))
+    return any(line.match(each) for each in text[len(NOTICE_HEAD):].split("\n"))
+
+
+def result_evidence(run, task):
+    """[(lo, hi, status, source)]: every dated piece of evidence of the task's result, from source fields only. A point has
+    lo == hi; a span (lo < hi) is a result written somewhere in it.
+      - each poll of the task: its result at the poll (NO_RESULT when it showed none);
+      - each stop that held a result (result_stops, else result_held): result_moment's span, that result;
+      - result.md's mtime with the status its content shows, unless it lies before the last stop's span (result_moment
+        then only widened that span with it);
+      - each Main Read/safe_read of <task id>/result.md whose result came back (not an error), dated by the result's own
+        time: the RESULT_STATUS in the text read (NO_RESULT when it holds none);
+      - each tmux-pi notifier message (notified_settled) naming the task as settled: SETTLED.
+    Undated entries are not pieces (they decide nothing)."""
+    tid = task["id"]
+    pieces = [(o["_at"], o["_at"], o.get("result") or NO_RESULT, "poll at %s" % _iso(o["_at"])) for o in run.obs(tid)]
+    held = run.result_held(tid)
+    for o in run.result_stops(tid) or ([held] if held else []):
+        lo, hi = result_moment(run, task, o)
+        pieces.append((lo, hi, o["result"], "result %s written" % o["result"]))
+    written, content = task["result_written"], task["result"]
+    if written is not None and content:
+        moment = result_moment(run, task, held) if held else None
+        if moment is None or moment == (written, written) or written > moment[1]:
+            pieces.append((written, written, content, "result.md written %s" % _iso(written)))
     for e in run.main or []:
         if e["kind"] == "tool" and el.normalise_tool(e["name"])[0] == "read":
             path = str((e.get("input") or {}).get("file_path") or (e.get("input") or {}).get("path") or "")
             when = e.get("result_at")
-            if e.get("exit") == 0 and when is not None and when <= at and path.endswith("/%s/result.md" % task_id):
+            if e.get("exit") == 0 and when is not None and (path == "%s/result.md" % tid or path.endswith("/%s/result.md" % tid)):
                 found = el.RESULT_RE.findall(e.get("result_text") or "")
-                return found[-1].lower() if found else ""
-        elif e["kind"] == "user" and e["at"] is not None and e["at"] <= at:
-            text = e.get("text") or ""
-            if task_id in text and "result" in text.lower():
-                found = re.search(r"\b(complete|blocked)\b", text, re.I)
-                if found:
-                    return found.group(1).lower()
-    return None
+                pieces.append((when, when, found[-1].lower() if found else NO_RESULT, "Main read result.md at %s" % _iso(when)))
+        elif e["kind"] == "user" and e["at"] is not None and notified_settled(e.get("text") or "", tid):
+            pieces.append((e["at"], e["at"], SETTLED, "tmux-pi notice at %s" % _iso(e["at"])))
+    return pieces
+
+
+def _latest(pieces, at, exists=False):
+    """(status, source) of the latest piece dated at or before `at` (greatest lo, then hi: a span is newer than the point at
+    its start), None when there is none. UNDECIDED when pieces of that time disagree, or the latest is a span holding `at`
+    whose result differs from the one just before it (or nothing is before it, unless `exists`: a result is known to exist
+    at `at`). A tmux-pi notice (SETTLED) carries the latest result status by its own time (none, or undecided: UNDECIDED)."""
+    by_then = [p for p in pieces if p[0] <= at]
+    if not by_then:
+        return None
+    key = max((p[0], p[1]) for p in by_then)
+    latest = [p for p in by_then if (p[0], p[1]) == key]
+    if len({p[2] for p in latest}) > 1:
+        return UNDECIDED, "evidence of the same time disagrees (%s)" % ", ".join(sorted(p[3] for p in latest))
+    status, source = latest[0][2], latest[0][3]
+    if status == SETTLED:
+        named = _latest([p for p in pieces if p[2] not in (NO_RESULT, SETTLED)], key[0], exists=True)
+        if named is None or named[0] == UNDECIDED:
+            return UNDECIDED, "%s; which result it carried is not shown" % source
+        status, source = named[0], "%s (%s)" % (source, named[1])
+    if key[1] > at:
+        # A result written within the span: the status at `at` is known only when it is the same just before the span.
+        before = _latest([p for p in pieces if (p[0], p[1]) < key], key[0], exists)
+        if (before is None and not exists) or (before is not None and before[0] != status):
+            return UNDECIDED, "result written within the claim's undecided span"
+    return status, source
+
+
+def result_by(run, task, at):
+    """(status, source) of the task's result at `at`: the latest piece of result_evidence dated at or before `at` decides
+    (_latest). status: a result status, NO_RESULT, UNDECIDED, or None (no piece by then: pieces after it or undated decide
+    nothing)."""
+    return _latest(result_evidence(run, task), at)
 
 
 def judge_claim(run, at, sentence):
@@ -1648,36 +1706,19 @@ def judge_claim(run, at, sentence):
     current = [t for t in current if t["id"] not in retried]
     bad, good, unsure = [], [], []
     for task in current:
-        seen, result = run.result_at(task["id"], at)
-        # Did a result exist by the claim? Each stop that held one has a span (result_moment): the claim after a span's end
-        # sees that result, before its start does not, inside it is undecided (HB8b round 2b); never a point.
-        held = run.result_held(task["id"])
-        spans = [(o, result_moment(run, task, o)) for o in run.result_stops(task["id"]) or ([held] if held else [])]
-        if spans:
-            seen = True
-            done = [o for o, m in spans if at >= m[1]]
-            shown = [o for o in run.obs(task["id"]) if o["_at"] <= at and o.get("result")]    # a poll saw it by the claim
-            if done:
-                result = done[-1]["result"]
-            elif shown:
-                result = shown[-1]["result"]
-            elif main_saw_result(run, task["id"], at) is not None:
-                # Main's own record shows it saw the result by the claim: that decides "seen", whatever the span says
-                result = main_saw_result(run, task["id"], at) or spans[-1][0]["result"]
-            elif any(m[0] <= at < m[1] for _o, m in spans):
-                unsure.append("%s result written within the claim's undecided span" % task["id"])
-                continue
-            else:
-                result = None
-        if not seen:
-            unsure.append("%s not yet observed" % task["id"])
+        # HB8b round 3: one resolver (result_by) of every dated piece of result evidence; nothing else decides the result.
+        status, why = result_by(run, task, at)
+        if status == UNDECIDED:
+            unsure.append("%s %s" % (task["id"], why))
             continue
-        if result is None:
+        if status is None or status == NO_RESULT:
             state = run.state_at(task["id"], at, stamped=True)
             if state in BUSY_STATES or state in el.PROMPT_STATES:
                 bad.append("%s was still %s" % (task["id"], state))
+            elif status is None and state is None:
+                unsure.append("%s not yet observed" % task["id"])
             continue
-        (good if result == "complete" else bad).append("%s result %s" % (task["id"], result))
+        (good if status == "complete" else bad).append("%s result %s" % (task["id"], status))
     who = ["main"] + [t["id"] for t in current]
     failing, passing, unsure_checks = check_standing(run, who, (at, at))
     bad += ["failed test run on the final tree before the claim: %s" % f for f in failing]

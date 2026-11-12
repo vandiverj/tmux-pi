@@ -162,6 +162,12 @@ esac
                     spawned = subprocess.run([str(ROOT / "bin/tp-spawn"), "--worker", "pi", "--model", MODEL, "--workdir", str(self.project)],
                                              env={**self.env, "LC_ALL": loc}, input=task, capture_output=True)
                     self.assertNotIn(b"Usage: tp-spawn", spawned.stdout + spawned.stderr)   # (later steps may still reject non-UTF-8 text)
+        # a lone Latin-1 NBSP (0xa0): the original substitution calls it blank in a UTF-8 locale and text in C
+        for loc, usage in (("en_US.UTF-8", True), ("C", False)):
+            with self.subTest(task=b"\xa0", locale=loc):
+                spawned = subprocess.run([str(ROOT / "bin/tp-spawn"), "--worker", "pi", "--model", MODEL, "--workdir", str(self.project)],
+                                         env={**self.env, "LC_ALL": loc}, input=b"\xa0", capture_output=True)
+                self.assertEqual(b"Usage: tp-spawn" in spawned.stdout + spawned.stderr, usage)
         long_task = "word " * 20000   # 100 000 characters: the emptiness test must not be quadratic in the length
         spawned = subprocess.run([str(ROOT / "bin/tp-spawn"), "--worker", "pi", "--model", MODEL, "--workdir", str(self.project), "--", long_task],
                                  env=self.env, text=True, capture_output=True, timeout=60)

@@ -105,6 +105,37 @@ def plant(tmp):
             "memory": str(mem), "root": repo}
 
 
+KINDS = {"record": ("record:fr/R1", "owner+quote"), "label": ("label:labels-T.json#0", "owner+quote"),
+         "memory": ("memory:fb-cmd.md", "main"), "doc": ("doc:docs/ideas.md#H1", "main")}
+
+
+def attribution_cells(p):
+    """Rule 1, both levels: every (key by) x (source by) x (source kind) -> (source provenance, key status). One build per
+    (key by, source by); each build maps one key per source kind. The source's own provenance holds only when neither level says
+    worker; only an owner+quote source can make a key active, and a worker key never is."""
+    cells = []
+    for key_by in ("main", "worker", None):
+        for src_by in (None, "main", "worker"):
+            keys = {}
+            for kind, (ref, _) in KINDS.items():
+                keys[kind] = {"scope": "role:coder", "proposed_home": "adapter", "sources": [ref if src_by is None else {"ref": ref, "by": src_by}]}
+                if key_by:
+                    keys[kind]["by"] = key_by
+            path = Path(p["map"]).with_name("attr.json")
+            path.write_text(json.dumps({"schema": "tp-frictions:v1", "keys": keys}))
+            got = {k["key"]: k for k in report.build(str(path), p["store"], p["labels"], p["memory"], p["root"])["keys"]}
+            for kind, (ref, own) in KINDS.items():
+                worker = "worker" in (key_by, src_by)
+                want_prov = "worker" if worker else own
+                want_status = "active" if own == "owner+quote" and not worker else "candidate"
+                cells.append((f"attribution key {key_by} source {src_by} {kind}", (want_prov, want_status),
+                              (got[kind]["evidence"][0]["provenance"], got[kind]["status"])))
+                if key_by == "worker":
+                    cells.append((f"attribution reason key worker {src_by} {kind}",
+                                  "key attributed to a worker (by worker): never active", got[kind]["status_reason"]))
+    return cells
+
+
 def excluded(key):
     return {e["pointer"]: e["excluded"] for e in key["evidence"] if e.get("excluded")}
 
@@ -222,13 +253,20 @@ class FrictionReport(unittest.TestCase):
             with contextlib.redirect_stdout(text):
                 code = report.main(["--map", p["map"], "--store", p["store"], "--labels", *p["labels"], "--memory", p["memory"]],
                                    root=p["root"])
+            helped = io.StringIO()
+            with contextlib.redirect_stdout(helped), self.assertRaises(SystemExit):
+                report.main(["--help"])
             raw = io.StringIO()
             with contextlib.redirect_stdout(raw):
                 report.main(["--map", p["map"], "--json"], root=p["root"])  # no store, labels or memory: listed, not a crash
             after = sorted((str(f), f.stat().st_mtime_ns) for f in Path(tmp).rglob("*") if f.is_file())
+            for cell, want, got in attribution_cells(p):  # writes its own mapping files, so after the read-only snapshot
+                with self.subTest(cell):
+                    self.assertEqual(got, want)
         self.assertEqual(code, 0)
         self.assertIn("## alpha  [active", text.getvalue())
         self.assertIn("recurrence after correction (2026-11-01T10:00:00Z): sessions 1 ", text.getvalue())
+        self.assertIn("A record-local `friction` key is not read: that is deferred", " ".join(helped.getvalue().split()))
         self.assertNotIn(SECRET, text.getvalue() + json.dumps(out))  # no quote, why, body, description or project leaves the tool
         bare = json.loads(raw.getvalue())
         self.assertEqual((bare["inputs"]["records"]["given"], bare["inputs"]["memory"]["given"], bare["ungrouped"]["label"]),
@@ -258,6 +296,20 @@ class FrictionReport(unittest.TestCase):
             {"doc:docs/ideas.md#H1", "doc:docs/ideas.md#H2"})
         self.assertEqual(alpha["occurrences"].get("label"), {"dated": 1, "undated": 1})  # labels and contract files still reported
         self.assertEqual(len(out["contract_size"]["files"]), 2)  # roles dir unreadable: listed, main prompt and worker contract still counted
+
+        # a store root that can be traversed but not listed (0o111): the root itself is the listed problem; the other sources report
+        with tempfile.TemporaryDirectory() as tmp:
+            p = plant(tmp)
+            try:
+                Path(p["store"]).chmod(0o111)
+                out = report.build(p["map"], p["store"], p["labels"], p["memory"], p["root"])
+            finally:
+                Path(p["store"]).chmod(0o755)
+        self.assertEqual([(x["where"], x["problem"]) for x in out["problems"] if x["source"] == "record"],
+                         [(p["store"], "store not readable: PermissionError")])
+        self.assertEqual(out["inputs"]["records"]["records"], 0)
+        self.assertEqual(out["inputs"]["memory"]["feedback"], 4)
+        self.assertEqual(out["inputs"]["labels"]["rows"], 8)
 
 
 if __name__ == "__main__":

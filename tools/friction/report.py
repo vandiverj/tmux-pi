@@ -104,13 +104,13 @@ def load_records(store, problems):
     if not found:
         problems.append({"source": "record", "where": str(store), "problem": "store directory not found"})
         return {}, info
-    for sub in ("workspaces", "archive/workspaces"):  # Path.glob/is_dir skip an unreadable directory silently on Python 3.13+; listdir raises
+    for sub in ("", "workspaces", "archive/workspaces"):  # Path.glob/is_dir skip an unreadable directory silently on Python 3.13+; listdir raises
         try:
             os.listdir(Path(store) / sub)
         except FileNotFoundError:
             pass
         except OSError as error:
-            problems.append({"source": "record", "where": sub, "problem": f"store not readable: {type(error).__name__}"})
+            problems.append({"source": "record", "where": sub or str(store), "problem": f"store not readable: {type(error).__name__}"})
             return {}, info
     import work  # noqa: E402  imported here: the store root is read from TP_WORK_DIR at call time
     old = os.environ.get("TP_WORK_DIR")
@@ -243,7 +243,7 @@ def load_memory(directory, problems):
         if not folder.is_dir():
             problems.append({"source": "memory", "where": folder.name, "problem": "memory directory not found"})
             return {}, info
-        entries = sorted(folder.iterdir())
+        entries = [folder / n for n in sorted(os.listdir(folder))]  # listdir raises on every Python; iterdir/glob may skip
     except OSError as error:
         problems.append({"source": "memory", "where": folder.name, "problem": f"memory directory not readable: {type(error).__name__}"})
         return {}, info
@@ -402,21 +402,22 @@ def build(map_path, store=None, labels=None, memory=None, root=ROOT):
     out_keys = []
     for key in keys:
         occurrences, evidence, unresolved = [], [], []
+        worker_key = key["by"] == "worker"
         for ref, by in key["refs"]:
             if len(claims[ref]) > 1:
                 evidence.append({"pointer": ref, "excluded": "claimed by keys " + ", ".join(claims[ref])})
                 continue
             source, rest = POINTER_RE.match(ref).groups()
             if source == "doc":
-                found, reason = resolve_doc(ref, rest, by, root)
+                found, reason = resolve_doc(ref, rest, "worker" if worker_key else by, root)
             else:
                 found = items.get(ref)
                 reason = None if found else not_found(source, rest, store, label_info, memory)
             if found is None:
                 unresolved.append({"pointer": ref, "problem": reason})
                 continue
-            if by == "worker":
-                found = {**found, "provenance": "worker"}  # the mapping says a worker wrote it: evidence only, whatever the source
+            if worker_key or by == "worker":  # either mapping level says a worker wrote it: evidence only, whatever the source
+                found = {**found, "provenance": "worker"}
             excluded = found["excluded"] or (None if found["correction"] else "not a correction")
             if not excluded and found["provenance"] == "worker":
                 excluded = "worker text: evidence only, never policy"
@@ -425,13 +426,15 @@ def build(map_path, store=None, labels=None, memory=None, root=ROOT):
                 occurrences.append(found)
         scope_stated = bool(key["scope"] and work.SCOPE_RE.fullmatch(key["scope"]))
         owner = any(o["provenance"] == "owner+quote" for o in occurrences)
+        active = owner and scope_stated and not worker_key
         by_source = {}
         for o in occurrences:
             row = by_source.setdefault(o["source"], {"dated": 0, "undated": 0})
             row["dated" if o["time"] else "undated"] += 1
         out_keys.append({
-            "key": key["key"], "by": key["by"], "status": "active" if owner and scope_stated else "candidate",
-            "status_reason": ("owner correction with quote, scope stated" if owner and scope_stated else
+            "key": key["key"], "by": key["by"], "status": "active" if active else "candidate",
+            "status_reason": ("key attributed to a worker (by worker): never active" if worker_key else
+                              "owner correction with quote, scope stated" if active else
                               "no owner correction with a quote" if not owner else "scope not stated"),
             "scope": key["scope"] if scope_stated else None, "trigger": key["trigger"], "correction": key["correction"],
             "successful_action": key["successful_action"], "proposed_home": key["proposed_home"],
@@ -562,8 +565,13 @@ def render(report):
     return "\n".join(out)
 
 
+EPILOG = ("Grouping comes from the mapping only. A record-local `friction` key is not read: that is deferred (it needs lib/work.py "
+          "and interfaces.md section 5). Attribution has two levels: a key or a source pointer marked `by: worker` is worker text and "
+          "never makes a key active.")
+
+
 def main(argv=None, root=ROOT):
-    parser = argparse.ArgumentParser(prog="tools/friction/report.py", description=__doc__.split("\n")[0])
+    parser = argparse.ArgumentParser(prog="tools/friction/report.py", description=__doc__.split("\n")[0], epilog=EPILOG)
     parser.add_argument("--map", required=True, help="the friction mapping (docs/plans/det-prep/hub/hb7/frictions.json)")
     parser.add_argument("--store", help="HB3 work store directory (sets TP_WORK_DIR for lib.work); not read when absent")
     parser.add_argument("--labels", nargs="*", default=[], help="H48 labels JSON files")

@@ -66,7 +66,7 @@
 #   --rules-file <path>      the packet section `# Rules in force` (lib/work_brief.py worker_rules: the owner's active records whose
 #                            scope covers this task), read from this file as data (no expansion) and placed right after the task
 #                            and its test scope, before the rest of the packet and any context file; screened like a context
-#                            file and counted against the packet limit. tp-agent omits the flag when no rule applies
+#                            file and counted against the packet limit. The flag is left out when no rule applies
 #   --worker-env KEY=VAL     export KEY=VAL in the worker's run.sh (the worker's window does not inherit the caller's
 #                            environment); repeatable. Only TP_DOCS_TOOLS, TP_TRIAL_ID and LANE_BASE are accepted, once each, and a value
 #                            has no line break. Without the flag run.sh is exactly what it was before the flag existed

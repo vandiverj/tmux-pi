@@ -778,7 +778,10 @@ fi
 system_prompt="$preamble"
 if [[ -n "$prompt" ]]; then system_prompt+="${system_prompt:+$'\n\n'}$prompt"; fi
 if [[ -n "$system_prompt" ]]; then
-  cmd+=(--append-system-prompt "$system_prompt")  # system-prompt.md (written below with run.sh) holds exactly this
+  # system-prompt.md (written below, before run.sh can run) holds exactly this. pi reads a file path given to the flag; a
+  # long argv gets script interpreters SIGKILLed (~4 KB), so pi gets the path. claude keeps the text.
+  if [[ "$worker" == pi ]]; then cmd+=(--append-system-prompt "$task_dir/system-prompt.md")
+  else cmd+=(--append-system-prompt "$system_prompt"); fi
 fi
 
 run_sh="$(
@@ -799,9 +802,14 @@ run_sh="$(
   # The ctx tools follow the spawner, never --worker-env: main with TP_CTX_TOOLS=1 gives the worker the tools; otherwise
   # run.sh clears the switch, because the new window inherits the environment of the session, which may still hold a stale 1.
   if [[ "${TP_CTX_TOOLS:-}" == 1 ]]; then echo 'export TP_CTX_TOOLS=1'; else echo 'unset TP_CTX_TOOLS'; fi
-  # The packet text is the first message (not @packet.md: pi would present it as
-  # a file in the task dir, and models then resolve relative paths against that).
-  printf '%q ' "${cmd[@]}"; printf -- '-- "$(cat %q)"\n' "$task_dir/packet.md"
+  # claude: the packet text is the first message. pi: the packet is attached as @packet.md (a long argv gets the interpreter
+  # SIGKILLed) with one short line saying it is the task.
+  printf '%q ' "${cmd[@]}"
+  if [[ "$worker" == pi ]]; then
+    # The task dir is not the working directory: say which one relative paths resolve against.
+    printf -- '-- %q %q\n' "@$task_dir/packet.md" \
+      "The attached packet.md is your task. Do it as it says. Your working directory is $workdir; resolve relative paths against it, not against the packet's directory."
+  else printf -- '-- "$(cat %q)"\n' "$task_dir/packet.md"; fi
   echo 'status=$?'
   printf 'echo "$status" | python3 %q write %q --root %q\n' "$ROOT/lib/safe_write.py" "$task_dir/exit" "$state_dir"
   printf 'echo; echo "[%s exited with status $status]"\n' "$id"

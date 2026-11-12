@@ -598,6 +598,14 @@ esac
             if len(line) > 40:
                 self.assertNotIn(line, raw)
         self.assertNotIn("Make a focused change", raw)
+        run_sh = (task / "run.sh").read_text()
+        if harness == "pi":   # a long argv gets the interpreter SIGKILLed: files, not text, and no word over 1 KB
+            self.assertIn(f"--append-system-prompt {task}/system-prompt.md ", run_sh)
+            self.assertIn(f"-- @{task}/packet.md ", run_sh)
+            self.assertNotIn("$(cat", run_sh)
+            self.assertTrue(all(len(w) <= 1024 for w in run_sh.split()))
+        else:
+            self.assertIn("$(cat", run_sh)
 
     def test_launch_record_of_a_missing_harness_binary_is_failed_never_prepared(self):
         # HB2b: a harness the launcher cannot find gets a record marked failed, with why; the start itself goes on as before.

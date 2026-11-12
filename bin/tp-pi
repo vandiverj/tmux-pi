@@ -36,18 +36,31 @@ ROOT="$(cd "$(dirname "$src")/.." && pwd)"
 # alone. The config is read and checked on every start, with or without --model, so a bad alias (or a bad local.json) refuses
 # with the loader's text before pi starts. The applied map is exported to pi as TP_PROVIDER_ALIASES (JSON; unset when there is
 # none) so agent/extensions/reporter.ts records every launched name under its shared one. Claude launches do not pass here.
-launch="$(python3 -c '
+# pi's argv (system prompt, task packet: several KB) must not ride on python3's command line: endpoint security software
+# SIGKILLs a python3 whose argv passes about 1 KB. So the script is read from a file descriptor and pi's argv goes in over
+# stdin, NUL-separated; python3 gets only $ROOT.
+read -r -d '' LAUNCH_PY <<'PYEOF' || true
 import json, shlex, sys
-sys.path.insert(0, sys.argv[1] + "/lib")
+root = sys.argv[1]
+sys.path.insert(0, root + "/lib")
 from router import RouterError, launch_argv, load_config
+data = sys.stdin.buffer.read()
+args = [a.decode("utf-8", "surrogateescape") for a in data.split(b"\0")[:-1]] if data else []
 try:
-    config = load_config(sys.argv[1] + "/config/router.json", laya_model=False)
+    config = load_config(root + "/config/router.json", laya_model=False)
 except RouterError as exc:
     sys.exit("tp-pi: {}".format(exc))
 aliases = (config.get("local") or {}).get("provider_aliases") or {}
 print("export TP_PROVIDER_ALIASES={}".format(shlex.quote(json.dumps(aliases))) if aliases else "unset TP_PROVIDER_ALIASES")
-print("set -- " + " ".join(shlex.quote(a) for a in launch_argv(sys.argv[2:], config)))
-' "$ROOT" "$@")" || exit 1
+print("set -- " + " ".join(shlex.quote(a) for a in launch_argv(args, config)))
+PYEOF
+status=0
+launch="$( { (($#)) && printf '%s\0' "$@"; true; } | python3 <(printf '%s' "$LAUNCH_PY") "$ROOT")" || status=$?
+if ((status)); then
+  # A config error already printed the loader's text (exit 1); any other status is the step dying (e.g. SIGKILL = 137).
+  ((status == 1)) || echo "tp-pi: launch step failed (status $status)" >&2
+  exit 1
+fi
 eval "$launch"
 
 PI_NODE="${TP_PI_NODE-$HOME/.nvm/versions/node/v24.16.0/bin/node}"

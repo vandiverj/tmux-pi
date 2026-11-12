@@ -195,7 +195,7 @@ def worker(facts, env=None):
     harness = facts["harness"]
     task_dir = Path(facts["task_dir"])
     system = (task_dir / "system-prompt.md").read_text(encoding="utf-8") if (task_dir / "system-prompt.md").exists() else ""
-    packet = (task_dir / "packet.md").read_text(encoding="utf-8").rstrip("\n")  # run.sh passes "$(cat packet.md)"
+    packet = (task_dir / "packet.md").read_text(encoding="utf-8").rstrip("\n")  # run.sh passes "$(cat packet.md)" (claude) or @packet.md (pi): the same text
     role_text = facts.get("role") or facts.get("preamble_role") or ""
     source = facts.get("preamble_from") or None
     workdir = facts["workdir"]

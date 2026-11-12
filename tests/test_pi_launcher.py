@@ -126,6 +126,30 @@ class PiLauncherTests(unittest.TestCase):
         self.assertEqual(registered - set(listed), set(), "main tools missing from MAIN_TOOLS in bin/tp-pi")
         self.assertEqual(set(listed), registered | BUILTIN)
 
+    def test_long_argv_never_reaches_python_and_the_model_alias_still_applies(self):
+        # Endpoint security SIGKILLs a python3 whose argv passes ~1 KB: a stub python3 fails the launch step on a long argv.
+        real = shutil.which("python3")
+        stub = self.fake / "python3"
+        stub.write_text('#!/bin/sh\n[ "${1##*/}" = pi ] || [ "$(printf %s "$*" | wc -c)" -lt 600 ] || { echo "python3 argv too long" >&2; exit 137; }\n'
+                        'exec "' + real + '" "$@"\n')
+        stub.chmod(0o755)
+        local = self.base / "local.json"
+        local.write_text(json.dumps({"provider_aliases": {"openai": "openai-codex"}}))
+        long = "x y\n'\"$z " * 400
+        args = ["--model", "openai/gpt-5", "--append-system-prompt", long, "--", "--model=openai/keep", long, ""]
+        argv = self.launched(*args, TP_LOCAL_CONFIG=str(local))
+        self.assertEqual(argv[-len(args):], ["--model", "openai-codex/gpt-5", *args[2:]])
+        (self.base / "bad.json").write_text("{")
+        bad = subprocess.run([str(ROOT / "bin/tp-pi"), "--append-system-prompt", long], capture_output=True, text=True,
+                             env={**self.env, "TP_LOCAL_CONFIG": str(self.base / "bad.json")}, timeout=15)
+        self.assertEqual(bad.returncode, 1)
+        self.assertIn("tp-pi:", bad.stderr)
+        self.assertNotIn("launch step failed", bad.stderr)
+        stub.write_text("#!/bin/sh\nkill -9 $$\n")
+        dead = subprocess.run([str(ROOT / "bin/tp-pi")], env=self.env, capture_output=True, text=True, timeout=15)
+        self.assertEqual(dead.returncode, 1)
+        self.assertIn("tp-pi: launch step failed (status 137)", dead.stderr)
+
     def test_ask_local_child_is_not_an_orchestrator_main(self):
         package = pi_package()
         # pi-ai is nested under the package or installed beside it, depending on the install layout.

@@ -1176,3 +1176,5 @@ Each lane: checkpoint, Main's evidence, openai-codex review, notes closed, `lane
 - TR2 (lane task-reader-utf8, 2 rounds, from TR1 review F3): tp-agent record/retry, model_router review_plan, contract ledger_row
   read with utf-8/replace. Round 1 F1: retry's fix had no row. review-coder-bd259bdc7e-141312 APPROVED_WITH_NOTES; merged 20af558.
   Not fixed: lib/bench/runner.py:381,422 read result.md strictly (bench harness).
+- Full run on main 20af558 (tree 0e10c42, python 3.9.6, outside tmux): 5545 tests OK (skipped 78), 2789 s. The two failures from
+  the 9b23173 run are gone on main: the stale test_local_provider row (LP2); the HB3b comment is still on its unmerged lane.

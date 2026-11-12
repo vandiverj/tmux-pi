@@ -1,0 +1,103 @@
+{
+ "schema": "tp-frictions:v1",
+ "about": "HB7a mapping: friction key -> trigger, scope, proposed home, source pointers. Written by Main (every key is `by main`, inferred); the owner corrects it by editing this file. Pointers only: label:<file>#<i> (the row's own i), record:<ws>/<id>, memory:<file>, doc:<repo path>#<heading>. No quoted text.",
+ "keys": {
+  "fix-brief-states-the-rule": {
+   "by": "main",
+   "trigger": "a review finding names a family and the fix brief cites only the sample site",
+   "correction": "the fix brief states the rule that closes the family and asks for a test that proves the rule",
+   "successful_action": "one round closes the family: a parity table or a stub that proves the rule",
+   "scope": "role:main",
+   "proposed_home": "retrieved procedure",
+   "home_target": "a brief-writing checklist doc that claude/main-prompt.md names for fix briefs",
+   "why_home": "it applies only when Main writes a fix brief for a finding family; a standing contract line would be paid on every turn",
+   "worked_if": "rounds-to-approve in one finding family drops on review-loop lanes after adoption (H12 eval)",
+   "sources": ["doc:docs/plans/det-prep/loop/ideas.md#H12"]
+  },
+  "parser-brief-grammar-first": {
+   "by": "main",
+   "trigger": "a lane parses worker free text and the brief gives cases, not a grammar",
+   "correction": "the first brief states the parser as a transition table and the test enumerates short combinations",
+   "successful_action": "the parser lane approves without a new entry-validation round",
+   "scope": "role:main",
+   "proposed_home": "retrieved procedure",
+   "home_target": "the same brief-writing checklist doc (section: free-text parsers)",
+   "why_home": "it applies only to parser briefs, a small class; Main retrieves it when the brief touches a parser",
+   "worked_if": "review rounds per parser lane before and after (H22 check)",
+   "sources": ["doc:docs/plans/det-prep/loop/ideas.md#H22"]
+  },
+  "detector-fail-closed-first": {
+   "by": "main",
+   "trigger": "a fix decides a security rule by parsing display or command text",
+   "correction": "the first brief states the fail-closed default (uncertain -> strictest) and the reviewer checks the default",
+   "successful_action": "the detector lane converges without a round per newly found text shape",
+   "scope": "role:main",
+   "proposed_home": "retrieved procedure",
+   "home_target": "the same brief-writing checklist doc (section: text-based security detectors)",
+   "why_home": "it applies only to security detectors over text; retrieved with the security brief, not loaded on every turn",
+   "worked_if": "rounds in one source-path-redaction-like family on the next detector lane",
+   "sources": ["doc:docs/plans/det-prep/loop/ideas.md#H26"]
+  },
+  "model-choice": {
+   "by": "main",
+   "trigger": "workers are dispatched on a model or effort the owner did not intend",
+   "correction": "dispatch uses the model family and effort the owner named for that work",
+   "successful_action": "the routed model matches the owner's stated choice without a reminder",
+   "scope": "global",
+   "proposed_home": "adapter",
+   "home_target": "the per-model routing layer (model catalog and router profiles, H15 / HB7c)",
+   "why_home": "the choice is per model and provider; a prompt line cannot change what the router picks",
+   "worked_if": "no model-choice process label after the routing change lands",
+   "sources": ["label:labels-A.json#3", "label:labels-A.json#5"]
+  },
+  "tools-serve-target-projects": {
+   "by": "main",
+   "trigger": "Main evaluates a code-quality tool against tmux-pi itself",
+   "correction": "tmux-pi tools are evaluated on the target project tmux-pi works on (the battle-soccer clone), not on tmux-pi",
+   "successful_action": "tool evals name a target-project fixture from the first brief",
+   "scope": "global",
+   "proposed_home": "contract line",
+   "home_target": "claude/main-prompt.md",
+   "why_home": "it is Main's standing purpose, needed whenever a tool lane is scoped; it is short and always applies",
+   "worked_if": "no purpose-or-scope-drift label of this point after the line lands",
+   "sources": ["label:labels-A.json#58", "label:labels-A.json#59"]
+  },
+  "safe-search-from-start": {
+   "by": "main",
+   "trigger": "workers search with shell grep and stop on sensitive-read prompts",
+   "correction": "workers use safe_grep and safe_read from the first call and Main's packet tells them to",
+   "successful_action": "no worker permission prompt from a recursive shell search",
+   "scope": "global",
+   "proposed_home": "contract line",
+   "home_target": "agent/contract/worker.md (line 4 already holds it)",
+   "why_home": "it holds for every worker on every route, which is what the worker contract is for",
+   "worked_if": "worker permission prompts from recursive search per lane fall after the contract line (H27 count)",
+   "sources": ["label:labels-A.json#41", "label:labels-A.json#78"]
+  },
+  "state-saved-for-restart": {
+   "by": "main",
+   "trigger": "a compaction or session restart loses where work stood",
+   "correction": "Main keeps task state in durable records and stops at a clean point before a restart",
+   "successful_action": "after a restart Main resumes from records without the owner restating state",
+   "scope": "global",
+   "proposed_home": "tool default",
+   "home_target": "the work store checkpoint and session-start brief hooks (HB3 tp-agent brief)",
+   "why_home": "a hook that always saves and re-reads state does not depend on Main remembering a rule at the moment it matters",
+   "worked_if": "no recovery-after-compaction-or-restart label after the hooks are on by default",
+   "sources": ["label:labels-B.json#50", "label:labels-B.json#127", "label:labels-B.json#175", "label:labels-B.json#228",
+               "label:labels-A.json#73"]
+  },
+  "run-only-affected-tests": {
+   "by": "main",
+   "trigger": "a coder runs the whole suite or unrelated tests while others wait",
+   "correction": "a coder runs only the tests that check its change and stops other test runs",
+   "successful_action": "lane workers run the affected set and name how they chose it",
+   "scope": "role:coder",
+   "proposed_home": "tool default",
+   "home_target": "tp-agent dispatch --tests affected (the Test Scope packet section)",
+   "why_home": "the dispatcher already computes the set; a default removes the choice instead of asking the worker to remember it",
+   "worked_if": "no verification-or-evals label of this point after --tests affected became the lane default",
+   "sources": ["label:labels-B.json#130", "label:labels-B.json#131", "label:labels-B.json#135", "label:labels-B.json#136"]
+  }
+ }
+}

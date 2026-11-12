@@ -44,12 +44,28 @@ def lmstudio_budget():
     atexit.register(lambda: os.path.exists(path) and os.unlink(path))
 
 
+def isolated_work_store():
+    """No default test reads the owner's real work store: a packet built without TP_WORK_DIR would carry the machine's own rules.
+    When the caller set no TP_WORK_DIR, point it at an empty temporary store that every module and subprocess of this run
+    inherits. A fixture that sets its own TP_WORK_DIR still wins, and a test that really means to read a store must say so in
+    its name. Idempotent."""
+    if os.environ.get("TP_WORK_DIR"):
+        return
+    import atexit
+    import shutil
+    import tempfile
+    path = tempfile.mkdtemp(prefix="tp-test-work-store-{}-".format(os.getpid()))
+    os.environ["TP_WORK_DIR"] = path
+    atexit.register(shutil.rmtree, path, True)
+
+
 def scrub():
     """Called when this module is first imported, so `import session_env` as the first line of a test module is the whole
     mechanism: whichever way the suite is started, it runs before any test code or tested module. Idempotent. It also installs
-    the LM Studio request budget (lmstudio_budget), on the same import every way of starting the suite shares."""
+    the empty work store (isolated_work_store) and the LM Studio request budget (lmstudio_budget), on the same import every way of starting the suite shares."""
     drop_caller_session()
     lmstudio_budget()
+    isolated_work_store()
 
 
 def outside_session(env=None):

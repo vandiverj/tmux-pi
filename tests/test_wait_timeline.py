@@ -885,6 +885,58 @@ class StatusTest(unittest.TestCase):
         self.assertEqual(len([line for line in text.splitlines() if "  -> " in line]), len(want))
         for secret in ("done", "broken"):
             self.assertNotIn(secret, text)
+        # Round 4: unreadable evidence never becomes a definite action. In-process rows over existing lanes (no new worktree):
+        # each mutates one record, reads that one lane, asserts the rule and the problem naming the record, then puts it back.
+        self.assertEqual(set(status.LIFE_READS), set(__import__("lifecycle_files").LIFECYCLE_FILES))  # every lifecycle file is read
+        t("t-run-new", "final", 30)                       # a newer running writer: the step is at it (rule 4), not at t-final
+        t("r-appr-new", "appr", 30, review_of="t-appr")   # a newer running review of t-appr (rule 5), not the older approval
+        rows = [  # (lane, file, contents or None to delete, rule, record named under problems)
+            ("run", "t-run/state.json", "{}", 10, "t-run/state.json"),
+            ("run", "t-run/state.json", '{"state": null, "updated": "%s"}' % iso_s(11), 10, "t-run/state.json"),
+            ("run", "t-run/state.json", '{"state": 7, "updated": "%s"}' % iso_s(11), 10, "t-run/state.json"),
+            ("run", "t-run/state.json", '{"state": "working", "updated": "soon"}', 10, "t-run/state.json"),
+            ("run", "t-run/checkpoints.json", '{"events": [3]}', 10, "t-run/checkpoints.json"),
+            ("run", "t-run/checkpoints.json", '{"events": [{"action": "pause", "tools": "x"}]}', 10, "t-run/checkpoints.json"),
+            ("run", "t-run/checkpoints.json", "{bad", 10, "t-run/checkpoints.json"),
+            ("run", "t-run/completed", "bad", 10, "t-run/completed"),
+            ("run", "t-run/result.md", b"\xff\xfe\xfa", 10, "t-run/result.md"),
+            ("run", "t-run/permission-request.json", "{bad", 10, "t-run/permission-request.json"),
+            ("run", "t-run/capability-request.json", "{bad", 10, "t-run/capability-request.json"),
+            ("revrun", "r-revrun/checkpoints.json", '{"events": [3]}', 10, "r-revrun/checkpoints.json"),   # the review's too
+            ("perm", "t-perm/capability-request.json", "{bad", 1, "t-perm/capability-request.json"),  # a readable permission decides
+            ("final", "t-run-new/meta.json", None, 4, None),  # baseline: the newest writer is at work
+            ("final", "t-run-new/meta.json", {"created": []}, 10, "t-run-new/meta.json"),
+            ("final", "t-run-new/meta.json", {"created": "broken"}, 10, "t-run-new/meta.json"),
+            ("final", "t-run-new/meta.json", {"lane_step": []}, 10, "t-run-new/meta.json"),
+            ("appr", "r-appr-new/meta.json", None, 5, None),
+            ("appr", "r-appr-new/meta.json", {"created": []}, 10, "r-appr-new/meta.json"),
+            ("fresh", "t-fresh/state.json", None, 4, None),   # just started, no optional file: running, nothing listed
+        ]
+        for lane_name, rel, body, rule, where in rows:
+            with self.subTest(lane=lane_name, record=rel, body=body):
+                path = self.tasks / rel
+                saved = path.read_bytes() if path.exists() else None
+                if isinstance(body, dict):
+                    path.write_text(json.dumps(dict(json.loads(saved), **body)))
+                elif isinstance(body, bytes):
+                    path.write_bytes(body)
+                elif body is not None:
+                    path.write_text(body)
+                try:
+                    one = status.build(self.tasks, self.repo, now=self.NOW, rows=[{"name": lane_name, "state": "open"}])
+                finally:
+                    if saved is not None:
+                        path.write_bytes(saved)
+                    elif path.exists():
+                        path.unlink()
+                row, = one["lanes"]
+                self.assertEqual(row["rule"], rule, row)
+                listed = [p["where"] for p in one["problems"]]
+                if where:
+                    self.assertIn(str(self.tasks / where), listed)
+                    self.assertTrue(row["next"].startswith("unknown") or rule == 1, row)
+                else:
+                    self.assertFalse([w for w in listed if Path(w).parent.name in rel], listed)
 
     def test_cli(self):
         import contextlib

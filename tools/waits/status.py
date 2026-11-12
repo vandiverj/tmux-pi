@@ -15,6 +15,7 @@ names, states, verdict words and times. A missing or malformed record makes that
 import argparse
 import importlib.util
 import json
+import math
 import os
 import re
 import sys
@@ -30,6 +31,7 @@ import lane_commands  # noqa: E402
 import lane_remove  # noqa: E402
 import lane_steps  # noqa: E402
 import lanes  # noqa: E402
+import request_file  # noqa: E402
 import review_verdict  # noqa: E402
 
 _spec = importlib.util.spec_from_file_location("wait_timeline", HERE / "timeline.py")
@@ -124,60 +126,161 @@ def _newest(items):
     return max(items, key=lambda t: t["when"]) if items else None
 
 
-def _life(task):
-    """(lifecycle word, problem) of a task, read here. lane_steps.life_of and contract.task_lifecycle default a malformed record
-    (to working, or to absent), which is right for their own uses but would show here as a definite wait. So every file the
-    lifecycle reads is checked first; one that exists and is malformed gives (None, why).
-    Optional, because a task that has just started has not written them: every file of LIFECYCLE_FILES (state.json, which
-    the reporter writes at its first hook; checkpoints.json; result.md; completed; exit; the markers). A missing one is
-    absent, never a problem; one that exists must be well formed."""
-    d = task["path"]
+class _Bad(Exception):
+    """A record that exists and cannot be read as the field its reader uses: (path, why)."""
 
-    def text(name):
-        try:
-            return (d / name).read_text(encoding="utf-8")
-        except FileNotFoundError:
-            return None
-        except (OSError, ValueError) as error:
-            raise ValueError(f"{name} is unreadable ({error.__class__.__name__})")
 
-    def obj(name):
-        raw = text(name)
-        if raw is None:
-            return None
-        try:
-            value = json.loads(raw)
-        except ValueError:
-            value = None
-        if not isinstance(value, dict):
-            raise ValueError(f"{name} is not a JSON object")
-        return value
-
+def _text(path):
+    """A file's text, None when there is no file; one that exists and cannot be read as UTF-8 text raises _Bad."""
     try:
-        state = obj("state.json")
-        if state is not None and not (state.get("state") is None or isinstance(state["state"], str)):
-            raise ValueError("state.json has a state that is not text")
-        checks = obj("checkpoints.json")
-        if checks is not None and not isinstance(checks.get("events", []), list):
-            raise ValueError("checkpoints.json events is not a list")
-        for name in ("result.md", "exit"):
-            text(name)
-        done = text("completed")
-        if done is not None and done.strip():
-            try:
-                float(done.strip())
-            except ValueError:
-                raise ValueError("completed is not a number")
-        return contract.task_lifecycle(d)[0], ""
-    except Exception as error:  # noqa: BLE001 - any failure to read is "cannot be read", never a default
-        return None, str(error)[:100]
+        return path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as error:
+        raise _Bad(path, f"{path.name} is unreadable ({error.__class__.__name__})")
+
+
+def _present(path):
+    """Does a marker file exist (as contract.task_lifecycle's Path.exists sees it: a dangling link is absent)?"""
+    try:
+        os.stat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError as error:
+        raise _Bad(path, f"{path.name} cannot be looked at ({error.__class__.__name__})")
+    return True
+
+
+def _number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _json_object(path):
+    raw = _text(path)
+    if raw is None:
+        return None
+    try:
+        value = json.loads(raw)
+    except (ValueError, RecursionError):
+        value = None
+    if not isinstance(value, dict):
+        raise _Bad(path, f"{path.name} is not a JSON object")
+    return value
+
+
+def _state_of(path):
+    """state.json as contract.lifecycle reads it: state (text), updated (a time), and when present tools (a number) and
+    completedTurn (a turn number). Absent: {} (a task that has just started)."""
+    state = _json_object(path)
+    if state is None:
+        return {}
+    if not isinstance(state.get("state"), str):
+        raise _Bad(path, "state.json has no text state")
+    if not isinstance(state.get("updated"), str) or contract._epoch(state["updated"]) is None:
+        raise _Bad(path, "state.json has no readable updated")
+    if "tools" in state and not _number(state["tools"]):
+        raise _Bad(path, "state.json tools is not a number")
+    if "completedTurn" in state and contract._turn_number(state["completedTurn"]) is None:
+        raise _Bad(path, "state.json completedTurn is not a turn number")
+    return state
+
+
+def _events_of(path):
+    """checkpoints.json's events as contract.lifecycle reads each one: an object with a text action, and when present a numeric
+    tools and a turn that is null or a turn number. Absent: no events."""
+    value = _json_object(path)
+    if value is None:
+        return []
+    events = value.get("events")
+    if not isinstance(events, list):
+        raise _Bad(path, "checkpoints.json events is not a list")
+    for n, event in enumerate(events):
+        ok = isinstance(event, dict) and isinstance(event.get("action"), str) and \
+            ("tools" not in event or _number(event["tools"])) and \
+            (event.get("turn") is None or contract._turn_number(event["turn"]) is not None)
+        if not ok:
+            raise _Bad(path, f"checkpoints.json event {n} is not an event (action, tools, turn)")
+    return events
+
+
+def _pending(path):
+    """A request file of REQUEST_NAMES: absent is no request; one that exists must be one JSON object with a text status."""
+    kind, value = request_file.read_request(path)
+    if kind == request_file.ABSENT:
+        return False
+    if kind == request_file.UNREADABLE or not isinstance(value.get("status"), str):
+        raise _Bad(path, f"{path.name} is not a request record (one JSON object with a text status)")
+    return value["status"] == "pending"
+
+
+# Every file _life reads, by the reader that checks it; tests hold it equal to lifecycle_files.LIFECYCLE_FILES.
+LIFE_READS = {"state.json": "_state_of", "checkpoints.json": "_events_of", "result.md": "_text", "completed": "_text", "exit": "_text",
+              "escalated": "_present", "stopped.json": "_present", "collected.json": "_present", "pending-capability.json": "_present",
+              "requests": "_read_requests", "permission-request.json": "_pending", "capability-request.json": "_pending"}
+
+
+def _life(task):
+    """(lifecycle word, [(path, problem)]) of a task, decided by contract.lifecycle from inputs read and checked here.
+
+    contract.task_lifecycle (and lane_steps.life_of over it) fills in a default for a record it cannot read: {} for state.json,
+    no events, an empty reply, pending for a request file. Right for its own callers, those defaults would show here as a
+    definite wait, so every file of LIFECYCLE_FILES is read here instead. A file that does not exist is absent (a task that has
+    just started has written none of them). One that exists must give every field lifecycle uses, or the word is None and each
+    such file is a problem. Markers (escalated, stopped.json, collected.json, pending-capability.json) need only exist."""
+    d = task["path"]
+    bad = []
+
+    def read(reader, name, default=None):
+        try:
+            return reader(d / name)
+        except _Bad as error:
+            bad.append((error.args[0], error.args[1]))
+            return default
+
+    state = read(_state_of, "state.json", {})
+    events = read(_events_of, "checkpoints.json", [])
+    reply = read(_text, "result.md") or ""
+    replied_at = None
+    if read(_present, "result.md"):
+        try:
+            replied_at = (d / "result.md").stat().st_mtime
+        except OSError as error:
+            bad.append((d / "result.md", f"result.md cannot be looked at ({error.__class__.__name__})"))
+    completed_at = read(_text, "completed")
+    if completed_at is not None:
+        try:
+            completed_at = float(completed_at.strip())
+        except ValueError:
+            completed_at = None
+        if not _number(completed_at):
+            bad.append((d / "completed", "completed is not a number"))
+    exit_code = read(_text, "exit")
+    if exit_code is not None:
+        exit_code = exit_code.strip()
+        if not exit_code:
+            bad.append((d / "exit", "exit is empty"))
+    markers = {name: read(_present, name, False) for name in ("escalated", "stopped.json", "collected.json", "pending-capability.json")}
+    asking = any([read(_pending, name, False) for name in request_file.REQUEST_NAMES])
+    opened, broken = _read_requests(d)
+    bad += [(path, "malformed request record") for path in broken]
+    if bad:
+        return None, bad
+    life = contract.lifecycle(state, None, events, reply.strip(), completed_at, exit_code, markers["escalated"], replied_at,
+                              stopped=markers["stopped.json"], collected=markers["collected.json"],
+                              asking=asking or any(r["kind"] == "capability" for r in opened),
+                              capability_pending=markers["pending-capability.json"])
+    return life, []
+
+
+def _why(bad):
+    return "; ".join(why for _, why in bad)[:160]
 
 
 def _read_review(task):
     """{id, life, life_problem, verdict, incomplete, unusable} of a review task; verdict only when it has finished."""
-    life, problem = _life(task)
-    out = {"id": task["id"], "life": life or "unknown", "life_problem": problem, "verdict": None, "incomplete": None, "unusable": None}
-    if problem or out["life"] not in lane_steps.FINISHED_REVIEW:
+    life, bad = _life(task)
+    out = {"id": task["id"], "life": life or "unknown", "life_problem": _why(bad), "bad": bad, "verdict": None, "incomplete": None, "unusable": None}
+    if bad or out["life"] not in lane_steps.FINISHED_REVIEW:
         return out
     try:
         text = review_verdict.read_review(task["path"] / "result.md")
@@ -193,7 +296,11 @@ def _read_requests(task_path):
     name), kind, status and opened are all readable. Open ones are oldest id first."""
     folder = task_path / "requests"
     try:
-        files = sorted(folder.glob("req-*.json")) if folder.is_dir() and not folder.is_symlink() else []
+        if not os.path.lexists(folder):
+            return [], []
+        if folder.is_symlink() or not folder.is_dir():
+            return [], [folder]
+        files = sorted(folder.glob("req-*.json"))
     except OSError:
         return [], [folder]
     opened, bad = [], []
@@ -210,6 +317,49 @@ def _read_requests(task_path):
         elif value["status"] == "open":
             opened.append({"id": value["id"], "kind": value["kind"]})
     return opened, bad
+
+
+REVIEW_OF = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*")  # tp-spawn's --review-of check
+
+
+def _selection_bad(task):
+    """[(path, problem)] for the fields a task is chosen by (lane_steps.Session reads them with defaults: created unreadable sorts
+    as the oldest, a lane_step that is not text drops the task out of its step, an unreadable review-of makes a review a writer)."""
+    meta, d, bad = task["meta"], task["path"], []
+    created = meta.get("created")
+    try:
+        ok = isinstance(created, str) and datetime.fromisoformat(created.replace("Z", "+00:00")) is not None
+    except ValueError:
+        ok = False
+    if not ok:
+        bad.append((d / "meta.json", "meta.json created is not a time"))
+    if not isinstance(meta.get("lane"), str):
+        bad.append((d / "meta.json", "meta.json lane is not text"))
+    if not (isinstance(meta.get("lane_step"), str) and lanes.STEP_ID.fullmatch(meta["lane_step"])):
+        bad.append((d / "meta.json", "meta.json lane_step is not a step id"))
+    if "role" in meta and not isinstance(meta["role"], str):
+        bad.append((d / "meta.json", "meta.json role is not text"))
+    try:
+        raw = _text(d / "review-of")
+        if raw is not None and not REVIEW_OF.fullmatch(raw.strip()):
+            bad.append((d / "review-of", "review-of does not name a task"))
+    except _Bad as error:
+        bad.append((error.args[0], error.args[1]))
+    return bad
+
+
+def _lane_selection_bad(session, name, ids):
+    """{task id: [(path, problem)]} over every task the lane's choice reads: each whose meta.json names lane `name`, each that
+    carries a lane tag that names no lane (it could be this lane's), and each review of a task in `ids` (the lane's tasks)."""
+    out = {}
+    for t in session.tasks:
+        meta = t["meta"]
+        unplaced = ("lane" in meta or "lane_step" in meta) and not isinstance(meta.get("lane"), str)
+        if meta.get("lane") == name or unplaced or (t["review_of"] in ids):
+            bad = _selection_bad(t)
+            if bad:
+                out[t["id"]] = bad
+    return out
 
 
 def _problem_dirs(state_dir):
@@ -243,10 +393,16 @@ def _merged(repo, branch):
         return None
 
 
-def build(tasks_dir, repo, now=None):
-    """The whole status as a dict. Never raises on bad records; a repository that cannot be read raises ValueError."""
+def build(tasks_dir, repo, now=None, rows=None):
+    """The whole status as a dict. Never raises on bad records; a repository that cannot be read raises ValueError.
+    rows: the lane rows to report (lane_commands.list_lanes's {name, state, error?}); default every lane of the repository."""
     now = time.time() if now is None else now
     problems = []
+
+    def problem(where, why):
+        """One entry per record: a record timeline (or an earlier check) already lists is not listed again."""
+        if not any(p["where"] == str(where) for p in problems):
+            problems.append({"where": str(where), "problem": why})
     tasks_dir = Path(tasks_dir)
     state_dir = tasks_dir.parent if tasks_dir.name == "tasks" else tasks_dir
     common, main_repo = lane_commands._main_repo(repo)
@@ -257,7 +413,10 @@ def build(tasks_dir, repo, now=None):
         problems.append({"where": str(state_dir), "problem": f"session unreadable ({error.__class__.__name__})"})
     for d, why in _problem_dirs(state_dir):
         problems.append({"where": str(d), "problem": why})
-    rows = lane_commands.list_lanes(repo) if session else []  # no step fields: lane_steps.row_fields runs the lane gate (writes)
+    if not session:
+        rows = []
+    elif rows is None:
+        rows = lane_commands.list_lanes(repo)  # no step fields: lane_steps.row_fields runs the lane gate (writes)
     chosen = []  # (lane row, record, task)
     for lane in rows:
         if lane.get("state") not in ("open", "error"):
@@ -289,8 +448,14 @@ def build(tasks_dir, repo, now=None):
         if task is not None:
             requests, bad = _read_requests(task["path"])
             request_problem = bool(bad)
-            problems += [{"where": str(path), "problem": "malformed request record"} for path in bad]
+            for path in bad:
+                problem(path, "malformed request record")
         unreadable = ""
+        own = {t["id"] for t in session.tasks if t["meta"].get("lane") == record["name"]}
+        selection = _lane_selection_bad(session, record["name"], own)
+        for bad in selection.values():
+            for where, why in bad:
+                problem(where, why)
         try:
             tied = [u for u in session.unreadable_of(record) if u["step"] in (None, step)]
         except ValueError as error:
@@ -298,6 +463,9 @@ def build(tasks_dir, repo, now=None):
             unreadable = "the lane's lease cannot be read, so its unreadable tasks are not known (" + str(error).split(";")[0][:80] + ")"
         if tied:
             unreadable = "a task of this lane's step cannot be read: " + ", ".join(sorted(u["id"] for u in tied))
+        elif selection:
+            unreadable = "which task or review this lane is at cannot be read: " + ", ".join(
+                f"{ident} ({_why(bad)})" for ident, bad in sorted(selection.items()))
         state = "unknown"
         row = by_task.get(task["path"].name) if task else None
         if row and row["intervals"]:
@@ -306,7 +474,10 @@ def build(tasks_dir, repo, now=None):
         elif task:
             problems.append({"where": str(task["path"]), "problem": "no timeline for the task (archived or unreadable)"})
         step_closed = step is None and bool(record["closed"])
-        life, life_problem = _life(task) if task else (None, "")
+        life, bad = _life(task) if task else (None, [])
+        for where, why in bad + (review["bad"] if review else []):
+            problem(where, why)
+        life_problem = _why(bad)
         facts = {"lane": record["name"], "step": step, "unreadable": unreadable, "requests": requests, "request_problem": request_problem, "step_closed": step_closed, "task": task,
                  "queued": bool(step and session.queued_for(record["name"], step)), "life": life, "life_problem": life_problem,
                  "review": review, "merged": _merged(main_repo, record["branch"]) if step_closed else None}

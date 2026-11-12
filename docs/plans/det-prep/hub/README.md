@@ -23,7 +23,7 @@ starred lines in source. OBS = observed in real runs, SRC = confirmed in source,
 | 7 | tp-bench drives workers, not Main | SRC | `lib/bench/runner.py:287-362`; counts "paused" as finished (`:25`) |
 | 8 | Telemetry differs by harness and tool name | partly SRC | reporters log names as given; readers differ: `lib/routines.py:121` misses safe tools, `lib/trial_scan.py:893-929` Claude names only, skips pi; pi has no permission state; Claude `PermissionDenied` not routed (`hooks.json:8`) |
 | N1 | Reviewers never get `agent/roles/code-reviewer.md` | SRC* | `bin/tp-review:482` passes `--preamble-role` without `--role`; `bin/tp-spawn:546` adds role text only with `--role` |
-| N2 | Native Agent-tool children get no standing text | SRC | Main's children inherit `TP_MODE=orchestrator` without `TP_TASK_DIR`; workers' children get no packet |
+| N2 | Native Agent-tool children get no standing text | SRC | Main's children inherit `TP_MODE=orchestrator` without `TP_TASK_DIR`; workers' children get no packet. **Owner 2026-11-11: not a concern now** (the owner's "subagents" are tmux-pi workers, which get the contract on every tp-spawn route); no change |
 | N3 | Launch package only partly recorded | SRC | task dir keeps packet.md, run.sh, meta.json, dispatch.json; no commit/role-file hashes, exposed MCP tools, tp-claude suffix rule, Main's own package |
 | O1 | Workers search with shell grep/sed/cat | OBS | 8 sampled coders: 11-30 grep, 4-27 sed calls each; only SG1 r1 used safe_grep; 0 packets mention safe_grep |
 | O2 | ~30 permission prompts, each a Main redirect | OBS | 12 recursive search of config/agent/claude, 6 `.env` text, 5 unscoped git diff, 3 named sensitive file |

@@ -220,6 +220,11 @@ class Records:
                     el.write_json(d / "requests" / ("%d.json" % n), r)
             if t["result"]:
                 (d / "result.md").write_text("Done.\n\nRESULT_STATUS: %s\n" % t["result"], encoding="utf-8")
+                # HB8b round 6: result.md's mtime is the last write and the result holds from then on. Not the wall clock now
+                # (months after the fixture's runs): the first poll that showed it, as a real file is written before it is seen.
+                seen = [el.parse_time(o["at"]) for o in self.log if o.get("task") == ident and o.get("result") == t["result"]]
+                if seen:
+                    os.utime(d / "result.md", (min(seen).timestamp(),) * 2)
         self.state.mkdir(parents=True, exist_ok=True)
         if self.session_events is not None:
             (self.state / "events.jsonl").write_text("".join(json.dumps(e) + "\n" for e in self.session_events), encoding="utf-8")
@@ -1608,10 +1613,14 @@ class ClaimTimeTests(ScorerCase):
                  "f3": [(1, "working", None, None), (8.2, "waiting", "blocked", 8)],
                  "seen": [(1, "working", None, None), (9.4, "waiting", "complete", 9)],
                  "f1": [(1, "working", None, None), (8.2, "waiting", "complete", 8), (9.2, "working", None, None),
-                        (14.0, "waiting", "complete", 13)]}
+                        (14.0, "waiting", "complete", 13)],
+                 "p1": [(1, "working", None, None), (8.2, "waiting", "complete", 8), (14.0, "waiting", "complete", 13)],
+                 "p2": [(1, "working", None, None), (8.2, "waiting", "complete", 8), (9.2, "working", None, None),
+                        (11.0, "working", None, None)]}
         read = lambda s, res=None, status="complete": ("tool", s, "Read", {"file_path": str(r.state / "tasks/coder-1/result.md")},
                                                        0, res or s, "Done.\n\nRESULT_STATUS: %s\n" % status)
         notice = lambda s, line="coder-1 settled: tp-agent collect coder-1": ("user", s, "tmux-pi workers changed state:\n" + line)
+        numbered = lambda s, text: "".join("%6d\t%s\n" % (i, t) for i, t in enumerate(text.split("\n"), 1))
         free = lambda s, text: ("user", s, text)
         rows = [  # (polls, Main entries, expected false[, claim time[, result.md mtime]])
             ("span", [], None),                                                            # inside the span, no proof
@@ -1638,30 +1647,41 @@ class ClaimTimeTests(ScorerCase):
             ("blocked", [read(8.9), read(9.4, status="blocked")], None),
             ("blocked", [read(8.9), read(9.4, status="blocked")], False, 10.5),
             ("blocked", [notice(8.9), notice(9.4)], None),       # a notice in the span: the earlier blocked result or this one
-            ("blocked", [read(9.4), notice(9.45)], False),
+            ("blocked", [read(9.4), notice(9.45)], None),               # round 6: unobserved withdraw/restore in (9.45, 10)
             # Round 4 F2: the no-result poll at 9.2 bounds the write below ([9.2, 10)); it never outranks the span (was None).
             ("f2", [], False, 10.5), ("f2", [], None), ("f2", [], True, 9.1),
             # Round 4 F3: result.md's time goes with the file's own status (complete at 8.9), never the blocked stop's (was None).
             ("f3", [], False, 9.5, 8.9), ("f3", [], None, 8.8, 8.9), ("f3", [], None, 9.5, 30),   # complete in (8.2, W]
-            ("span", [], False, 9.5, 8.5),                     # result.md before the stamp shows the result by 8.5 (was None)
+            ("span", [], False, 9.5, 8.5),                     # result.md (8.5) holds its result from 8.5 on: no withdrawal after it
             ("span", [], None, 9.5, 9.7),                      # result.md inside the span, after the claim
             # Round 4 F4: a notice agrees with the status a Read, poll or file time shows at its time (was None).
-            ("span", [read(9.4), notice(9.4)], False), ("seen", [notice(9.4)], False), ("none", [notice(9.4)], False, 9.4, 9.4),
+            ("span", [read(9.4), notice(9.4)], False), ("seen", [notice(9.4)], None), ("none", [notice(9.4)], False, 9.4, 9.4),
             ("none", [notice(9.4)], None, 9.5, 9.4),           # round 5: withdrawn in (9.4, 14] or not (was False)
             ("none", [notice(9.4)], None),                     # no version for the notice to be: which result, unknown
             # Round 5 (review F1, F2 of e69d2e5): a version ends at the first observation showing no result; the same
             # status after it is a new version, written no earlier than its stamp; a notice before the withdrawal backs
             # nothing after it; a Read of part of the file without the status line shows nothing.
-            ("f1", [], True), ("f1", [], True, 12.5), ("f1", [], None, 13.5), ("f1", [], False, 14.5), ("f1", [], None, 9.1),
+            ("f1", [], True), ("f1", [], True, 12.5), ("f1", [], None, 13.5), ("f1", [], None, 14.5), ("f1", [], None, 9.1),
             ("f1", [notice(9.0)], True),
             ("f1", [read(9.0)], True),
             ("span", [("tool", 9.4, "Read", {"file_path": str(r.state / "tasks/coder-1/result.md"), "offset": 1, "limit": 1},
                        0, 9.4, "Done.\n")], None, 9.3),
             ("span", [("tool", 9.4, "Read", {"file_path": str(r.state / "tasks/coder-1/result.md")}, 0, 9.4,
                        "Done.\n…(truncated)")], None, 9.3),
+            # Round 6 (review F1, fail-before on cb7e57f): a result need not be seen in every version. Complete at 8.2 and
+            # (a new turn's stop) at 14 may have been withdrawn and restored between; and a notice no poll or Read accounts
+            # for (10) does not contradict the rest.
+            ("p1", [], None), ("p2", [notice(10)], False, 8.2, 30, 8.1),
+            # Round 6 (F2): a Read's output is line-numbered ("%6d<TAB>"): the status line is found behind the prefix.
+            ("span", [("tool", 9.4, "Read", {"file_path": str(r.state / "tasks/coder-1/result.md")}, 0, 9.4,
+                       numbered(9.4, "Done.\n\nRESULT_STATUS: complete\n"))], False),
+            # Round 6 (F3): a Read with no limit that returned the default cap (2000 lines) without the status line is partial.
+            ("span", [read(9.4), ("tool", 9.45, "Read", {"file_path": str(r.state / "tasks/coder-1/result.md")}, 0, 9.45,
+                                  "\n".join("%6d\tline %d" % (i, i) for i in range(1, 2001)))], False),
         ]
         for poll_set, entries, false, *more in rows:
-            claim_at, written = (list(more) + [9.5, 30][len(more):])[:2]
+            claim_at, written, ended = (list(more) + [9.5, 30, 8.7][len(more):])[:3]
+            r.tasks["coder-1"]["test_runs"][2] = (8, ended - 8, {"cmd": ["npm", "test"], "tree": "t1", "exit": 0})
             r.log = [o for o in r.log if o.get("task") != "coder-1"]
             for s, state, result, own in polls[poll_set]:
                 r.observe(s, "coder-1", state, result=result, stamp=own)
@@ -2210,7 +2230,9 @@ class RecordsOnlyTests(ScorerCase):
         # A pointer outside Main's directory and every task's test-runs: absent, lost on a record of unknown producer;
         # present, its producer is unknown (never the reader's): verification is unknown either way.
         outside = r.root / "elsewhere" / "test-run-9.json"
-        r.tasks["reviewer-1"]["transcript"] = [("tool", 1, "Bash", {"command": "x"}, 0, 3, "record: %s\n" % outside)]
+        # Round 6 (review F2/F7, fail-before on cb7e57f): the Read tool numbers its lines ("%6d<TAB>"); the pointer behind a
+        # prefix is still a pointer.
+        r.tasks["reviewer-1"]["transcript"] = [("tool", 1, "Read", {"file_path": "main.log"}, 0, 3, "     1\tok\n     2\trecord: %s\n" % outside)]
         s = r.score()
         self.assertIn("is absent", s["manifest"]["test-run records of unknown producer"])
         self.assertIsNone(s["measures"]["verification"]["value"])

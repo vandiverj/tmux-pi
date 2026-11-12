@@ -101,6 +101,12 @@ FLAGGED = "flagged"         # a problem a reader flagged without a record (Run.f
 NEVER = datetime.max.replace(tzinfo=timezone.utc)
 RECORD_LINE = re.compile(r"(?m)^record: (/[^\r\n]*?\.json)[ \t\r]*$")   # test-run.sh's `record: PATH` (rule 5: spaces kept)
 OUTSIDE = "ran outside test-run.sh"
+NUMBERED = re.compile(r"(?m)^ *\d+\t")      # the line prefix Read/safe_read put on each line (safe.ts:101, safe.mjs:89): `%6d<TAB>`
+
+
+def unnumbered(text):
+    """`text` without the line-number prefix Read/safe_read put on each line (round 6): the file's own lines."""
+    return NUMBERED.sub("", text or "")
 
 
 def final_tree(clone):
@@ -115,7 +121,7 @@ def final_tree(clone):
 def record_pointers(text):
     """The record paths a tool result names (round 9 rule 5): the rest of each `record: ` line, spaces included, and a
     JSON result's `record` field. A pointer is a reference only (rule 2): it never says who ran the record."""
-    out = RECORD_LINE.findall(text or "")
+    out = RECORD_LINE.findall(unnumbered(text))
     try:
         data = json.loads(text) if text and text.lstrip().startswith("{") else None
     except ValueError:
@@ -1614,21 +1620,28 @@ def _standing(run, who, by_then, claim, final):
     return failing, passing, unsure
 
 
-# HB8b round 5: the one source of what a task's result was at a moment (result_by), a possible-histories model. A history is
-# a step function of the task's result (no result, or a result with a status) that starts with no result. Every dated piece
-# of evidence is an observation at its own source's time (round 4 rule 1): present(status) (a poll, a stop's write,
-# result.md's mtime, a Read that shows the status line), absent (a poll, or a Read of the whole file with no status line),
-# exists (tmux-pi's notice: some result, status unsaid). A Read that shows part of the file (offset, limit, truncated) and
-# no status line is no observation: it constrains nothing. Every version is seen: each value the result takes after the
-# first no-result is shown by a present or absent observation while it holds (a notice says a result exists, never which
-# version; a notice no such observation accounts for leaves no consistent history). So a result withdrawn by a new turn
-# (report.sh, reporter.ts unlink result.md) ends before the first absent observation after it, and the same status shown
-# after that is a new version. A stop's write span start (write_span) bounds the start of the stop's version, unless that
-# version was observed before the start (the stamp then dates a rewrite). The result at a moment is the set of values the
-# consistent histories hold then; no consistent history (contradictory evidence) is the empty set.
+# HB8b round 6 (round 5's possible-histories model without "every version is seen"): the one source of what a task's result
+# was at a moment (result_by). A history is a step function of the task's result (no result, or a result with a status) that
+# starts with no result. Every dated piece of evidence is an observation at its own source's time (round 4 rule 1):
+# present(status) (a poll, a stop's write, result.md's mtime, a Read that shows the status line), absent (a poll, or a Read
+# of the whole file with no status line), exists (tmux-pi's notice: some result, status unsaid: SETTLED). A Read that shows
+# part of the file (offset, limit, truncated, the default 2000-line cap) and no status line is no observation: it constrains
+# nothing. Between two observations the result may have been withdrawn and restored unseen (a new turn unlinks result.md:
+# report.sh, reporter.ts), and a notice may stand for a version no poll or Read shows (its status unsaid); an unseen result
+# that no observation holds is not assumed. So a history gives each observation a value its pieces allow, and a gap keeps the
+# earlier value, changes to the next value, or passes through no result. A stop's write span start (write_span) bounds the
+# start of the stop's version, unless that version was observed before the start (the stamp then dates a rewrite). The result
+# at a moment is the set of values the consistent histories hold then; contradictory evidence (pieces of one time that
+# disagree) leaves no history: the empty set.
+# Two facts bound that freedom. (1) A withdrawal comes with a new turn (report.sh and reporter.ts unlink result.md as the turn
+# starts), which changes the worker's stamp: no withdrawal falls in [stamp, last poll] of consecutive polls with the same
+# state and a usable stamp (stable_windows). (2) A notice-only version (SETTLED: a result whose status no piece shows) is
+# bracketed by no result: it never turns into a shown status without a withdrawal, so in a stable gap a notice stands for
+# the status the next observation shows.
 NO_RESULT = "none"               # a piece showing the task held no result
 SETTLED = "settled"              # tmux-pi's notice: a result with a RESULT_STATUS exists; which one, the notice does not say
 TRUNCATED_RE = re.compile(r"(?i)truncated")
+READ_CAP = 2000    # safe_read's default line limit (agent/extensions/safe.ts:100, claude/mcp/safe.mjs:88); it adds no marker
 # tmux-pi's notifier (claude/plugins/tmux-pi/hooks/register.tsx:471, wakeText) submits "tmux-pi workers changed state:" then
 # one line per task (hint, register.tsx:287-291): a result with a status is `<id> settled: ...` or `<id> settled and reports
 # failing tests it does not own: ...` (lib/contract.py _lifecycle: settled needs a RESULT_STATUS line).
@@ -1646,10 +1659,12 @@ def notified_settled(text, task_id):
 
 
 def whole_read(entry):
-    """True when a Read/safe_read result shows the whole file: no offset past line 1, no line limit, no truncation note."""
+    """True when a Read/safe_read result shows the whole file: no offset past line 1, no line limit, no truncation note, and
+    fewer lines than the default cap (a response of READ_CAP lines may have been cut with no marker)."""
     args = entry.get("input") or {}
     return (args.get("offset") in (None, "", 0, 1) and args.get("limit") in (None, "")
-            and not TRUNCATED_RE.search(entry.get("result_text") or ""))
+            and not TRUNCATED_RE.search(entry.get("result_text") or "")
+            and len((entry.get("result_text") or "").split("\n")) < READ_CAP)
 
 
 def result_evidence(run, task):
@@ -1679,7 +1694,7 @@ def result_evidence(run, task):
             path = str((e.get("input") or {}).get("file_path") or (e.get("input") or {}).get("path") or "")
             when = e.get("result_at")
             if e.get("exit") == 0 and when is not None and (path == "%s/result.md" % tid or path.endswith("/%s/result.md" % tid)):
-                found = el.RESULT_RE.findall(e.get("result_text") or "")
+                found = el.RESULT_RE.findall(unnumbered(e.get("result_text")))
                 if found or whole_read(e):
                     pieces.append((when, found[-1].lower() if found else NO_RESULT, None, "Main read result.md at %s" % _iso(when)))
         elif e["kind"] == "user" and e["at"] is not None and notified_settled(e.get("text") or "", tid):
@@ -1687,69 +1702,113 @@ def result_evidence(run, task):
     return pieces
 
 
-def result_possible(pieces, at):
-    """(possible, why): the set of values (NO_RESULT or a status) the task's result can hold at `at` in the histories
-    consistent with every piece (the model above); empty when no history is. Pieces of one time are one observation: it
-    allows the values every piece there allows (a notice: any status some piece shows) and shows its value unless all its
-    pieces are notices. A history gives each observation a value; a run of equal values is one version, and every version
-    but the first no-result is shown by an observation in it. A version starts in the gap before its first observation, no
-    earlier than the start of each stop in it whose start is not after that first observation (seen before the stamp, the
-    stamp dates a rewrite)."""
+NEG_INF = float("-inf")
+FOREVER = datetime.max.replace(tzinfo=timezone.utc)      # result.md written at W holds its result from W on
+
+
+def stable_windows(run, task):
+    """[(since, until)]: spans in which the worker had no new turn: runs of consecutive polls of the task with the same state
+    and the same usable stamp (not after its poll), each from the stamp to its last poll."""
+    out, last = [], None
+    for o in run.obs(task["id"]):
+        own = o.get("_own")
+        key = (o.get("state"), own) if own is not None and own <= o["_at"] else None
+        if key is None:
+            last = None
+        elif key == last:
+            out[-1][1] = o["_at"]
+        else:
+            # a busy poll's stamp dates a new turn that began in its second, which may have removed result.md then
+            out.append([min(own + timedelta(seconds=1), o["_at"]) if o.get("state") in BUSY_STATES + ("permission",) else own, o["_at"]])
+            last = key
+    return [(a, b) for a, b in out]
+
+
+def result_possible(pieces, at, windows=()):
+    """(possible, why): the set of values (NO_RESULT, a status, or SETTLED for a result whose status a notice left unsaid) the
+    task's result can hold at `at` in the histories consistent with every piece (the model above); empty when none is.
+    Pieces of one time are one observation: it allows the values every piece there allows (a notice: any status some piece
+    shows, or SETTLED). A history gives each observation one of its allowed values. Between two observations the result goes
+    from the earlier value to the later one directly, or through no result (a withdrawal and a restore) unless the gap lies in
+    a stable window; SETTLED turns into a shown status only through no result. The value at `at` between two observations is
+    the earlier value (kept), no result (withdrawn before `at`, restored after it), or the later value once its version may
+    have started: no stop of the later observation was written after `at` (a stop's start bounds its version)."""
     statuses = {p[1] for p in pieces if p[1] not in (NO_RESULT, SETTLED)}
     groups = []
     for when in sorted({p[0] for p in pieces}):
         here = [p for p in pieces if p[0] == when]
-        allowed = {NO_RESULT} | statuses
+        allowed = {NO_RESULT} | statuses | {SETTLED}
         for p in here:
-            allowed &= statuses if p[1] == SETTLED else {p[1]}
-        groups.append({"at": when, "allowed": allowed, "shows": any(p[1] != SETTLED for p in here),
-                       "stops": [(p[1], p[2]) for p in here if p[2] is not None],
+            allowed &= (statuses | {SETTLED}) if p[1] == SETTLED else {p[1]}
+        groups.append({"at": when, "allowed": allowed, "stops": [(p[1], p[2]) for p in here if p[2] is not None],
                        "source": ", ".join(sorted(p[3] for p in here))})
-    n = len(groups)
-    # fwd[i]: {(value at observation i-1, whether its version is shown by then)} over consistent histories of the first i
-    # observations; fwd[0] holds the first no-result. bwd[i]: {(value at observation i, whether its version is shown from
-    # i on)} over consistent histories of observations i..n-1; bwd[n] is the open end.
-    fwd = [{(NO_RESULT, True)}]
-    for g in groups:
-        fwd.append({(w, (s or g["shows"]) if w == v else g["shows"])
-                    for v, s in fwd[-1] for w in g["allowed"] if w == v or s})
-    bwd = [None] * n + [{(None, True)}]
-    for i in range(n - 1, -1, -1):
-        g = groups[i]
-        bwd[i] = {(v, (s or g["shows"]) if w == v else g["shows"])
-                  for v in g["allowed"] for w, s in bwd[i + 1] if w is None or w == v or s}
-
-    def joins(i):
-        """[(a, b)]: the values at observations i-1 and i (b None past the last) in some consistent history."""
-        return [(a, b) for a, sa in fwd[i] for b, sb in bwd[i]
-                if ((sa or sb) if a == b else (sa and (b is None or sb)))]
-
     if not groups:
         return frozenset({NO_RESULT}), "no dated evidence of the result"
-    if not joins(n):
+    n = len(groups)
+    stable = [any(since <= groups[i]["at"] and groups[i + 1]["at"] <= until for since, until in windows) for i in range(n - 1)]
+
+    def version_start(m, b):
+        """the latest start of a stop of status b in the version that holds observation m: its own stops and, while no
+        withdrawal or change can come between (a stable gap to an observation that allows only b), the stops after it,
+        unless the version was observed before that stop's start."""
+        out = [st for status, st in groups[m]["stops"] if status == b]
+        k = m
+        while k + 1 < n and stable[k] and groups[k + 1]["allowed"] == {b}:
+            k += 1
+            out += [st for status, st in groups[k]["stops"] if status == b and st <= groups[m]["at"]]
+        return max(out, default=None)
+
+    def direct(a, b):
+        """a changes to b without a withdrawal: a first write, or one status to another; not to no result, and not
+        between a notice's unsaid status and a shown one."""
+        return a == b or a == NO_RESULT or (b != NO_RESULT and SETTLED not in (a, b))
+
+    def step(i, a, b):
+        """a at observation i then b at observation i + 1 in some history: directly, or through no result (not in a stable
+        window)."""
+        return direct(a, b) or not stable[i]
+
+    left = [set(groups[0]["allowed"])]
+    for i in range(1, n):
+        left.append({b for b in groups[i]["allowed"] if any(step(i - 1, a, b) for a in left[-1])})
+    if not left[-1]:
         return frozenset(), "no history fits the evidence (%s)" % "; ".join(g["source"] for g in groups)
+    right = [None] * (n - 1) + [set(groups[-1]["allowed"])]
+    for i in range(n - 2, -1, -1):
+        right[i] = {a for a in groups[i]["allowed"] if any(step(i, a, b) for b in right[i + 1])}
     m = next((i for i, g in enumerate(groups) if g["at"] >= at), n)
     if m < n and groups[m]["at"] == at:
-        return frozenset(b for a, b in joins(m)), groups[m]["source"]
+        return frozenset(left[m] & right[m]), groups[m]["source"]
     possible, later = set(), []
-    for a, b in joins(m):
-        possible.add(a)                              # no change in this gap, or the change comes after `at`
-        if b is None or b == a:
-            continue
-        # The change to b came by `at` unless every version of b over observations m..j consistent with the rest starts
-        # after `at`.
-        for j in range(m, n):
-            if b not in groups[j]["allowed"]:
-                break
-            shown = any(groups[k]["shows"] for k in range(m, j + 1))
-            if not shown or not any(w is None or w != b and s for w, s in bwd[j + 1]):
+    if m == n:
+        possible = set(left[-1])
+    else:
+        pairs = [(NO_RESULT, b) for b in right[0]] if m == 0 else [
+            (a, b) for a in left[m - 1] for b in right[m] if step(m - 1, a, b)]
+        def covered(x, y):
+            """no withdrawal can fall in (x, y): one stable window holds it."""
+            return any(since <= x and y <= until for since, until in windows)
+
+        for a, b in pairs:
+            first = m == 0 or groups[m - 1]["at"] == NEG_INF
+            before = first or not covered(groups[m - 1]["at"], at)       # a withdrawal fits in (previous observation, at)
+            after = not covered(at, groups[m]["at"])                       # ... or in (at, next observation)
+            if b == a:
+                possible.add(a)
+                if a != NO_RESULT and before:
+                    possible.add(NO_RESULT)               # withdrawn before `at`, restored after it
                 continue
-            bound = max([st for k in range(m, j + 1) for status, st in groups[k]["stops"]
-                         if status == b and st <= groups[m]["at"]], default=None)
+            if direct(a, b) or after:
+                possible.add(a)                           # kept until after `at`
+            if a != NO_RESULT and b != NO_RESULT and before:
+                possible.add(NO_RESULT)                   # withdrawn before `at`, restored after it
+            bound = version_start(m, b)
+            if not (direct(a, b) or before):
+                continue
             if bound is None or bound <= at:
                 possible.add(b)
-                break
-            later.append((b, bound))
+            else:
+                later.append((b, bound))
     why = "between %s and %s (%s)" % (_iso(groups[m - 1]["at"]) if m else "the start",
                                       _iso(groups[m]["at"]) if m < n else "now", groups[m - 1 if m == n else m]["source"])
     later = [t for b, t in later if b not in possible]
@@ -1762,7 +1821,11 @@ def result_by(run, task, at):
     """(possible, why, seen): the task's result at `at` (result_possible over result_evidence; total, never None) and
     whether any piece is dated at or before `at`."""
     pieces = result_evidence(run, task)
-    possible, why = result_possible(pieces, at)
+    windows = stable_windows(run, task)
+    written = [p[0] for p in pieces if p[3].startswith("result.md (")]
+    possible, why = result_possible(pieces, at, windows + [(min(written), FOREVER)] if written else windows)
+    if written and not possible:        # a record after the file's time says it was absent: the file's time is a point only
+        possible, why = result_possible(pieces, at, windows)
     return possible, why, any(p[0] <= at for p in pieces)
 
 
@@ -1790,7 +1853,7 @@ def judge_claim(run, at, sentence):
                 unsure.append("%s not yet observed" % task["id"])
         elif possible == {"complete"}:
             good.append("%s result complete" % task["id"])
-        elif "complete" in possible:
+        elif "complete" in possible or SETTLED in possible:          # SETTLED: a result whose status no piece says
             unsure.append("%s result %s at the claim (%s)" % (task["id"], " or ".join(sorted(possible)), why))
         else:
             bad.append("%s result %s" % (task["id"], " or ".join(sorted(possible))))

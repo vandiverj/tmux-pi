@@ -20,6 +20,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 _spec = importlib.util.spec_from_file_location("check_repeats", ROOT / "tools" / "checks" / "repeats.py")
@@ -518,19 +519,37 @@ class RepeatsTest(unittest.TestCase):
             ("no cover: disjoint tests", [("w", y, T, 3, I14), ("m", x, T, 4, I14)], 0),
             ("Main before any worker run", [("m", x, T, 4, I14), ("w", x, T, 3, I14)], 0),
             ("a failed worker run covers nothing", [("w", x, T, 3, I14, 1), ("m", x, T, 4, I14)], 0),
+            # round 3: strict, numeric end-time comparison (the display order breaks ties by task name; this does not).
+            # The optional 4th element is the end time of each run (None: unreadable); default 1, 2, ...
+            ("equal end times, same check (worker name sorts first)", [("w", xy, T, 3, I14), ("m", xy, T, 4, I14)], 0, [5, 5]),
+            ("equal end times, covered", [("w", xy, T, 3, I14), ("m", x, T, 4, I14)], 0, [5, 5]),
+            ("equal end times, reviewer, covered", [("r", xy, T, 3, I14), ("m", x, T, 4, I14)], 0, [5, 5]),
+            ("worker one microsecond earlier, same check", [("w", xy, T, 3, I14), ("m", xy, T, 4, I14)], 4, [5, 5.000001]),
+            ("worker one microsecond earlier, covered", [("w", xy, T, 3, I14), ("m", x, T, 4, I14)], 4, [5, 5.000001]),
+            ("worker later than Main", [("w", xy, T, 3, I14), ("m", xy, T, 4, I14)], 0, [5.000001, 5]),
+            ("worker end time missing, same check", [("w", xy, T, 3, I14), ("m", xy, T, 4, I14)], 0, [None, 5]),
+            ("worker end time missing, covered", [("w", xy, T, 3, I14), ("m", x, T, 4, I14)], 0, [None, 5]),
+            ("Main end time missing", [("w", xy, T, 3, I14), ("m", xy, T, 4, I14)], 0, [5, None]),
+            ("both end times missing", [("w", xy, T, 3, I14), ("m", x, T, 4, I14)], 0, [None, None]),
         ]
-        for name, runs, want in rows:
+        for name, runs, want, *ends in rows:
+            ends = ends[0] if ends else list(range(1, len(runs) + 1))
             with self.subTest(name), tempfile.TemporaryDirectory() as tmp:
                 session = Path(tmp) / "session"
                 s, m = Tasks(session / "tasks"), Tasks(session)
                 s.task("coder-1")
                 s.task("review-coder-1-1", review_of="coder-1")
-                for at, (who, cmd, tree, sec, interp, *rc) in enumerate(runs, 1):
-                    if who == "m":
-                        m.run(".", cmd, tree, 0, sec, at=at, interp=interp, dirname="main-runs", extra={"role": "main", "lane": "ln", "step": "S1"})
-                    else:
-                        s.run("coder-1" if who == "w" else "review-coder-1-1", cmd, tree, rc[0] if rc else 0, sec, at=at, interp=interp)
-                per = {(r["lane"], r["step"]): r for r in repeats.build(str(session / "tasks"))["per_lane_step"]}
+                unreadable = set()
+                for at, (who, cmd, tree, sec, interp, *rc) in zip(ends, runs):
+                    path = (m.run(".", cmd, tree, 0, sec, at=at or 0, interp=interp, dirname="main-runs",
+                                  extra={"role": "main", "lane": "ln", "step": "S1"}) if who == "m" else
+                            s.run("coder-1" if who == "w" else "review-coder-1-1", cmd, tree, rc[0] if rc else 0, sec,
+                                  at=at or 0, interp=interp))
+                    if at is None:
+                        unreadable.add(path)
+                real = repeats.Reader.mtime
+                with mock.patch.object(repeats.Reader, "mtime", lambda self, p: None if str(p) in unreadable else real(self, p)):
+                    per = {(r["lane"], r["step"]): r for r in repeats.build(str(session / "tasks"))["per_lane_step"]}
                 self.assertAlmostEqual(per[("ln", "S1")]["main_rerun"], want)
 
     def test_case1_planted_schedule(self):

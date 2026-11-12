@@ -862,12 +862,14 @@ def _main_rerun(run, earlier):
     is judged alone against every earlier (by end time) successful worker or reviewer run `earlier` (other Main runs never
     cover it). The same check (key, tree, interpreters that do not differ) counts all its seconds; else the largest cover of
     its test set by one run of the same runner and tree: an earlier run that holds its tests, all its seconds (measured); one
-    that lies inside it, the smaller of the two times (estimated), nothing when that run timed out (unknown)."""
-    if run["role"] != "main" or run["never"] or run["outside"]:
+    that lies inside it, the smaller of the two times (estimated), nothing when that run timed out (unknown).
+    "Earlier" is strict: the end time of the worker run is a number less than Main's. Equal end times, or one missing on
+    either side, never make a rerun (the display order `_order` breaks ties by name; this does not)."""
+    if run["role"] != "main" or run["never"] or run["outside"] or run["end"] is None:
         return 0.0
     best = 0.0
     for a in earlier:
-        if a["tree"] != run["tree"] or _interp_differs(a, run) or _order(a) >= _order(run):
+        if a["end"] is None or not a["end"] < run["end"] or a["tree"] != run["tree"] or _interp_differs(a, run):
             continue
         if a["canon"]["key"] == run["canon"]["key"]:
             return run["seconds"]

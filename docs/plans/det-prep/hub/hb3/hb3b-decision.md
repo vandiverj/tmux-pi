@@ -41,3 +41,6 @@ Full suite on main + PF1c + HB3b (2026-11-12, 5546 tests): 2 failures, one from 
 ## Options (Main recommends A)
 - **A. Adopt:** close and merge after the batched full suite; then follow-ups 1, 3 and 4 as one small slice.
 - **B. Park:** keep the lane; nothing changes for workers.
+
+## Owner decision (2026-11-12)
+A, adopt: "adopt HB3b". `tp-agent lane close hub-packet HB3b` passed; merged into main. Follow-up slice: tp-review `--rules-file`, the lib/launch_record.py:271 comment, a TP_WORK_DIR test fixture.

@@ -1,6 +1,6 @@
 {
  "schema": "tp-frictions:v1",
- "about": "HB7a mapping: friction key -> trigger, scope, proposed home, source pointers. Written by Main (every key is `by main`, inferred); the owner corrects it by editing this file. Pointers only: label:<file>#<i> (the row's own i), record:<ws>/<id>, memory:<file>, doc:<repo path>#<heading>. No quoted text.",
+ "about": "HB7a mapping: friction key -> trigger, scope, proposed home, source pointers. Written by Main (every key is `by main`, inferred); the owner corrects it by editing this file. Pointers only: label:<file>#<i> (the row's own i), record:<ws>/<id>, memory:<file>, doc:<repo path>#<heading>. No quoted text. Rows labels-B.json#89, #91, #185, #186, #187 are Main's instructions to workers mislabeled as owner messages (H48 label error); they are left ungrouped on purpose.",
  "keys": {
   "fix-brief-states-the-rule": {
    "by": "main",
@@ -12,7 +12,9 @@
    "home_target": "a brief-writing checklist doc that claude/main-prompt.md names for fix briefs",
    "why_home": "it applies only when Main writes a fix brief for a finding family; a standing contract line would be paid on every turn",
    "worked_if": "rounds-to-approve in one finding family drops on review-loop lanes after adoption (H12 eval)",
-   "sources": ["doc:docs/plans/det-prep/loop/ideas.md#H12"]
+   "sources": [
+    "doc:docs/plans/det-prep/loop/ideas.md#H12"
+   ]
   },
   "parser-brief-grammar-first": {
    "by": "main",
@@ -24,7 +26,9 @@
    "home_target": "the same brief-writing checklist doc (section: free-text parsers)",
    "why_home": "it applies only to parser briefs, a small class; Main retrieves it when the brief touches a parser",
    "worked_if": "review rounds per parser lane before and after (H22 check)",
-   "sources": ["doc:docs/plans/det-prep/loop/ideas.md#H22"]
+   "sources": [
+    "doc:docs/plans/det-prep/loop/ideas.md#H22"
+   ]
   },
   "detector-fail-closed-first": {
    "by": "main",
@@ -36,7 +40,9 @@
    "home_target": "the same brief-writing checklist doc (section: text-based security detectors)",
    "why_home": "it applies only to security detectors over text; retrieved with the security brief, not loaded on every turn",
    "worked_if": "rounds in one source-path-redaction-like family on the next detector lane",
-   "sources": ["doc:docs/plans/det-prep/loop/ideas.md#H26"]
+   "sources": [
+    "doc:docs/plans/det-prep/loop/ideas.md#H26"
+   ]
   },
   "model-choice": {
    "by": "main",
@@ -48,7 +54,12 @@
    "home_target": "the per-model routing layer (model catalog and router profiles, H15 / HB7c)",
    "why_home": "the choice is per model and provider; a prompt line cannot change what the router picks",
    "worked_if": "no model-choice process label after the routing change lands",
-   "sources": ["label:labels-A.json#3", "label:labels-A.json#5"]
+   "sources": [
+    "label:labels-A.json#3",
+    "label:labels-A.json#5",
+    "label:labels-A.json#66",
+    "label:labels-B.json#25"
+   ]
   },
   "tools-serve-target-projects": {
    "by": "main",
@@ -60,7 +71,11 @@
    "home_target": "claude/main-prompt.md",
    "why_home": "it is Main's standing purpose, needed whenever a tool lane is scoped; it is short and always applies",
    "worked_if": "no purpose-or-scope-drift label of this point after the line lands",
-   "sources": ["label:labels-A.json#58", "label:labels-A.json#59"]
+   "sources": [
+    "label:labels-A.json#58",
+    "label:labels-A.json#59",
+    "memory:cq-tools-target-projects.md"
+   ]
   },
   "safe-search-from-start": {
    "by": "main",
@@ -72,7 +87,10 @@
    "home_target": "agent/contract/worker.md (line 4 already holds it)",
    "why_home": "it holds for every worker on every route, which is what the worker contract is for",
    "worked_if": "worker permission prompts from recursive search per lane fall after the contract line (H27 count)",
-   "sources": ["label:labels-A.json#41", "label:labels-A.json#78"]
+   "sources": [
+    "label:labels-A.json#41",
+    "label:labels-A.json#78"
+   ]
   },
   "state-saved-for-restart": {
    "by": "main",
@@ -84,8 +102,15 @@
    "home_target": "the work store checkpoint and session-start brief hooks (HB3 tp-agent brief)",
    "why_home": "a hook that always saves and re-reads state does not depend on Main remembering a rule at the moment it matters",
    "worked_if": "no recovery-after-compaction-or-restart label after the hooks are on by default",
-   "sources": ["label:labels-B.json#50", "label:labels-B.json#127", "label:labels-B.json#175", "label:labels-B.json#228",
-               "label:labels-A.json#73"]
+   "sources": [
+    "label:labels-B.json#50",
+    "label:labels-B.json#127",
+    "label:labels-B.json#175",
+    "label:labels-B.json#228",
+    "label:labels-A.json#73",
+    "label:labels-B.json#92",
+    "label:labels-B.json#188"
+   ]
   },
   "run-only-affected-tests": {
    "by": "main",
@@ -97,7 +122,247 @@
    "home_target": "tp-agent dispatch --tests affected (the Test Scope packet section)",
    "why_home": "the dispatcher already computes the set; a default removes the choice instead of asking the worker to remember it",
    "worked_if": "no verification-or-evals label of this point after --tests affected became the lane default",
-   "sources": ["label:labels-B.json#130", "label:labels-B.json#131", "label:labels-B.json#135", "label:labels-B.json#136"]
+   "sources": [
+    "label:labels-B.json#130",
+    "label:labels-B.json#131",
+    "label:labels-B.json#135",
+    "label:labels-B.json#136",
+    "label:labels-B.json#199",
+    "memory:workers-test-once.md"
+   ]
+  },
+  "orchestrate-in-parallel": {
+   "by": "main",
+   "trigger": "Main works one item at a time while independent queued work waits",
+   "correction": "Main checks the queue for independent work and dispatches it in parallel lanes",
+   "successful_action": "independent queued steps run in parallel without the owner asking",
+   "scope": "role:main",
+   "proposed_home": "retrieved procedure",
+   "home_target": "the run-log queue check Main does at each lane close",
+   "why_home": "it applies at a decision point (a lane closes or waits), not every turn",
+   "worked_if": "no delegation-or-model label asking for parallel work after the check is in the lane-close procedure",
+   "sources": [
+    "label:labels-A.json#25",
+    "label:labels-B.json#210"
+   ]
+  },
+  "dispatch-via-tmux-pi-workers": {
+   "by": "main",
+   "trigger": "Main does side work itself or through in-process agents instead of tmux-pi workers",
+   "correction": "side tasks go to tmux-pi workers (panes the owner can see), dispatched through tp-agent",
+   "successful_action": "every side task shows in the tmux-pi worker status",
+   "scope": "role:main",
+   "proposed_home": "contract line",
+   "home_target": "claude/main-prompt.md",
+   "why_home": "it is Main's standing way of working and always applies",
+   "worked_if": "no label of this point after the line lands",
+   "sources": [
+    "label:labels-A.json#29",
+    "label:labels-B.json#24",
+    "label:labels-B.json#98"
+   ]
+  },
+  "research-before-recommending": {
+   "by": "main",
+   "trigger": "Main recommends a change before checking what was tried and what the options are",
+   "correction": "a researcher worker (a lower-cost model) looks at prior attempts and options before Main recommends",
+   "successful_action": "recommendations cite the research and prior attempts",
+   "scope": "role:main",
+   "proposed_home": "retrieved procedure",
+   "home_target": "the brief-writing checklist doc (section: recommendations)",
+   "why_home": "it applies only when Main prepares an owner decision",
+   "worked_if": "no label asking for research first after adoption",
+   "sources": [
+    "label:labels-A.json#65",
+    "label:labels-A.json#77"
+   ]
+  },
+  "wait-for-findings-before-next-step": {
+   "by": "main",
+   "trigger": "Main starts the next chained or costly step before a pending review or research result",
+   "correction": "the next step in a chain starts only after the review or research that could change it has finished",
+   "successful_action": "no step is redone because a review landed after it started",
+   "scope": "role:main",
+   "proposed_home": "tool default",
+   "home_target": "tp-agent lane step ordering (a dependent step refuses to dispatch while its predecessor review is open)",
+   "why_home": "a refusal at dispatch does not depend on Main remembering the order",
+   "worked_if": "no reworked step caused by an earlier review after the default",
+   "sources": [
+    "label:labels-B.json#140",
+    "label:labels-B.json#63"
+   ]
+  },
+  "continue-while-owner-away": {
+   "by": "main",
+   "trigger": "the owner leaves for hours or days and Main stops at the first decision",
+   "correction": "Main keeps working through queued steps, decides by its recommendation within the owner's limits, and stops only at owner-only gates",
+   "successful_action": "the owner returns to finished, reviewed steps and a short list of owner-only decisions",
+   "scope": "role:main",
+   "proposed_home": "contract line",
+   "home_target": "claude/main-prompt.md (with the owner-only list: pushes, permission prompts, overrides)",
+   "why_home": "it holds whenever the owner is away and Main must know it without a reminder",
+   "worked_if": "no waiting-or-stall label after the line lands",
+   "sources": [
+    "label:labels-B.json#109",
+    "label:labels-B.json#211"
+   ]
+  },
+  "lm-studio-available": {
+   "by": "main",
+   "trigger": "Main treats the local model server as unavailable or as an owner dependency",
+   "correction": "the local model server runs all the time; Main probes it with a small prompt",
+   "successful_action": "no owner dependency listed for the local model server",
+   "scope": "role:main",
+   "proposed_home": "tool default",
+   "home_target": "a probe command Main runs before reporting it down",
+   "why_home": "a probe answers the question; a remembered rule can go stale",
+   "worked_if": "no label of this point after the probe exists",
+   "sources": [
+    "label:labels-A.json#24",
+    "memory:lm-studio-always-up.md"
+   ]
+  },
+  "rigor-matches-real-use": {
+   "by": "main",
+   "trigger": "reviews or guardrails chase contrived inputs to the point of hurting usability",
+   "correction": "judge work by the owner's realistic use; contrived inputs become known limits, not rounds",
+   "successful_action": "reviewers tag findings realistic or contrived and only realistic ones block",
+   "scope": "global",
+   "proposed_home": "contract line",
+   "home_target": "agent/roles reviewer role and the brief template",
+   "why_home": "it applies to every review on the realistic-use lanes",
+   "worked_if": "rounds spent on contrived findings drop after the reviewer line",
+   "sources": [
+    "label:labels-B.json#161",
+    "memory:realistic-use-bar.md"
+   ]
+  },
+  "workers-cover-whole-scope": {
+   "by": "main",
+   "trigger": "workers find one or two issues and stop",
+   "correction": "briefs demand the whole scope (an input-space attack table) and workers report coverage",
+   "successful_action": "review rounds per lane fall because the first round covers the scope",
+   "scope": "role:main",
+   "proposed_home": "retrieved procedure",
+   "home_target": "the brief-writing checklist doc (section: scope coverage)",
+   "why_home": "it applies when Main writes a brief",
+   "worked_if": "rounds-to-approve per lane after adoption",
+   "sources": [
+    "label:labels-A.json#31",
+    "memory:workers-attack-own-rule.md"
+   ]
+  },
+  "tests-earn-their-place": {
+   "by": "main",
+   "trigger": "workers add a test per finding as ritual",
+   "correction": "extend or correct an existing test first; a new test must cover an area that needs it",
+   "successful_action": "test count grows only where coverage was missing",
+   "scope": "global",
+   "proposed_home": "contract line",
+   "home_target": "agent/contract/worker.md",
+   "why_home": "it holds for every worker that writes tests",
+   "worked_if": "test count per lane vs findings per lane",
+   "sources": [
+    "memory:tests-earn-their-place.md"
+   ]
+  },
+  "slice-work-incrementally": {
+   "by": "main",
+   "trigger": "a step runs long before any result comes back",
+   "correction": "cut work into slices under about 20 minutes that feed improvements back early; the whole-scope run comes last",
+   "successful_action": "each slice reports before the next starts",
+   "scope": "role:main",
+   "proposed_home": "retrieved procedure",
+   "home_target": "the brief-writing checklist doc (section: slicing)",
+   "why_home": "it applies when Main plans a step",
+   "worked_if": "slice durations in the run log",
+   "sources": [
+    "memory:slice-work-incrementally.md"
+   ]
+  },
+  "rules-set-up-once": {
+   "by": "main",
+   "trigger": "Main proposes a maintained pipeline for keeping business rules consistent",
+   "correction": "Main writes a per-project rule map once and references it; no maintained job",
+   "successful_action": "rule-consistency work names the map, not a new job",
+   "scope": "project",
+   "proposed_home": "retrieved procedure",
+   "home_target": "the per-project rule map",
+   "why_home": "it applies only to rule-heavy projects",
+   "worked_if": "no new maintained job proposed for it",
+   "sources": [
+    "memory:rules-setup-once.md"
+   ]
+  },
+  "gate-commands-run-alone": {
+   "by": "main",
+   "trigger": "a gating command is piped inside an && chain",
+   "correction": "run lane close and review alone, never piped",
+   "successful_action": "the step runs correctly the first time",
+   "scope": "role:main",
+   "proposed_home": "tool default",
+   "home_target": "a gate that fails loudly on a closed pipe",
+   "why_home": "Main's own operating lesson; a default or tool removes the need to remember it",
+   "worked_if": "no repeat of the failure in the run log",
+   "sources": [
+    "memory:gate-commands-not-piped.md"
+   ]
+  },
+  "lane-create-base-main": {
+   "by": "main",
+   "trigger": "a lane is created on the stale default base",
+   "correction": "create lanes with --base main",
+   "successful_action": "the step runs correctly the first time",
+   "scope": "role:main",
+   "proposed_home": "tool default",
+   "home_target": "tp-agent lane create default base",
+   "why_home": "Main's own operating lesson; a default or tool removes the need to remember it",
+   "worked_if": "no repeat of the failure in the run log",
+   "sources": [
+    "memory:lane-create-base-main.md"
+   ]
+  },
+  "lane-verify-includes-session-env": {
+   "by": "main",
+   "trigger": "a scoped lane verify skips the whole-repo guard",
+   "correction": "every lane verify adds tests.test_session_env",
+   "successful_action": "the step runs correctly the first time",
+   "scope": "role:main",
+   "proposed_home": "tool default",
+   "home_target": "the verify script template",
+   "why_home": "Main's own operating lesson; a default or tool removes the need to remember it",
+   "worked_if": "no repeat of the failure in the run log",
+   "sources": [
+    "memory:lane-verify-include-session-env.md"
+   ]
+  },
+  "worker-tests-isolate-tmux": {
+   "by": "main",
+   "trigger": "a worker test touches the default tmux server",
+   "correction": "tests run with TMUX_TMPDIR and a private socket",
+   "successful_action": "the step runs correctly the first time",
+   "scope": "role:main",
+   "proposed_home": "tool default",
+   "home_target": "tools/agent/test-run.sh",
+   "why_home": "Main's own operating lesson; a default or tool removes the need to remember it",
+   "worked_if": "no repeat of the failure in the run log",
+   "sources": [
+    "memory:worker-tests-tmux-isolation.md"
+   ]
+  },
+  "shell-is-zsh": {
+   "by": "main",
+   "trigger": "a bash-style loop runs in the zsh tool shell",
+   "correction": "loops go in bash script files",
+   "successful_action": "the step runs correctly the first time",
+   "scope": "role:main",
+   "proposed_home": "retrieved procedure",
+   "home_target": "Main memory",
+   "why_home": "Main's own operating lesson; a default or tool removes the need to remember it",
+   "worked_if": "no repeat of the failure in the run log",
+   "sources": [
+    "memory:zsh-bash-tool-watchers.md"
+   ]
   }
  }
 }

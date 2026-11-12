@@ -1135,3 +1135,8 @@ Each lane: checkpoint, Main's evidence, openai-codex review, notes closed, `lane
   was `Path.glob` skipping an unreadable folder silently. review-coder-b5a566b6cc-085938 APPROVED_WITH_NOTES (list-then-read
   window a known limit). Full run on preview 76aa79e (main 3ffa8cf + lane 584d109, tree c2d663b): 5538 tests OK (skipped 78),
   550 s. Not merged: the brief says adoption is the owner's; options in docs/plans/det-prep/hub/hb7/hb7a-decision.md.
+- HB7a adopted (owner "use recommendation" = A): `tp-agent lane close hub-friction HB7a` passed; merged 0427722. Key file
+  filled: 24 keys (16 active on the owner's own words, 8 candidate from Main's memories and ideas); 12 label rows left
+  ungrouped on purpose (7 one-off task instructions; labels-B #89, #91, #185-187 are Main's instructions to workers that H48
+  labeled as owner messages). Recurrence by session: state-saved-for-restart 5, model-choice 2, dispatch-via-tmux-pi-workers 2.
+  Next: the owner's OK for a claude/main-prompt.md line so Main records corrections as HB3 records.

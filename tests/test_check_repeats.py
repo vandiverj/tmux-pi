@@ -83,8 +83,9 @@ class RepeatsTest(unittest.TestCase):
             ("D1 same cmd other tree", (ut, T, 0, 3), (ut, T2, 0, 3), "first", 0, {}),
             ("N1 other cwd spelling (abs path in worktree, other worktree path)",
              (PY + [WT + "/tests/test_x.py"], T, 0, 3), (PY + ["tests/test_x.py"], T, 0, 3, "/work/other-wt"), "duplicate", 3, {}),
-            ("N1 cd tests && ... is another cwd (naive: duplicate)",
-             (PY + ["test_x"], T, 0, 3), (["bash", "-c", "cd tests && python3 -m unittest test_x"], T, 0, 3), "first", 0, {}),
+            ("N1 cd tests && ... is not understood (naive: duplicate)",
+             (PY + ["test_x"], T, 0, 3), (["bash", "-c", "cd tests && python3 -m unittest test_x"], T, 0, 3), "outside", 0,
+             {"outside": 1, "reason": "not understood: cd"}),
             ("N2 other interpreter (naive: duplicate)", (ut, T, 0, 3), (["/usr/bin/python3"] + ut[1:], T, 0, 3), "first", 0,
              {"interpreter_spelling_only": 1}),
             ("N2 interpreter path spelling", (["/usr/bin//python3"] + ut[1:], T, 0, 3), (["/usr/bin/python3"] + ut[1:], T, 0, 3),
@@ -156,27 +157,67 @@ class RepeatsTest(unittest.TestCase):
              (["git", "-C", WT, "submodule", "update"], T, 0, 1), "never", 0, {"never": 2}),
             ("D4 git ls-remote / clone", (["git", "-C", WT, "ls-remote"], T, 0, 1), (["git", "-C", WT, "ls-remote"], T, 0, 1),
              "never", 0, {"never": 2}),
-            ("D4 local git is not network", (["git", "-C", WT, "status"], T, 0, 1), (["git", "-C", WT, "status"], T, 0, 1),
-             "duplicate", 1, {}),
+            ("D4 local git is not network, and not understood (reads refs and the index)",
+             (["git", "-C", WT, "status"], T, 0, 1), (["git", "-C", WT, "status"], T, 0, 1), "outside", 0,
+             {"outside": 2, "reason": "not understood: command git"}),
             # F3: shell text is words, never a path
             ("F3 bash -c of an absolute interpreter equals the direct form",
              (["/usr/bin/python3", "-m", "unittest", "tests/test_x.py"], T, 0, 3),
              (["bash", "-c", "/usr/bin/python3 -m unittest tests/test_x.py"], T, 0, 3), "duplicate", 3, {}),
-            ("F3 opaque bash -c with an absolute interpreter is not outside",
+            ("F3 opaque bash -c (pipe, redirect) is not understood, not a path",
              (["bash", "-c", "/usr/bin/python3 -m unittest tests/test_x.py 2>&1 | tail -3"], T, 0, 3),
-             (["bash", "-c", "/usr/bin/python3 -m unittest tests/test_x.py 2>&1 | tail -3"], T, 0, 3), "duplicate", 3, {}),
-            ("F3 nested sh -c text is not outside",
+             (["bash", "-c", "/usr/bin/python3 -m unittest tests/test_x.py 2>&1 | tail -3"], T, 0, 3), "outside", 0,
+             {"outside": 2, "reason": "not understood: shell operator"}),
+            ("F3 nested sh -c with an operator is not understood",
              (["bash", "-c", "sh -c '/usr/bin/python3 -m unittest tests/test_x.py'; true"], T, 0, 3),
-             (["bash", "-c", "sh -c '/usr/bin/python3 -m unittest tests/test_x.py'; true"], T, 0, 3), "duplicate", 3, {}),
+             (["bash", "-c", "sh -c '/usr/bin/python3 -m unittest tests/test_x.py'; true"], T, 0, 3), "outside", 0,
+             {"outside": 2, "reason": "not understood: shell operator"}),
+            ("F3 nested plain sh -c equals the direct form",
+             (PY + ["tests.test_x"], T, 0, 3), (["bash", "-c", "sh -c 'python3 -m unittest tests.test_x'"], T, 0, 3), "duplicate", 3, {}),
             ("F3 external script inside bash -c stays outside",
              (["bash", "-c", "python3 /sessions/s/tasks/r/probes.py > /dev/null"], T, 0, 1),
-             (["bash", "-c", "python3 /sessions/s/tasks/r/probes.py > /dev/null"], T, 0, 1), "outside", 0, {"outside": 2}),
-            ("F3 relative path inside the cwd (after cd) is not outside",
-             (["bash", "-c", "cd tests && python3 ../tools/x.py"], T, 0, 1), (["bash", "-c", "cd tests && python3 ../tools/x.py"], T, 0, 1),
-             "duplicate", 1, {}),
-            ("F3 relative path leaving the cwd is outside",
-             (["bash", "-c", "cd tests && python3 ../../x.py; true"], T, 0, 1), (["bash", "-c", "cd tests && python3 ../../x.py; true"], T, 0, 1),
+             (["bash", "-c", "python3 /sessions/s/tasks/r/probes.py > /dev/null"], T, 0, 1), "outside", 0,
+             {"outside": 2, "reason": "input outside the tree: probes.py"}),
+            # R3: eligible only when understood; every other form is outside, whatever it is spelt like
+            ("R3 cd tests && .. path (review F4)", (["bash", "-c", "cd tests && python3 ../tools/x.py; true"], T, 0, 1),
+             (["bash", "-c", "cd tests && python3 ../tools/x.py; true"], T, 0, 1), "outside", 0, {"outside": 2, "reason": "not understood: cd"}),
+            ("R3 embedded .. leaves the tree (review F4)", (["bash", "-c", "python3 tools/../../probe.py; true"], T, 0, 1),
+             (["bash", "-c", "python3 tools/../../probe.py; true"], T, 0, 1), "outside", 0, {"outside": 2}),
+            ("R3 embedded .. in a direct argv", (["python3", "tools/../x.py"], T, 0, 1), (["python3", "tools/../x.py"], T, 0, 1),
+             "outside", 0, {"outside": 2, "reason": "not understood: a .. component"}),
+            ("R3 .. in an option value", (["python3", "tools/x.py", "--out=../r"], T, 0, 1), (["python3", "tools/x.py", "--out=../r"], T, 0, 1),
              "outside", 0, {"outside": 2}),
+            ("R3 env option the parser does not read", (["env", "-i", "X=1"] + ut, T, 0, 1), (["env", "-i", "X=1"] + ut, T, 0, 1),
+             "outside", 0, {"outside": 2, "reason": "not understood: an env option"}),
+            ("R3 unknown wrapper", (["timeout", "60"] + ut, T, 0, 1), (["timeout", "60"] + ut, T, 0, 1), "outside", 0,
+             {"outside": 2, "reason": "not understood: command timeout"}),
+            ("R3 alias or other runner", (["deno", "test"], T, 0, 1), (["deno", "test"], T, 0, 1), "outside", 0, {"outside": 2}),
+            ("R3 python -c code", (["python3", "-c", "print(1)"], T, 0, 1), (["python3", "-c", "print(1)"], T, 0, 1), "outside", 0,
+             {"outside": 2, "reason": "not understood: python3 option -c"}),
+            ("R3 python -m other than unittest", (["python3", "-m", "pytest", "tests"], T, 0, 1), (["python3", "-m", "pytest", "tests"], T, 0, 1),
+             "outside", 0, {"outside": 2}),
+            ("R3 unittest discover", (PY + ["discover"], T, 0, 1), (PY + ["discover"], T, 0, 1), "outside", 0, {"outside": 2}),
+            ("R3 bash -lc is not plain", (["bash", "-lc", "python3 -m unittest tests.test_x"], T, 0, 1),
+             (["bash", "-lc", "python3 -m unittest tests.test_x"], T, 0, 1), "outside", 0, {"outside": 2, "reason": "not understood: shell options"}),
+            ("R3 shell expansion in a program", (["bash", "-c", "python3 -m unittest $MODS"], T, 0, 1),
+             (["bash", "-c", "python3 -m unittest $MODS"], T, 0, 1), "outside", 0, {"outside": 2, "reason": "not understood: shell expansion"}),
+            ("R3 in-tree script with a prefix assignment and perl alarm", (["perl", "-e", "alarm 9; exec @ARGV", "X=1", "python3", "tools/x.py"], T, 0, 1),
+             (["perl", "-e", "alarm 9; exec @ARGV", "X=1", "python3", "tools/x.py"], T, 0, 1), "duplicate", 1, {}),
+            ("R3 in-tree shell script", (["bash", "tests/x.sh"], T, 0, 1), (["bash", "tests/x.sh"], T, 0, 1), "duplicate", 1, {}),
+            ("R3 in-tree executable path", (["tools/agent/x.sh", "a"], T, 0, 1), (["tools/agent/x.sh", "a"], T, 0, 1), "duplicate", 1, {}),
+            # R3: the never scan reads every word, so a run that is not understood is still never counted
+            ("R3 never behind an unknown wrapper", (["timeout", "60", "env", "TP_LIVE_LMSTUDIO=1"] + ut, T, 0, 1),
+             (["timeout", "60", "env", "TP_LIVE_LMSTUDIO=1"] + ut, T, 0, 1), "never", 0, {"never": 2}),
+            ("R3 never inside text an unknown wrapper passes on", (["timeout", "60", "bash", "-c", "TP_LIVE_LMSTUDIO=1 python3 -m unittest x; true"], T, 0, 1),
+             (["timeout", "60", "bash", "-c", "TP_LIVE_LMSTUDIO=1 python3 -m unittest x; true"], T, 0, 1), "never", 0, {"never": 2}),
+            ("R3 never in env -S text", (["env", "-S", "TP_LIVE_LMSTUDIO=1 python3 -m unittest x"], T, 0, 1),
+             (["env", "-S", "TP_LIVE_LMSTUDIO=1 python3 -m unittest x"], T, 0, 1), "never", 0, {"never": 2}),
+            ("R3 never named in python -c code", (["python3", "-c", "import os; os.environ['TP_LIVE_LMSTUDIO']='1'"], T, 0, 1),
+             (["python3", "-c", "import os; os.environ['TP_LIVE_LMSTUDIO']='1'"], T, 0, 1), "never", 0, {"never": 2}),
+            ("R3 git -C fetch behind an unknown wrapper", (["nice", "git", "-C", WT, "fetch"], T, 0, 1), (["nice", "git", "-C", WT, "fetch"], T, 0, 1),
+             "never", 0, {"never": 2}),
+            ("R3 unsetting a live switch is not live", (["env", "-u", "TP_LIVE_LMSTUDIO"] + ut, T, 0, 1),
+             (["env", "-u", "TP_LIVE_LMSTUDIO"] + ut, T, 0, 1), "duplicate", 1, {}),
             ("D4 a module named bench is not a bench run", (PY + ["tests.test_bench_runner"], T, 0, 1),
              (PY + ["tests.test_bench_runner"], T, 0, 1, WT, "py-test_bench_runner"), "duplicate", 1, {}),
         ]
@@ -195,6 +236,8 @@ class RepeatsTest(unittest.TestCase):
                 self.assertAlmostEqual(repeats.repeated_seconds(rb), want_rep)
                 if "how" in extra:
                     self.assertEqual(rb["covered"]["how"], extra["how"])
+                if "reason" in extra:
+                    self.assertTrue(rb["outside"].startswith(extra["reason"]), rb["outside"])
                 if "differs" in extra:
                     self.assertTrue(rb["outcome_differs"])
                 for key in ("retries", "never", "outside", "interpreter_spelling_only"):
@@ -212,7 +255,11 @@ class RepeatsTest(unittest.TestCase):
             s.gate("coder-2", "gate.json", tree=T2, finished="20")           # other tree
             # F1: checks whose scope reads head/base (gitleaks BASE..HEAD, gitleaks-dirty, typecheck) key on them too.
             s.task("coder-3")
-            scoped = (("gitleaks", "passed", 0, 3.0), ("gitleaks-dirty", "passed", 0, 1.0), ("typecheck:web", "passed", 0, 4.0))
+            # R3: only checks whose whole scope is in the record are comparable: prettier (files+tree), gitleaks (head+base),
+            # gitleaks-dirty (head+tree). eslint (Deno lint reads the index: a file restored untracked, then staged, has
+            # the same files/tree/head/base) and typecheck (files deleted since base) are not understood.
+            scoped = (("gitleaks", "passed", 0, 3.0), ("gitleaks-dirty", "passed", 0, 1.0), ("typecheck:web", "passed", 0, 4.0),
+                      ("eslint:web", "passed", 0, 5.0), ("newcheck", "passed", 0, 1.0))
             H1, H2, B1, B2 = "1" * 40, "2" * 40, "3" * 40, "4" * 40
             s.gate("coder-3", "gate-20261112-080000-1.json", checks=scoped + (("prettier:web", "passed", 0, 2.0),), tree="e" * 40, finished="31",
                    head=H1, base=B1)
@@ -241,17 +288,26 @@ class RepeatsTest(unittest.TestCase):
             g3 = [r for r in rep["runs"] if r["task"] == "coder-3"]
             def classes(label):
                 return [r["class"] for r in sorted((r for r in g3 if r["label"] == label), key=lambda r: r["end"])]
-            for label in ("gitleaks", "gitleaks-dirty", "typecheck:web"):
+            for label in ("gitleaks", "gitleaks-dirty"):
                 self.assertEqual(classes(label)[:4], ["first", "duplicate", "first", "first"], label)  # head, then base changed
+            for label in ("typecheck:web", "eslint:web", "newcheck"):
+                self.assertEqual(classes(label), ["outside"] * 4, label)
             self.assertEqual(classes("prettier:web"), ["first", "duplicate", "duplicate", "duplicate"])  # files+tree only
             self.assertEqual(classes("gitleaks")[4:], ["outside", "outside"])  # head or base.sha not recorded
-            self.assertTrue(all("head/base" in r["outside"] for r in g3 if r["class"] == "outside"))
+            self.assertTrue(all("head/base" in r["outside"] for r in g3 if r["label"] == "gitleaks" and r["class"] == "outside"))
+            self.assertTrue(all(r["outside"].startswith("not understood: ") for r in g3 if r["class"] == "outside"))
+            self.assertEqual(rep["totals"]["not_understood"], len([r for r in rep["runs"] if r["class"] == "outside" and r["task"] == "coder-3"]))
             shown = " ".join(" ".join(repeats.shown_cmd(c)) for c in (
                 ["env", "API_TOKEN=s3cret", "python3"], ["bash", "-c", "export DB_PASSWORD='p w' X=1; API_KEY=abc cmd"],
-                ["bash", "-c", "AUTH_HEADER=zzz python3 -m unittest"]))
-            for leaked in ("s3cret", "p w", "abc", "zzz"):
+                ["bash", "-c", "AUTH_HEADER=zzz python3 -m unittest"],
+                # R3 F1: an argv element NAME=VALUE is hidden whole; shell text hides through the end of the shell word
+                ["env", "API_TOKEN=dummy firstw secondw", "python3"], ["env", "DB_PASSWORD=semi;colonw 'quotew\"", "python3"],
+                ["bash", "-c", "export API_KEY=a\"qb cw\"dw ew; true"], ["bash", "-c", "echo x; AUTH_X=esc\\ apedw fw"],
+                ["bash", "-c", "SECRET_Y='open quoted w"]))
+            for leaked in ("s3cret", "p w", "abc", "zzz", "firstw", "secondw", "colonw", "quotew", "qb", "cw", "dw", "apedw", "open", "quoted"):
                 self.assertNotIn(leaked, shown)
-            self.assertIn("X=1", shown)
+            for kept in ("X=1", "ew;", "fw"):
+                self.assertIn(kept, shown)
             self.assertEqual({r["task"]: r["role"] for r in rep["runs"] if r["kind"] == "test-run"},
                              {"main-like": "main", "no-meta": "unknown"})
             self.assertEqual(rep["totals"]["main_visible"], 1)

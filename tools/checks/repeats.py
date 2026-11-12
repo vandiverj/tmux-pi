@@ -31,7 +31,10 @@ GATE_NAME = re.compile(r"gate(-[0-9]{8}-[0-9]{6}-[0-9]+)?\.json")
 TASK_ID = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*")
 ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 SECRET_NAME = re.compile(r"KEY|TOKEN|SECRET|PASSWORD|PASS|CREDENTIAL|AUTH", re.I)
-ASSIGN_IN_TEXT = re.compile(r"(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]*)=(\"[^\"]*\"|'[^']*'|[^\s;&|()<>\"']*)")
+# NAME=VALUE in shell text; VALUE runs to the end of the shell word: quoted parts, backslash escapes and plain characters,
+# and an unterminated quote to the end of the text.
+ASSIGN_IN_TEXT = re.compile(r"(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]*)=((?:\"[^\"]*\"|'[^']*'|\\.|[^\s;&|()<>\"'\\])*"
+                            r"(?:\"[^\"]*$|'[^']*$)?)", re.S)
 SHELLS = ("bash", "sh", "zsh", "dash", "ksh")
 SHELL_C = re.compile(r"-[A-Za-z]*c[A-Za-z]*")
 INTERP = re.compile(r"python[0-9.]*")
@@ -182,6 +185,18 @@ def _plain_shell(text):
     return tokens if tokens and not any("$" in t or "`" in t for t in tokens) else None
 
 
+def _shell_opaque(args, words):
+    """What in a `-c` program the tool does not read, for the reason `not understood`."""
+    if len(args) != 3 or args[1] != "-c":
+        return "shell options or arguments (%s)" % args[1]
+    if "cd" in words:
+        return "cd in a shell program"
+    for w in words:
+        if w and all(c in "();<>|&" for c in w):
+            return "shell operator %s" % w
+    return "shell expansion in a program"
+
+
 def _top(arg, cwd):
     """N1: an argument naming the worktree or a path in it, spelt relative to the top."""
     if not cwd or not arg.startswith("/"):
@@ -209,12 +224,13 @@ def canonical(cmd, cwd):
     cwd = os.path.normpath(cwd) if isinstance(cwd, str) and cwd.startswith("/") else ""
     args = [_top(a, cwd) for a in cmd]
     rel, wrappers, env = ".", [], []
-    tokens, shell_texts = list(args), []
+    tokens, shell_texts, opaque = list(args), [], None
     while args:
         base = os.path.basename(args[0])
         if base == "env":
             parsed = _env_ops(args)
             if parsed is None:
+                opaque = "an env option the parser does not read"
                 break
             env += parsed[0]
             args = parsed[1]
@@ -228,24 +244,24 @@ def canonical(cmd, cwd):
             text = args[2]
             if text in tokens:
                 tokens.remove(text)  # the program text is not a path; its words are the tokens (F3)
-            match = re.fullmatch(r"\s*cd\s+(\S+)\s*&&\s*(.*)", text, re.S) if len(args) == 3 and args[1] == "-c" else None
-            inner = _plain_shell(match.group(2) if match else text) if len(args) == 3 and args[1] == "-c" else None
+            inner = _plain_shell(text) if len(args) == 3 and args[1] == "-c" else None
             words, texts = _scan_shell(text)
             shell_texts += texts
             if inner is None:  # opaque: kept as written; its words still count for D4
                 tokens += [_top(w, cwd) for w in words]
+                opaque = _shell_opaque(args, words)
                 break
-            if match:
-                where = _top(match.group(1), cwd)
-                where = "." if where == "<top>" else where[len("<top>/"):] if where.startswith("<top>/") else where
-                rel = os.path.normpath(os.path.join(rel, where))
             args = [_top(a, cwd) for a in inner]
             tokens += args
         else:
             break
-    # N1: a path in the worktree, absolute or relative, is spelt relative to the directory the command ran in (top/rel).
-    args = [os.path.relpath("." if a == "<top>" else a[len("<top>/"):], rel) if a == "<top>" or a.startswith("<top>/") else a
-            for a in args]
+    for tok in [t for t in tokens if re.search(r"\s", t) and t not in shell_texts]:  # text a wrapper passes on (timeout, eval, env -S)
+        words, texts = _scan_shell(tok)
+        if len(words) > 1:
+            tokens += [_top(w, cwd) for w in words]
+            shell_texts += texts
+    # N1: a path in the worktree, absolute or relative, is spelt relative to the worktree top.
+    args = ["." if a == "<top>" else a[len("<top>/"):] if a.startswith("<top>/") else a for a in args]
     interp = ""
     if args and INTERP.fullmatch(os.path.basename(args[0])):
         interp = os.path.normpath(args[0]) if args[0].startswith("/") else args[0]  # N2
@@ -255,7 +271,7 @@ def canonical(cmd, cwd):
     body = list(args) if tests is None else opts + [tests]
     return {"key": json.dumps([head, body]), "runner": json.dumps([head, opts]) if tests is not None else None,
             "tests": tests, "interp": interp, "env": env, "tokens": tokens, "shell_texts": shell_texts, "cwd": cwd,
-            "rel": rel,
+            "argv": args, "opaque": opaque,
             "no_interp": json.dumps([head, (["<py>"] + body[1:]) if interp else body])}
 
 
@@ -353,6 +369,12 @@ def never_reason(canon, label):
         if name == "TP_LMSTUDIO_BUDGET" and value not in ("", "0"):
             return "live model (TP_LMSTUDIO_BUDGET set)"
     toks = canon["tokens"]
+    # Every word is scanned, whatever wraps it (an unknown wrapper, python -c code, env -S text): a live switch named
+    # anywhere is a live run, except where it is unset (`-u NAME`).
+    scan = [t for i, t in enumerate(toks) if not (i and toks[i - 1] == "-u")] + [re.sub(r"-u\s+\S+", "", s) for s in canon["shell_texts"]]
+    for name in LIVE_SWITCHES:
+        if any(name in t for t in scan):
+            return "live model (%s named)" % name
     bases = [os.path.basename(t) for t in toks]
     if "tp-lmstudio" in bases or "live" in words:
         return "live model"
@@ -369,28 +391,68 @@ def never_reason(canon, label):
     return None
 
 
+PY_FLAGS = {"-u", "-B", "-E", "-s", "-S", "-I", "-b", "-q"}  # interpreter options that do not change what a script reads
+
+
 def outside_reason(canon):
-    """D4b: a cmd that names a file outside the worktree (a probe script in a task dir, a temp script) has inputs the tree
-    does not cover, so two such runs cannot be shown to be the same check. A path in a `bin` directory (the interpreter,
-    a tool) and /dev/ are not inputs of this kind. A relative path resolves against the record's cwd (and a `cd` in the
-    command) and is outside only when it leaves it. Shell program text is never a path: its words are the tokens."""
-    cwd = canon["cwd"]
+    """D4b and D8: why a run is not comparable at all (class `outside`), or None. The rule is the inverse of a deny-list:
+    a run can be a duplicate or covered only when the tool understands all of it. It is understood when (1) every path it
+    names is a relative path in the worktree with no `..` component (an absolute path outside is `input outside the tree`;
+    shell program text is never a path, its words are), and (2) after the wrappers it reads (env -u/NAME=VALUE, perl alarm,
+    a shell prefix assignment, a plain `bash -c` of one command) it is an interpreter (python*) running `-m unittest NAMES`
+    or a script in the tree, a shell running a script in the tree, or an executable at a relative path in the tree. Anything
+    else (cd, an operator, an unknown env option, an unknown wrapper, python -c, a runner such as node or deno, git, whose
+    output reads refs and the index the record does not hold) is `not understood: WHAT`. The never-reused scan runs before
+    this, over every word, so a live or network run is `never` even when not understood."""
     for tok in canon["tokens"]:
         if tok.startswith("/") and not tok.startswith("/dev/") and os.path.basename(os.path.dirname(tok)) != "bin":
             return "input outside the tree: " + os.path.basename(tok)
-        if tok == ".." or tok.startswith("../"):
-            where = os.path.normpath(os.path.join(cwd, canon["rel"], tok)) if cwd else ""
-            if not cwd or not (where == cwd or where.startswith(cwd + "/")):
-                return "input outside the tree: " + os.path.basename(tok)
-    return None
+    if canon["opaque"]:
+        return "not understood: " + canon["opaque"]
+    for tok in canon["tokens"]:
+        if any(".." in part.split("/") for part in (tok, tok.split("=", 1)[1] if "=" in tok else "")):
+            return "not understood: a .. component in a path"
+    args = canon["argv"]
+    if not args:
+        return "not understood: an empty command"
+    head = os.path.basename(args[0])
+    i = 1
+    if INTERP.fullmatch(head):
+        while i < len(args) and args[i] in PY_FLAGS:
+            i += 1
+        if i >= len(args):
+            return "not understood: python without a script"
+        if args[i] == "-m":
+            return None if canon["tests"] is not None else "not understood: python -m other than unittest with named tests"
+    elif head in SHELLS:
+        if i >= len(args):
+            return "not understood: a shell without a script"
+    elif not ("/" in args[0] and not args[0].startswith("/")):
+        return "not understood: command %s" % head
+    else:
+        return None
+    a = args[i]
+    if a.startswith("-"):
+        return "not understood: %s option %s" % (head, a)
+    return None if not a.startswith("/") else "not understood: %s script outside the tree" % head
 
 
 def shown_cmd(cmd):
-    """The cmd for printing: the value of a NAME=VALUE with a secret-like name is hidden, as a word or inside shell text
-    (D6). Other secret forms (the value of a --token flag) are not recognised."""
+    """The cmd for printing: the value of a NAME=VALUE with a secret-like name is hidden (D6). A cmd element that is itself
+    NAME=VALUE is hidden whole; in shell text the value is hidden through the end of the shell word. Other secret forms
+    (the value of a --token flag) are not recognised."""
     def hide(match):
         return match.group(1) + "=<hidden>" if SECRET_NAME.search(match.group(1)) else match.group(0)
-    return [ASSIGN_IN_TEXT.sub(hide, a) if "=" in a else a for a in cmd]
+    out = []
+    for a in cmd:
+        name = a.split("=", 1)[0]
+        if "=" not in a:
+            out.append(a)
+        elif ENV_NAME.fullmatch(name) and SECRET_NAME.search(name):
+            out.append(name + "=<hidden>")
+        else:
+            out.append(ASSIGN_IN_TEXT.sub(hide, a))
+    return out
 
 
 # ------------------------------------------------------------------ loading tasks and runs
@@ -454,7 +516,7 @@ def load(tasks_dir, lane=None):
                     continue  # missing / not_applicable: the check did not run
                 key, outside = _gate_key(check["name"], record)
                 canon = {"key": key, "runner": None, "tests": None, "interp": "", "env": [], "tokens": [], "no_interp": key,
-                         "shell_texts": [], "cwd": "", "rel": "."}
+                         "shell_texts": [], "cwd": "", "argv": [], "opaque": None}
                 runs.append(dict(info, kind="gate", label=check["name"], cmd=["<gate>", check["name"]] + record["files"],
                                  tree=record["tree"], exit=check["exit"], timed_out=False, seconds=float(check["seconds"]),
                                  end=_iso_epoch(record["finished"]), path=str(path), n=0, canon=canon, never=None,
@@ -477,17 +539,27 @@ def load(tasks_dir, lane=None):
 
 
 def _gate_key(name, record):
-    """(key, outside) of one gate check. prettier reads the changed files and the tree only. Every other check reads more:
-    gitleaks scans BASE..HEAD, gitleaks-dirty the files that differ from HEAD, eslint (deno) the diff from merge-base(BASE,
-    HEAD), typecheck the files deleted since BASE (tools/agent/pre-commit-gate.sh). Their key adds head and base.sha, and a
-    record without them is not comparable (F1)."""
+    """(key, outside) of one gate check. Eligible for a duplicate only when every input that decides the check is in the
+    record (tools/agent/pre-commit-gate.sh):
+      prettier:APP      the changed files of the app and the tree (tool_check, :395-449): files + tree.
+      gitleaks          commits BASE..HEAD (:608): head + base.sha.
+      gitleaks-dirty    the files that differ from HEAD plus untracked ones, copied and scanned (:617-645): head + tree.
+    Every other check is `not understood`: eslint:APP (Deno apps read the index, `git ls-files --others`, to count an
+    untracked file as all-new, :325-346, and the name does not say which apps are Deno), typecheck:APP (the files deleted
+    since BASE and the app's ts file count, :536-600, are not recorded), and any name this tool does not know. A gitleaks
+    record without head or base.sha is not comparable either (F1)."""
     files = sorted(record["files"])
-    if name.split(":", 1)[0] == "prettier":
+    kind = name.split(":", 1)[0]
+    if kind == "prettier":
         return json.dumps(["gate", name, files]), None
+    if kind not in ("gitleaks", "gitleaks-dirty"):
+        why = {"eslint": "Deno lint reads the index (untracked files count as all-new)",
+               "typecheck": "the files deleted since base are not recorded"}.get(kind, "its scope is unknown")
+        return json.dumps(["gate", name, files, None]), "not understood: scope of %s (%s)" % (name, why)
     head = record.get("head")
     base = record["base"].get("sha") if isinstance(record.get("base"), dict) else None
     if not (isinstance(head, str) and head and isinstance(base, str) and base):
-        return json.dumps(["gate", name, files, None]), "scope input not recorded: head/base of " + name
+        return json.dumps(["gate", name, files, None]), "not understood: head/base of %s not recorded" % name
     return json.dumps(["gate", name, files, head, base]), None
 
 
@@ -604,6 +676,7 @@ def build(tasks_dir, lane=None):
                    "never": sum(r["class"] == "never" for r in runs),
                    "outside": sum(r["class"] == "outside" for r in runs),
                    "outside_seconds": sum(r["seconds"] for r in runs if r["class"] == "outside"),
+                   "not_understood": sum(bool(r["outside"] and r["outside"].startswith("not understood")) for r in runs),
                    "repeat_share": repeated / total if total else 0.0,
                    "interpreter_spelling_only": sum(1 for keys in spelling.values() if len(keys) > 1),
                    "main_visible": sum(r["role"] == "main" for r in runs)},
@@ -639,9 +712,9 @@ def _line(r):
 def render(report):
     t = report["totals"]
     out = ["recorded runs: %d (%.1f s); repeats: %d duplicate + %d covered = %.1f s (%.1f%% of recorded seconds); "
-           "retries: %d (%.1f s); never counted: %d; input outside the tree: %d (%.1f s)" % (
+           "retries: %d (%.1f s); never counted: %d; not comparable: %d (%.1f s; %d of them not understood)" % (
                t["runs"], t["seconds"], t["duplicates"], t["covered"], t["repeated"], 100 * t["repeat_share"], t["retries"],
-               t["retry_seconds"], t["never"], t["outside"], t["outside_seconds"])]
+               t["retry_seconds"], t["never"], t["outside"], t["outside_seconds"], t["not_understood"])]
     out.append("Main: " + report["main"] + " Main-visible records: %d." % t["main_visible"])
     out.append("\nsame check, same content (key + tree), largest repeat first:")
     for g in report["groups"]:
@@ -656,7 +729,7 @@ def render(report):
     out += [_line(r) for r in report["runs"] if r["class"] == "retry"]
     out.append("\nnever counted (VR1 never-reused):")
     out += [_line(r) + "  " + r["never"] for r in report["runs"] if r["class"] == "never"]
-    out.append("\nnot comparable, input outside the tree (D4b):")
+    out.append("\nnot comparable: input outside the tree (D4b) or not understood (D8):")
     out += [_line(r) + "  " + r["outside"] for r in report["runs"] if r["class"] == "outside"]
     out.append("\nper lane and step (seconds):")
     out.append("  %-20s %-8s %5s %9s %9s %9s %9s %9s %9s %9s %6s" % ("lane", "step", "runs", "total", "first", "duplicate",

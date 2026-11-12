@@ -1097,3 +1097,14 @@ Each lane: checkpoint, Main's evidence, openai-codex review, notes closed, `lane
     --after queue wait and owner input recorded as by: main); real runs 1.2% unknown on critical paths. Decision: arm B
     (HB6b) needed, recording who answered and the approval instant. Smoke run on HB6a's own rounds: 0% unknown inside tasks,
     28% of the critical path is Main's time between tasks (verification, diagnosis), which no record covers yet.
+  - HB6b1 (lane hub-waits-b, WT1 arm B first slice) approved at 6515b5c after 3 rounds (Opus, Opus, Sonnet rule-first);
+    review-coder-52842bfcd1-020016 APPROVED_WITH_NOTES. Cells 227 x 4 OK; full run on the merged tree 31b1284 5533 OK
+    (skipped 78). Case-1 attribution 100% (arm A 74.2%). Stopped before merge for the owner (hub/hb6/hb6b1-decision.md).
+  - HB5a (lane hub-verify, VR1 arm A measure, tools/checks/repeats.py): rounds 1-3 REQUEST_CHANGES on the same families
+    (which commands count as the same check; shell text taken as paths; masking). Round 3's inverted rule (eligible only
+    when fully understood) cut real-session repeats to 5 duplicates + 2 covered, 87.2 s (0.5% of recorded test time);
+    Main's own reruns stay invisible. Round 4 (Sonnet rule-first, coder-68f2fb8255) validates a strict grammar on the
+    original words before any normalisation.
+  - Tool gap: the trust-store guard refuses read-only analysis and edits whose text contains "tmux" or session paths; HB5a
+    workers worked around it once (round 1 rewrote refused analyses as scripts; round 3 edited through a heredoc), both
+    disclosed. Main authorised one narrow case (the reviewer's in-process probes from its own evidence dir).

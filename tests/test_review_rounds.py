@@ -189,11 +189,18 @@ class RoundsTests(unittest.TestCase):
         self.assertEqual(got["rounds"], 4)
         self.assertEqual(got["families"], [["alpha"], ["beta"], ["gamma"], ["delta"]])  # the family names of every round still reach the review text
 
-    def test_two_gates_the_last_one_wins(self):
-        # w1 alone (r-a triggered it) would summarise nothing; w2's gate, triggered by r-c, wins
-        two = self.gated_chain({"w1": "rule-first", "w2": "design"})
-        self.assertEqual([s["review"] for s in two["summarised"]], ["r-a", "r-b"])
-        self.assertEqual(self.attached(two), ["earlier-summary.md", "earlier-findings-03-r-c.md", "earlier-findings-04-r-d.md"])
+    def test_the_gate_that_applies_to_the_newest_task_summarises_the_rounds_before_its_trigger(self):
+        rows = (("two gates: the last one wins",  # w1 alone (r-a triggered it) would summarise nothing; w2's gate, triggered by r-c, wins
+                 {"w1": "rule-first", "w2": "design"}, ()),
+                # w2 was dispatched with w1's sweep.md; r-c is w1's newest review made before w2
+                ("a task from before the gate field is gated by the sweep in its own dispatch record", {}, ["w2"]))
+        for number, (name, gates, legacy) in enumerate(rows):
+            with self.subTest(name):
+                if number:  # a fresh state directory for each row's chain
+                    self.setUp()
+                got = self.gated_chain(gates, legacy=legacy)
+                self.assertEqual([s["review"] for s in got["summarised"]], ["r-a", "r-b"])
+                self.assertEqual(self.attached(got), ["earlier-summary.md", "earlier-findings-03-r-c.md", "earlier-findings-04-r-d.md"])
 
     def test_a_summary_line_keeps_the_verdict_families_and_headings_but_no_body(self):
         got = self.gated_chain({"w2": "rule-first"})
@@ -204,11 +211,6 @@ class RoundsTests(unittest.TestCase):
         self.assertNotIn("SECRET-TEXT", text)
         self.assertIn("SECRET-TEXT", Path(got["contexts"][2]).read_text())  # a round inside the window keeps its body
         self.assertEqual(got["summarised"][0]["result"], str(self.state / "tasks" / "r-a" / "result.md"))
-
-    def test_a_task_from_before_the_gate_field_is_gated_by_the_sweep_in_its_own_dispatch_record(self):
-        got = self.gated_chain({}, legacy=["w2"])  # w2 was dispatched with w1's sweep.md; r-c is w1's newest review made before w2
-        self.assertEqual(self.attached(got), ["earlier-summary.md", "earlier-findings-03-r-c.md", "earlier-findings-04-r-d.md"])
-        self.assertEqual([s["review"] for s in got["summarised"]], ["r-a", "r-b"])
 
     def test_a_legacy_trigger_is_the_parents_newest_review_made_before_the_child(self):
         got = self.gated_chain({}, legacy=["w2"], extra_review_on_w1=True)  # r-e (09Z) was made after w2 (05Z): not the trigger
@@ -328,13 +330,18 @@ class RoundsTests(unittest.TestCase):
         self.task("w1", reviews=["r-a"])
         self.assertIn("identical", Path(self.prepare("w1")["contexts"][0]).read_text())
 
-    def test_a_round_with_no_recorded_state_says_so_and_falls_back_to_the_change_against_the_review_base(self):
-        (self.work / "a.txt").write_text("one\n")
-        self.review("r-a", "RC")
-        self.task("w1", reviews=["r-a"])
-        text = Path(self.prepare("w1")["contexts"][0]).read_text()
-        self.assertIn("recorded no reviewed state", text)
-        self.assertIn("+one\n", text)  # the diff against the review base, not nothing
+    def test_a_round_without_a_usable_recorded_state_is_named_and_the_change_is_diffed_against_the_review_base(self):
+        rows = (("a round with no recorded state says so and falls back to the change against the review base", None, "recorded no reviewed state"),
+                ("a different workdir is named and the change is diffed against the review base instead",
+                 {"workdir": "/elsewhere", "tree": "0" * 40}, "/elsewhere"))
+        for number, (name, state, said) in enumerate(rows):
+            with self.subTest(name):
+                (self.work / "a.txt").write_text("one\n")
+                self.review(f"r-a{number}", "RC", state)
+                self.task(f"w1-{number}", reviews=[f"r-a{number}"])
+                text = Path(self.prepare(f"w1-{number}")["contexts"][0]).read_text()
+                self.assertIn(said, text)
+                self.assertIn("+one\n", text)  # the diff against the review base, not nothing
 
     def test_unusable_recorded_state_refuses(self):
         self.review("r-a", "RC", {"workdir": str(self.work.resolve()), "tree": "0" * 40})
@@ -346,14 +353,6 @@ class RoundsTests(unittest.TestCase):
         self.task("w2", reviews=["r-b"])
         with self.assertRaises(review_rounds.Refused):
             self.prepare("w2")
-
-    def test_a_different_workdir_is_named_and_the_change_is_diffed_against_the_review_base_instead(self):
-        (self.work / "a.txt").write_text("one\n")
-        self.review("r-a", "RC", {"workdir": "/elsewhere", "tree": "0" * 40})
-        self.task("w1", reviews=["r-a"])
-        text = Path(self.prepare("w1")["contexts"][0]).read_text()
-        self.assertIn("/elsewhere", text)
-        self.assertIn("+one\n", text)
 
     def test_a_review_that_never_replied_is_skipped_and_reported(self):
         self.task("r-a")
@@ -1213,6 +1212,9 @@ class TimerWaitsTests(unittest.TestCase):
     """T2: added lines in test files that wait on a clock are listed as facts for the reviewer."""
 
     def setUp(self):
+        self.fresh_repo()
+
+    def fresh_repo(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.work = Path(tmp.name).resolve()
@@ -1300,13 +1302,16 @@ class TimerWaitsTests(unittest.TestCase):
         self.assertEqual(entries[cap - 1], f"src/foo_test.ts:{cap}: sleep({cap - 1})")
         self.assertEqual(text.splitlines()[0], f"# Timer waits in added test lines: {cap + 1} matching added line(s); 1 listed as path:line without their text")
 
-    def test_at_or_under_the_cap_the_first_line_says_none_lack_text(self):
-        self.put("src/foo_test.ts", "sleep(1)\n")
-        self.assertEqual(self.waits().splitlines()[0], "# Timer waits in added test lines: 1 matching added line(s); 0 listed as path:line without their text")
-
-    def test_with_no_match_the_first_line_says_none_found(self):
-        self.put("src/foo_test.ts", "const a = 1\n")
-        self.assertEqual(self.waits().splitlines()[0], "# Timer waits in added test lines: none found")
+    def test_the_first_line_counts_the_matches_or_says_none_found(self):
+        rows = (("at or under the cap the first line says none lack text", "sleep(1)\n",
+                 "# Timer waits in added test lines: 1 matching added line(s); 0 listed as path:line without their text"),
+                ("with no match the first line says none found", "const a = 1\n", "# Timer waits in added test lines: none found"))
+        for number, (name, text, first) in enumerate(rows):
+            with self.subTest(name):
+                if number:
+                    self.fresh_repo()
+                self.put("src/foo_test.ts", text)
+                self.assertEqual(self.waits().splitlines()[0], first)
 
     def test_when_it_cannot_be_computed_the_first_line_still_starts_with_the_title(self):
         with tempfile.TemporaryDirectory() as plain:

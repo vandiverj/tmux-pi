@@ -106,14 +106,18 @@ class OtherLanePathsTests(LaneCase):
         self.assertNotIn("more", text)
         self.assertEqual(lane_commands.other_lanes_section([]), "")
 
-    def test_an_ordinary_path_is_shown_as_a_json_string_in_a_code_span(self):
-        self.assertIn('`"lib/x.py"`', self.section("lib/x.py"))
-
-    def test_a_path_with_a_backtick_is_named_in_a_span_it_cannot_close(self):
-        text = self.section("lib/a.py", "lib/`important.py", "lib/x``y.py")
-        self.assertIn('`` "lib/`important.py" ``', text)  # CommonMark: a longer fence, padded with a space each side
-        self.assertIn('``` "lib/x``y.py" ```', text)
-        self.assertIn('`"lib/a.py"`', text)
+    def test_a_path_is_shown_as_a_json_string_in_a_span_it_cannot_close(self):
+        rows = (("an ordinary path is shown as a json string in a code span", ("lib/x.py",), ['`"lib/x.py"`']),
+                ("a path with a backtick is named in a span it cannot close", ("lib/a.py", "lib/`important.py", "lib/x``y.py"),
+                 ['`` "lib/`important.py" ``',  # CommonMark: a longer fence, padded with a space each side
+                  '``` "lib/x``y.py" ```', '`"lib/a.py"`']),
+                ("a backslash n and a real newline are shown differently", ("lib/a\\nb.py", "lib/a\nb.py"), [r'`"lib/a\\nb.py"`', r'`"lib/a\nb.py"`']),
+                ("leading and trailing spaces stay visible inside the quotes", (" lib/x.py ",), ['`" lib/x.py "`']))
+        for name, paths, shown in rows:
+            with self.subTest(name):
+                text = self.section(*paths)
+                for expected in shown:
+                    self.assertIn(expected, text)
 
     def test_a_path_with_a_control_character_is_named_escaped_on_one_line(self):
         text = self.section("lib/a\nb.py", "lib/t\tab.py", "lib/e\x1b[0m.py")
@@ -122,14 +126,6 @@ class OtherLanePathsTests(LaneCase):
         body = text.split("\n\n", 1)[0]
         self.assertEqual(len(body.splitlines()), 1)
         self.assertFalse(any(ord(c) < 32 and c != "\n" for c in text))
-
-    def test_a_backslash_n_and_a_real_newline_are_shown_differently(self):
-        text = self.section("lib/a\\nb.py", "lib/a\nb.py")
-        self.assertIn(r'`"lib/a\\nb.py"`', text)
-        self.assertIn(r'`"lib/a\nb.py"`', text)
-
-    def test_leading_and_trailing_spaces_stay_visible_inside_the_quotes(self):
-        self.assertIn('`" lib/x.py "`', self.section(" lib/x.py "))
 
     def test_a_non_ascii_path_is_shown_escaped_on_one_line(self):
         text = self.section("lib/é.py")

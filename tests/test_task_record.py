@@ -45,6 +45,43 @@ class TaskRecordTests(unittest.TestCase):
         self.assertEqual(request_text(d), "ticket: ABC-42 Fix checkout timeout\n\nKeep the current API.")
         self.assertEqual((rec["ticket"], rec["pinned"]), ("ABC-42", True))
 
+    BYTE_SHAPES = (("lone continuation", b"\x80"), ("truncated sequence", b"\xe2\x82"), ("latin-1", "caf\xe9".encode("latin-1")),
+                   ("0xFF", b"\xff"), ("NUL", b"\x00"), ("valid UTF-8 control", "café".encode("utf-8")))
+
+    def test_task_files_that_are_not_utf8_never_raise_and_verbatim_fields_keep_their_bytes(self):
+        for name, shape in self.BYTE_SHAPES:
+            body = b"Fix TEST-5 " + shape + b" end"
+            with self.subTest(shape=name, file="request.md"):
+                d = self.task(task_id="req-" + name.replace(" ", "-"))
+                (d / "request.md").write_bytes(body + b"\n")
+                write_record(d, lifecycle_state="working")
+                self.assertIn(body, (d / "task.md").read_bytes())  # fenced request: the worker's bytes
+                self.assertIsInstance(request_text(d), str)
+                self.assertEqual(parse_record(d)["state"], "working")
+                format_record_for_resume(d)
+                before = (d / "task.md").read_bytes()
+                write_record(d, lifecycle_state="working")  # nothing material changed: not rewritten
+                self.assertEqual((d / "task.md").read_bytes(), before)
+            with self.subTest(shape=name, file="legacy task.md"):
+                d = self.task(task_id="leg-" + name.replace(" ", "-"))
+                (d / "task.md").write_bytes(body + b"\n")
+                write_record(d, lifecycle_state="working")
+                self.assertEqual((d / "request.md").read_bytes(), body + b"\n")  # copied byte for byte
+                self.assertIn(body, (d / "task.md").read_bytes())
+            with self.subTest(shape=name, file="result.md and escalated"):
+                d = self.task(task_id="res-" + name.replace(" ", "-"), worker="main", preflight={"stop": True, "mode": "x"})
+                (d / "result.md").write_bytes(b"Answer " + shape + b" done\n")
+                (d / "escalated").write_bytes(b"esc-" + shape + b"\n")
+                write_record(d, lifecycle_state="settled")
+                self.assertIn(b"Answer " + shape + b" done", (d / "task.md").read_bytes())  # captured stop-mode output: verbatim
+                self.assertIn("Resume output from result.md", format_record_for_resume(d))
+            with self.subTest(shape=name, file="canonical task.md"):
+                d = self.task(task_id="can-" + name.replace(" ", "-"))
+                write_record(d, lifecycle_state="working")
+                (d / "task.md").write_bytes((d / "task.md").read_bytes() + b"\n" + shape + b"\n")
+                self.assertEqual(parse_record(d)["state"], "working")
+                format_record_for_resume(d)
+
     def test_result_artifact_and_next_action_are_visible(self):
         artifact = self.root / "report.md"
         artifact.write_text("Status: final\nDone\n")

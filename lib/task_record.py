@@ -42,11 +42,18 @@ def is_canonical(text):
     return MARKER in (text or "")
 
 
-def _read(path):
+def _read(path, errors="replace"):
+    """Text of a task file, "" when unreadable. Never raises on bad bytes: errors="replace" (default) is for text shown to
+    a person, parsed or compared; errors="surrogateescape" keeps every byte for a field written back verbatim (see _clean)."""
     try:
-        return Path(path).read_text(encoding="utf-8")
+        return Path(path).read_text(encoding="utf-8", errors=errors)
     except OSError:
         return ""
+
+
+def _clean(text):
+    """A surrogateescape-read text as displayable text: each undecodable byte becomes U+FFFD."""
+    return text.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
 
 
 def _write_atomic(path, text):
@@ -55,7 +62,7 @@ def _write_atomic(path, text):
     path = Path(path)
     root = safe_write.task_root(path.parent)
     safe_write.ensure_dir(path.parent, what="task directory", root=root)
-    safe_write.write_atomic(path, text, mode=0o600, fsync=True, root=root)
+    safe_write.write_atomic(path, text, mode=0o600, fsync=True, errors="surrogateescape", root=root)
 
 
 def _fence(text):
@@ -89,13 +96,13 @@ def _extract_fenced_request(record):
     return "\n".join(body).strip()
 
 
-def request_text(task_dir):
-    """Verbatim request for a task dir, supporting canonical and legacy layouts."""
+def request_text(task_dir, errors="replace"):
+    """Verbatim request for a task dir, supporting canonical and legacy layouts. Bad bytes: see _read."""
     d = Path(task_dir)
-    req = _read(d / "request.md").strip()
+    req = _read(d / "request.md", errors).strip()
     if req:
         return req
-    task = _read(d / "task.md").strip()
+    task = _read(d / "task.md", errors).strip()
     if is_canonical(task):
         return _extract_fenced_request(task)
     return task
@@ -292,10 +299,11 @@ def write_record(task_dir, lifecycle_state="starting", detail="", meta=None, for
     d = Path(task_dir)
     safe_write.ensure_dir(d, what="task directory", root=safe_write.task_root(d))  # tasks/ and the task directory: a link at either is refused
     meta = meta or read_json(d / "meta.json")
-    old_task = _read(d / "task.md")
+    old_task = _read(d / "task.md", "surrogateescape")  # kept byte for byte: copied to request.md, compared with the new record
     if old_task.strip() and not is_canonical(old_task) and not (d / "request.md").exists():
         _write_atomic(d / "request.md", old_task if old_task.endswith("\n") else old_task + "\n")
-    req = request_text(d)
+    req_raw = request_text(d, "surrogateescape")  # the fenced request is verbatim; title, ticket, retention use the displayable copy
+    req = _clean(req_raw)
     title, ticket = title_for(req, meta.get("id") or d.name)
     ret = retention(d, req)
     # Record auto-protection in retention.json only for explicit visibility; the
@@ -305,11 +313,12 @@ def write_record(task_dir, lifecycle_state="starting", detail="", meta=None, for
         ret = retention(d, req)
 
     state = lifecycle_state or "starting"
-    reply = _read(d / "result.md").strip()
+    reply_raw = _read(d / "result.md", "surrogateescape").strip()
+    reply = _clean(reply_raw)
     contract = meta.get("contract") or {}
     artifact = contract.get("artifact")
     preflight = meta.get("preflight") or {}
-    fence = _fence(req)
+    fence = _fence(req_raw)
     parts = ["# {}".format(title), "", MARKER, ""]
     parts += [
         "- **Task ID:** `{}`".format(meta.get("id") or d.name),
@@ -327,7 +336,7 @@ def write_record(task_dir, lifecycle_state="starting", detail="", meta=None, for
         "Verbatim request captured for faithful resume/review:",
         "",
         fence + "text",
-        req.strip(),
+        req_raw.strip(),
         fence,
         "",
         "## Current Result",
@@ -337,8 +346,8 @@ def write_record(task_dir, lifecycle_state="starting", detail="", meta=None, for
         parts.append("- Result file: `{}` (updated {})".format(d / "result.md", _mtime_iso(d / "result.md")))
         parts.append("- Summary: {}".format(_clip(_summary(reply), 220)))
         if meta.get("worker") == "main" and preflight.get("stop"):
-            out_fence = _fence(reply)
-            parts += ["", "Captured main-owned stop-mode output:", "", out_fence + "text", reply, out_fence]
+            out_fence = _fence(reply_raw)
+            parts += ["", "Captured main-owned stop-mode output:", "", out_fence + "text", reply_raw, out_fence]
     else:
         parts.append("- No `result.md` yet.")
     if artifact:

@@ -451,21 +451,30 @@ class WaitTimelineTest(unittest.TestCase):
              [(lambda x: x["totals"]["elapsed"], 40.0), (lambda x: x["totals"]["busy"], 40.0),
               (lambda x: x["totals"]["accumulated"], 60.0)]),
             ("D9 critical path: gap between tasks is unknown; review hold names the focus; an overlapping predecessor counts,"
-             " so the path tiles the whole window from the first created",
+             " so the path tiles the whole window from the first created to the last logical end (a later stop or review end on a reaped coder counts)",
              lambda r: one(r, lines=talk, finish={"result": 20, "reaped": 30, "exit_at": 30, "collected": 300},
                            extra=lambda s: (s.task("rev", 40, "pi", role="code-reviewer", review_of="w"),
                                             s.finish("rev", result=290, collected=295, exit_at=295),
                                             s.task("early", -50, "claude"), s.claude_state("early", [-49]),
                                             s.finish("early", result=10, collected=20, exit_at=20),
                                             s.task("next", 330, "claude"), s.claude_state("next", [331]),
-                                            s.finish("next", result=340, collected=350, exit_at=350))), 400,
-             [(lambda x: x["critical_path"]["tasks"], ["early", "w", "next"]),
+                                            s.finish("next", result=340, collected=350, exit_at=350),
+                                            s.task("late", 355, "claude"), s.claude_state("late", [356]),
+                                            s.finish("late", result=380, stopped=390, exit_at=390),
+                                            s.task("x", 400, "claude"), s.claude_state("x", [401]),
+                                            s.finish("x", result=405, reaped=410, exit_at=410),
+                                            s.task("rx", 411, "pi", role="code-reviewer", review_of="x"),
+                                            s.finish("rx", result=440, reaped=445, exit_at=445))), 500,
+             [(lambda x: x["critical_path"]["tasks"][:3], ["early", "w", "next"]),
+              (lambda x: x["critical_path"]["tasks"][-1], "rx"),
+              (lambda x: x["critical_path"]["intervals"][-1]["end"] - T0, 445.0),
+              (lambda x: x["critical_path"]["intervals"][-1]["end"] == x["totals"]["window_end"], True),
               (lambda x: x["critical_path"]["focus"]["state"], "waiting:review"),
               (lambda x: x["critical_path"]["by_state"]["unknown"] >= 30, True),
               (lambda x: [(i["start"] - T0, i["end"] - T0) for i in x["critical_path"]["intervals"]][0][0], -50),
               (lambda x: all(abs(a["end"] - b["start"]) < 1e-9 for a, b in zip(x["critical_path"]["intervals"],
                                                                                x["critical_path"]["intervals"][1:])), True),
-              (lambda x: sum(i["end"] - i["start"] for i in x["critical_path"]["intervals"]), 400.0)]),
+              (lambda x: sum(i["end"] - i["start"] for i in x["critical_path"]["intervals"]), 495.0)]),
             ("R22 a queued task waits by its reason (lane, slots, dependency)",
              lambda r: one(r, lines=talk, finish=done, extra=lambda s: (s.queued("q1", 5, None, "waiting for lane x's writer w"),
                                                                         s.queued("q2", 5, None, "global worker slots full"),
@@ -499,7 +508,10 @@ class WaitTimelineTest(unittest.TestCase):
         self.assertEqual(misses, {("coder-c", "waiting:dependency", None): 135,
                                   ("coder-b", "waiting:owner-input", "waiting:main"): 135})
         self.assertEqual((right, total), (775, 1045))
-        self.assertEqual(report["critical_path"]["focus"]["state"], "waiting:review")
+        # round 3: the path ends where the window ends. coder-d is still running at 320 (stalled since 150), so the path
+        # runs 0..320 through it and its 170 s of stalled outweigh the review hold (the elapsed window already counted it)
+        self.assertEqual(report["critical_path"]["focus"]["state"], "stalled")
+        self.assertEqual(report["critical_path"]["intervals"][-1]["end"], report["totals"]["window_end"])
         self.assertEqual(report["totals"]["elapsed"], 320.0)
         review = next(r for r in report["tasks"] if r["task"] == "review-coder-a-1")
         self.assertEqual([(i["state"], i["actor"]) for i in review["intervals"][:2]], [("starting", "reviewer"), ("model", "reviewer")])

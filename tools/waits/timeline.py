@@ -720,14 +720,14 @@ def by_state(intervals):
 
 
 def critical_path(rows):
-    """D9: delayed completion runs from the first created to the last collected (the last-ending task when nothing was
-    collected). Walk back from that task: the predecessor is a task created earlier, the one reaching furthest toward this
+    """D9: delayed completion runs from the first created to the last logical end: the window's own end, the row with the
+    latest `end` (span_end: collected/stopped, the review a reaped coder waits on, or now for a running task), whatever its
+    end_source. Walk back from that task: the predecessor is a task created earlier, the one reaching furthest toward this
     task's created (overlap allowed; ties: the later created). Each task holds the path from its created to its successor's
     created; seconds no task covers there are `unknown`. So the path tiles the whole window, overlap or not."""
     if not rows:
         return {"tasks": [], "intervals": [], "by_state": {}, "interval": None, "focus": None}
-    done = [r for r in rows if r["end_source"] == "collected.json"] or rows
-    cur = max(done, key=lambda r: (r["end"], r["start"]))
+    cur = max(rows, key=lambda r: (r["end"], r["start"]))
     chain, used = [cur], {cur["task"]}
     while True:
         cands = [r for r in rows if r["task"] not in used and r["start"] < cur["start"]]

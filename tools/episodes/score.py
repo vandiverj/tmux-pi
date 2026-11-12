@@ -138,14 +138,16 @@ def trusted_stamp(own, at):
     return own is not None and at is not None and timedelta(0) <= at - own <= TRUST
 
 
-def result_moment(run, task):
+def result_moment(run, task, obs=None):
     """(lo, hi) when the task's result was written, or None, from source fields only (HB8b round 2): the observation of
     the worker's last stop with the result (result_held), its worker stamp `_own`, poll `_at` and previous poll `_prev`,
     and result.md's mtime. A usable stamp (not after the poll) is a lower bound: the change is in its second when the
     stamp is trusted (trusted_stamp), else anywhere up to the poll (a far stamp widens; it never becomes the poll). No
     usable stamp: the change is after the last poll that showed another result (none: unbounded) and by this poll. A
-    previous poll after the span widens it. result.md's mtime inside the span is the exact time."""
-    obs = run.result_held(task["id"])
+    previous poll after the span widens it. result.md's mtime inside the span is the exact time; one before the span
+    widens it down to the mtime (a normalization only widens an undecided span); one after it is a later rewrite."""
+    held = run.result_held(task["id"])
+    obs = obs or held
     if obs is None:
         return None
     own, at, prev = obs.get("_own"), obs["_at"], obs.get("_prev")
@@ -160,9 +162,11 @@ def result_moment(run, task):
                 break
             if earlier.get("result") != obs.get("result"):
                 lo = earlier["_at"]
-    written = task["result_written"]
+    written = task["result_written"] if obs is held else None     # result.md holds what the last stop left
     if written is not None and lo <= written <= hi:
         return written, written
+    if written is not None and written < lo:
+        lo = written        # result.md older than the worker's stamp: the sources disagree, so the span holds both
     return lo, hi
 
 
@@ -777,18 +781,26 @@ class Run:
                 seen, result = True, obs.get("result")
         return seen, result
 
+    def result_stops(self, task_id):
+        """Every observation where the worker had stopped (not working/tool/permission) holding a result, one for each
+        change of (state, result); [] when none."""
+        stops, last = [], None
+        for obs in self.obs(task_id):
+            key = (obs.get("state"), obs.get("result"))
+            if key != last and obs.get("result") and obs.get("state") not in BUSY_STATES + ("permission",):
+                stops.append(obs)
+            last = key
+        return stops
+
     def result_held(self, task_id):
         """The observation of the worker's last stop (left working/tool/permission) holding a result, else its first
         observed result, else None. A worker that wrote result.md, took a message and wrote it again claims what
         result.md now holds. result_moment reads its source fields (`_own`, `_at`, `_prev`), never `_t`."""
-        stops, last, first = [], None, None
+        stops, first = self.result_stops(task_id), None
         for obs in self.obs(task_id):
-            key = (obs.get("state"), obs.get("result"))
-            if obs.get("result") and first is None:
+            if obs.get("result"):
                 first = obs
-            if key != last and obs.get("result") and obs.get("state") not in BUSY_STATES + ("permission",):
-                stops.append(obs)
-            last = key
+                break
         return stops[-1] if stops else first
 
     def missed_kind(self, *kinds):
@@ -1615,6 +1627,23 @@ def judge_claim(run, at, sentence):
     bad, good, unsure = [], [], []
     for task in current:
         seen, result = run.result_at(task["id"], at)
+        # Did a result exist by the claim? Each stop that held one has a span (result_moment): the claim after a span's end
+        # sees that result, before its start does not, inside it is undecided (HB8b round 2b); never a point.
+        held = run.result_held(task["id"])
+        spans = [(o, result_moment(run, task, o)) for o in run.result_stops(task["id"]) or ([held] if held else [])]
+        if spans:
+            seen = True
+            done = [o for o, m in spans if at >= m[1]]
+            shown = [o for o in run.obs(task["id"]) if o["_at"] <= at and o.get("result")]    # a poll saw it by the claim
+            if done:
+                result = done[-1]["result"]
+            elif shown:
+                result = shown[-1]["result"]
+            elif any(m[0] <= at < m[1] for _o, m in spans):
+                unsure.append("%s result written within the claim's undecided span" % task["id"])
+                continue
+            else:
+                result = None
         if not seen:
             unsure.append("%s not yet observed" % task["id"])
             continue

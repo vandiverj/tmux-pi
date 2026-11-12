@@ -1533,6 +1533,10 @@ class ClaimTimeTests(ScorerCase):
             (9.4, "", 30, 9.25, (None, None)),       # no stamp, rewritten: (1, 9.4] holds every record: undecided
             (9.4, "not-a-time", 9.2, 9.25, (1, True)),   # unparsable: as no stamp
             (9.4, 10, 9.2, 9.25, (1, True)),         # stamp after the poll: as no stamp
+            # HB8b round 2b: result.md older than the stamp: the span holds both, [8.5, 10); an end between them is undecided
+            (9.4, 9, 8.5, 8.7, (None, None)),        # was before the stamp 9 (decided 0, False)
+            (9.4, 9, 8.5, 8.4, (0, False)),          # ended by result.md's time: before either way
+            (9.4, 9, 8.5, 9.5, (None, None)),        # inside the stamp's second, after result.md: undecided
         ]
         for poll, own, written, end, expected in rows:
             r.log = [o for o in r.log if o.get("task") != "coder-1"]
@@ -1548,6 +1552,22 @@ class ClaimTimeTests(ScorerCase):
             m = score.score(r.root)["measures"]
             got = (m["verification"]["stale"], m["false_claims"]["workers"][0]["false"])
             self.assertEqual(got, expected, (poll, own, written, end))
+        # HB8b round 2b: Main's "done" asks whether the result existed by then through the same span (stamp 9, poll 9.4,
+        # result.md rewritten at 30: [9, 10)). Before the span the result did not exist (the worker was still working:
+        # false); inside it is undecided, never "present" (no poll had shown it yet; a poll at or before the claim that
+        # showed one is proof it existed); after it the result is present (backed by the pass: not false).
+        r.log = [o for o in r.log if o.get("task") != "coder-1"]
+        r.observe(1, "coder-1", "working")
+        r.observe(14.0, "coder-1", "waiting", result="complete", stamp=9)      # 5 s: trusted, span [9, 10); no earlier poll
+        r.tasks["coder-1"]["test_runs"][2] = (8, 0.7, {"cmd": ["npm", "test"], "tree": "t1", "exit": 0})
+        stamp = (T0 + timedelta(seconds=30)).timestamp()
+        for claim_at, false in ((8.5, True), (9.5, None), (10.5, False)):
+            r.main = None
+            r.said(claim_at, "Done.")
+            r.write()
+            os.utime(result_md, (stamp, stamp))
+            claims = [c for c in score.score(r.root)["measures"]["false_claims"]["claims"] if c["at"] == score._iso(T0 + timedelta(seconds=claim_at))]
+            self.assertIs(claims[0]["false"], false, (claim_at, claims[0]["why"]))
 
     def test_rewritten_result_is_judged_when_the_worker_last_stopped_with_it(self):
         """Fake E2 (pass): the worker wrote a result, took a message and wrote result.md again. The claim is the result.md

@@ -1120,3 +1120,10 @@ Each lane: checkpoint, Main's evidence, openai-codex review, notes closed, `lane
   10ff356): 5535 tests OK (skipped 78), 568 s. To answer a worker on the owner's behalf: `tp-agent message ID --resolves R
   --by owner --quote "..."`. Report: `python3 tools/checks/repeats.py .tmux-pi/sessions/<id>/tasks`.
 - HB8b (A2): round 7 (Sonnet, rule-first, coder-c1a7ce3072) reverts round 6's two additions (mtime window, stable window).
+- HB8b (A2) rounds 7-8 (Sonnet, rule-first): round 7 reverted the mtime and stable-window rules (17 of 28 stored fake runs'
+  claims went backed -> unknown); review-coder-c1a7ce3072-073558 found the runner test's false_claims expectation held for
+  one interleaving only; round 8 derived it from the run's recorded stamps. review-coder-6c12ed2ab4-075154
+  APPROVED_WITH_NOTES (stale comment at tests/test_episode_harness.py:223 and report wording still describe the removed
+  continuous-presence rule; note only). `tp-agent lane close hub-episodes2 HB8b` passed; merged e731aa8. Full run on main
+  e731aa8 (tree f9facdd): 5535 tests OK (skipped 78), 553 s. Effect for live E-runs: a claim not near a poll or Read scores
+  unknown, so "0 false claims" needs direct evidence. HB7 (H40) is now unblocked.

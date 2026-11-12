@@ -775,7 +775,7 @@ class StatusTest(unittest.TestCase):
         lane = type(self).lane
         for name in ("perm", "cap", "none", "run", "revrun", "final", "rc", "appr", "unusable", "incomplete", "dead", "queued",
                      "twotasks", "chain", "olderrev", "badreq", "closedun", "dirty", "undisp", "unlease", "unnewer", "idonly",
-                     "nokind", "capbad", "permbad"):
+                     "nokind", "capbad", "permbad", "reqlist", "reqdict", "reqnum", "wbad", "wbadtype", "rvbad", "fresh"):
             lane(self.repo, name, commit=name == "closedun", closed="S1" if name == "closedun" else None)
         lane(self.repo, "closedmerged", closed="S1")
         lane(self.repo, "badlane", raw="{not json")
@@ -827,6 +827,18 @@ class StatusTest(unittest.TestCase):
         t("t-nokind", "nokind", 10, raw_requests=[json.dumps({"id": "req-" + "0" * 25 + "Y", "status": "open", "opened": iso_s(12)})])
         t("t-capbad", "capbad", 10, requests=["capability"], raw_requests=["{broken"])   # a valid request beside a corrupt one
         t("t-permbad", "permbad", 10, requests=["permission"], raw_requests=["{broken"])  # a readable permission still decides
+        for lane_name, bad in (("reqlist", []), ("reqdict", {}), ("reqnum", 3)):   # round 3: a status of the wrong JSON type is unreadable, not a crash
+            rid = "req-" + "0" * 25 + "Y"
+            t("t-" + lane_name, lane_name, 10, raw_requests=[json.dumps({"id": rid, "kind": "capability", "status": bad, "opened": iso_s(12)})])
+        t("t-wbad", "wbad", 10)                           # a corrupt writer state.json is not "working"
+        (self.tasks / "t-wbad" / "state.json").write_text("[1")
+        t("t-wbadtype", "wbadtype", 10)
+        (self.tasks / "t-wbadtype" / "state.json").write_text(json.dumps({"state": ["working"]}))
+        t("t-rvbad", "rvbad", 10, life="settled")         # a corrupt review state.json is not "review running"
+        t("r-rvbad", "rvbad", 20, review_of="t-rvbad")
+        (self.tasks / "r-rvbad" / "state.json").write_text("{}x")
+        t("t-fresh", "fresh", 10)                         # just started: no optional marker written yet, still running
+        (self.tasks / "t-fresh" / "state.json").unlink()
         (self.tasks / "no-meta").mkdir()
         status = self.status
         before = self.footprint()
@@ -840,7 +852,9 @@ class StatusTest(unittest.TestCase):
             "twotasks": (4, "worker"), "chain": (4, "worker"), "olderrev": (6, "main"), "badreq": (10, "unknown"),
             "closedmerged": (10, "unknown"), "badlane": (10, "unknown"), "dirty": (6, "main"),
             "undisp": (10, "unknown"), "unlease": (10, "unknown"), "unnewer": (10, "unknown"), "idonly": (10, "unknown"),
-            "nokind": (10, "unknown"), "capbad": (10, "unknown"), "permbad": (1, "owner")}
+            "nokind": (10, "unknown"), "capbad": (10, "unknown"), "permbad": (1, "owner"),
+            "reqlist": (10, "unknown"), "reqdict": (10, "unknown"), "reqnum": (10, "unknown"), "wbad": (10, "unknown"),
+            "wbadtype": (10, "unknown"), "rvbad": (10, "unknown"), "fresh": (4, "worker")}
         self.assertEqual(sorted(got), sorted(want))     # the foreign lane is left out, every other open lane has a row
         for name, (rule, who) in want.items():
             with self.subTest(lane=name):

@@ -39,6 +39,15 @@ class ResetFailed(RunnerError):
     """The copy could not be put back on the base tag, so no further task may run in it."""
 
 
+def read_worker_text(path):
+    """A file a worker wrote, as text: UTF-8 with invalid bytes replaced (the choice of TR2's readers in bin/tp-agent, lib/model_router.py
+    and lib/contract.py), and "" when the file is gone, so one bad byte or a missing file scores the task and does not end the run."""
+    try:
+        return Path(path).read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        return ""
+
+
 def parse_env(items):
     """['K=V', ...] -> {K: V}; refuses a malformed pair. An empty value is allowed (TP_PI_NODE=)."""
     out = {}
@@ -278,7 +287,7 @@ class Runner:
             if pi_file.is_file():
                 transcript = str(pi_file)
             elif claude_file.is_file():
-                transcript = claude_file.read_text().strip() or None
+                transcript = read_worker_text(claude_file).strip() or None
         raw = info.get("tokens")
         return {"id": ident, "task_dir": task_dir, "transcript": transcript,
                 "tokens": record.token_figures(raw) if isinstance(raw, dict) else None, "model": info.get("model"),
@@ -378,7 +387,7 @@ class Runner:
             if calls is not None:
                 entry["tool_counts"] = trace.analyse(calls)["tool_counts"]
         if kind == "local":
-            text = Path(ev["result_path"]).read_text() if ev["result_path"] else ""
+            text = read_worker_text(ev["result_path"]) if ev["result_path"] else ""
             expected = answers.read_json(spec, self.answers_directory)["answer"]
             entry["detail"]["answer"] = match.reply_answer(text)
             entry["status"] = "pass" if match.score_local(text, expected) else "fail"
@@ -419,7 +428,7 @@ class Runner:
             if stopped:
                 self.stopped_entry(spec, entry, stopped)
             else:
-                text = Path(ev["result_path"]).read_text() if ev["result_path"] else ""
+                text = read_worker_text(ev["result_path"]) if ev["result_path"] else ""
                 entry["detail"].update(match.score_review(text, key, bool(spec.get("clean"))))
                 entry["status"] = "scored"
             self.finish_tokens(entry)

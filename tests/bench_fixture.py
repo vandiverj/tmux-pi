@@ -14,6 +14,7 @@ from bench import answers, runner, specs  # noqa: E402
 from bench.shell import Result, Shell, ShellError  # noqa: E402
 
 OK = Result(0, "", "")
+MISSING = object()
 EXPECTED = "forty two"
 FINDINGS = "F1 src/a.ts:4 off-by-one in the loop bound\nCloses by: code\n"
 
@@ -60,7 +61,7 @@ class FakeShell(Shell):
     """Records every call as (argv, effective env, cwd). `sessions` maps a tmux session name to its @tp_state_dir."""
 
     def __init__(self, root, running=False, pane_text="", sessions=None, on_inspect=None, on_exit=None, settle_after=None, inject=None,
-                 trust_inspect=False):
+                 trust_inspect=False, result_bytes=None, pointer_bytes=None):
         """`running` keeps every task unfinished (until its `settle_after`-th inspect, when set). `trust_inspect` makes inspect answer as
         tp-agent does for a Claude worker stopped at the folder-trust dialog: status needs_input with trust_dialog {dir}, until it settles. `on_inspect(shell)` runs on each
         inspect; `on_exit(shell, env)` replaces tp-exit (return a Result, or None for the default). `inject(shell, argv)` runs before
@@ -72,6 +73,8 @@ class FakeShell(Shell):
         self.sessions, self.calls, self.dispatched, self.made, self.last_copy = dict(sessions or {}), [], [], 0, None
         self.raised, self.tolerated, self.failed = [], [], []
         self.trust_inspect = trust_inspect
+        self.pointer_bytes = pointer_bytes  # None: explicit transcript.jsonl; else no transcript key or file, and transcript-path holds these bytes (MISSING: absent)
+        self.result_bytes = result_bytes  # None: the default text; bytes: written as result.md; MISSING: result_path named, file absent
 
     def names(self):
         return [(Path(argv[0]).name, argv[1] if len(argv) > 1 else "") for argv, _, _ in self.calls]
@@ -175,11 +178,19 @@ class FakeShell(Shell):
         folder = self.task_dir(ident)
         folder.mkdir(parents=True, exist_ok=True)
         result = folder / "result.md"
-        result.write_text(text)
+        if self.result_bytes is None:
+            result.write_text(text)
+        elif self.result_bytes is not MISSING:
+            result.write_bytes(self.result_bytes)
         (folder / ".env.local").write_text("SECRET=1\n")  # never copied out of the workspace
-        (folder / "transcript.jsonl").write_text("{}\n")
-        return {"status": "settled", "task_dir": str(folder), "result_path": str(result), "model": "m",
-                "transcript": str(folder / "transcript.jsonl"), "tokens": {"input": 10, "output": 5, "cacheRead": None, "cacheWrite": 0}}
+        info = {"status": "settled", "task_dir": str(folder), "result_path": str(result), "model": "m",
+                "tokens": {"input": 10, "output": 5, "cacheRead": None, "cacheWrite": 0}}
+        if self.pointer_bytes is None:
+            (folder / "transcript.jsonl").write_text("{}\n")
+            info["transcript"] = str(folder / "transcript.jsonl")
+        elif self.pointer_bytes is not MISSING:
+            (folder / "transcript-path").write_bytes(self.pointer_bytes)
+        return info
 
 
 def make_runner(root, shell, bench, ans, clock=None, **kwargs):

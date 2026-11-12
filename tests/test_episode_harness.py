@@ -220,8 +220,9 @@ class Records:
                     el.write_json(d / "requests" / ("%d.json" % n), r)
             if t["result"]:
                 (d / "result.md").write_text("Done.\n\nRESULT_STATUS: %s\n" % t["result"], encoding="utf-8")
-                # HB8b round 6: result.md's mtime is the last write and the result holds from then on. Not the wall clock now
-                # (months after the fixture's runs): the first poll that showed it, as a real file is written before it is seen.
+                # result.md's mtime is one dated observation that the file held this content then (score.result_evidence); it is
+                # no write time and no "holds from then on" (HB8b round 7 removed both). Not the wall clock now (months after the
+                # fixture's runs): the first poll that showed it, as a real file is written before it is seen.
                 seen = [el.parse_time(o["at"]) for o in self.log if o.get("task") == ident and o.get("result") == t["result"]]
                 if seen:
                     os.utime(d / "result.md", (min(seen).timestamp(),) * 2)

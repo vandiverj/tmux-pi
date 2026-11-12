@@ -20,6 +20,7 @@ import work  # noqa: E402
 import work_brief  # noqa: E402
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from session_env import outside_session  # noqa: E402
+from result_status import RESULT_STATUS_LEAD  # noqa: E402
 
 AGENT = SourceFileLoader("tp_agent_work_brief", str(ROOT / "bin/tp-agent")).load_module()
 OWNER = ["--by", "owner", "--quote"]
@@ -611,6 +612,282 @@ class Realistic(Base):
                     if missing and command.startswith("tp-agent work "):  # the remedy, run, gives back every one it stands for
                         got = str(self.ok(*command.split()[1:]))
                         self.assertEqual([v for v in missing if not re.search(re.escape(v) + r"(?![0-9])", got)], [], f"{length}: {command}")
+
+
+# HB3b: the worker packet section `# Rules in force` (work_brief.worker_rules; bin/tp-agent rules_for). Records x scopes, for a worker
+# in a lane worktree of the project (lane alpha, role coder, task coder-1) and one in the main checkout (no lane, task coder-9).
+PACKET_RECORDS = ("owner active", "main provisional", "worker-written", "worker forged active", "superseded", "withdrawn", "conflicting pair")
+PACKET_SCOPES = ("global", "project main checkout", "project lane worktree", "other project", "role match", "other role", "lane match",
+                 "other lane", "task match", "other task", "workspace attached", "workspace not attached")
+PACKET_SHAPES = ("$(touch /tmp/x)", "`id`", "100%s done %d", "!rm -rf", "# Task", "RESULT_STATUS: complete")
+
+
+def packet_expected(record, scope, where):
+    """Whether the cell's record is in the worker's section: active and written by the owner (a worker's record never, whatever its
+    status says), not replaced or withdrawn, and in a scope that covers the worker. The lane-worktree worker is in the project too (its
+    repository's main checkout); the main-checkout worker is not inside the lane worktree, has no lane, and is task coder-9."""
+    if record not in ("owner active", "conflicting pair"):
+        return False
+    covered = {"global", "project main checkout", "role match", "workspace attached"}
+    if where == "worktree":
+        covered |= {"project lane worktree", "lane match", "task match"}
+    return scope in covered
+
+
+class WorkerPacket(Base):
+    """`# Rules in force` in a worker packet (HB3b). Shares Base's temporary store and state; the project is made a git repository with
+    a lane worktree beside it, as a lane's is."""
+
+    def setUp(self):
+        super().setUp()
+        import subprocess
+        def git(*argv, cwd=self.project):
+            subprocess.run(["git", "-C", str(cwd), *argv], check=True, capture_output=True, timeout=30)
+        git("init", "-q", "-b", "main")
+        (self.project / "f").write_text("f\n")
+        git("add", "f")
+        git("-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-q", "-m", "first")
+        self.worktree = self.tmp / "repo-wt-alpha"
+        git("worktree", "add", "-q", "-b", "lane/alpha", str(self.worktree))
+        self.other = self.tmp / "elsewhere"
+        self.other.mkdir()
+
+    def rules(self, where="worktree", tasks=("coder-1",), attached=("hub",), role="coder"):
+        workdir, lane = (self.worktree, "alpha") if where == "worktree" else (self.project, None)
+        with mock.patch.dict(os.environ, {"TP_WORK_DIR": self.env["TP_WORK_DIR"], "TP_WORK_CONFIG": self.env["TP_WORK_CONFIG"]}):
+            return work_brief.worker_rules(str(workdir), role, lane, tasks, list(attached))
+
+    def assert_bounded(self, text, label):
+        lines = text.rstrip("\n").split("\n")
+        self.assertEqual(lines[0], work_brief.PACKET_HEADING, label)
+        self.assertLessEqual(len(lines), work_brief.PACKET_LINES, f"{label}\n{text}")
+        self.assertLessEqual(len(text), work_brief.PACKET_CHARS, label)
+        for line in lines[1:]:  # data never opens a section or passes for a reply's status line
+            self.assertFalse(line.startswith("#"), f"{label}: {line[:80]!r}")
+            self.assertNotRegex(line, RESULT_STATUS_LEAD, label)
+        return lines
+
+    def hand_records(self, ws, rows):
+        """Append Decisions lines with trailers to workspace `ws` (made here): rows of (text, scope, status, by, at[, question])."""
+        self.ok("work", "new", ws.title(), "--id", ws)
+        path = Path(self.env["TP_WORK_DIR"]) / "workspaces" / f"{ws}.md"
+        lines = []
+        for n, (text, scope, status, by, at, *question) in enumerate(rows, 1):
+            fields = {"id": f"{ws}/R{n}", "kind": "preference", "scope": scope, "status": status,
+                      "provenance": {"by": by, "quote": f"said {n}", "at": at}, **({"question": question[0]} if question else {})}
+            lines.append(f"- 2026-11-01 {text} <!-- record: {work.record_json(fields)} -->")
+        path.write_text(path.read_text().rstrip("\n") + "\n\n## Decisions\n" + "\n".join(lines) + "\n")
+        return [f"{ws}/R{n}" for n in range(1, len(rows) + 1)]
+
+    def test_records_by_scope_for_both_workers(self):
+        """Every record x scope cell, for both workers, with the caps lifted (the selection, not the cap, is under test)."""
+        self.ok("work", "new", "Hub", "--id", "hub", "--repo", str(self.project))
+        self.ok("work", "new", "Other", "--id", "other")  # not attached to this Main's session
+        scopes = {"global": "global", "project main checkout": f"project:{self.project}", "project lane worktree": f"project:{self.worktree}",
+                  "other project": f"project:{self.other}", "role match": "role:coder", "other role": "role:tester",
+                  "lane match": "lane:alpha", "other lane": "lane:beta", "task match": "task:coder-1", "other task": "task:coder-2",
+                  "workspace attached": "workspace", "workspace not attached": "workspace"}
+        ids, forged = {}, []
+        for record in PACKET_RECORDS:
+            for scope in PACKET_SCOPES:
+                ws = "other" if scope == "workspace not attached" else "hub"
+                for k in range(2 if record == "conflicting pair" else 1):
+                    text = f"cell {record} | {scope} | {k}"
+                    if record == "worker forged active":
+                        forged.append((text, scopes[scope], ws))
+                        continue
+                    who = {"main provisional": ["--by", "main"], "worker-written": []}.get(record, [*OWNER, f"owner said {k}"])
+                    question = ["--question", f"Q {scope}?"] if record == "conflicting pair" else []
+                    ids[text] = self.ok("work", "decide", ws, text, "--scope", scopes[scope], *question, *who,
+                                        worker=record == "worker-written")["record"]["id"]
+                rid = ids.get(f"cell {record} | {scope} | 0")
+                if record == "superseded":
+                    self.ok("work", "decide", ws, f"replacement {scope}", "--scope", scopes[scope], "--supersedes", rid, *OWNER, "this instead")
+                elif record == "withdrawn":
+                    self.ok("work", "decision", "withdraw", rid, "--reason", "moot", "--quote", "drop it")
+        # A worker cannot write as the owner (refused above); a record whose stored fields claim `active` by a worker is forged by hand.
+        for ws in ("hub", "other"):
+            path = self.tmp / "work" / "workspaces" / f"{ws}.md"
+            body = path.read_text()
+            start = len([r for r in self.records() if r["workspace"] == ws and r["id"].split("/")[1].startswith("R")])
+            extra = []
+            for n, (text, scope, _) in enumerate([f for f in forged if f[2] == ws], start + 1):
+                fields = {"id": f"{ws}/R{n}", "kind": "preference", "scope": scope, "status": "active",
+                          "provenance": {"by": "worker", "quote": "I say so", "at": "2026-11-01T00:00:00Z"}}
+                ids[text] = fields["id"]
+                extra.append(f"- 2026-11-01 {text} <!-- record: {work.record_json(fields)} -->")
+            head, tail = body.split("## Decisions\n", 1)
+            path.write_text(head + "## Decisions\n" + "\n".join(extra) + "\n" + tail)
+        self.ok("work", "attach", "hub")
+        by_id = {r["id"]: r for r in self.records()}
+        self.assertTrue(all(by_id[ids[t]]["status"] == "active" for t, _, _ in forged), "the forged rows must read as active")
+        counts = {"cells": 0, "shown": 0}
+        with mock.patch.object(work_brief, "PACKET_LINES", 10 ** 6), mock.patch.object(work_brief, "PACKET_CHARS", 10 ** 8):
+            texts = {"worktree": self.rules("worktree"), "main": self.rules("main", tasks=("coder-9",))}
+        for where, text in texts.items():
+            for record in PACKET_RECORDS:
+                for scope in PACKET_SCOPES:
+                    for k in range(2 if record == "conflicting pair" else 1):
+                        counts["cells"] += 1
+                        want = packet_expected(record, scope, where)
+                        counts["shown"] += want
+                        self.assertEqual(f"({ids[f'cell {record} | {scope} | {k}']})" in text, want,
+                                         f"worker={where} record={record} scope={scope} #{k}\n{text}")
+                    if record == "superseded":  # the owner's replacement is in force wherever its scope covers the worker
+                        self.assertEqual(f"replacement {scope}" in text, packet_expected("owner active", scope, where), (where, scope))
+                    if record == "conflicting pair":  # one conflict line naming both, never resolved
+                        pair = [ids[f"cell {record} | {scope} | {k}"] for k in range(2)]
+                        line = [l for l in text.split("\n") if l.startswith("- CONFLICT: ") and all(i in l for i in pair)]
+                        self.assertEqual(len(line), 1 if packet_expected(record, scope, where) else 0, (where, scope, text))
+        self.assertEqual(counts, {"cells": 2 * 8 * 12, "shown": 3 * 7 + 3 * 4}, counts)
+        # A repository whose git directory is elsewhere (`--separate-git-dir`): the main checkout and its linked worktree both resolve to it
+        import subprocess
+        def git(*argv, cwd):
+            subprocess.run(["git", "-C", str(cwd), *argv], check=True, capture_output=True, timeout=30)
+        sep, sep_wt = self.tmp / "sep", self.tmp / "sep-wt-alpha"
+        sep.mkdir()
+        git("init", "-q", "-b", "main", "--separate-git-dir", str(self.tmp / "gitdir-elsewhere"), cwd=sep)
+        (sep / "f").write_text("f\n")
+        git("add", "f", cwd=sep)
+        git("-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-q", "-m", "first", cwd=sep)
+        git("worktree", "add", "-q", "-b", "lane/alpha", str(sep_wt), cwd=sep)
+        self.ok("work", "decide", "hub", "rule for the separate-git-dir project", "--scope", f"project:{sep}", *OWNER, "mine")
+        self.ok("work", "decide", "hub", "rule for another project", "--scope", f"project:{self.tmp / 'sep-other'}", *OWNER, "mine")
+        for name, workdir in (("main checkout", sep), ("linked worktree", sep_wt), ("subdirectory", sep / "sub")):
+            (sep / "sub").mkdir(exist_ok=True)
+            with mock.patch.dict(os.environ, {"TP_WORK_DIR": self.env["TP_WORK_DIR"], "TP_WORK_CONFIG": self.env["TP_WORK_CONFIG"]}):
+                text = work_brief.worker_rules(str(workdir), "coder", None, (), ["hub"])
+            self.assertIn("rule for the separate-git-dir project", text, name)
+            self.assertNotIn("rule for another project", text, name)
+        # Under the real caps the same store gives a bounded section that ends by naming how many were left out and where to see them.
+        lines = self.assert_bounded(self.rules("worktree"), "capped")
+        self.assertRegex(lines[-1], r"^- \+\d+ more left out \(newest shown first\); all of them: tp-agent work records --status active$")
+
+    def test_store_states_counts_and_content(self):
+        """Store rows (none, empty, corrupt record, unreadable file, unreadable store, not a directory, a reader that raises), counts (0, 1, 20, 21, 200 matching), one 5000-character
+        record, and the content shapes that must arrive as text."""
+        none = self.rules()
+        store = self.tmp / "work"
+        self.assertEqual(none, f"# Rules in force\n\n- no work store at {store}, so no owner rules are recorded for this task\n", "no store: one calm line")
+        self.assertFalse((self.tmp / "work").exists(), "no store: reading created it")
+        (self.tmp / "work" / "workspaces").mkdir(parents=True)
+        self.assertEqual(self.rules(), "", "empty store: no section")
+        self.hand_records("zero", [("only another lane", "lane:beta", "active", "owner", "2026-11-01T00:00:00Z")])
+        self.assertEqual(self.rules(), "", "0 matching: no section (not an empty heading)")
+        for count in (1, 20, 21, 200):
+            store = self.tmp / f"count-{count}"
+            self.env["TP_WORK_DIR"] = str(store)
+            (store / "workspaces").mkdir(parents=True)
+            ids = self.hand_records("many", [(f"rule {n}", "global", "active", "owner", f"2026-11-01T00:{n // 60:02d}:{n % 60:02d}Z")
+                                             for n in range(count)])
+            lines = self.assert_bounded(self.rules(), f"{count} records")
+            shown = [l for l in lines if l.startswith("- [preference global] ")]
+            if count == 1:
+                self.assertEqual(shown, [f'- [preference global] rule 0 — owner: "said 1" ({ids[0]})'])
+                self.assertEqual(len(lines), 4)
+                continue
+            self.assertEqual([l.rsplit(" (", 1)[1] for l in shown], [f"{i})" for i in reversed(ids)][:len(shown)], "newest first, whole lines")
+            self.assertEqual(lines[-1], f"- +{count - len(shown)} more left out (newest shown first); all of them: tp-agent work records --status active")
+        # a rule is never clipped: a 321-character rule arrives whole (its last sentence too); a 5000-character record alone does not fit
+        # the section, so it is left out whole and counted (the shorter, older rule still comes)
+        store = self.tmp / "long"
+        self.env["TP_WORK_DIR"] = str(store)
+        (store / "workspaces").mkdir(parents=True)
+        rule = "Keep every commit small. " * 12 + "Final sentence: never skip the check."
+        self.assertGreater(len(rule), 320)
+        old, huge = self.hand_records("long", [(rule, "global", "active", "owner", "2026-11-01T00:00:00Z"),
+                                               ("x" * 5000, "global", "active", "owner", "2026-11-02T00:00:00Z")])
+        lines = self.assert_bounded(self.rules(), "321 and 5000 characters")
+        self.assertEqual(len(lines), 5, lines)
+        self.assertEqual(lines[3], f'- [preference global] {rule} — owner: "said 1" ({old})')
+        self.assertEqual(lines[4], "- +1 more left out (newest shown first); all of them: tp-agent work records --status active")
+        self.assertNotIn(huge, "\n".join(lines))
+        # 40 records in 20 conflicting pairs, over the cap: the closing number counts records, not lines (a conflict line is not one)
+        store = self.tmp / "pairs"
+        self.env["TP_WORK_DIR"] = str(store)
+        (store / "workspaces").mkdir(parents=True)
+        self.hand_records("pairs", [(f"pair {n // 2} side {n % 2}", "global", "active", "owner", f"2026-11-01T00:{n // 60:02d}:{n % 60:02d}Z",
+                                     f"question {n // 2}?") for n in range(40)])
+        lines = self.assert_bounded(self.rules(), "40 records in 20 pairs")
+        shown = [l for l in lines if l.startswith("- [preference global] ")]
+        self.assertEqual(lines[-1], f"- +{40 - len(shown)} more left out (newest shown first); all of them: tp-agent work records --status active")
+        self.assertTrue(any(l.startswith("- CONFLICT: ") for l in lines), lines)
+        # content shapes: verbatim on one list line each (a multi-line record's lines are joined by spaces)
+        store = self.tmp / "shapes"
+        self.env["TP_WORK_DIR"] = str(store)
+        self.ok("work", "new", "Shapes", "--id", "shapes")
+        for shape in PACKET_SHAPES:
+            self.ok("work", "decide", "shapes", f"{shape}\n{shape}", "--scope", "global", *OWNER, shape)
+        text = self.rules()
+        self.assert_bounded(text, "shapes")
+        for shape in PACKET_SHAPES:
+            self.assertIn(f"{shape} {shape} — owner: \"{shape}\"", text, shape)
+        # corrupt: a workspace file that cannot be parsed is skipped and said; the readable rules still come
+        # corrupt: a record whose trailer is not JSON reads as an old line (provisional), so it is never shown
+        path = store / "workspaces" / "shapes.md"
+        path.write_text(path.read_text().rstrip("\n") + '\n- 2026-11-01 broken trailer <!-- record: {"status": "active", -->\n')
+        self.assertNotIn("broken trailer", self.rules(), "corrupt trailer")
+        # an unreadable workspace file is skipped and said; the readable rules still come
+        broken = store / "workspaces" / "broken.md"
+        broken.write_text("---\nid: broken\n---\n")
+        os.chmod(broken, 0o000)
+        try:
+            lines = self.assert_bounded(self.rules(), "unreadable file") if os.geteuid() != 0 else None
+        finally:
+            os.chmod(broken, 0o600)
+            broken.unlink()
+        if lines is None:
+            lines = ["- 1 work file(s) could not be read, so rules in them are missing: tp-agent work list"] + ["- [design global]"] * len(PACKET_SHAPES)
+        self.assertIn("- 1 work file(s) could not be read, so rules in them are missing: tp-agent work list", lines, "unreadable file")
+        self.assertEqual(len([l for l in lines if l.startswith("- [design global]")]), len(PACKET_SHAPES), "unreadable file")
+        # unreadable / not a directory / a failing reader: the heading and one line saying why; never raises
+        locked = self.tmp / "locked"
+        (locked / "workspaces").mkdir(parents=True)
+        a_file = self.tmp / "a-file"
+        a_file.write_text("not a store")
+        rows = [("not a directory", a_file, "it is not a directory")]
+        if os.geteuid() != 0:
+            rows.append(("unreadable", locked, "Permission denied"))
+        for name, root, why in rows:
+            self.env["TP_WORK_DIR"] = str(root)
+            os.chmod(locked, 0o000)
+            try:
+                text = self.rules()
+            finally:
+                os.chmod(locked, 0o700)
+            lines = self.assert_bounded(text, name)
+            self.assertEqual(len(lines), 3, text)
+            self.assertTrue(lines[2].startswith("- the owner's rules in force could not be read (work store "), text)
+            self.assertIn(why, lines[2], name)
+        self.env["TP_WORK_DIR"] = str(store)
+        with mock.patch.object(work, "all_records", side_effect=RuntimeError("boom")):
+            lines = self.assert_bounded(self.rules(), "reader raises")
+        self.assertEqual(lines[2], "- the owner's rules in force could not be read (RuntimeError: boom); this task starts without them: "
+                                   "ask Main which rules apply")
+
+    def test_rules_for_names_the_task_its_ancestors_and_the_attached_workspaces(self):
+        """bin/tp-agent rules_for (every start through launch: dispatch, lane dispatch, queue tick, retry, investigate): task: records
+        of the task, the task it retries or investigates and that one's parent; workspace records of the session's attached workspace."""
+        self.ok("work", "new", "Hub", "--id", "hub")
+        for scope in ("task:coder-new", "task:coder-prior", "task:coder-first", "task:coder-unrelated", "workspace"):
+            self.ok("work", "decide", "hub", f"rule {scope}", "--scope", scope, *OWNER, "yes")
+        for ident, parent in (("coder-prior", "coder-first"), ("coder-first", None)):
+            (self.state / "tasks" / ident).mkdir()
+            (self.state / "tasks" / ident / "meta.json").write_text(json.dumps({"parent": parent} if parent else {}))
+        item = {"id": "coder-new", "parent": "coder-prior", "workdir": str(self.worktree), "role": "coder", "lane": "alpha"}
+        with mock.patch.dict(os.environ, {"TP_WORK_DIR": self.env["TP_WORK_DIR"]}):
+            text = AGENT.rules_for(self.state, item)
+            self.assertNotIn("rule workspace", text, "not attached yet")
+            self.ok("work", "attach", "hub")
+            text = AGENT.rules_for(self.state, item)
+            self.assertIn("rule workspace", text)
+            for scope in ("task:coder-new", "task:coder-prior", "task:coder-first"):
+                self.assertIn(f"rule {scope}", text, scope)
+            self.assertNotIn("coder-unrelated", text)
+            with mock.patch.object(AGENT.work_index, "attached_ids", side_effect=OSError("gone")):
+                text = AGENT.rules_for(self.state, item)
+        self.assertEqual(text.split("\n")[2], "- the owner's rules in force could not be read (the task's ancestry or attached workspaces: "
+                                              "OSError: gone); this task starts without them: ask Main which rules apply")
 
 
 if __name__ == "__main__":

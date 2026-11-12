@@ -135,7 +135,9 @@ class OtherLanePathsTests(LaneCase):
 
 class LaneFactsTests(LaneCase):
     """The packet section `## Lane` and the worker's LANE_BASE (lib/lane_commands.py lane_facts, bin/tp-agent launch, bin/tp-spawn
-    --lane-facts-file / --worker-env LANE_BASE=). Extends this module because it already builds a dispatched lane in a fixture."""
+    --lane-facts-file / --worker-env LANE_BASE=). Extends this module because it already builds a dispatched lane in a fixture. Two
+    dispatches also carry HB3b's `# Rules in force` (bin/tp-agent rules_for, bin/tp-spawn --rules-file); the matrix is in
+    tests/test_work_brief.py WorkerPacket."""
     def commit(self, name, text="v\n"):
         (self.worktree / name).write_text(text)
         git(self.worktree, "add", name)
@@ -144,9 +146,37 @@ class LaneFactsTests(LaneCase):
     def record(self):
         return lanes.read_lane(Path(git(self.repo, "rev-parse", "--path-format=absolute", "--git-common-dir")), "alpha")
 
+    def owner_rules(self):
+        """Owner records in the fixture's work store (TP_WORK_DIR), written as `work decide` stores them: {scope: rule text}. The
+        global rule holds a command substitution whose file must never appear (the packet takes record text as data)."""
+        self.marker = self.root / "expanded"
+        rules = {"global": f"never $(touch {self.marker}) or `touch {self.marker}`", f"project:{self.repo}": "rule for the project",
+                 "role:coder": "rule for coders", "lane:alpha": "rule for lane alpha", "lane:beta": "rule for lane beta",
+                 "role:tester": "rule for testers", f"project:{self.root / 'elsewhere'}": "rule for another project"}
+        lines = [f"- 2026-11-01 {text} <!-- record: " + json.dumps({"id": f"hub/R{n}", "kind": "preference", "scope": scope, "status": "active",
+                 "provenance": {"by": "owner", "quote": "my words", "at": f"2026-11-01T00:00:{n:02d}Z"}}) + " -->"
+                 for n, (scope, text) in enumerate(rules.items(), 1)]
+        store = Path(self.env["TP_WORK_DIR"]) / "workspaces"
+        store.mkdir(parents=True, exist_ok=True)
+        (store / "hub.md").write_text("---\nid: hub\ntitle: Hub\nstatus: active\n---\n\n## Decisions\n" + "\n".join(lines) + "\n")
+        return rules
+
+    def rules_section(self, packet):
+        self.assertEqual(packet.count("# Rules in force\n"), 1, packet)
+        return packet.split("# Rules in force\n", 1)[1].split("\n\n# ", 1)[0]
+
     def test_a_dispatch_puts_the_section_after_the_working_directory_and_exports_lane_base(self):
+        rules = self.owner_rules()
         _, task = self.lane_ok()
         packet, run_sh = (task / "packet.md").read_text(), (task / "run.sh").read_text()
+        # HB3b: the owner's rules for this worker (in the lane worktree: global, the repository's project, role coder, lane alpha) come
+        # right after the task and its test scope, before the rest of the packet; other lanes, roles and projects do not; data stays text
+        section = self.rules_section(packet)
+        for scope, text in rules.items():
+            self.assertEqual(text in section, scope in ("global", f"project:{self.repo}", "role:coder", "lane:alpha"), (scope, section))
+        self.assertLess(packet.index("# Test Scope"), packet.index("# Rules in force"))
+        self.assertLess(packet.index("# Rules in force"), packet.index("# Local Task Artifacts"))
+        self.assertFalse(self.marker.exists(), "record text was run")
         base = self.record()["base"]["commit"]
         self.assertRegex(packet, r"## Lane \(snapshot at \d{4}-\d\d-\d\dT[\d:]+Z; refresh: tools/agent/lane-info\.sh " + re.escape(str(self.worktree)))
         self.assertLess(packet.index("Working directory:"), packet.index("## Lane"))
@@ -215,8 +245,13 @@ class LaneFactsTests(LaneCase):
         self.assertEqual(lane_commands.lane_facts({"name": "x"}, "s1").split(":")[0], "lane facts unavailable")  # a record that lacks fields
 
     def test_a_task_that_is_not_in_a_lane_has_neither_the_section_nor_the_variable(self):
+        rules = self.owner_rules()
         _, task = self.dispatch(self.repo)
         self.assertNotIn("## Lane", (task / "packet.md").read_text())
+        # HB3b: a dispatch with no lane still gets the owner's rules that cover it (global, its project, its role); no lane rule
+        section = self.rules_section((task / "packet.md").read_text())
+        for scope, text in rules.items():
+            self.assertEqual(text in section, scope in ("global", f"project:{self.repo}", "role:coder"), (scope, section))
         self.assertNotIn("LANE_BASE", (task / "run.sh").read_text())
 
 

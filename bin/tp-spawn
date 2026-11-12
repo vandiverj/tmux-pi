@@ -63,6 +63,10 @@
 #                            has no lane and passes the section the task it copies was given
 #   --lane-facts-file <path> the packet section `## Lane` (lib/lane_commands.py lane_facts), read from this file and placed right
 #                            after `Working directory:`, before any context file; counted against the packet limit
+#   --rules-file <path>      the packet section `# Rules in force` (lib/work_brief.py worker_rules: the owner's active records whose
+#                            scope covers this task), read from this file as data (no expansion) and placed right after the task
+#                            and its test scope, before the rest of the packet and any context file; screened like a context
+#                            file and counted against the packet limit. The flag is left out when no rule applies
 #   --worker-env KEY=VAL     export KEY=VAL in the worker's run.sh (the worker's window does not inherit the caller's
 #                            environment); repeatable. Only TP_DOCS_TOOLS, TP_TRIAL_ID and LANE_BASE are accepted, once each, and a value
 #                            has no line break. Without the flag run.sh is exactly what it was before the flag existed
@@ -98,7 +102,7 @@ usage() { sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit "${1:-0}
 
 worker=pi model="" thinking="" name="" file="" view=0 conversation="" requested_workdir="" explicit_workdir=0
 role="" reserved_id="" parent="" gate="" gate_review="" deliverable="" route_json="null"
-kind="" artifact="" budget="" checkpoints="" preflight_file="" main_contract_file="" policy_decision_file="" context_manifest_file="" decision_json="" tests="" preamble_role="" review_of="" check=0 lane="" lane_step="" preamble_from="" lane_replaces="" other_lane_paths="" lane_facts_file=""
+kind="" artifact="" budget="" checkpoints="" preflight_file="" main_contract_file="" policy_decision_file="" context_manifest_file="" decision_json="" tests="" preamble_role="" review_of="" check=0 lane="" lane_step="" preamble_from="" lane_replaces="" other_lane_paths="" lane_facts_file="" rules_file=""
 words=() contexts=() notes=() worker_env=()
 # Options may appear before or after the task words; "--" ends option parsing.
 while [[ $# -gt 0 ]]; do
@@ -139,6 +143,7 @@ while [[ $# -gt 0 ]]; do
     --preamble-from) preamble_from="${2:?}"; shift 2 ;;
     --other-lane-paths) other_lane_paths="${2:?}"; shift 2 ;;
     --lane-facts-file) lane_facts_file="${2:?}"; shift 2 ;;
+    --rules-file)  rules_file="${2:?}"; shift 2 ;;
     --worker-env)  worker_env+=("${2:?}"); shift 2 ;;
     -h|--help)     usage ;;
     --)            shift; words+=("$@"); break ;;
@@ -535,6 +540,15 @@ if [[ -n "$tests" ]]; then
     none)     packet+="Do not run tests. Say that none were run." ;;
   esac
   packet+=$'\n'
+fi
+if [[ -n "$rules_file" ]]; then
+  [[ -f "$rules_file" ]] || die "--rules-file not found: $rules_file"
+  # the same screening as --lane-facts-file; the text is appended as it is (a variable's value is never expanded again)
+  if secret_file "$rules_file"; then
+    notes+=("Sensitive context $rules_file was omitted from the packet. If this task needs specific information from it, request authorization through the worker's permission prompt before reading.")
+  else
+    packet+=$'\n\n'"$(cat "$rules_file")"$'\n'
+  fi
 fi
 # The worker contract and the repository preamble go to the worker's system prompt, not the packet (see below), so they sit
 # ahead of everything per-task and their bytes stay the same across tasks. Validated here, before anything is created.

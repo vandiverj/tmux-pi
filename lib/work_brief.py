@@ -131,19 +131,35 @@ PACKET_INTRO = ("The owner's confirmed rules whose scope covers this task, newes
                 "them; when one conflicts with the task, ask Main instead of choosing.")
 
 
-def checkout_dirs(workdir):
-    """(the working directory, the main checkout of its repository) resolved, without a repeat: a lane worktree is not inside the
-    repository a `project:` record names, so the main checkout is found through its common git directory (read-only git). A
-    directory outside git, or a bare repository, gives the working directory alone."""
+def _git_dir_of(repo):
+    """The realpath of the git directory a checkout at `repo` uses: its `.git` directory, or the one its `.git` file names (a linked
+    worktree's or a `--separate-git-dir` checkout's file says `gitdir: PATH`); None when `repo` is not a checkout."""
+    dotgit = Path(repo) / ".git"
+    if dotgit.is_dir():
+        return os.path.realpath(dotgit)
+    text = dotgit.read_text().strip() if dotgit.is_file() else ""
+    return os.path.realpath(os.path.join(str(repo), text[len("gitdir:"):].strip())) if text.startswith("gitdir:") else None
+
+
+def checkout_dirs(workdir, repos=()):
+    """(the working directory, then each of `repos` that is a checkout of the same repository) resolved, without a repeat. A lane
+    worktree is not inside the repository a `project:` record names, so identity comes from git, not from directory names: the
+    repository's common git directory (read-only `git rev-parse`) is compared with the git directory each named checkout uses (its
+    `.git` directory, or the one its `.git` file names), so a main checkout whose git directory is elsewhere (`--separate-git-dir`)
+    and its linked worktrees resolve alike. A directory outside git gives the working directory alone."""
     here = project_dir(workdir)
     if here is None:
         return ()
     found = [here]
     try:
         import lanes
-        common = Path(lanes.git_common_dir(str(here)))
-        if common.name == ".git" and common.parent not in found:
-            found.append(common.parent)
+        common = lanes.git_common_dir(str(here))
+        for repo in repos:
+            try:
+                if _git_dir_of(repo) == common and Path(repo) not in found:
+                    found.append(Path(repo))
+            except OSError:
+                continue
     except Exception:  # noqa: BLE001 - not a repository (or git missing): the working directory alone
         pass
     return tuple(found)
@@ -169,24 +185,28 @@ def worker_rules(workdir, role, lane=None, tasks=(), attached=()):
     many were left out and the command that lists them. Never raises: a store that cannot be read is one line saying so and why."""
     try:
         problem = store_problem()
+        if problem is None and not work.store_root().exists():  # never written: said, calmly (a machine with no store is normal)
+            return f"{PACKET_HEADING}\n\n" + "\n".join(_packet_line("no work store at ", Whole(str(work.store_root())),
+                                                                   ", so no owner rules are recorded for this task")) + "\n"
         if problem:
             return unreadable(f"work store {work.store_root()} unusable: {problem}")
         skipped = []
         records = work.all_records(skipped)
         target = {"role": role or None, "lane": lane or None, "tasks": {t for t in tasks if t}}
-        shown, conflicts = in_force(records, checkout_dirs(workdir), list(attached), target)
+        shown, conflicts = in_force(records, checkout_dirs(workdir, [Path(r["scope"][len("project:"):]) for r in records if r["scope"].startswith("project:")]), list(attached), target)
         shown = [r for r in shown if r["provenance"]["by"] == "owner"]
         ids = {r["id"] for r in shown}
         entries = []
         for group in conflicts:
             group = [r["id"] for r in group if r["id"] in ids]
             if len(group) > 1:
-                entries.append(_packet_line("CONFLICT: ", *[Whole(i if not n else ", " + i) for n, i in enumerate(group)],
+                entries.append((0, _packet_line("CONFLICT: ", *[Whole(i if not n else ", " + i) for n, i in enumerate(group)],
                                             " are active in one scope and answer the same question; the owner has not said which "
-                                            "stands, so ask Main before relying on either"))
+                                            "stands, so ask Main before relying on either")))
         for r in shown:
-            entries.append(_packet_line(f"[{r['kind']} ", Whole(_scope_label(r["scope"])), "] ", _clip(r["text"], 400),
-                                        " — owner: \"", _clip(r["provenance"]["quote"], 120), "\"", Whole(f" ({r['id']})")))
+            # the rule text is never clipped (a clipped rule is a different rule); only the owner's quote is
+            entries.append((1, [f"- [{r['kind']} {_scope_label(r['scope'])}] {_clip(r['text'], 10 ** 9)} — owner: \"" +
+                                f"{_clip(r['provenance']['quote'], 120)}\" ({r['id']})"]))
         fixed = [PACKET_HEADING, "", PACKET_INTRO]
         if work.skipped_count(skipped):
             fixed += _packet_line(f"{work.skipped_count(skipped)} work file(s) could not be read, so rules in them are missing: ",
@@ -199,21 +219,21 @@ def worker_rules(workdir, role, lane=None, tasks=(), attached=()):
 
 
 def _fit(fixed, entries):
-    """The entries (each a list of lines, kept or dropped whole) that fit beside `fixed` in PACKET_LINES and PACKET_CHARS, in order;
-    when not all fit, the kept ones and one closing line naming how many were left out."""
+    """The entries ((records, lines): kept or dropped whole) that fit beside `fixed` in PACKET_LINES and PACKET_CHARS, in order; when not
+    all fit, the kept ones and one closing line naming how many RECORDS are left out (a conflict line is not a record). An entry that
+    alone does not fit is left out (counted); shorter ones after it still fit."""
     def size(lines):
         return sum(len(line) + 1 for line in lines)
-    if len(fixed) + sum(map(len, entries)) <= PACKET_LINES and size(fixed) + sum(map(size, entries)) <= PACKET_CHARS:
-        return [line for entry in entries for line in entry]
-    kept, n = [], 0
-    for entry in entries:
-        closing = _packet_line(f"+{len(entries) - n - 1} more left out (newest shown first); all of them: ", Whole(PACKET_MORE))
-        if len(fixed) + len(kept) + len(entry) + len(closing) > PACKET_LINES or \
-                size(fixed) + size(kept) + size(entry) + size(closing) > PACKET_CHARS:
-            break
-        kept += entry
-        n += 1
-    return kept + _packet_line(f"+{len(entries) - n} more left out (newest shown first); all of them: ", Whole(PACKET_MORE))
+    if len(fixed) + sum(len(e[1]) for e in entries) <= PACKET_LINES and size(fixed) + sum(size(e[1]) for e in entries) <= PACKET_CHARS:
+        return [line for _, lines in entries for line in lines]
+    kept, left = [], 0
+    reserve = _packet_line(f"+{sum(r for r, _ in entries)} more left out (newest shown first); all of them: ", Whole(PACKET_MORE))
+    for records, lines in entries:
+        if len(fixed) + len(kept) + len(lines) + len(reserve) > PACKET_LINES or size(fixed) + size(kept) + size(lines) + size(reserve) > PACKET_CHARS:
+            left += records
+        else:
+            kept += lines
+    return kept + _packet_line(f"+{left} more left out (newest shown first); all of them: ", Whole(PACKET_MORE))
 
 
 def matching(project, skipped):

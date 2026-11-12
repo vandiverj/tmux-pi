@@ -668,13 +668,13 @@ class WorkerPacket(Base):
         return lines
 
     def hand_records(self, ws, rows):
-        """Append Decisions lines with trailers to workspace `ws` (made here): rows of (text, scope, status, by, at)."""
+        """Append Decisions lines with trailers to workspace `ws` (made here): rows of (text, scope, status, by, at[, question])."""
         self.ok("work", "new", ws.title(), "--id", ws)
         path = Path(self.env["TP_WORK_DIR"]) / "workspaces" / f"{ws}.md"
         lines = []
-        for n, (text, scope, status, by, at) in enumerate(rows, 1):
+        for n, (text, scope, status, by, at, *question) in enumerate(rows, 1):
             fields = {"id": f"{ws}/R{n}", "kind": "preference", "scope": scope, "status": status,
-                      "provenance": {"by": by, "quote": f"said {n}", "at": at}}
+                      "provenance": {"by": by, "quote": f"said {n}", "at": at}, **({"question": question[0]} if question else {})}
             lines.append(f"- 2026-11-01 {text} <!-- record: {work.record_json(fields)} -->")
         path.write_text(path.read_text().rstrip("\n") + "\n\n## Decisions\n" + "\n".join(lines) + "\n")
         return [f"{ws}/R{n}" for n in range(1, len(rows) + 1)]
@@ -740,6 +740,25 @@ class WorkerPacket(Base):
                         line = [l for l in text.split("\n") if l.startswith("- CONFLICT: ") and all(i in l for i in pair)]
                         self.assertEqual(len(line), 1 if packet_expected(record, scope, where) else 0, (where, scope, text))
         self.assertEqual(counts, {"cells": 2 * 8 * 12, "shown": 3 * 7 + 3 * 4}, counts)
+        # A repository whose git directory is elsewhere (`--separate-git-dir`): the main checkout and its linked worktree both resolve to it
+        import subprocess
+        def git(*argv, cwd):
+            subprocess.run(["git", "-C", str(cwd), *argv], check=True, capture_output=True, timeout=30)
+        sep, sep_wt = self.tmp / "sep", self.tmp / "sep-wt-alpha"
+        sep.mkdir()
+        git("init", "-q", "-b", "main", "--separate-git-dir", str(self.tmp / "gitdir-elsewhere"), cwd=sep)
+        (sep / "f").write_text("f\n")
+        git("add", "f", cwd=sep)
+        git("-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-q", "-m", "first", cwd=sep)
+        git("worktree", "add", "-q", "-b", "lane/alpha", str(sep_wt), cwd=sep)
+        self.ok("work", "decide", "hub", "rule for the separate-git-dir project", "--scope", f"project:{sep}", *OWNER, "mine")
+        self.ok("work", "decide", "hub", "rule for another project", "--scope", f"project:{self.tmp / 'sep-other'}", *OWNER, "mine")
+        for name, workdir in (("main checkout", sep), ("linked worktree", sep_wt), ("subdirectory", sep / "sub")):
+            (sep / "sub").mkdir(exist_ok=True)
+            with mock.patch.dict(os.environ, {"TP_WORK_DIR": self.env["TP_WORK_DIR"], "TP_WORK_CONFIG": self.env["TP_WORK_CONFIG"]}):
+                text = work_brief.worker_rules(str(workdir), "coder", None, (), ["hub"])
+            self.assertIn("rule for the separate-git-dir project", text, name)
+            self.assertNotIn("rule for another project", text, name)
         # Under the real caps the same store gives a bounded section that ends by naming how many were left out and where to see them.
         lines = self.assert_bounded(self.rules("worktree"), "capped")
         self.assertRegex(lines[-1], r"^- \+\d+ more left out \(newest shown first\); all of them: tp-agent work records --status active$")
@@ -748,7 +767,8 @@ class WorkerPacket(Base):
         """Store rows (none, empty, corrupt record, unreadable file, unreadable store, not a directory, a reader that raises), counts (0, 1, 20, 21, 200 matching), one 5000-character
         record, and the content shapes that must arrive as text."""
         none = self.rules()
-        self.assertEqual(none, "", "no store: no section")
+        store = self.tmp / "work"
+        self.assertEqual(none, f"# Rules in force\n\n- no work store at {store}, so no owner rules are recorded for this task\n", "no store: one calm line")
         self.assertFalse((self.tmp / "work").exists(), "no store: reading created it")
         (self.tmp / "work" / "workspaces").mkdir(parents=True)
         self.assertEqual(self.rules(), "", "empty store: no section")
@@ -768,15 +788,30 @@ class WorkerPacket(Base):
                 continue
             self.assertEqual([l.rsplit(" (", 1)[1] for l in shown], [f"{i})" for i in reversed(ids)][:len(shown)], "newest first, whole lines")
             self.assertEqual(lines[-1], f"- +{count - len(shown)} more left out (newest shown first); all of them: tp-agent work records --status active")
-        # one record of 5000 characters: one whole line (the text clipped, the id and the quote kept), the section under its caps
+        # a rule is never clipped: a 321-character rule arrives whole (its last sentence too); a 5000-character record alone does not fit
+        # the section, so it is left out whole and counted (the shorter, older rule still comes)
         store = self.tmp / "long"
         self.env["TP_WORK_DIR"] = str(store)
         (store / "workspaces").mkdir(parents=True)
-        (rid,) = self.hand_records("long", [("x" * 5000, "global", "active", "owner", "2026-11-01T00:00:00Z")])
-        lines = self.assert_bounded(self.rules(), "5000 characters")
-        self.assertEqual(len(lines), 4)
-        self.assertTrue(lines[3].endswith(f'…" — owner: "said 1" ({rid})') or lines[3].endswith(f'— owner: "said 1" ({rid})'), lines[3])
-        self.assertLess(len(lines[3]), work_brief.LINE_CHARS + 1)
+        rule = "Keep every commit small. " * 12 + "Final sentence: never skip the check."
+        self.assertGreater(len(rule), 320)
+        old, huge = self.hand_records("long", [(rule, "global", "active", "owner", "2026-11-01T00:00:00Z"),
+                                               ("x" * 5000, "global", "active", "owner", "2026-11-02T00:00:00Z")])
+        lines = self.assert_bounded(self.rules(), "321 and 5000 characters")
+        self.assertEqual(len(lines), 5, lines)
+        self.assertEqual(lines[3], f'- [preference global] {rule} — owner: "said 1" ({old})')
+        self.assertEqual(lines[4], "- +1 more left out (newest shown first); all of them: tp-agent work records --status active")
+        self.assertNotIn(huge, "\n".join(lines))
+        # 40 records in 20 conflicting pairs, over the cap: the closing number counts records, not lines (a conflict line is not one)
+        store = self.tmp / "pairs"
+        self.env["TP_WORK_DIR"] = str(store)
+        (store / "workspaces").mkdir(parents=True)
+        self.hand_records("pairs", [(f"pair {n // 2} side {n % 2}", "global", "active", "owner", f"2026-11-01T00:{n // 60:02d}:{n % 60:02d}Z",
+                                     f"question {n // 2}?") for n in range(40)])
+        lines = self.assert_bounded(self.rules(), "40 records in 20 pairs")
+        shown = [l for l in lines if l.startswith("- [preference global] ")]
+        self.assertEqual(lines[-1], f"- +{40 - len(shown)} more left out (newest shown first); all of them: tp-agent work records --status active")
+        self.assertTrue(any(l.startswith("- CONFLICT: ") for l in lines), lines)
         # content shapes: verbatim on one list line each (a multi-line record's lines are joined by spaces)
         store = self.tmp / "shapes"
         self.env["TP_WORK_DIR"] = str(store)

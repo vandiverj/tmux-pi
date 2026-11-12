@@ -1082,3 +1082,7 @@ Each lane: checkpoint, Main's evidence, openai-codex review, notes closed, `lane
     group; until then full runs leak these loops (see "Leaked shell loops" above).
   - HB8b rounds 3-5 (design, Opus) each got REQUEST_CHANGES on verification-tree-identity. Main stopped the lane at cb7e57f
     (cells 314 x 4 OK) for the owner's decision: hub/hb8/hb8b-decision.md.
+  - TL1 (lane test-leak) merged dec415e: TmuxCase.pane() registers a cleanup that SIGKILLs the pane's process group (only
+    while the pid still leads its group and has the recorded start time). Review review-coder-ce153756f1-212530
+    APPROVED_WITH_NOTES; Main's dispositions for the other launch sites are in the task evidence (each has its own cleanup
+    or a bound). Cells 164 x 4 OK, 0 leftover loops; on merged main test_process_end + test_session_env 57 OK, 0 loops.

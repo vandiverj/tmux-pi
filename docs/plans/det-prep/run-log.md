@@ -1127,3 +1127,11 @@ Each lane: checkpoint, Main's evidence, openai-codex review, notes closed, `lane
   continuous-presence rule; note only). `tp-agent lane close hub-episodes2 HB8b` passed; merged e731aa8. Full run on main
   e731aa8 (tree f9facdd): 5535 tests OK (skipped 78), 553 s. Effect for live E-runs: a claim not near a poll or Read scores
   unknown, so "0 false claims" needs direct evidence. HB7 (H40) is now unblocked.
+
+## 2026-11-12 (afternoon): HB7a waits on the owner's adoption decision
+- HB7a (H40, lane hub-friction, rounds 1-4): read-only report `tools/friction/report.py` of the owner's process corrections
+  by key (H48 labels, Main's feedback memories, HB3 records), recurrence by session, contract size. Rounds 1 and 3
+  REQUEST_CHANGES were Main's brief wording (quote marks as owner authority; key-level worker mark); round 2's py3.14 failure
+  was `Path.glob` skipping an unreadable folder silently. review-coder-b5a566b6cc-085938 APPROVED_WITH_NOTES (list-then-read
+  window a known limit). Full run on preview 76aa79e (main 3ffa8cf + lane 584d109, tree c2d663b): 5538 tests OK (skipped 78),
+  550 s. Not merged: the brief says adoption is the owner's; options in docs/plans/det-prep/hub/hb7/hb7a-decision.md.

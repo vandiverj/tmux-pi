@@ -1070,3 +1070,15 @@ Each lane: checkpoint, Main's evidence, openai-codex review, notes closed, `lane
 - HB8a round 8 got REQUEST_CHANGES; three families recurred at new sites. Under the owner's delegation, Main sent one
   rule-first last round on Opus (hub/hb8/hb8a-round9.md): one function per record fact. A recurrence merges as is with HB8b
   known limits. The retry recorded gate_review (RR1 in use).
+- 2026-11-11 evening, owner away (delegation: decide by recommendation).
+  - Merged into local main after combined runs: HB4b (81bb48e), Q3 (8313708), PF1b (7bb49ad); combo8 5524 tests, the 3
+    test_g3_e2e_tamper failures were "fork failed: Device not configured" and the module passed alone. HB2b round 6
+    (rule-first, Sonnet: state_digest compares an in-tree file's text, not launch.json's hash of it) approved with notes and
+    merged (c42bc97); combo9 5530 tests, OK. Nothing pushed.
+  - Pty exhaustion: 415 orphaned `trap '' HUP TERM; while true; do sleep 1; done` loops from tests/test_process_end.py
+    (test_stop_ends_a_process_that_ignores_hangup, HUP_PROOF) held 439 of 511 ptys (kern.tty.ptmx_max). Main killed them
+    (exact command, ppid 1); 24 ttys after. The combo10 failures (test_pane_send, test_trial_shadow_outcomes,
+    test_lane_recovery) passed on rerun (51 tests, OK). Follow-up: test_process_end cleanup must kill the pane's process
+    group; until then full runs leak these loops (see "Leaked shell loops" above).
+  - HB8b rounds 3-5 (design, Opus) each got REQUEST_CHANGES on verification-tree-identity. Main stopped the lane at cb7e57f
+    (cells 314 x 4 OK) for the owner's decision: hub/hb8/hb8b-decision.md.

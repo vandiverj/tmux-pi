@@ -1150,3 +1150,6 @@ Each lane: checkpoint, Main's evidence, openai-codex review, notes closed, `lane
   after the merge test_friction_report, test_session_env, test_docs_wiring 42 OK. Ledger written:
   docs/plans/det-prep/hub/hb7/contract-ledger.json, 97 entries, 0 problems, 0 unresolved pointers: 53 justified on the owner's
   words, 20 on Main's docs/keys, 24 provenance only (owner list in hb7b-decision.md "Ledger result"). No contract line changed.
+- HB7b ledger, owner decision (2026-11-12, "use recommendation for decision"): keep the 24 provenance-only lines; HB3 record
+  det-prep/R1 (first record in the work store; workspace det-prep created). Ledger: 97 justified (77 owner-stated / 20 Main),
+  0 problems with `--store ~/.config/tmux-pi/work`.

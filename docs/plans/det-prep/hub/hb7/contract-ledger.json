@@ -6,7 +6,8 @@
    "sha": "94a581eef8bd",
    "prefix": "You are the main agent in a tmux-pi",
    "reasons": [
-    "commit:7a22c8f8ce96"
+    "commit:7a22c8f8ce96",
+    "record:det-prep/R1"
    ],
    "by": "main",
    "status": "keep"
@@ -29,7 +30,8 @@
    "sha": "0453ec8ad9ef",
    "prefix": "- If the user says \"+here\", do the",
    "reasons": [
-    "commit:7a22c8f8ce96"
+    "commit:7a22c8f8ce96",
+    "record:det-prep/R1"
    ],
    "by": "main",
    "status": "keep"
@@ -39,7 +41,8 @@
    "sha": "b0f8d6cc435e",
    "prefix": "- Do not edit files or spawn workers",
    "reasons": [
-    "commit:7a22c8f8ce96"
+    "commit:7a22c8f8ce96",
+    "record:det-prep/R1"
    ],
    "by": "main",
    "status": "keep"
@@ -49,7 +52,8 @@
    "sha": "c80ef19867c6",
    "prefix": "- If ambiguity would materially change files, behavior,",
    "reasons": [
-    "commit:7a22c8f8ce96"
+    "commit:7a22c8f8ce96",
+    "record:det-prep/R1"
    ],
    "by": "main",
    "status": "keep"
@@ -59,7 +63,8 @@
    "sha": "214f2b543663",
    "prefix": "- A subagent sees only its packet: your",
    "reasons": [
-    "commit:7a22c8f8ce96"
+    "commit:7a22c8f8ce96",
+    "record:det-prep/R1"
    ],
    "by": "main",
    "status": "keep"
@@ -82,7 +87,8 @@
    "sha": "d3c7d92b225b",
    "prefix": "- Pass the user's own request, unedited, in",
    "reasons": [
-    "commit:2659b4b0588f"
+    "commit:2659b4b0588f",
+    "record:det-prep/R1"
    ],
    "by": "main",
    "status": "keep"
@@ -92,7 +98,8 @@
    "sha": "d52cc40fab4d",
    "prefix": "- Tell workers to ask if the task",
    "reasons": [
-    "commit:7a22c8f8ce96"
+    "commit:7a22c8f8ce96",
+    "record:det-prep/R1"
    ],
    "by": "main",
    "status": "keep"
@@ -115,7 +122,8 @@
    "sha": "7b6bcf69ac52",
    "prefix": "- If collect_result shows a worker stopped at",
    "reasons": [
-    "commit:7a22c8f8ce96"
+    "commit:7a22c8f8ce96",
+    "record:det-prep/R1"
    ],
    "by": "main",
    "status": "keep"
@@ -125,7 +133,8 @@
    "sha": "e0efe1ac519c",
    "prefix": "- Route follow-ups for a running worker with",
    "reasons": [
-    "commit:7a22c8f8ce96"
+    "commit:7a22c8f8ce96",
+    "record:det-prep/R1"
    ],
    "by": "main",
    "status": "keep"
@@ -146,7 +155,8 @@
    "sha": "eea43cfac03f",
    "prefix": "- Report results to the user faithfully, including",
    "reasons": [
-    "commit:7a22c8f8ce96"
+    "commit:7a22c8f8ce96",
+    "record:det-prep/R1"
    ],
    "by": "main",
    "status": "keep"
@@ -156,7 +166,8 @@
    "sha": "b12e6d636d7c",
    "prefix": "- After APPROVED_WITH_NOTES, close the step, then give",
    "reasons": [
-    "commit:80568c212d7f"
+    "commit:80568c212d7f",
+    "record:det-prep/R1"
    ],
    "by": "main",
    "status": "keep"
@@ -166,7 +177,8 @@
    "sha": "a661a3f135d2",
    "prefix": "- A failing test a worker reports as",
    "reasons": [
-    "commit:a1f0de8e948c"
+    "commit:a1f0de8e948c",
+    "record:det-prep/R1"
    ],
    "by": "main",
    "status": "keep"
@@ -188,7 +200,8 @@
    "sha": "fca9c4fe0a09",
    "prefix": "- Use kill_subagent only for workers the user",
    "reasons": [
-    "commit:7a22c8f8ce96"
+    "commit:7a22c8f8ce96",
+    "record:det-prep/R1"
    ],
    "by": "main",
    "status": "keep"
@@ -212,7 +225,8 @@
    "sha": "0d101f770ac4",
    "prefix": "When the case's steps are reviewed and the",
    "reasons": [
-    "commit:9f3deed90c39"
+    "commit:9f3deed90c39",
+    "record:det-prep/R1"
    ],
    "by": "main",
    "status": "keep"
@@ -256,7 +270,8 @@
    "sha": "a65b21071d51",
    "prefix": "Analyze a specific design decision against the existing",
    "reasons": [
-    "commit:911d22ffc1a3"
+    "commit:911d22ffc1a3",
+    "record:det-prep/R1"
    ],
    "by": "main",
    "status": "keep"
@@ -443,7 +458,8 @@
    "sha": "0597a804d026",
    "prefix": "Review the tests as code. A fixed wait",
    "reasons": [
-    "commit:2ea63b99bb2d"
+    "commit:2ea63b99bb2d",
+    "record:det-prep/R1"
    ],
    "by": "main",
    "status": "keep"
@@ -466,7 +482,8 @@
    "sha": "086e15e97bf9",
    "prefix": "Label how each finding closes: end it with",
    "reasons": [
-    "commit:03e3b1de60b5"
+    "commit:03e3b1de60b5",
+    "record:det-prep/R1"
    ],
    "by": "main",
    "status": "keep"
@@ -682,7 +699,8 @@
    "sha": "92f990a53e2b",
    "prefix": "Do not decide a rule that affects compliance,",
    "reasons": [
-    "commit:5ca1176475e3"
+    "commit:5ca1176475e3",
+    "record:det-prep/R1"
    ],
    "by": "main",
    "status": "keep"
@@ -741,7 +759,8 @@
    "sha": "e08aa4fe757c",
    "prefix": "Trace what sensitive information enters, moves through, is",
    "reasons": [
-    "commit:911d22ffc1a3"
+    "commit:911d22ffc1a3",
+    "record:det-prep/R1"
    ],
    "by": "main",
    "status": "keep"
@@ -777,7 +796,8 @@
    "sha": "086e15e97bf9",
    "prefix": "Label how each finding closes: end it with",
    "reasons": [
-    "commit:03e3b1de60b5"
+    "commit:03e3b1de60b5",
+    "record:det-prep/R1"
    ],
    "by": "main",
    "status": "keep"
@@ -787,7 +807,8 @@
    "sha": "2d049394bf65",
    "prefix": "Work on the assigned runtime, deployment, or operations",
    "reasons": [
-    "commit:911d22ffc1a3"
+    "commit:911d22ffc1a3",
+    "record:det-prep/R1"
    ],
    "by": "main",
    "status": "keep"
@@ -797,7 +818,8 @@
    "sha": "63e1a1fed5b8",
    "prefix": "Answer the assigned question from relevant evidence. Record",
    "reasons": [
-    "commit:5ca1176475e3"
+    "commit:5ca1176475e3",
+    "record:det-prep/R1"
    ],
    "by": "main",
    "status": "keep"
@@ -1002,7 +1024,8 @@
    "sha": "d491a8abbfbd",
    "prefix": "Inspect the assigned code or flow for exploitable",
    "reasons": [
-    "commit:911d22ffc1a3"
+    "commit:911d22ffc1a3",
+    "record:det-prep/R1"
    ],
    "by": "main",
    "status": "keep"
@@ -1038,7 +1061,8 @@
    "sha": "086e15e97bf9",
    "prefix": "Label how each finding closes: end it with",
    "reasons": [
-    "commit:03e3b1de60b5"
+    "commit:03e3b1de60b5",
+    "record:det-prep/R1"
    ],
    "by": "main",
    "status": "keep"

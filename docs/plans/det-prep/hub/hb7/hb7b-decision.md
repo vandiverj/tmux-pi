@@ -66,3 +66,9 @@ word to keep (Main then records it as the reason) or to remove (a removal reason
 - code-reviewer.md, 2ea63b9 (2026-11-01): a fixed wait in a test is a defect.
 - coder.md, 5ca1176 (2026-11-11): do not decide a compliance, security or data-handling rule; ask.
 - researcher.md, 5ca1176 (2026-11-11): the role's opening line.
+
+**Owner decision (2026-11-12):** "use recommendation for decision" = keep all 24 (Main recommended no removal). Recorded as HB3
+record `det-prep/R1` (kind design, by owner, with the quote); the 24 entries point to `record:det-prep/R1`. Ledger now: 97
+justified (77 owner-stated, 20 Main), 0 provenance only, 0 problems. The record lives in this Mac's work store
+(`~/.config/tmux-pi/work`), so check with `--store` there; on another machine those 24 pointers resolve only after the record
+is copied or re-recorded (known limit: HB3 records are machine-local).

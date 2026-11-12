@@ -115,6 +115,13 @@ class T9Tests(unittest.TestCase):
                 self.assertEqual(logged.call_args[0][0]["task_sha256"], hashlib.sha256(shown.encode()).hexdigest())  # of the replaced text
                 (task / "request.md").write_text("fix it")   # ledger_row's own request read is task_record's (lane task-record-utf8)
                 self.assertEqual(ledger_row(task, 0)["escalated_to"], shown)         # tp-contract, tp-ledger
+                item = self.dispatch()                                               # tp-agent retry replays the request text
+                previous = self.settle(item, "RESULT_STATUS: complete\n")
+                (previous / "request.md").write_bytes(raw)
+                with mock.patch.object(agent, "dispatch", return_value={}) as dispatched, \
+                        mock.patch("sys.stdout"):                                    # nothing is started: the dispatch is captured
+                    agent.main(["retry", item["id"], "--reason", "again", "--worker", "pi", "--model", test_orchestration.MODEL], env=self.env)
+                self.assertEqual(dispatched.call_args[0][0].task, shown)             # the replaced text, not a crash
 
     # (c) a queue entry's reason is the current one
     def test_a_waiting_queue_entry_gets_the_current_reason(self):

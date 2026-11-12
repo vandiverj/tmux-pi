@@ -152,22 +152,35 @@ class Session:
             "schema": "tp-gate:v1", "worktree": "/w", "base": {"ref": "main", "sha": "s"}, "head": "h", "tree": "t", "files": [],
             "checks": [], "exit": 0, "started": iso_off(started), "finished": iso_off(finished), "log": "/l.log"}))
 
-    def request(self, ident, rid, kind, opened, resolved=None, by="main", how="message"):
+    def request(self, ident, rid, kind, opened, resolved=None, by="main", how="message", answer=None):
+        """answer: (t, by) for hub_records.answer: an answer recorded on a request the worker's state change had closed."""
         def record(now):
             r = {"id": rid, "task": ident, "kind": kind, "opened": iso_ms(opened), "text_sha256": "0" * 64, "summary": "SECRET-ASK",
                  "status": "open"}
             if resolved is not None and resolved <= now:
                 r.update(status="resolved", resolved=iso_ms(resolved), resolution={"by": by, "how": how, "ref": None})
+                if answer is not None and answer[0] <= now:
+                    r["resolution"]["answer"] = {"by": answer[1], "how": "message", "ref": None, "at": iso_ms(answer[0])}
             return json.dumps(r, indent=2)
         self.put(opened, "tasks/{}/requests/{}.json".format(ident, rid), record)
 
-    def events(self, ident, items):
-        """items: (t, kind, ref, detail)."""
+    def events(self, ident, items, folder="tasks"):
+        """items: (t, kind, ref, detail) or (t, kind, ref, detail, state)."""
         def content(now):
-            return "".join(json.dumps({"v": 1, "id": "ev-{}".format(n), "at": iso_ms(t), "task": ident, "actor": "main", "kind": k,
-                                       "ref": ref, "detail": d, "source": "file", "confidence": "exact"}) + "\n"
-                           for n, (t, k, ref, d) in enumerate(items) if t <= now) or None
-        self.put(min(i[0] for i in items), "tasks/{}/events.jsonl".format(ident), content)
+            return "".join(json.dumps({"v": 1, "id": "ev-{}".format(n), "at": iso_ms(item[0]), "task": ident, "actor": "main",
+                                       "kind": item[1], "ref": item[2], "detail": item[3],
+                                       **({"state": item[4]} if len(item) > 4 else {}), "source": "file", "confidence": "exact"}) + "\n"
+                           for n, item in enumerate(items) if item[0] <= now) or None
+        self.put(min(i[0] for i in items), "{}/{}/events.jsonl".format(folder, ident), content)
+
+    def cancelled(self, ident, created, log, at):
+        """bin/tp-agent record_queue_cancel (`tp-agent stop` of a queued task, HB6b1 round 2): the entry and its queue.reason
+        events (queued per log entry, backdated, then cancelled) in queue-cancelled/<id>/, from the stop on."""
+        entry = {"id": ident, "role": "coder", "worker": "pi", "model": "m", "created": iso_s(created), "after": ["w"],
+                 "queue_reason": log[-1][1] if log else "", "queue_log": [{"at": iso_s(t), "reason": r} for t, r in log], "workdir": "/w"}
+        self.put(at, "queue-cancelled/{}/entry.json".format(ident), json.dumps(entry))
+        self.events(ident, [(t, "queue.reason", None, {"reason": r}, "queued") for t, r in log]
+                    + [(at, "queue.reason", None, {"reason": entry["queue_reason"]}, "cancelled")], folder="queue-cancelled")
 
     def capability(self, ident, requested, answered=None):
         def content(now):
@@ -546,6 +559,39 @@ class WaitTimelineTest(unittest.TestCase):
                           for i in row(x, "w")["intervals"] if i["start"] <= T0 + 30 < i["end"]][0], ("inferred", True)),
               (lambda x: [(i["confidence"], i["wait_reason"]) for i in row(x, "v")["intervals"] if i["start"] <= T0 + 20 < i["end"]][0],
                ("exact", "permission prompt inside a tool call denied")), (lambda x: at(x, 40, "v"), "tool")]),
+            ("B3 round 2: approved without a transcript is inferred too, from the request file and from events alone",
+             lambda r: one(r, prompts=(2,), finish={"result": 60, "collected": 70, "exit_at": 70}, extra=lambda s: (
+                 s.request("w", REQ, "permission", 6, resolved=50, by="hook", how="approved"),
+                 s.task("v", 0, "claude"), s.claude_state("v", [2]), s.finish("v", result=60, collected=70, exit_at=70),
+                 s.events("v", [(6, "request.opened", REQ2, {"kind": "permission"}),
+                                (30, "request.resolved", REQ2, {"kind": "permission", "by": "hook", "how": "approved"})]))), 100,
+             [(lambda x: [next((i["state"], i["confidence"], "approval instant is not recorded" in i["wait_reason"])
+                               for i in row(x, t)["intervals"] if i["start"] <= T0 + 20 < i["end"]) for t in ("w", "v")],
+               [("waiting:permission", "inferred", True)] * 2)]),
+            ("B2 round 2: an owner answer recorded on a request the worker's state change closed (file: resolution.answer;"
+             " events: request.resolved detail.answer) is owner input; the close alone (by worker) stays main",
+             lambda r: one(r, prompts=(2,), finish={"result": 60, "collected": 70, "exit_at": 70}, extra=lambda s: (
+                 s.request("w", REQ, "input", 6, resolved=30, by="worker", how="left-state", answer=(31, "owner")),
+                 s.request("w", REQ2, "input", 35, resolved=50, by="worker", how="left-state"),
+                 s.task("v", 0, "claude"), s.claude_state("v", [2]), s.finish("v", result=60, collected=70, exit_at=70),
+                 s.events("v", [(6, "request.opened", REQ, {"kind": "input"}),
+                                (30, "request.resolved", REQ, {"kind": "input", "by": "worker", "how": "left-state"}),
+                                (31, "request.resolved", REQ, {"kind": "input", "by": "owner", "how": "message", "answer": True})]))), 100,
+             [(lambda x: (at(x, 20), at(x, 40), at(x, 20, "v")), ("waiting:owner-input", "waiting:main", "waiting:owner-input"))]),
+            ("B1 round 2: a queued task stopped before it started (queue-cancelled/<id>/): its row runs from created to the"
+             " cancel, each reason exact; a cancelled record without the cancelled event is listed, not drawn",
+             lambda r: one(r, lines=talk, finish=done, extra=lambda s: (
+                 s.cancelled("q1", 5, [(5, "global worker slots full"), (12, "waiting for w")], 40),
+                 s.put(5, "queue-cancelled/q2/entry.json", json.dumps({"id": "q2", "created": iso_s(5)})))), 100,
+             [(lambda x: at(x, 8, "q1"), "waiting:worker-slot"), (lambda x: at(x, 30, "q1"), "waiting:dependency"),
+              (lambda x: (row(x, "q1")["end"] - T0, row(x, "q1")["role"], row(x, "q1")["running"]), (40, "cancelled", False)),
+              (lambda x: {i["confidence"] for i in row(x, "q1")["intervals"]}, {"exact"}),
+              (lambda x: ("q2" in [t["task"] for t in x["tasks"]], "no readable queue.reason cancelled" in problems(x)), (False, True))]),
+            ("F5 (round 2): a queue reason dated after the report time (skewed clock, or a historical --now) never draws the"
+             " row's unknown prefix past the row's end",
+             lambda r: one(r, lines=talk, finish=done, extra=lambda s: s.queued("q9", 5, None, "waiting for w", log=[(80, "waiting for w")])),
+             50,
+             [(lambda x: [(i["start"] - T0, i["end"] - T0, i["state"]) for i in row(x, "q9")["intervals"]], [(5, 50, "unknown")])]),
             ("D10 malformed and missing records are listed, never raise",
              lambda r: one(r, lines=talk, finish=done, extra=lambda s: (
                  s.put(1, "tasks/w/state.json", "{not json"), s.put(1, "tasks/w/test-runs/1.json", "[1]"),

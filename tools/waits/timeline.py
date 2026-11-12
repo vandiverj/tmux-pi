@@ -10,10 +10,14 @@ docs/plans/det-prep/hub/hb6/hb6a-brief.md and the HB6a report; the D-numbers bel
 
 Arm B (HB6b1) adds exact records, preferred when present; without them the output is arm A's, unchanged:
 B1 a queued task's meta.json queued_at and its backdated queue.reason events (state queued, then released) paint
-   [queued_at, created] by the QUEUE_REASONS table; a still-queued item's queue_log does the same up to now.
-B2 a request resolved with by owner (tp-agent message --by owner --quote) is waiting:owner-input; anything else stays main.
-B3 a permission close with how approved is the call's end, not the approval instant (no hook sees it): the seconds stay
-   waiting:permission, confidence inferred; denied and left are named in the reason.
+   [queued_at, created] by the QUEUE_REASONS table; a still-queued item's queue_log does the same up to now; a queued task
+   that was stopped (queue-cancelled/<id>/, queue.reason cancelled) is a row from its created to the cancel.
+B2 a request answered by owner (tp-agent message --by owner --quote) is waiting:owner-input; anything else stays main. The
+   answer is the request's resolution, or resolution.answer (an answer recorded on a request the worker's state change had
+   closed during the delivery; in events, a request.resolved with detail.answer).
+B3 a permission close with how approved is the approved call's end, not the approval instant (no hook sees it): the seconds
+   stay waiting:permission, confidence inferred, from every source (request file or events, with or without a transcript);
+   denied and left are named in the reason.
 
 Read-only: it opens files for reading only and writes nothing anywhere. It prints no transcript text and no file content:
 from a transcript it takes only line times, roles, tool names and ids. A missing or malformed record makes its piece absent
@@ -426,7 +430,7 @@ def queue_log_segments(log, start, end):
     time to the next one; seconds before the first are unknown (no reason recorded)."""
     out, log = [], sorted(log, key=lambda item: item[0])
     if not log or log[0][0] > start + TOL:
-        out.append((start, log[0][0] if log else end, "unknown", "queued; no reason recorded"))
+        out.append((start, min(log[0][0], end) if log else end, "unknown", "queued; no reason recorded"))
     for k, (t, reason) in enumerate(log):
         a = start if k == 0 and t <= start + TOL else t
         b = log[k + 1][0] if k + 1 < len(log) else end
@@ -441,6 +445,18 @@ def request_state(kind, by):
     if by == "owner":
         return "waiting:owner-input"
     return "waiting:main"
+
+
+APPROVED_WHY = "the approval instant is not recorded (closed at the call's end)"
+
+
+def request_payload(kind, by, how, source, closed=True):
+    """B3 round 2: a request span from a request file or its events. A permission prompt closed `approved` closed at the
+    approved call's END (no Claude hook sees the approval), so its end is an upper bound: inferred, said so, whatever the
+    source and whether or not a transcript is there. Every other span is exact."""
+    if closed and kind == "permission" and how == "approved":
+        return payload(request_state(kind, by), "request permission approved: " + APPROVED_WHY, source, "inferred")
+    return payload(request_state(kind, by), "request {} {}".format(kind, "resolved" if closed else "open"), source, "exact")
 
 
 def build_task(reader, task, tasks_by_review, now, lanes_cache, lanes_override):
@@ -548,8 +564,11 @@ def build_task(reader, task, tasks_by_review, now, lanes_cache, lanes_override):
                 continue
             req_ids.add(record["id"])
             closed = parse_time(record.get("resolved")) if record.get("status") != "open" else None
-            by = (record.get("resolution") or {}).get("by") if isinstance(record.get("resolution"), dict) else None
-            how = (record.get("resolution") or {}).get("how") if isinstance(record.get("resolution"), dict) else None
+            resolution = record.get("resolution") if isinstance(record.get("resolution"), dict) else {}
+            how = resolution.get("how")
+            # B2 round 2: an answer recorded on a request the worker's state change closed (hub_records.answer) says who
+            # answered; the close itself (by worker or hook) does not.
+            by = resolution["answer"].get("by") if isinstance(resolution.get("answer"), dict) else resolution.get("by")
             kind = record.get("kind")
             if kind == "capability":
                 cap_opened.append(opened)
@@ -557,9 +576,8 @@ def build_task(reader, task, tasks_by_review, now, lanes_cache, lanes_override):
                 permission.append((opened, closed, "requests/" + path.name, how if closed is not None else None))
             clock_check(reader, task, path, opened, end)
             canvas.paint(opened, closed if closed is not None else end,
-                         payload(request_state(kind, by), "request {} {}".format(kind, "open" if closed is None else "resolved"),
-                                 "requests/" + path.name, "exact"))
-    opened_ev = {}
+                         request_payload(kind, by, how, "requests/" + path.name, closed is not None))
+    opened_ev, closed_ev = {}, {}
     for ev in events:
         ref = ev.get("ref")
         if ev.get("kind") in ("request.opened", "request.resolved") and isinstance(ref, str) and ref not in req_ids:
@@ -569,10 +587,14 @@ def build_task(reader, task, tasks_by_review, now, lanes_cache, lanes_override):
                 continue
             if ev["kind"] == "request.opened":
                 opened_ev[ref] = (t, detail.get("kind"))
+            elif detail.get("answer") is True:  # B2 round 2: the answer to a request already closed: who answered its span
+                if ref in closed_ev:
+                    o, c, kind, how = closed_ev.pop(ref)
+                    canvas.paint(o, c, request_payload(kind, detail.get("by"), how, "events.jsonl request.*"))
             elif ref in opened_ev:
                 o, kind = opened_ev.pop(ref)
-                canvas.paint(o, t, payload(request_state(kind, detail.get("by")), "request {} resolved".format(kind),
-                                           "events.jsonl request.*", "exact"))
+                canvas.paint(o, t, request_payload(kind, detail.get("by"), detail.get("how"), "events.jsonl request.*"))
+                closed_ev[ref] = (o, t, kind, detail.get("how"))
                 if kind == "capability":
                     cap_opened.append(o)
                 elif kind == "permission":
@@ -634,7 +656,7 @@ def build_task(reader, task, tasks_by_review, now, lanes_cache, lanes_override):
             if a - TOL <= opened < b:
                 stop = b if closed is None else min(closed, b)
                 if how == "approved":
-                    why, conf = "permission prompt inside a tool call, approved: the approval instant is not recorded (closed at the call's end)", "inferred"
+                    why, conf = "permission prompt inside a tool call, approved: " + APPROVED_WHY, "inferred"
                 else:
                     why = "permission prompt inside a tool call {}".format("open" if closed is None else (
                         how if how in ("denied", "left") else "resolved"))
@@ -761,6 +783,54 @@ def queued_items(reader, tasks_dir, now, known):
     return out
 
 
+def cancelled_items(reader, tasks_dir, now, known):
+    """B1 round 2: a queued task that `tp-agent stop` removed before it started. It has no task directory; tp-agent keeps
+    its queue entry and its queue.reason events (queued..., then cancelled) in <state>/queue-cancelled/<id>/ (bin/tp-agent
+    record_queue_cancel). Its row is [created, the cancelled event], painted from the reasons as a started task's wait is."""
+    out = []
+    folder = Path(tasks_dir).parent / "queue-cancelled"
+    if not folder.is_dir() or folder.is_symlink():
+        return out
+    for path in sorted(folder.iterdir()):
+        if not path.is_dir() or path.is_symlink():
+            continue
+        item = reader.json(path / "entry.json", "cancelled queue record")
+        if item is None:
+            continue
+        ident, created = item.get("id"), parse_time(item.get("created"))
+        if not isinstance(ident, str) or ident != path.name or created is None:
+            reader.problem(path / "entry.json", "malformed cancelled queue record (id or created)")
+            continue
+        if ident in known:
+            continue
+        events = reader.jsonl(path / "events.jsonl", "events.jsonl") or []
+        log, cancelled = [], None
+        for ev in events:
+            t = parse_time(ev.get("at")) if isinstance(ev, dict) and ev.get("kind") == "queue.reason" else None
+            if t is None:
+                continue
+            if ev.get("state") == "queued":
+                detail = ev.get("detail") if isinstance(ev.get("detail"), dict) else {}
+                if isinstance(detail.get("reason"), str):
+                    log.append((t, detail["reason"]))
+            elif ev.get("state") == "cancelled" and cancelled is None:
+                cancelled = t
+        if cancelled is None or cancelled < created:
+            reader.problem(path / "events.jsonl", "no readable queue.reason cancelled at or after created")
+            continue
+        if now < created:
+            continue
+        end = min(cancelled, now)
+        source = "queue-cancelled/" + ident + "/events.jsonl queue.reason"
+        intervals = [{"task": ident, "actor": ACTOR.get(st, ""), "state": st, "start": a, "end": b, "wait_reason": why,
+                      "source": source, "confidence": "exact" if st != "unknown" else "inferred"}
+                     for a, b, st, why in queue_log_segments([(t, r) for t, r in log if t <= end + TOL], created, end)]
+        out.append({"task": ident, "harness": item.get("worker") or "", "role": "cancelled", "start": created, "end": end,
+                    "end_source": "queue.reason cancelled", "running": False, "instants": [], "transcript": "none",
+                    "intervals": intervals})
+    return out
+
+
 # ------------------------------------------------------------------ totals and the critical path
 
 def union_length(spans):
@@ -848,6 +918,7 @@ def build(tasks_dir, task_ids=None, now=None, lanes_dir=None):
         rows.append(build_task(reader, tasks[ident], by_review, now, lanes_cache, lanes_dir))
     if not task_ids:
         rows += queued_items(reader, tasks_dir, now, set(tasks))
+        rows += cancelled_items(reader, tasks_dir, now, set(tasks))
     rows.sort(key=lambda r: (r["start"], r["task"]))
     for row in rows:
         row["by_state"] = by_state(row["intervals"])

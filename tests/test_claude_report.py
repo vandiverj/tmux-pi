@@ -13,6 +13,7 @@ import unittest.mock
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(ROOT / "lib"))
+import hub_records  # noqa: E402
 import pane_send  # noqa: E402
 from fake_tools import fake_tmux  # noqa: E402
 from session_env import outside_session  # noqa: E402
@@ -162,7 +163,7 @@ class ClaudeReportTests(unittest.TestCase):
 
     def at_tool(self):
         self.hook("UserPromptSubmit", prompt="go")
-        self.hook("PreToolUse", tool_name="Bash", tool_input={"command": "printf ''"})
+        self.hook("PreToolUse", tool_name="Bash", tool_use_id="tu1", tool_input={"command": "printf ''"})
 
     def test_a_permission_prompt_seen_twice_is_one_request_resolved_when_the_tool_runs(self):
         self.at_tool()
@@ -173,7 +174,8 @@ class ClaudeReportTests(unittest.TestCase):
         self.assertEqual((first["kind"], first["status"], first["task"]), ("permission", "open", "w1"))
         self.hook("Notification", message=self.ASK)  # the same prompt seen again
         self.assertEqual([r["id"] for r in self.requests()], [first["id"]])
-        self.hook("PostToolUse", tool_name="Bash")  # approved: the asked tool ran, the state left permission
+        self.assertEqual((self.journal()[0]["detail"]["tool_use_id"], self.state()["calls"]), ("tu1", [{"id": "tu1", "name": "Bash"}]))
+        self.hook("PostToolUse", tool_name="Bash", tool_use_id="tu1")  # approved: the asked call ran, the state left permission
         [first] = self.requests()
         # HB6b1 rule 3: approved, closed at the call's end (no hook sees the approval instant)
         self.assertEqual((first["status"], first["resolution"]), ("resolved", {"by": "hook", "how": "approved", "ref": None}))
@@ -182,11 +184,30 @@ class ClaudeReportTests(unittest.TestCase):
         # One tool-name table (lib/hub_records.py): the raw name is kept beside the normalised one.
         self.assertEqual((self.journal()[0]["detail"]["tool"], self.journal()[0]["detail"]["raw_tool"]), ("shell", "Bash"))
         self.assertTrue(all(e["v"] == 1 and e["actor"] == "hook" and e["source"] == "hook" for e in self.journal()))
+        self.assertEqual(self.state()["calls"], [])  # the call's end removes it from the calls in flight
+        # HB6b1 round 2 (F3): the close is classified by call identity (tool_use_id), never by tool name. permission_how:
+        # (hook, its tool_use_id) against the asked call -> how.
+        for hook_name, call, asked, how in [
+                ("PostToolUse", "tu1", "tu1", "approved"), ("PostToolUseFailure", "tu1", "tu1", "approved"),
+                ("PermissionDenied", "tu1", "tu1", "denied"),
+                ("PostToolUse", "tu2", "tu1", "left"), ("PostToolUseFailure", "tu2", "tu1", "left"),  # another call, same name
+                ("PermissionDenied", "tu2", "tu1", "left"),  # a denial counts only for the asking call
+                ("PostToolUse", None, "tu1", "left"), ("PermissionDenied", None, "tu1", "left"),  # no id on the hook
+                ("PostToolUse", "tu1", None, "left"), ("PermissionDenied", "tu1", None, "left"),  # asked call not known
+                ("PostToolUse", "", "", "left"), ("Stop", "tu1", "tu1", "left"), ("UserPromptSubmit", None, "tu1", "left")]:
+            fields = dict({"hook_event_name": hook_name, "tool_name": "Bash"}, **({"tool_use_id": call} if call is not None else {}))
+            self.assertEqual(hub_records.permission_how(fields, asked), how, (hook_name, call, asked))
+        # asking_call: the one call in flight with the prompt's tool name and an id; anything else is unknown
+        bash, bash2, write = {"id": "a", "name": "Bash"}, {"id": "b", "name": "Bash"}, {"id": "c", "name": "Write"}
+        for calls, tool, asked in [([bash, write], "Bash", "a"), ([bash, bash2], "Bash", None), ([write], "Bash", None),
+                                   ([bash], "", "a"), ([bash, write], "", None), ([{"id": None, "name": "Bash"}], "Bash", None),
+                                   ([{"name": "Bash"}], "Bash", None), ([], "Bash", None), (None, "Bash", None), ("x", "Bash", None)]:
+            self.assertEqual(hub_records.asking_call(calls, tool), asked, (calls, tool))
 
     def test_a_denied_prompt_is_resolved_and_the_same_prompt_after_it_is_a_new_request(self):
         self.at_tool()
         self.hook("Notification", message=self.ASK)
-        self.hook("PermissionDenied", tool_name="Bash")  # routed to report.sh (hooks.json): the turn goes on
+        self.hook("PermissionDenied", tool_name="Bash", tool_use_id="tu1")  # routed to report.sh (hooks.json): the turn goes on
         self.assertEqual(self.state()["state"], "working")
         [first] = self.requests()
         self.assertEqual((first["status"], first["resolution"]["how"]), ("resolved", "denied"))
@@ -205,9 +226,19 @@ class ClaudeReportTests(unittest.TestCase):
         self.assertEqual([(r["status"], r["summary"]) for r in self.requests()],
                          [("superseded", self.ASK), ("open", "Claude needs your permission to use Write")])
         # two prompts in one tool call: the Bash call's end is not the Write prompt's tool, so the second is left, not approved
-        self.hook("PostToolUse", tool_name="Bash")
+        self.hook("PostToolUse", tool_name="Bash", tool_use_id="tu1")
         self.assertEqual([(r["status"], r["resolution"]["how"]) for r in self.requests()],
                          [("superseded", "superseded"), ("resolved", "left")])
+        # HB6b1 round 2 (F3): two Bash calls in flight (parallel tool calls) when a Bash prompt comes: which one asks is
+        # not known, so the request names no call, and the first Bash call to end closes it `left`, not `approved`.
+        self.hook("PreToolUse", tool_name="Bash", tool_use_id="tu2")
+        self.hook("PreToolUse", tool_name="Bash", tool_use_id="tu3")
+        self.assertEqual([c["id"] for c in self.state()["calls"]], ["tu2", "tu3"])
+        self.hook("Notification", message=self.ASK)
+        self.assertNotIn("tool_use_id", self.journal()[-1]["detail"])
+        self.hook("PostToolUse", tool_name="Bash", tool_use_id="tu3")
+        self.assertEqual((self.requests()[-1]["status"], self.requests()[-1]["resolution"]["how"]), ("resolved", "left"))
+        self.assertEqual([c["id"] for c in self.state()["calls"]], ["tu2"])
 
     def test_a_turn_with_no_permission_prompt_writes_no_request_records(self):
         self.at_tool()

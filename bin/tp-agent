@@ -1187,25 +1187,54 @@ def with_queue_reason(entry, reason):
     return dict(entry, queue_reason=reason, queue_log=log)
 
 
+def record_queue_exit(folder, raw, state, root):
+    """HB6b1 rule 1: a task left the queue (`released`: it started; `cancelled`: tp-agent stop removed it). FOLDER's
+    events.jsonl gets one queue.reason event (state `queued`, detail.reason) per queue_log entry at the time it was noted,
+    then one with `state` now. Only appends, through hub_records.event."""
+    log = raw.get("queue_log") if isinstance(raw.get("queue_log"), list) else []
+    for entry in log:
+        if isinstance(entry, dict) and isinstance(entry.get("at"), str) and entry["at"] and isinstance(entry.get("reason"), str):
+            hub_records.event(folder, "queue.reason", "main", "file", "exact", state="queued",
+                              detail={"reason": entry["reason"]}, at=entry["at"], root=root)
+    hub_records.event(folder, "queue.reason", "main", "file", "exact", state=state,
+                      detail={"reason": raw.get("queue_reason") if isinstance(raw.get("queue_reason"), str) else ""}, root=root)
+
+
 def record_queue_wait(base, ident, raw):
     """HB6b1 rule 1, after a queued task started (its directory exists now): meta.json gets queued_at (the entry's created,
-    when it was queued), and events.jsonl one queue.reason event (state `queued`, detail.reason) per queue_log entry at the
-    time it was noted, then one with state `released` now. Only appends and one added meta field; a failure is reported
-    on stderr and never fails the start."""
+    when it was queued), and events.jsonl its queue reasons and `released` (record_queue_exit). Only appends and one added
+    meta field; a failure is reported on stderr and never fails the start."""
     try:
         path = task_dir(base, ident)
         meta = read_json(path / "meta.json")
         if meta and isinstance(raw.get("created"), str) and "queued_at" not in meta:
             atomic_json(path / "meta.json", dict(meta, queued_at=raw["created"]), base)
-        log = raw.get("queue_log") if isinstance(raw.get("queue_log"), list) else []
-        for entry in log:
-            if isinstance(entry, dict) and isinstance(entry.get("at"), str) and entry["at"] and isinstance(entry.get("reason"), str):
-                hub_records.event(path, "queue.reason", "main", "file", "exact", state="queued",
-                                  detail={"reason": entry["reason"]}, at=entry["at"])
-        hub_records.event(path, "queue.reason", "main", "file", "exact", state="released",
-                          detail={"reason": raw.get("queue_reason") if isinstance(raw.get("queue_reason"), str) else ""})
+        record_queue_exit(path, raw, "released", base)
     except (OSError, ValueError) as error:
         print(f"tp-agent: warning: the queue wait of {ident} was not recorded ({error})", file=sys.stderr)
+
+
+CANCELLED_QUEUE = "queue-cancelled"  # <state>/queue-cancelled/<id>/: what a queued task that was stopped leaves behind
+
+
+def record_queue_cancel(base, path):
+    """HB6b1 round 2, `tp-agent stop` of a queued task: the task never started, so it has no task directory, and its queue
+    file is about to be deleted. Its wait is kept in <state>/queue-cancelled/<id>/: entry.json (the queue entry as it was)
+    and events.jsonl (its queue reasons, then queue.reason `cancelled` now; record_queue_exit). Not under queue/ (every
+    *.json there is an entry tick would start) nor tasks/ (every reader there takes it for a started task); the timeline
+    reads it (tools/waits/timeline.py cancelled_items). Only a valid entry is recorded (a refused one is removed as before);
+    a failure is reported on stderr and never fails or changes the stop."""
+    raw, item, _ = queue_entry(path)
+    if item is None:
+        return
+    try:
+        folder = base / CANCELLED_QUEUE / item["id"]
+        safe_write.ensure_dir(folder, root=base)
+        if not (folder / "entry.json").exists():
+            atomic_json(folder / "entry.json", raw, base)
+        record_queue_exit(folder, raw, "cancelled", base)
+    except (OSError, ValueError) as error:
+        print(f"tp-agent: warning: the queue wait of {item['id']} was not recorded ({error})", file=sys.stderr)
 
 
 def note_queue_reason(path, raw, reason, log=True):
@@ -1780,6 +1809,7 @@ def _main(argv):
             if queued.is_dir() and not queued.is_symlink():
                 queued.rmdir()  # an empty directory named like an entry; a full one refuses (OSError)
             else:
+                record_queue_cancel(base, queued)
                 queued.unlink()
             value = {"id": args.id, "status": "stopped"}
             write_index(base)
@@ -1993,8 +2023,11 @@ def answered_by(args):
 
 
 def resolve_by_message(base, path, request, delivery, confirmed, owner_quote=None):
-    """--resolves: the request is resolved (by main, or by owner with the owner's quote in the event's detail; how message, ref
-    the delivery id) only when the delivery is confirmed; otherwise it stays open and the answer says so."""
+    """--resolves: the answer (by main, or by owner with the owner's quote; how message, ref the delivery id) is recorded only
+    when the delivery is confirmed; otherwise nothing is recorded and the answer says so. `request` is the record as it was
+    before anything was typed: one already closed then is left unchanged. One that the worker's own state change closed
+    while the message was delivered (pi's agent_start, a Claude hook leaving `permission`) keeps that close and gets the
+    answer recorded against its id (hub_records.answer), so who answered is never lost to the other writer."""
     if request.get("status") != "open":
         return {"request": request["id"], "resolved": False, "status": request.get("status"),
                 "why": f"the request was already {request.get('status')}; nothing changed"}
@@ -2002,11 +2035,18 @@ def resolve_by_message(base, path, request, delivery, confirmed, owner_quote=Non
         print(f"tp-agent: request {request['id']} stays open: the delivery {delivery} was not confirmed", file=sys.stderr)
         return {"request": request["id"], "resolved": False, "status": "open",
                 "why": "the delivery was not confirmed; the request stays open"}
-    record, changed = hub_records.resolve(path, request["id"], "owner" if owner_quote else "main", "message", delivery, "main", "file",
-                                          detail={"quote": owner_quote} if owner_quote else None)
+    record, changed = hub_records.answer(path, request["id"], "owner" if owner_quote else "main", delivery, "main", "file",
+                                         quote=owner_quote)
     if record is not None and record.get("kind") == "capability":
         mirror_capability(base, path, record)
-    return {"request": request["id"], "resolved": changed, "status": (record or {}).get("status")}
+    value = {"request": request["id"], "resolved": changed, "status": (record or {}).get("status")}
+    resolution = (record or {}).get("resolution") if isinstance((record or {}).get("resolution"), dict) else {}
+    if changed and "answer" in resolution:
+        value["why"] = (f"closed by {resolution.get('by')} ({resolution.get('how')}) while the message was delivered; "
+                        "the answer is recorded on it")
+    elif not changed:
+        value["why"] = f"closed by {resolution.get('by')} ({resolution.get('how')}) while the message was delivered; nothing changed"
+    return value
 
 
 def run_find(args):

@@ -1,5 +1,6 @@
 """Shared task interface and sensitive-read boundary without launching models."""
 import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -985,6 +986,24 @@ esac
         queue = [(e["state"], e["at"], e["detail"]["reason"]) for e in events if e["kind"] == "queue.reason"]
         self.assertEqual(queue[0], ("queued", entry["queue_log"][0]["at"], second["reason"]))
         self.assertEqual([(q[0], q[2]) for q in queue[1:]], [("released", second["reason"])])
+        # HB6b1 round 2 (F2): a queued task stopped before it starts has no task dir; its wait is kept in
+        # queue-cancelled/<id>/ (entry and queue.reason events ending `cancelled`), and the timeline draws it to the stop
+        third = self.dispatch(role="coder", task="Wait for the coder", after=second["id"])
+        self.assertEqual(third["status"], "queued")
+        self.assertEqual(self.cli("stop", third["id"])["status"], "stopped")
+        self.assertFalse((self.state / "queue" / f"{third['id']}.json").exists())
+        self.assertFalse((self.state / "tasks" / third["id"]).exists())
+        kept = self.state / "queue-cancelled" / third["id"]
+        self.assertEqual(json.loads((kept / "entry.json").read_text())["id"], third["id"])
+        events = [json.loads(line) for line in (kept / "events.jsonl").read_text().splitlines()]
+        self.assertEqual([(e["kind"], e["state"], e["detail"]["reason"]) for e in events],
+                         [("queue.reason", "queued", third["reason"]), ("queue.reason", "cancelled", third["reason"])])
+        spec = importlib.util.spec_from_file_location("wait_timeline", ROOT / "tools" / "waits" / "timeline.py")
+        timeline = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(timeline)
+        [row] = [r for r in timeline.build(self.state / "tasks")["tasks"] if r["task"] == third["id"]]
+        self.assertEqual((row["role"], row["end_source"], [i["state"] for i in row["intervals"]]),
+                         ("cancelled", "queue.reason cancelled", ["waiting:dependency"]))
 
     def test_total_slots_queue_without_blocking_direct_answers(self):
         limit = json.loads((ROOT / "config/orchestration.json").read_text())["max_active_workers"]

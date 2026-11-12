@@ -1140,3 +1140,8 @@ Each lane: checkpoint, Main's evidence, openai-codex review, notes closed, `lane
   ungrouped on purpose (7 one-off task instructions; labels-B #89, #91, #185-187 are Main's instructions to workers that H48
   labeled as owner messages). Recurrence by session: state-saved-for-restart 5, model-choice 2, dispatch-via-tmux-pi-workers 2.
   Next: the owner's OK for a claude/main-prompt.md line so Main records corrections as HB3 records.
+- HB7b (H40, lane hub-prune, rounds 1-2): contract ledger check and skeleton in tools/friction/report.py. Round 1
+  REQUEST_CHANGES (code against stated rules: duplicate identity, problem totals, stale pointers); round 2 (Sonnet)
+  review-coder-1653d423f5-100210 APPROVED_WITH_NOTES. Real data: 97 contract lines need a reason, 0 have one (all provenance
+  only). Cleanup: 23 merged lanes removed with `tp-agent lane remove` after collecting 16 finished reviewers; 7 HB7a preview
+  worktrees removed. Not merged: options in docs/plans/det-prep/hub/hb7/hb7b-decision.md.

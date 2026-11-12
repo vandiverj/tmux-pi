@@ -278,12 +278,12 @@ def _words_reason(words, cwd, depth, text):
         if text and w and all(c in "();<>|&" for c in w):
             i += 2 if ">" in w else 1
             continue
-        if not text and os.path.basename(w) == "perl" and i + 2 < len(words) and words[i + 1] == "-e" and ALARM.fullmatch(words[i + 2]):
-            i += 3
-            continue
-        why = _word_reason(w, cwd)
+        why = _word_reason(w, cwd)  # R6: the word is validated before anything recognises it
         if why:
             return why
+        if not text and os.path.basename(w) == "perl" and i + 2 < len(words) and words[i + 1] == "-e" and ALARM.fullmatch(words[i + 2]):
+            i += 3  # only the program text (words[i + 2]) is exempt; `perl` and `-e` passed the check above
+            continue
         if os.path.basename(w) in SHELLS and i + 2 < len(words) and SHELL_C.fullmatch(words[i + 1]):
             prog = words[i + 2]
             if text and len(prog) >= 2 and prog[0] in "'\"" and prog[-1] == prog[0] and prog[0] not in prog[1:-1]:

@@ -284,6 +284,17 @@ class RepeatsTest(unittest.TestCase):
              (["/usr/local/bin/mytool", "tests/x.sh"], T, 0, 1), "outside", 0, {"outside": 2, "reason": "input outside the tree: mytool"}),
             ("R5 absolute interpreter with .. is not plain", (["/opt/../usr/bin/python3", "-m", "unittest", "tests.test_x"], T, 0, 1),
              (["/opt/../usr/bin/python3", "-m", "unittest", "tests.test_x"], T, 0, 1), "outside", 0, {"outside": 2}),
+            # R6: the perl alarm wrapper's own executable word is validated before the alarm text is exempt (review F1)
+            ("R6 perl with .. in its path (review probe)", (["/usr/bin/../bin/perl", "-e", "alarm 60; exec @ARGV"] + ut, T, 0, 1),
+             (["/usr/bin/../bin/perl", "-e", "alarm 60; exec @ARGV"] + ut, T, 0, 1), "outside", 0, {"outside": 2, "reason": "input outside the tree: perl"}),
+            ("R6 perl relative ..", (["../bin/perl", "-e", "alarm 60; exec @ARGV"] + ut, T, 0, 1),
+             (["../bin/perl", "-e", "alarm 60; exec @ARGV"] + ut, T, 0, 1), "outside", 0, {"outside": 2}),
+            ("R6 perl tilde, glob and dollar", (["~/bin/perl", "-e", "alarm 60; exec @ARGV"] + ut, T, 0, 1),
+             (["bin*/perl", "-e", "alarm 60; exec @ARGV"] + ut, T, 0, 1), "outside", 0, {"outside": 2}),
+            ("R6 perl dollar", (["$HOME/bin/perl", "-e", "alarm 60; exec @ARGV"] + ut, T, 0, 1),
+             (["$HOME/bin/perl", "-e", "alarm 60; exec @ARGV"] + ut, T, 0, 1), "outside", 0, {"outside": 2}),
+            ("R6 perl plain absolute stays understood", (["/usr/bin/perl", "-e", "alarm 60; exec @ARGV"] + ut, T, 0, 1),
+             (["/usr/bin/perl", "-e", "alarm 60; exec @ARGV"] + ut, T, 0, 1), "duplicate", 1, {}),
             # R3: the never scan reads every word, so a run that is not understood is still never counted
             ("R3 never behind an unknown wrapper", (["timeout", "60", "env", "TP_LIVE_LMSTUDIO=1"] + ut, T, 0, 1),
              (["timeout", "60", "env", "TP_LIVE_LMSTUDIO=1"] + ut, T, 0, 1), "never", 0, {"never": 2}),

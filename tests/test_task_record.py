@@ -64,6 +64,17 @@ class TaskRecordTests(unittest.TestCase):
                 before = (d / "task.md").read_bytes()
                 write_record(d, lifecycle_state="working")  # nothing material changed: not rewritten
                 self.assertEqual((d / "task.md").read_bytes(), before)
+            with self.subTest(shape=name, file="request fallback (request.md absent)"):
+                # kept field x reader: fenced request in canonical task.md, read back by request_text, from a request.md
+                # source and from a legacy task.md source; verbatim reader exact, display reader normalised
+                shown = body.decode("utf-8", "replace").replace("\r\n", "\n").replace("\r", "\n")
+                for source in ("request.md", "legacy task.md"):
+                    d = self.task(task_id="fb-" + source[:3] + name.replace(" ", "-"))
+                    (d / ("request.md" if source == "request.md" else "task.md")).write_bytes(body + b"\n")
+                    write_record(d, lifecycle_state="working")
+                    (d / "request.md").unlink()
+                    self.assertEqual(request_text(d, "surrogateescape").encode("utf-8", "surrogateescape"), body, source)
+                    self.assertEqual(request_text(d), shown, source)
             with self.subTest(shape=name, file="legacy task.md"):
                 d = self.task(task_id="leg-" + name.replace(" ", "-"))
                 (d / "task.md").write_bytes(body + b"\n")

@@ -58,9 +58,10 @@ class Tasks:
         os.utime(path, (1_800_000_000 + at, 1_800_000_000 + at))
         return str(path)
 
-    def gate(self, ident, name, tree=T, checks=(("prettier:web", "passed", 0, 2.0),), files=("web/a.ts",), finished="10"):
+    def gate(self, ident, name, tree=T, checks=(("prettier:web", "passed", 0, 2.0),), files=("web/a.ts",), finished="10",
+             head="c" * 40, base="d" * 40):
         (self.root / ident / name).write_text(json.dumps({
-            "schema": "tp-gate:v1", "worktree": WT, "base": {"ref": "main", "sha": "d" * 40}, "head": "c" * 40, "tree": tree,
+            "schema": "tp-gate:v1", "worktree": WT, "base": {"ref": "main", "sha": base}, "head": head, "tree": tree,
             "files": list(files), "checks": [{"name": c, "status": s, "exit": e, "seconds": sec} for c, s, e, sec in checks],
             "exit": 0, "started": "2026-11-12T08:00:00Z", "finished": "2026-11-12T08:00:%sZ" % finished,
             "log": "/tmp/tp-tools/g.log"}))
@@ -75,6 +76,7 @@ class RepeatsTest(unittest.TestCase):
         """One row per rule; each builds two runs a (earlier) and b (later) and states b's class, its repeated seconds, and
         the totals the row proves. `naive` names the obvious reading the rule replaces (it would have said duplicate)."""
         ut = PY + ["tests.test_x"]
+        live_ut = PY + ["tests.test_qual_summarize_structured.LiveLmStudioTests"]
         rows = [
             # name, a(cmd, tree, exit, seconds), b(...), expected b class, b repeated seconds, extra checks
             ("D1 same cmd+tree", (ut, T, 0, 3), (ut, T, 0, 3), "duplicate", 3, {}),
@@ -125,6 +127,56 @@ class RepeatsTest(unittest.TestCase):
              (["python3", "/sessions/s/tasks/r/probes.py"], T, 0, 1), "outside", 0, {"outside": 2}),
             ("D4b script inside the tree", (["python3", WT + "/tools/x.py"], T, 0, 1), (["python3", "tools/x.py"], T, 0, 1),
              "duplicate", 1, {}),
+            # F2: every form a never-reused command can take (this repo's LiveLmStudioTests shape: env or prefix + unittest)
+            ("D4 real LiveLmStudioTests shape (env)", (["env", "TP_LIVE_LMSTUDIO=1"] + live_ut, T, 0, 30),
+             (["env", "TP_LIVE_LMSTUDIO=1"] + live_ut, T, 0, 30), "never", 0, {"never": 2}),
+            ("D4 shell prefix assignment in bash -c (naive: duplicate)",
+             (["bash", "-c", "TP_LIVE_LMSTUDIO=1 python3 -m unittest tests.test_q.LiveLmStudioTests"], T, 0, 30),
+             (["bash", "-c", "TP_LIVE_LMSTUDIO=1 python3 -m unittest tests.test_q.LiveLmStudioTests"], T, 0, 30), "never", 0, {"never": 2}),
+            ("D4 env inside opaque bash -lc (naive: duplicate)",
+             (["bash", "-lc", "cd tests; env TP_LIVE_LMSTUDIO=1 python3 -m unittest test_q"], T, 0, 30),
+             (["bash", "-lc", "cd tests; env TP_LIVE_LMSTUDIO=1 python3 -m unittest test_q"], T, 0, 30), "never", 0, {"never": 2}),
+            ("D4 export inside nested sh -c", (["bash", "-c", "sh -c 'export TP_LIVE_LMSTUDIO_MODEL=m; python3 -m unittest test_q'"], T, 0, 1),
+             (["bash", "-c", "sh -c 'export TP_LIVE_LMSTUDIO_MODEL=m; python3 -m unittest test_q'"], T, 0, 1), "never", 0, {"never": 2}),
+            ("D4 env with a flag the parser keeps opaque", (["env", "-i", "TP_LIVE_LMSTUDIO=1"] + ut, T, 0, 1),
+             (["env", "-i", "TP_LIVE_LMSTUDIO=1"] + ut, T, 0, 1), "never", 0, {"never": 2}),
+            ("D4 budget switch set", (["env", "TP_LMSTUDIO_BUDGET=20"] + ut, T, 0, 1), (["env", "TP_LMSTUDIO_BUDGET=20"] + ut, T, 0, 1),
+             "never", 0, {"never": 2}),
+            ("D4 budget zero is the offline default", (["env", "TP_LMSTUDIO_BUDGET=0"] + ut, T, 0, 1),
+             (["env", "TP_LMSTUDIO_BUDGET=0"] + ut, T, 0, 1), "duplicate", 1, {}),
+            ("D4 extra LM Studio endpoint", (["env", "TP_LMSTUDIO_ENDPOINT=1235"] + ut, T, 0, 1),
+             (["env", "TP_LMSTUDIO_ENDPOINT=1235"] + ut, T, 0, 1), "never", 0, {"never": 2}),
+            ("D4 git -C fetch (naive: duplicate)", (["git", "-C", WT, "fetch"], T, 0, 1), (["git", "-C", WT, "fetch"], T, 0, 1),
+             "never", 0, {"never": 2}),
+            ("D4 git -c k=v --no-pager pull", (["git", "-c", "a.b=c", "--no-pager", "pull"], T, 0, 1),
+             (["git", "-c", "a.b=c", "--no-pager", "pull"], T, 0, 1), "never", 0, {"never": 2}),
+            ("D4 git --git-dir=D push in bash -c", (["bash", "-c", "git --git-dir=.git push origin x; true"], T, 0, 1),
+             (["bash", "-c", "git --git-dir=.git push origin x; true"], T, 0, 1), "never", 0, {"never": 2}),
+            ("D4 git submodule update", (["git", "-C", WT, "submodule", "update"], T, 0, 1),
+             (["git", "-C", WT, "submodule", "update"], T, 0, 1), "never", 0, {"never": 2}),
+            ("D4 git ls-remote / clone", (["git", "-C", WT, "ls-remote"], T, 0, 1), (["git", "-C", WT, "ls-remote"], T, 0, 1),
+             "never", 0, {"never": 2}),
+            ("D4 local git is not network", (["git", "-C", WT, "status"], T, 0, 1), (["git", "-C", WT, "status"], T, 0, 1),
+             "duplicate", 1, {}),
+            # F3: shell text is words, never a path
+            ("F3 bash -c of an absolute interpreter equals the direct form",
+             (["/usr/bin/python3", "-m", "unittest", "tests/test_x.py"], T, 0, 3),
+             (["bash", "-c", "/usr/bin/python3 -m unittest tests/test_x.py"], T, 0, 3), "duplicate", 3, {}),
+            ("F3 opaque bash -c with an absolute interpreter is not outside",
+             (["bash", "-c", "/usr/bin/python3 -m unittest tests/test_x.py 2>&1 | tail -3"], T, 0, 3),
+             (["bash", "-c", "/usr/bin/python3 -m unittest tests/test_x.py 2>&1 | tail -3"], T, 0, 3), "duplicate", 3, {}),
+            ("F3 nested sh -c text is not outside",
+             (["bash", "-c", "sh -c '/usr/bin/python3 -m unittest tests/test_x.py'; true"], T, 0, 3),
+             (["bash", "-c", "sh -c '/usr/bin/python3 -m unittest tests/test_x.py'; true"], T, 0, 3), "duplicate", 3, {}),
+            ("F3 external script inside bash -c stays outside",
+             (["bash", "-c", "python3 /sessions/s/tasks/r/probes.py > /dev/null"], T, 0, 1),
+             (["bash", "-c", "python3 /sessions/s/tasks/r/probes.py > /dev/null"], T, 0, 1), "outside", 0, {"outside": 2}),
+            ("F3 relative path inside the cwd (after cd) is not outside",
+             (["bash", "-c", "cd tests && python3 ../tools/x.py"], T, 0, 1), (["bash", "-c", "cd tests && python3 ../tools/x.py"], T, 0, 1),
+             "duplicate", 1, {}),
+            ("F3 relative path leaving the cwd is outside",
+             (["bash", "-c", "cd tests && python3 ../../x.py; true"], T, 0, 1), (["bash", "-c", "cd tests && python3 ../../x.py; true"], T, 0, 1),
+             "outside", 0, {"outside": 2}),
             ("D4 a module named bench is not a bench run", (PY + ["tests.test_bench_runner"], T, 0, 1),
              (PY + ["tests.test_bench_runner"], T, 0, 1, WT, "py-test_bench_runner"), "duplicate", 1, {}),
         ]
@@ -158,6 +210,20 @@ class RepeatsTest(unittest.TestCase):
             s.gate("coder-1", "gate.json", finished="09")                    # same check, same files, same tree
             s.task("coder-2")
             s.gate("coder-2", "gate.json", tree=T2, finished="20")           # other tree
+            # F1: checks whose scope reads head/base (gitleaks BASE..HEAD, gitleaks-dirty, typecheck) key on them too.
+            s.task("coder-3")
+            scoped = (("gitleaks", "passed", 0, 3.0), ("gitleaks-dirty", "passed", 0, 1.0), ("typecheck:web", "passed", 0, 4.0))
+            H1, H2, B1, B2 = "1" * 40, "2" * 40, "3" * 40, "4" * 40
+            s.gate("coder-3", "gate-20261112-080000-1.json", checks=scoped + (("prettier:web", "passed", 0, 2.0),), tree="e" * 40, finished="31",
+                   head=H1, base=B1)
+            s.gate("coder-3", "gate-20261112-080000-2.json", checks=scoped + (("prettier:web", "passed", 0, 2.0),), tree="e" * 40, finished="32",
+                   head=H1, base=B1)                                            # nothing changed: all four repeat
+            s.gate("coder-3", "gate-20261112-080000-3.json", checks=scoped + (("prettier:web", "passed", 0, 2.0),), tree="e" * 40, finished="33",
+                   head=H2, base=B1)                                            # partial commit: same tree and files, new head
+            s.gate("coder-3", "gate-20261112-080000-4.json", checks=scoped + (("prettier:web", "passed", 0, 2.0),), tree="e" * 40, finished="34",
+                   head=H2, base=B2)                                            # base moved
+            s.gate("coder-3", "gate-20261112-080000-5.json", checks=(("gitleaks", "passed", 0, 3.0),), tree="e" * 40, finished="35", head="", base=B2)
+            s.gate("coder-3", "gate.json", checks=(("gitleaks", "passed", 0, 3.0),), tree="e" * 40, finished="36", head=H2, base="")  # unrecorded
             (Path(tmp) / "coder-1" / "test-runs" / "7.json").write_text("{not json")
             (Path(tmp) / "coder-1" / "test-runs" / "8.json").write_text(json.dumps({"schema": "tp-test-run:v1", "cmd": "x"}))
             (Path(tmp) / "coder-1" / "test-runs" / "9.json").symlink_to(Path(tmp) / "coder-1" / "meta.json")
@@ -169,9 +235,23 @@ class RepeatsTest(unittest.TestCase):
             (Path(tmp) / "no-meta" / "test-runs").mkdir(parents=True)
             Tasks(tmp).run("no-meta", PY + ["tests.test_q"], at=40)
             rep = repeats.build(tmp)
-            gates = sorted((r for r in rep["runs"] if r["kind"] == "gate"), key=lambda r: r["end"])
+            gates = sorted((r for r in rep["runs"] if r["kind"] == "gate" and r["task"] != "coder-3"), key=lambda r: r["end"])
             self.assertEqual([(r["label"], r["class"]) for r in gates],
                              [("prettier:web", "first"), ("prettier:web", "duplicate"), ("prettier:web", "first")])
+            g3 = [r for r in rep["runs"] if r["task"] == "coder-3"]
+            def classes(label):
+                return [r["class"] for r in sorted((r for r in g3 if r["label"] == label), key=lambda r: r["end"])]
+            for label in ("gitleaks", "gitleaks-dirty", "typecheck:web"):
+                self.assertEqual(classes(label)[:4], ["first", "duplicate", "first", "first"], label)  # head, then base changed
+            self.assertEqual(classes("prettier:web"), ["first", "duplicate", "duplicate", "duplicate"])  # files+tree only
+            self.assertEqual(classes("gitleaks")[4:], ["outside", "outside"])  # head or base.sha not recorded
+            self.assertTrue(all("head/base" in r["outside"] for r in g3 if r["class"] == "outside"))
+            shown = " ".join(" ".join(repeats.shown_cmd(c)) for c in (
+                ["env", "API_TOKEN=s3cret", "python3"], ["bash", "-c", "export DB_PASSWORD='p w' X=1; API_KEY=abc cmd"],
+                ["bash", "-c", "AUTH_HEADER=zzz python3 -m unittest"]))
+            for leaked in ("s3cret", "p w", "abc", "zzz"):
+                self.assertNotIn(leaked, shown)
+            self.assertIn("X=1", shown)
             self.assertEqual({r["task"]: r["role"] for r in rep["runs"] if r["kind"] == "test-run"},
                              {"main-like": "main", "no-meta": "unknown"})
             self.assertEqual(rep["totals"]["main_visible"], 1)

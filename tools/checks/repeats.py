@@ -30,7 +30,10 @@ TEST_RUN_NAME = re.compile(r"\d+\.json")
 GATE_NAME = re.compile(r"gate(-[0-9]{8}-[0-9]{6}-[0-9]+)?\.json")
 TASK_ID = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*")
 ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
-SECRET_NAME = re.compile(r"KEY|TOKEN|SECRET|PASSWORD|PASS|CREDENTIAL", re.I)
+SECRET_NAME = re.compile(r"KEY|TOKEN|SECRET|PASSWORD|PASS|CREDENTIAL|AUTH", re.I)
+ASSIGN_IN_TEXT = re.compile(r"(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]*)=(\"[^\"]*\"|'[^']*'|[^\s;&|()<>\"']*)")
+SHELLS = ("bash", "sh", "zsh", "dash", "ksh")
+SHELL_C = re.compile(r"-[A-Za-z]*c[A-Za-z]*")
 INTERP = re.compile(r"python[0-9.]*")
 MODULE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*")
 ALARM = re.compile(r"\s*alarm\s+(\d+);\s*exec\s+@ARGV;?\s*")
@@ -121,13 +124,49 @@ def _env_ops(args):
             i += 2
         elif a.startswith("-"):
             return None
-        elif "=" in a and ENV_NAME.fullmatch(a.split("=", 1)[0]):
-            name, value = a.split("=", 1)
-            ops.append(("set", name, "<set>" if name == "TMUX_TMPDIR" else value))  # N3: VR1 keys its presence only
+        elif _assign(a):
+            ops.append(_assign(a))
             i += 1
         else:
             break
     return ops, args[i:]
+
+
+def _assign(a):
+    """("set", NAME, VALUE) for a NAME=VALUE word, else None. N3: TMUX_TMPDIR is keyed by its presence only."""
+    if "=" not in a or not ENV_NAME.fullmatch(a.split("=", 1)[0]):
+        return None
+    name, value = a.split("=", 1)
+    return ("set", name, "<set>" if name == "TMUX_TMPDIR" else value)
+
+
+def _shell_words(text):
+    """The words of a shell string with operators as words of their own (`ls;` is `ls` and `;`); text.split() when the
+    quoting is broken."""
+    try:
+        lexer = shlex.shlex(text, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        return list(lexer)
+    except ValueError:
+        return text.split()
+
+
+def _scan_shell(text, depth=0):
+    """(words, texts) of a shell program: its words (a nested `sh -c TEXT` is split in turn, so no whole program text is
+    ever a word; a redirection target is an output, not an input) and every program text seen."""
+    words, texts, out, skip = _shell_words(text), [text], [], set()
+    for i, w in enumerate(words):
+        if i in skip:
+            continue
+        if i and words[i - 1] and all(c in "<>&|;()" for c in words[i - 1]) and ">" in words[i - 1]:
+            continue
+        out.append(w)
+        if depth < 4 and os.path.basename(w) in SHELLS and i + 2 < len(words) and SHELL_C.fullmatch(words[i + 1]):
+            inner_words, inner_texts = _scan_shell(words[i + 2], depth + 1)
+            out += [words[i + 1]] + inner_words
+            texts += inner_texts
+            skip.update((i + 1, i + 2))
+    return out, texts
 
 
 def _plain_shell(text):
@@ -170,7 +209,7 @@ def canonical(cmd, cwd):
     cwd = os.path.normpath(cwd) if isinstance(cwd, str) and cwd.startswith("/") else ""
     args = [_top(a, cwd) for a in cmd]
     rel, wrappers, env = ".", [], []
-    tokens = list(args)
+    tokens, shell_texts = list(args), []
     while args:
         base = os.path.basename(args[0])
         if base == "env":
@@ -182,11 +221,19 @@ def canonical(cmd, cwd):
         elif base == "perl" and len(args) >= 3 and args[1] == "-e" and ALARM.fullmatch(args[2]):
             wrappers.append("alarm " + ALARM.fullmatch(args[2]).group(1))
             args = args[3:]
-        elif base in ("bash", "sh") and len(args) == 3 and args[1] == "-c":
-            match = re.fullmatch(r"\s*cd\s+(\S+)\s*&&\s*(.*)", args[2], re.S)
-            inner = _plain_shell(match.group(2)) if match else _plain_shell(args[2])
+        elif _assign(args[0]):  # a shell prefix assignment: NAME=VALUE CMD
+            env.append(_assign(args[0]))
+            args = args[1:]
+        elif base in SHELLS and len(args) >= 3 and SHELL_C.fullmatch(args[1]):
+            text = args[2]
+            if text in tokens:
+                tokens.remove(text)  # the program text is not a path; its words are the tokens (F3)
+            match = re.fullmatch(r"\s*cd\s+(\S+)\s*&&\s*(.*)", text, re.S) if len(args) == 3 and args[1] == "-c" else None
+            inner = _plain_shell(match.group(2) if match else text) if len(args) == 3 and args[1] == "-c" else None
+            words, texts = _scan_shell(text)
+            shell_texts += texts
             if inner is None:  # opaque: kept as written; its words still count for D4
-                tokens += [_top(w, cwd) for w in _words(args[2])]
+                tokens += [_top(w, cwd) for w in words]
                 break
             if match:
                 where = _top(match.group(1), cwd)
@@ -207,15 +254,9 @@ def canonical(cmd, cwd):
     head = [rel, [list(o) for o in env], wrappers]
     body = list(args) if tests is None else opts + [tests]
     return {"key": json.dumps([head, body]), "runner": json.dumps([head, opts]) if tests is not None else None,
-            "tests": tests, "interp": interp, "env": env, "tokens": tokens,
+            "tests": tests, "interp": interp, "env": env, "tokens": tokens, "shell_texts": shell_texts, "cwd": cwd,
+            "rel": rel,
             "no_interp": json.dumps([head, (["<py>"] + body[1:]) if interp else body])}
-
-
-def _words(text):
-    try:
-        return shlex.split(text)
-    except ValueError:
-        return text.split()
 
 
 def _tests(args):
@@ -260,23 +301,63 @@ NETWORK_CMDS = {"curl", "wget", "gh"}
 GIT_NETWORK = {"fetch", "pull", "push", "clone", "ls-remote"}
 
 
+GIT_VALUE_OPTS = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env"}
+# Switches that make a run reach LM Studio (F2), and where each is read: TP_LIVE_LMSTUDIO / TP_LIVE_LMSTUDIO_MODEL
+# (tests/test_qual_summarize_structured.py LiveLmStudioTests, tests/session_env.py), TP_LMSTUDIO_BUDGET nonzero (lib/router.py
+# local_open; session_env sets 20 with TP_LIVE_LMSTUDIO=1), TP_LMSTUDIO_ENDPOINT (lib/router.py ENDPOINT_VAR: an extra LM
+# Studio address). TP_LMSTUDIO_BUDGET_FILE is only the counter file and TP_LIVE_FAKE (tests/test_run_bounded.py) a fake.
+LIVE_SWITCHES = ("TP_LIVE_LMSTUDIO", "TP_LIVE_LMSTUDIO_MODEL", "TP_LMSTUDIO_ENDPOINT")
+
+
+def _assignments(canon):
+    """Every NAME=VALUE the command can set: parsed env wrappers and prefixes, any assignment word (`env -i X=1 cmd`), and
+    any assignment inside shell program text, nested quotes included."""
+    found = [(op[1], op[2]) for op in canon["env"] if op[0] == "set"]
+    for t in canon["tokens"]:
+        op = _assign(t)
+        if op:
+            found.append((op[1], op[2]))
+    for text in canon["shell_texts"]:
+        for name, value in ASSIGN_IN_TEXT.findall(text):
+            found.append((name, value.strip("\"'")))
+    return found
+
+
+def _git_network(toks):
+    """True when a `git` word is followed (after global options, with their values) by a subcommand that reaches the network."""
+    for i, t in enumerate(toks):
+        if os.path.basename(t) != "git":
+            continue
+        j = i + 1
+        while j < len(toks) and toks[j].startswith("-"):
+            j += 2 if toks[j] in GIT_VALUE_OPTS else 1
+        if j >= len(toks):
+            continue
+        if toks[j] in GIT_NETWORK:
+            return True
+        if toks[j] in ("submodule", "remote"):
+            k = j + 1
+            while k < len(toks) and toks[k].startswith("-"):
+                k += 1
+            if k < len(toks) and toks[k] in (("update", "add") if toks[j] == "submodule" else ("update",)):
+                return True
+    return False
+
+
 def never_reason(canon, label):
     """D4: why a run is never counted as a duplicate (VR1's never-reused list), or None."""
     words = set(re.findall(r"[a-z0-9_]+", (label or "").lower()))  # `_` joins: test_bench_runner is no bench word
-    for op in canon["env"]:
-        if op[0] == "set" and op[1] in ("TP_LIVE_LMSTUDIO", "TP_LIVE_LMSTUDIO_MODEL"):
-            return "live model (%s set)" % op[1]
-        if op[0] == "set" and op[1] == "TP_LMSTUDIO_BUDGET" and op[2] not in ("", "0"):
+    for name, value in _assignments(canon):
+        if name in LIVE_SWITCHES:
+            return "live model (%s set)" % name
+        if name == "TP_LMSTUDIO_BUDGET" and value not in ("", "0"):
             return "live model (TP_LMSTUDIO_BUDGET set)"
     toks = canon["tokens"]
     bases = [os.path.basename(t) for t in toks]
     if "tp-lmstudio" in bases or "live" in words:
         return "live model"
-    if any(t.startswith(("http://", "https://")) for t in toks) or NETWORK_CMDS & set(bases):
+    if any(t.startswith(("http://", "https://")) for t in toks) or NETWORK_CMDS & set(bases) or _git_network(toks):
         return "network"
-    for i, b in enumerate(bases[:-1]):
-        if b == "git" and bases[i + 1] in GIT_NETWORK:
-            return "network"
     if "tmux" in bases:
         return "live tmux"
     if "tp-bench" in bases or "bench" in words:
@@ -291,20 +372,25 @@ def never_reason(canon, label):
 def outside_reason(canon):
     """D4b: a cmd that names a file outside the worktree (a probe script in a task dir, a temp script) has inputs the tree
     does not cover, so two such runs cannot be shown to be the same check. A path in a `bin` directory (the interpreter,
-    a tool) and /dev/ are not inputs of this kind."""
+    a tool) and /dev/ are not inputs of this kind. A relative path resolves against the record's cwd (and a `cd` in the
+    command) and is outside only when it leaves it. Shell program text is never a path: its words are the tokens."""
+    cwd = canon["cwd"]
     for tok in canon["tokens"]:
         if tok.startswith("/") and not tok.startswith("/dev/") and os.path.basename(os.path.dirname(tok)) != "bin":
             return "input outside the tree: " + os.path.basename(tok)
+        if tok == ".." or tok.startswith("../"):
+            where = os.path.normpath(os.path.join(cwd, canon["rel"], tok)) if cwd else ""
+            if not cwd or not (where == cwd or where.startswith(cwd + "/")):
+                return "input outside the tree: " + os.path.basename(tok)
     return None
 
 
 def shown_cmd(cmd):
-    """The cmd for printing: env assignments with a secret-like name have their value hidden (D6)."""
-    out = []
-    for a in cmd:
-        name = a.split("=", 1)[0] if "=" in a else ""
-        out.append(name + "=<hidden>" if name and ENV_NAME.fullmatch(name) and SECRET_NAME.search(name) else a)
-    return out
+    """The cmd for printing: the value of a NAME=VALUE with a secret-like name is hidden, as a word or inside shell text
+    (D6). Other secret forms (the value of a --token flag) are not recognised."""
+    def hide(match):
+        return match.group(1) + "=<hidden>" if SECRET_NAME.search(match.group(1)) else match.group(0)
+    return [ASSIGN_IN_TEXT.sub(hide, a) if "=" in a else a for a in cmd]
 
 
 # ------------------------------------------------------------------ loading tasks and runs
@@ -366,12 +452,13 @@ def load(tasks_dir, lane=None):
             for check in record["checks"]:
                 if check["status"] not in ("passed", "failed"):
                     continue  # missing / not_applicable: the check did not run
-                key = json.dumps(["gate", check["name"], sorted(record["files"])])
-                canon = {"key": key, "runner": None, "tests": None, "interp": "", "env": [], "tokens": [], "no_interp": key}
+                key, outside = _gate_key(check["name"], record)
+                canon = {"key": key, "runner": None, "tests": None, "interp": "", "env": [], "tokens": [], "no_interp": key,
+                         "shell_texts": [], "cwd": "", "rel": "."}
                 runs.append(dict(info, kind="gate", label=check["name"], cmd=["<gate>", check["name"]] + record["files"],
                                  tree=record["tree"], exit=check["exit"], timed_out=False, seconds=float(check["seconds"]),
                                  end=_iso_epoch(record["finished"]), path=str(path), n=0, canon=canon, never=None,
-                                 outside=None))
+                                 outside=outside))
         if (task_dir / "tests.jsonl").exists():
             seen = set()
             for line in reader.jsonl(task_dir / "tests.jsonl"):
@@ -387,6 +474,21 @@ def load(tasks_dir, lane=None):
     if jsonl["other_shape"]:
         reader.problem(tasks_dir, "%d tests.jsonl line(s) of another shape skipped" % jsonl["other_shape"])
     return runs, jsonl, reader.problems
+
+
+def _gate_key(name, record):
+    """(key, outside) of one gate check. prettier reads the changed files and the tree only. Every other check reads more:
+    gitleaks scans BASE..HEAD, gitleaks-dirty the files that differ from HEAD, eslint (deno) the diff from merge-base(BASE,
+    HEAD), typecheck the files deleted since BASE (tools/agent/pre-commit-gate.sh). Their key adds head and base.sha, and a
+    record without them is not comparable (F1)."""
+    files = sorted(record["files"])
+    if name.split(":", 1)[0] == "prettier":
+        return json.dumps(["gate", name, files]), None
+    head = record.get("head")
+    base = record["base"].get("sha") if isinstance(record.get("base"), dict) else None
+    if not (isinstance(head, str) and head and isinstance(base, str) and base):
+        return json.dumps(["gate", name, files, None]), "scope input not recorded: head/base of " + name
+    return json.dumps(["gate", name, files, head, base]), None
 
 
 def _iso_epoch(text):

@@ -282,7 +282,9 @@ rm -f "$state_tmp"
 
 # Request identity (HB4a, docs/plans/det-prep/hub/interfaces.md section 4): entering `permission` opens (or finds, for the
 # same prompt seen again) a request record under requests/ with an id; leaving `permission` (a tool event, a new prompt, a
-# PermissionDenied, a Stop) resolves it with how `left-state`. lib/hub_records.py is the one writer; it runs only on those
+# PermissionDenied, a Stop) resolves it at this hook with how approved (the asked call's PostToolUse/PostToolUseFailure: it
+# ran, so the close is the call's end, not the approval, which no hook sees), denied (PermissionDenied) or left (anything
+# else; HB6b1, hub_records.permission_how). lib/hub_records.py is the one writer; it runs only on those
 # transitions, so ordinary tool events start no extra process. A failure there never fails the hook.
 prev_state="$(jq -r '.state // empty' <<<"$prev" 2>/dev/null)"
 new_state="$(jq -r '.state // empty' "$state" 2>/dev/null)"

@@ -356,11 +356,12 @@ esac
         def add(label, content):
             entries[f"shape{len(entries):02d}"] = (label, content)
         for key in good:
-            if key != "queue_reason":  # the one optional field may be absent
+            if key not in ("queue_reason", "queue_log"):  # the optional fields may be absent
                 add(f"{key} missing", {k: v for k, v in good.items() if k != key})
             add(f"{key} wrong type", {**good, key: wrong[key]})
         add("queue_reason a list", {**good, "queue_reason": ["x"]})
         add("queue_reason null", {**good, "queue_reason": None})
+        add("queue_log entry without at", {**good, "queue_log": [{"reason": "x"}]})
         add("after has null", {**good, "after": [None]})
         add("context has a number", {**good, "context": ["a", 1]})
         for label, content in (("empty object", {}), ("null", None), ("array", []), ("string", "x"), ("number", 7)):
@@ -482,7 +483,7 @@ esac
         self.assertEqual(agent.queue_item(clean, queued["id"]), clean)  # idempotent: tick passes its return value on
         self.assertEqual(set(clean), {"id", "created", "role", "task", "workdir", "worker", "model", "thinking",
                                       "route_info", "deliverable", "parent", "after", "context", "notes", "tests",
-                                      "queue_reason"})
+                                      "queue_reason", "queue_log"})
 
     def test_missing_preamble_adds_only_the_worker_contract(self):
         item = self.dispatch()
@@ -967,12 +968,23 @@ esac
         second = self.dispatch(role="coder", task="Use the interface", after=first["id"])
         self.assertEqual(second["status"], "queued")
         self.assertIn("waiting for", second["reason"])
+        # HB6b1 rule 1: the reason waits in the queue file with its time (no task dir yet); an unchanged reason adds nothing
+        self.assertEqual(self.cli("tick")["started"], [])
+        entry = json.loads((self.state / "queue" / f"{second['id']}.json").read_text())
+        self.assertEqual([e["reason"] for e in entry["queue_log"]], [second["reason"]])
         self.settle(first, "RESULT_STATUS: complete\nInterface found.\n")
         started = self.cli("tick")
         self.assertEqual(started["started"], [second["id"]])
         packet = self.packet(second)
         self.assertIn(f"Dependency {first['id']} result:", packet)
         self.assertFalse((self.state / "queue" / f"{second['id']}.json").exists())
+        # ...and at the start it is the task's: meta.json queued_at, one queue.reason per reason (backdated), then released
+        meta = json.loads((self.task_dir(second) / "meta.json").read_text())
+        self.assertEqual(meta["queued_at"], entry["created"])
+        events = [json.loads(line) for line in (self.task_dir(second) / "events.jsonl").read_text().splitlines()]
+        queue = [(e["state"], e["at"], e["detail"]["reason"]) for e in events if e["kind"] == "queue.reason"]
+        self.assertEqual(queue[0], ("queued", entry["queue_log"][0]["at"], second["reason"]))
+        self.assertEqual([(q[0], q[2]) for q in queue[1:]], [("released", second["reason"])])
 
     def test_total_slots_queue_without_blocking_direct_answers(self):
         limit = json.loads((ROOT / "config/orchestration.json").read_text())["max_active_workers"]

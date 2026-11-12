@@ -173,9 +173,10 @@ class ClaudeReportTests(unittest.TestCase):
         self.assertEqual((first["kind"], first["status"], first["task"]), ("permission", "open", "w1"))
         self.hook("Notification", message=self.ASK)  # the same prompt seen again
         self.assertEqual([r["id"] for r in self.requests()], [first["id"]])
-        self.hook("PostToolUse", tool_name="Bash")  # approved: the tool ran, the state left permission
+        self.hook("PostToolUse", tool_name="Bash")  # approved: the asked tool ran, the state left permission
         [first] = self.requests()
-        self.assertEqual((first["status"], first["resolution"]), ("resolved", {"by": "hook", "how": "left-state", "ref": None}))
+        # HB6b1 rule 3: approved, closed at the call's end (no hook sees the approval instant)
+        self.assertEqual((first["status"], first["resolution"]), ("resolved", {"by": "hook", "how": "approved", "ref": None}))
         self.assertEqual([(e["kind"], e["ref"]) for e in self.journal()],
                          [("request.opened", first["id"]), ("request.resolved", first["id"])])
         # One tool-name table (lib/hub_records.py): the raw name is kept beside the normalised one.
@@ -188,10 +189,14 @@ class ClaudeReportTests(unittest.TestCase):
         self.hook("PermissionDenied", tool_name="Bash")  # routed to report.sh (hooks.json): the turn goes on
         self.assertEqual(self.state()["state"], "working")
         [first] = self.requests()
-        self.assertEqual((first["status"], first["resolution"]["how"]), ("resolved", "left-state"))
+        self.assertEqual((first["status"], first["resolution"]["how"]), ("resolved", "denied"))
         self.hook("Notification", message=self.ASK)  # the same text after resolution
         self.assertEqual([r["status"] for r in self.requests()], ["resolved", "open"])
         self.assertNotEqual(self.requests()[-1]["id"], first["id"])
+        # the owner declines the dialog: no hook fires for it (tests/test_g3_e2e.py); the turn's Stop ends the prompt, left
+        self.hook("Stop", last_assistant_message="stopped")
+        self.assertEqual([(r["status"], r["resolution"]["how"], r["resolution"]["by"]) for r in self.requests()],
+                         [("resolved", "denied", "hook"), ("resolved", "left", "hook")])
 
     def test_a_second_prompt_before_main_looks_supersedes_the_first(self):
         self.at_tool()
@@ -199,6 +204,10 @@ class ClaudeReportTests(unittest.TestCase):
         self.hook("Notification", message="Claude needs your permission to use Write")
         self.assertEqual([(r["status"], r["summary"]) for r in self.requests()],
                          [("superseded", self.ASK), ("open", "Claude needs your permission to use Write")])
+        # two prompts in one tool call: the Bash call's end is not the Write prompt's tool, so the second is left, not approved
+        self.hook("PostToolUse", tool_name="Bash")
+        self.assertEqual([(r["status"], r["resolution"]["how"]) for r in self.requests()],
+                         [("superseded", "superseded"), ("resolved", "left")])
 
     def test_a_turn_with_no_permission_prompt_writes_no_request_records(self):
         self.at_tool()

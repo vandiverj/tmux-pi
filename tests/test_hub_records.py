@@ -177,12 +177,33 @@ class TpAgentRequestTests(AgentCase):
         self.assertEqual(self.legacy()["status"], "answered")
         value, _, _, _ = self.run_agent("message", "w1", "--resolves", req, "--text", "again")  # already resolved: unchanged
         self.assertEqual(value["resolves"]["resolved"], False)
+        # HB6b1 rule 2: the owner decided, Main relays: by owner, with the owner's words on the resolved event
+        self.run_agent("request", "--kind", "context", "--what", "api", "--reason", "fetch", worker=True)
+        second = self.legacy()["id"]
+        value, _, error, _ = self.run_agent("message", "w1", "--resolves", second, "--by", "owner", "--quote", " yes, use it ",
+                                            "--text", "the owner says yes")
+        self.assertIsNone(error)
+        self.assertEqual(self.requests()[second]["resolution"], {"by": "owner", "how": "message", "ref": value["delivery"]})
+        resolved = [e for e in hub_records.read_events(self.task) if e["kind"] == "request.resolved" and e["ref"] == second]
+        self.assertEqual([(e["detail"]["by"], e["detail"]["quote"], e["actor"]) for e in resolved], [("owner", "yes, use it", "main")])
 
     def test_an_unknown_request_id_is_refused_before_anything_is_typed(self):
         _, sent, error, _ = self.run_agent("message", "w1", "--resolves", "req-01JABCDEFGHJKMNPQRSTVWXYZ0", "--text", "yes")
         self.assertIn("has no request", error)
         self.assertEqual(sent, [])
         self.assertFalse((self.task / "messages.jsonl").exists())
+        # HB6b1 rule 2: who answered is never inferred; an owner answer without the owner's words is refused, untyped
+        self.run_agent("request", "--kind", "tool", "--what", "browser", "--reason", "render", worker=True)
+        req = self.legacy()["id"]
+        for argv, refusal in ((("--resolves", req, "--by", "owner"), "needs --quote"),
+                              (("--resolves", req, "--by", "owner", "--quote", "  "), "needs --quote"),
+                              (("--by", "owner", "--quote", "yes"), "needs --resolves"),
+                              (("--resolves", req, "--quote", "yes"), "needs --by owner")):
+            _, sent, error, _ = self.run_agent("message", "w1", *argv, "--text", "yes")
+            self.assertIn(refusal, error or "", argv)
+            self.assertEqual(sent, [], argv)
+        self.assertFalse((self.task / "messages.jsonl").exists())
+        self.assertEqual(self.requests()[req]["status"], "open")
 
     def test_the_capability_file_stays_pending_while_another_capability_request_is_open(self):
         self.run_agent("request", "--kind", "tool", "--what", "browser", "--reason", "render", worker=True)

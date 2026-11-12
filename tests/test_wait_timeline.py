@@ -69,9 +69,11 @@ class Session:
         return self.tasks
 
     # --- producer shapes
-    def task(self, ident, created, worker, role="coder", review_of=None, lane=None):
+    def task(self, ident, created, worker, role="coder", review_of=None, lane=None, queued_at=None):
         meta = {"id": ident, "worker": worker, "model": "m", "thinking": "medium", "pane": "%1", "workdir": "/nonexistent",
                 "created": iso_s(created), "role": role}
+        if queued_at is not None:  # bin/tp-agent record_queue_wait: the queue entry's created (iso_s), or a malformed value
+            meta["queued_at"] = iso_s(queued_at) if isinstance(queued_at, (int, float)) else queued_at
         if lane:
             meta.update(lane=lane, lane_step="S1")
         self.put(created, "tasks/{}/meta.json".format(ident), json.dumps(meta, indent=2))
@@ -150,12 +152,12 @@ class Session:
             "schema": "tp-gate:v1", "worktree": "/w", "base": {"ref": "main", "sha": "s"}, "head": "h", "tree": "t", "files": [],
             "checks": [], "exit": 0, "started": iso_off(started), "finished": iso_off(finished), "log": "/l.log"}))
 
-    def request(self, ident, rid, kind, opened, resolved=None, by="main"):
+    def request(self, ident, rid, kind, opened, resolved=None, by="main", how="message"):
         def record(now):
             r = {"id": rid, "task": ident, "kind": kind, "opened": iso_ms(opened), "text_sha256": "0" * 64, "summary": "SECRET-ASK",
                  "status": "open"}
             if resolved is not None and resolved <= now:
-                r.update(status="resolved", resolved=iso_ms(resolved), resolution={"by": by, "how": "message", "ref": None})
+                r.update(status="resolved", resolved=iso_ms(resolved), resolution={"by": by, "how": how, "ref": None})
             return json.dumps(r, indent=2)
         self.put(opened, "tasks/{}/requests/{}.json".format(ident, rid), record)
 
@@ -188,18 +190,34 @@ class Session:
         if exit_at is not None:
             self.put(exit_at, "tasks/{}/exit".format(ident), "0\n")
 
-    def queued(self, ident, created, removed, reason):
-        self.put(created, "queue/{}.json".format(ident), json.dumps({
-            "id": ident, "role": "coder", "worker": "claude", "model": "m", "created": iso_s(created), "after": ["coder-b"],
-            "queue_reason": reason, "workdir": "/w"}), removed=removed)
+    def queued(self, ident, created, removed, reason, log=None):
+        """log: [(t, reason)] as bin/tp-agent with_queue_reason keeps it in queue_log (HB6b1); None: arm A's entry."""
+        entry = {"id": ident, "role": "coder", "worker": "claude", "model": "m", "created": iso_s(created), "after": ["coder-b"],
+                 "queue_reason": reason, "workdir": "/w"}
+        if log is not None:
+            entry["queue_log"] = [{"at": iso_s(t), "reason": r} for t, r in log]
+        self.put(created, "queue/{}.json".format(ident), json.dumps(entry), removed=removed)
+
+    def queue_events(self, ident, log, released):
+        """bin/tp-agent record_queue_wait at the task's start (`released`): one queue.reason (state queued) per queue_log
+        entry, backdated to its time, then one released. The lines exist only from `released` on."""
+        def content(now):
+            if now < released:
+                return None
+            items = [(t, "queued", r) for t, r in log] + [(released, "released", log[-1][1] if log else "")]
+            return "".join(json.dumps({"v": 1, "id": "ev-q{}".format(n), "at": iso_s(t), "task": ident, "actor": "main",
+                                       "kind": "queue.reason", "state": st, "detail": {"reason": r}, "source": "file",
+                                       "confidence": "exact"}) + "\n" for n, (t, st, r) in enumerate(items))
+        self.put(released, "tasks/{}/events.jsonl".format(ident), content)
 
 
 REQ = "req-01JZ0000000000000000000000"
 REQ2 = "req-01JZ0000000000000000000001"
 
 
-def case1(root):
-    """The planted schedule of case 1 (seconds after T0) and its ground truth [(task, state, start, end)]."""
+def case1(root, arm_b=False):
+    """The planted schedule of case 1 (seconds after T0) and its ground truth [(task, state, start, end)]. arm_b: the records
+    HB6b1's producers add (coder-c's queue_log, queued_at and queue.reason events; coder-b's request resolved by owner)."""
     s = Session(root)
     truth = []
     # coder-a: a 90 s test run inside a shell call, then a review holds it until Main collects
@@ -228,17 +246,21 @@ def case1(root):
     s.claude_state("coder-b", [53, 200])
     s.claude_transcript("coder-b", [(53, "prompt", None), (60, "use", ("b1", [("b1", "Bash")])), (61, "result", ["b1"]),
                                     (65, "text", "b2"), (200, "prompt", None), (220, "text", "b3")])
-    s.request("coder-b", REQ, "capability", 60.5, resolved=200)
+    by = "owner" if arm_b else "main"  # arm B: tp-agent message --resolves REQ --by owner --quote "..."
+    s.request("coder-b", REQ, "capability", 60.5, resolved=200, by=by)
     s.events("coder-b", [(60.5, "request.opened", REQ, {"kind": "capability"}),
-                         (200, "request.resolved", REQ, {"kind": "capability", "by": "main", "how": "message"})])
+                         (200, "request.resolved", REQ, {"kind": "capability", "by": by, "how": "message"})])
     s.capability("coder-b", 60, answered=200)
     s.finish("coder-b", result=220, collected=230, reaped=230, exit_at=230)
     truth += [("coder-b", "starting", 50, 53), ("coder-b", "model", 53, 60), ("coder-b", "tool", 60, 61),
               ("coder-b", "model", 61, 65), ("coder-b", "waiting:owner-input", 65, 200), ("coder-b", "model", 200, 220),
               ("coder-b", "waiting:main", 220, 230)]
     # coder-c: dispatched with --after coder-b at 100; queued until coder-b is collected, starts at 235
-    s.queued("coder-c", 100, 235, "waiting for coder-b")
-    s.task("coder-c", 235, "claude")
+    log = [(100, "waiting for coder-b")] if arm_b else None
+    s.queued("coder-c", 100, 235, "waiting for coder-b", log=log)
+    s.task("coder-c", 235, "claude", queued_at=100 if arm_b else None)
+    if arm_b:
+        s.queue_events("coder-c", log, 235)
     s.claude_state("coder-c", [237])
     s.claude_transcript("coder-c", [(237, "prompt", None), (240, "use", ("c1", [("c1", "Edit")])), (241, "result", ["c1"]),
                                     (260, "text", "c2")])
@@ -327,6 +349,9 @@ class WaitTimelineTest(unittest.TestCase):
 
         def at(report, t, task="w"):
             return state_at(report, task, T0 + t)
+
+        def row(report, task):
+            return next(r for r in report["tasks"] if r["task"] == task)
 
         def problems(report):
             return " | ".join(p["problem"] for p in report["problems"])
@@ -481,6 +506,46 @@ class WaitTimelineTest(unittest.TestCase):
                                                                         s.queued("q3", 5, None, "dependency w has not started"))), 50,
              [(lambda x: at(x, 10, "q1"), "waiting:lane-lease"), (lambda x: at(x, 10, "q2"), "waiting:worker-slot"),
               (lambda x: at(x, 10, "q3"), "waiting:dependency")]),
+            ("B1 a started queued task: queued_at and its queue.reason events paint [queued_at, created] exact, each reason until"
+             " the next (lane, then dependency); the row starts at queued_at (arm A: nothing before created)",
+             lambda r: one(r, created=40, prompts=(42,), finish={"result": 60, "collected": 70, "exit_at": 70}, extra=lambda s: (
+                 s.task("w", 40, "claude", queued_at=10),
+                 s.queue_events("w", [(10, "waiting for lane x's writer v"), (25, "waiting for v")], 40))), 100,
+             [(lambda x: at(x, 15), "waiting:lane-lease"), (lambda x: at(x, 30), "waiting:dependency"), (lambda x: at(x, 41), "starting"),
+              (lambda x: x["tasks"][0]["start"] - T0, 10),
+              (lambda x: [(i["source"], i["confidence"]) for i in x["tasks"][0]["intervals"] if i["start"] <= T0 + 30 < i["end"]][0],
+               ("events.jsonl queue.reason", "exact"))]),
+            ("B1 queued_at without any queue.reason event: the queued seconds are unknown and the gap is listed",
+             lambda r: one(r, created=40, prompts=(42,), finish={"result": 60, "collected": 70, "exit_at": 70},
+                           extra=lambda s: s.task("w", 40, "claude", queued_at=10)), 100,
+             [(lambda x: at(x, 30), "unknown"), (lambda x: "queued_at but no queue.reason" in problems(x), True)]),
+            ("B1 malformed queued_at, or one after created: not used, listed; the row is arm A's (starts at created)",
+             lambda r: one(r, created=40, prompts=(42,), finish={"result": 60, "collected": 70, "exit_at": 70}, extra=lambda s: (
+                 s.task("w", 40, "claude", queued_at="yesterday"), s.queue_events("w", [(10, "waiting for v")], 40),
+                 s.task("v", 40, "claude", queued_at=50), s.claude_state("v", [42]))), 100,
+             [(lambda x: x["tasks"][0]["start"] - T0, 40), (lambda x: at(x, 30), None),
+              (lambda x: problems(x).count("queued_at unreadable or after created"), 2)]),
+            ("B1 a still-queued item's queue_log: each reason holds from its time (slots, then dependency), exact; open at now",
+             lambda r: one(r, lines=talk, finish=done, extra=lambda s: s.queued(
+                 "q1", 5, None, "dependency w has not started", log=[(5, "global worker slots full"), (12, "dependency w has not started")])), 50,
+             [(lambda x: at(x, 8, "q1"), "waiting:worker-slot"), (lambda x: at(x, 30, "q1"), "waiting:dependency"),
+              (lambda x: [(i["confidence"], i.get("open")) for i in row(x, "q1")["intervals"]], [("exact", None), ("exact", True)])]),
+            ("B1 a queue_log that is not a list: arm A's single derived segment from queue_reason",
+             lambda r: one(r, lines=talk, finish=done, extra=lambda s: s.put(5, "queue/q1.json", json.dumps({
+                 "id": "q1", "created": iso_s(5), "worker": "claude", "queue_reason": "waiting for w", "queue_log": "x"}))), 50,
+             [(lambda x: [(i["state"], i["confidence"]) for i in row(x, "q1")["intervals"]], [("waiting:dependency", "derived")])]),
+            ("B3 a permission prompt in a call closed approved (at the call's end): waiting:permission, inferred, said so;"
+             " denied is named and exact",
+             lambda r: one(r, lines=held, finish={"result": 60, "collected": 70, "exit_at": 70}, extra=lambda s: (
+                 s.request("w", REQ, "permission", 6, resolved=50, by="hook", how="approved"),
+                 s.task("v", 0, "claude"), s.claude_state("v", [2]), s.claude_transcript("v", held, skew=0),
+                 s.finish("v", result=60, collected=70, exit_at=70),
+                 s.request("v", REQ2, "permission", 6, resolved=30, by="hook", how="denied"))), 100,
+             [(lambda x: at(x, 30), "waiting:permission"),
+              (lambda x: [(i["confidence"], "approval instant is not recorded" in i["wait_reason"])
+                          for i in row(x, "w")["intervals"] if i["start"] <= T0 + 30 < i["end"]][0], ("inferred", True)),
+              (lambda x: [(i["confidence"], i["wait_reason"]) for i in row(x, "v")["intervals"] if i["start"] <= T0 + 20 < i["end"]][0],
+               ("exact", "permission prompt inside a tool call denied")), (lambda x: at(x, 40, "v"), "tool")]),
             ("D10 malformed and missing records are listed, never raise",
              lambda r: one(r, lines=talk, finish=done, extra=lambda s: (
                  s.put(1, "tasks/w/state.json", "{not json"), s.put(1, "tasks/w/test-runs/1.json", "[1]"),
@@ -508,6 +573,18 @@ class WaitTimelineTest(unittest.TestCase):
         self.assertEqual(misses, {("coder-c", "waiting:dependency", None): 135,
                                   ("coder-b", "waiting:owner-input", "waiting:main"): 135})
         self.assertEqual((right, total), (775, 1045))
+        # arm B (HB6b1): with coder-c's queued_at, queue_log and queue.reason events and coder-b's answer recorded by owner,
+        # both misses are gone; the queue wait is exact, from the events, after the queue file is deleted
+        armb, armb_truth = case1(Path(self.tmp) / "case1b", arm_b=True)
+        report_b = self.report(armb, 320)
+        self.assertEqual(score(report_b, armb_truth), (1045, 1045, {}))
+        row = next(r for r in report_b["tasks"] if r["task"] == "coder-c")
+        self.assertEqual((row["intervals"][0]["source"], row["intervals"][0]["confidence"], row["start"] - T0),
+                         ("events.jsonl queue.reason", "exact", 100))
+        self.assertEqual(report_b["problems"], report["problems"])
+        live_b = self.report(armb, 120)
+        self.assertEqual([(i["state"], i["source"]) for i in next(r for r in live_b["tasks"] if r["task"] == "coder-c")["intervals"]],
+                         [("waiting:dependency", "queue/coder-c.json queue_log")])
         # round 3: the path ends where the window ends. coder-d is still running at 320 (stalled since 150), so the path
         # runs 0..320 through it and its 170 s of stalled outweigh the review hold (the elapsed window already counted it)
         self.assertEqual(report["critical_path"]["focus"]["state"], "stalled")

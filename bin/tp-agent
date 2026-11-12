@@ -861,6 +861,12 @@ def queue_item(value, name=None):
         if not isinstance(value["queue_reason"], str):
             raise ValueError("the record's queue_reason is not text")
         clean["queue_reason"] = value["queue_reason"]
+    if "queue_log" in value:  # optional (HB6b1: the reasons with their times, written as queue.reason events at start)
+        log = value["queue_log"]
+        if not isinstance(log, list) or not all(isinstance(e, dict) and isinstance(e.get("at"), str) and e["at"]
+                                                and isinstance(e.get("reason"), str) for e in log):
+            raise ValueError("the record's queue_log is not a list of {at, reason}")
+        clean["queue_log"] = [{"at": e["at"], "reason": e["reason"]} for e in log]
     return clean
 
 
@@ -1077,8 +1083,7 @@ def lane_admit(base, plan, item):
         if ok:
             value = launch(base, item)
         else:
-            item["queue_reason"] = reason
-            atomic_json(base / "queue" / f"{item['id']}.json", item, base)
+            atomic_json(base / "queue" / f"{item['id']}.json", with_queue_reason(item, reason), base)
             value = {"id": item["id"], "status": "queued", "reason": reason, "role": item["role"],
                      "harness": item["worker"], "model": item["model"], "effort": item["thinking"]}
         started = True
@@ -1157,8 +1162,7 @@ def _dispatch(args, base):
             if ok:
                 value = launch(base, item)
             else:
-                item["queue_reason"] = reason
-                atomic_json(base / "queue" / f"{item['id']}.json", item, base)
+                atomic_json(base / "queue" / f"{item['id']}.json", with_queue_reason(item, reason), base)
                 value = {"id": item["id"], "status": "queued", "reason": reason, "role": item["role"],
                          "harness": worker, "model": model, "effort": thinking}
             write_index(base)
@@ -1169,12 +1173,48 @@ def _dispatch(args, base):
     return value
 
 
-def note_queue_reason(path, raw, reason):
+def with_queue_reason(entry, reason):
+    """The queue entry with `reason` as its queue_reason and, when the reason changed, {at, reason} appended to its
+    queue_log (HB6b1: a queued task has no task directory, so its reasons wait here, with their times, until it starts and
+    record_queue_wait writes them as queue.reason events). A log that is not a list is left as it is (queue_item refuses
+    the entry; rewriting the log would make a refused entry valid by default)."""
+    log = entry.get("queue_log")
+    if "queue_log" in entry and not isinstance(log, list):
+        return dict(entry, queue_reason=reason)
+    log = list(log or [])
+    if entry.get("queue_reason") != reason or not log:
+        log.append({"at": hub_records.utc_now(), "reason": reason})
+    return dict(entry, queue_reason=reason, queue_log=log)
+
+
+def record_queue_wait(base, ident, raw):
+    """HB6b1 rule 1, after a queued task started (its directory exists now): meta.json gets queued_at (the entry's created,
+    when it was queued), and events.jsonl one queue.reason event (state `queued`, detail.reason) per queue_log entry at the
+    time it was noted, then one with state `released` now. Only appends and one added meta field; a failure is reported
+    on stderr and never fails the start."""
+    try:
+        path = task_dir(base, ident)
+        meta = read_json(path / "meta.json")
+        if meta and isinstance(raw.get("created"), str) and "queued_at" not in meta:
+            atomic_json(path / "meta.json", dict(meta, queued_at=raw["created"]), base)
+        log = raw.get("queue_log") if isinstance(raw.get("queue_log"), list) else []
+        for entry in log:
+            if isinstance(entry, dict) and isinstance(entry.get("at"), str) and entry["at"] and isinstance(entry.get("reason"), str):
+                hub_records.event(path, "queue.reason", "main", "file", "exact", state="queued",
+                                  detail={"reason": entry["reason"]}, at=entry["at"])
+        hub_records.event(path, "queue.reason", "main", "file", "exact", state="released",
+                          detail={"reason": raw.get("queue_reason") if isinstance(raw.get("queue_reason"), str) else ""})
+    except (OSError, ValueError) as error:
+        print(f"tp-agent: warning: the queue wait of {ident} was not recorded ({error})", file=sys.stderr)
+
+
+def note_queue_reason(path, raw, reason, log=True):
     """Leave the entry queued with why it did not start. Only an object can carry a reason; an unreadable or
-    non-object entry is never rewritten (that would destroy it) and is reported in tick's output instead."""
+    non-object entry is never rewritten (that would destroy it) and is reported in tick's output instead. log=False (an
+    entry the validator refused): only the reason is added, never a queue_log; the entry keeps its data as it was."""
     if isinstance(raw, dict) and raw.get("queue_reason") != reason:
         try:
-            atomic_json(path, dict(raw, queue_reason=reason), path.parent.parent)
+            atomic_json(path, with_queue_reason(raw, reason) if log else dict(raw, queue_reason=reason), path.parent.parent)
         except OSError:
             pass
 
@@ -1185,7 +1225,7 @@ def tick(base):
         for path in queue_files(base):
             raw, item, reason = queue_entry(path)
             if item is None:
-                note_queue_reason(path, raw, reason)
+                note_queue_reason(path, raw, reason, log=False)
                 refused.append({"id": path.stem, "reason": reason})
                 continue
             try:
@@ -1195,6 +1235,7 @@ def tick(base):
                         note_queue_reason(path, raw, why)             # not what an earlier tick or failed start said
                     continue
                 started.append(launch(base, item)["id"])
+                record_queue_wait(base, item["id"], raw)
                 path.unlink()
             except (ValueError, RuntimeError, OSError) as error:
                 reason = f"start failed: {error}"
@@ -1458,6 +1499,9 @@ def _main(argv):
     m.add_argument("--text", required=True)
     m.add_argument("--resolves", metavar="REQ_ID",
                    help="the request this message answers (req-...); resolved only when the delivery is confirmed")
+    m.add_argument("--by", choices=("main", "owner"), default="main",
+                   help="who decided the answer to --resolves (default main); owner needs --quote with the owner's words")
+    m.add_argument("--quote", help="with --by owner: the owner's own words, recorded with the resolution")
     o = sub.add_parser("objective")
     o.add_argument("text")
     q = sub.add_parser("request", help="worker asks main for a skill, tool, or context")
@@ -1783,6 +1827,7 @@ def _main(argv):
             if refused:
                 raise ValueError(refused)
             answers = None
+            by_owner = answered_by(args)  # checked before anything is sent, like --resolves
             if args.resolves is not None:  # checked before anything is sent: an unknown id is a mistake, not a delivery
                 answers = hub_records.find_request(path, args.resolves)
                 if answers is None:
@@ -1803,7 +1848,7 @@ def _main(argv):
                                   "exact" if pane_send.uses_record(path) else "derived", ref=args.resolves,
                                   detail={"delivery": delivery, **submit})
                 if answers is not None:
-                    value["resolves"] = resolve_by_message(base, path, answers, delivery, sent["submitted"])
+                    value["resolves"] = resolve_by_message(base, path, answers, delivery, sent["submitted"], by_owner)
             finally:  # collected.json is already gone: the record is refreshed even if a later write fails
                 refreshed(base, args.id, value)
             if not sent["submitted"] and "received" in sent:  # MS2: submitted, but only the end of it reached the worker
@@ -1931,9 +1976,25 @@ def mirror_capability(base, path, request):
     atomic_json(file, legacy, base)
 
 
-def resolve_by_message(base, path, request, delivery, confirmed):
-    """--resolves: the request is resolved (by main, how message, ref the delivery id) only when the delivery is confirmed;
-    otherwise it stays open and the answer says so."""
+def answered_by(args):
+    """HB6b1 rule 2: None when Main answers (`by: main`, the default), else the owner's quote. `--by owner` resolves a request
+    on the owner's word, so it needs --resolves and the owner's own words (--quote, interfaces.md section 5 provenance); it is
+    never inferred. Refused before anything is typed."""
+    quote = getattr(args, "quote", None)
+    if getattr(args, "by", "main") != "owner":
+        if quote is not None:
+            raise ValueError("--quote records the owner's words and needs --by owner")
+        return None
+    if args.resolves is None:
+        raise ValueError("--by owner says who answered a request and needs --resolves REQ_ID")
+    if not isinstance(quote, str) or not quote.strip():
+        raise ValueError("--by owner needs --quote with the owner's own words; without them the answer is recorded as by main")
+    return quote.strip()
+
+
+def resolve_by_message(base, path, request, delivery, confirmed, owner_quote=None):
+    """--resolves: the request is resolved (by main, or by owner with the owner's quote in the event's detail; how message, ref
+    the delivery id) only when the delivery is confirmed; otherwise it stays open and the answer says so."""
     if request.get("status") != "open":
         return {"request": request["id"], "resolved": False, "status": request.get("status"),
                 "why": f"the request was already {request.get('status')}; nothing changed"}
@@ -1941,7 +2002,8 @@ def resolve_by_message(base, path, request, delivery, confirmed):
         print(f"tp-agent: request {request['id']} stays open: the delivery {delivery} was not confirmed", file=sys.stderr)
         return {"request": request["id"], "resolved": False, "status": "open",
                 "why": "the delivery was not confirmed; the request stays open"}
-    record, changed = hub_records.resolve(path, request["id"], "main", "message", delivery, "main", "file")
+    record, changed = hub_records.resolve(path, request["id"], "owner" if owner_quote else "main", "message", delivery, "main", "file",
+                                          detail={"quote": owner_quote} if owner_quote else None)
     if record is not None and record.get("kind") == "capability":
         mirror_capability(base, path, record)
     return {"request": request["id"], "resolved": changed, "status": (record or {}).get("status")}

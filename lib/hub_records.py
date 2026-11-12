@@ -113,13 +113,17 @@ def _task(task_dir):
     return Path(task_dir).name
 
 
-def event(task_dir, kind, actor, source, confidence, ref=None, state=None, detail=None):
-    """Append one tp-event:v1 line to TASK_DIR/events.jsonl and return it. A tool name in detail["tool"] is normalised."""
+def event(task_dir, kind, actor, source, confidence, ref=None, state=None, detail=None, at=None):
+    """Append one tp-event:v1 line to TASK_DIR/events.jsonl and return it. A tool name in detail["tool"] is normalised.
+    `at`: when the event happened, if that was recorded earlier than this write (a queue reason kept in the queue file while
+    the task had no directory yet, HB6b1); default now."""
     if kind not in EVENT_KINDS:
         raise ValueError("unknown event kind {!r}".format(kind))
     if actor not in ACTORS or source not in SOURCES or confidence not in CONFIDENCE:
         raise ValueError("bad actor, source or confidence: {!r} {!r} {!r}".format(actor, source, confidence))
-    line = {"v": EVENT_VERSION, "id": new_id("ev"), "at": utc_now(), "task": _task(task_dir), "actor": actor, "kind": kind}
+    if at is not None and (not isinstance(at, str) or not at):
+        raise ValueError("bad event time {!r}".format(at))
+    line = {"v": EVENT_VERSION, "id": new_id("ev"), "at": at or utc_now(), "task": _task(task_dir), "actor": actor, "kind": kind}
     if ref is not None:
         line["ref"] = ref
     if state is not None:
@@ -316,10 +320,37 @@ PERMISSION = re.compile(r"permission", re.I)
 TOOL_IN_MESSAGE = re.compile(r"permission to use (\S+)", re.I)
 
 
+def permission_how(hook, asked_tool):
+    """HB6b1 rule 3: how the hook that ends a permission prompt answered it. Claude Code fires PostToolUse or
+    PostToolUseFailure for the asked call only after it ran (so it was approved; the approval instant itself is not seen by
+    any hook: the request closes when the approved call ENDS), PermissionDenied when the call is denied (at the answer), and
+    nothing when the owner declines the dialog (tests/test_g3_e2e.py). Every other way out of `permission` (another call's
+    PreToolUse or PostToolUse, a new prompt, Stop) is `left`: the prompt is no longer the state; whether it was approved is not
+    known from that hook. A call is the asked one when its tool_name is the tool the prompt named; unknown is `left`."""
+    name = hook.get("hook_event_name") if isinstance(hook, dict) else None
+    if name == "PermissionDenied":
+        return "denied"
+    tool = hook.get("tool_name") if isinstance(hook, dict) else None
+    if name in ("PostToolUse", "PostToolUseFailure") and asked_tool and tool == asked_tool:
+        return "approved"
+    return "left"
+
+
+def _asked_tools(task_dir):
+    """{request id: the raw tool name its request.opened event named} (claude_hook writes it as detail.raw_tool)."""
+    out = {}
+    for line in read_events(task_dir):
+        detail = line.get("detail") if isinstance(line.get("detail"), dict) else {}
+        if line.get("kind") == "request.opened" and isinstance(detail.get("raw_tool"), str):
+            out[line.get("ref")] = detail["raw_tool"]
+    return out
+
+
 def claude_hook(task_dir, hook, prev_state, new_state, prev_tool=""):
     """report.sh's request bookkeeping, after state.json was written. A permission Notification that put the worker in
     `permission` opens (or finds) the permission request for its message; leaving `permission` for any other state, or a
-    PermissionDenied, resolves the open permission request(s) with how `left-state`."""
+    PermissionDenied, resolves the open permission request(s) at that hook, with how approved, denied or left
+    (permission_how) and the hook's name in detail.hook."""
     name = hook.get("hook_event_name") if isinstance(hook, dict) else None
     done = {"opened": None, "resolved": []}
     if new_state == "permission" and name == "Notification":
@@ -331,8 +362,16 @@ def claude_hook(task_dir, hook, prev_state, new_state, prev_tool=""):
                                            detail={"tool": tool} if tool else None)
             done["opened"] = {"id": record["id"], "created": created}
     elif (prev_state == "permission" and new_state != "permission") or name == "PermissionDenied":
-        done["resolved"] = [r["id"] for r in resolve_open(task_dir, "permission", "hook", "left-state", None, "hook", "hook",
-                                                          detail={"hook": name, "state": new_state})]
+        if not requests_dir(task_dir).is_dir():
+            return done
+        asked = _asked_tools(task_dir)
+        with _locked(task_dir):
+            for record in requests(task_dir):
+                if record.get("status") == "open" and record.get("kind") == "permission":
+                    how = permission_how(hook, asked.get(record["id"]))
+                    _close(task_dir, record, "resolved", "hook", how, None, "hook", "hook",
+                           detail={"hook": name, "state": new_state})
+                    done["resolved"].append(record["id"])
     return done
 
 

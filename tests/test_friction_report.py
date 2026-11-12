@@ -61,6 +61,7 @@ def plant(tmp):
         {"i": 6, "sid": "s", "at": "2026-11-01T09:00:00Z", "label": "process", "quote": f"{SECRET} 6", "why": SECRET},  # delta
         {"i": 7, "sid": "s", "at": "2026-11-10T00:00:00Z", "label": "process", "quote": "  ", "why": SECRET},           # no quote
         "not a row", {"i": "5", "label": "process"}, {"i": 0, "label": "process"},
+        {"i": 8, "sid": "s", "at": "2026-11-08T00:00:00Z", "label": "process", "quote": f"{SECRET} 8"},                  # zeta: by worker
     ]
     (tmp / "labels-T.json").write_text(json.dumps(rows))
     mem = tmp / "memory"
@@ -68,6 +69,8 @@ def plant(tmp):
     (mem / "fb-quote.md").write_text(f"---\nname: fb-quote\ndescription: {SECRET}\nmetadata:\n  type: feedback\n---\n"
                                      f'The owner said "{SECRET} stop it".\n**Why:** {SECRET}\n**How to apply:** x\n')
     (mem / "fb-noquote.md").write_text(f"---\nname: fb-noquote\ndescription: d\nmetadata:\n  type: feedback\n---\n{SECRET} paraphrase\n")
+    (mem / "fb-cmd.md").write_text(f'---\nname: fb-cmd\nmetadata:\n  type: feedback\n---\nMy inference: prefer "--tests {SECRET}".\n')
+    (mem / "fb-worker.md").write_text(f'---\nname: fb-worker\nmetadata:\n  type: feedback\n---\nThe worker said "{SECRET} only".\n')
     (mem / "project.md").write_text("---\nname: project\ndescription: d\nmetadata:\n  type: project\n---\nfact\n")
     (mem / "broken.md").write_text("---\nname broken\n---\nbody\n")
     (mem / "MEMORY.md").write_text("- [x](fb-quote.md) index\n")
@@ -78,6 +81,8 @@ def plant(tmp):
     (repo / "tasks" / "w" / "report.md").write_text("# R\n## R1 a worker finding\n")
     (repo / "claude").mkdir()
     (repo / "claude" / "main-prompt.md").write_text("# Main\n\n- a rule (record:fr/R1)\n- evidence: prose, not a pointer\n")
+    (repo / "agent" / "contract").mkdir(parents=True)
+    (repo / "agent" / "contract" / "worker.md").write_text("# W\nOne two.\n")
     (repo / "agent" / "roles").mkdir(parents=True)
     (repo / "agent" / "roles" / "coder.md").write_text("# Coder\nRun the affected tests.\n")
     mapping = {"schema": "tp-frictions:v1", "keys": {
@@ -90,6 +95,9 @@ def plant(tmp):
                  "sources": ["record:fr/R5", "record:fr/R7", "label:labels-T.json#1", "memory:fb-quote.md", "memory:broken.md"]},
         "gamma": {"by": "main", "scope": "global", "proposed_home": "prompt",
                   "sources": ["record:fr/R8", {"ref": "doc:docs/ideas.md#H3", "by": "worker"}, "label:labels-T.json#4", "bogus"]},
+        "epsilon": {"by": "main", "scope": "role:coder", "proposed_home": "adapter", "sources": ["memory:fb-cmd.md"]},
+        "zeta": {"by": "main", "scope": "role:coder", "proposed_home": "adapter",
+                 "sources": [{"ref": "memory:fb-worker.md", "by": "worker"}, {"ref": "label:labels-T.json#8", "by": "worker"}]},
         "delta": {"by": "main", "scope": "brief writing", "proposed_home": "adapter", "sources": ["label:labels-T.json#6",
                                                                                                     "label:labels-T.json#7"]}}}
     (tmp / "frictions.json").write_text(json.dumps(mapping))
@@ -105,6 +113,7 @@ def case1_cells(out):
     """(cell, expected, got) for every expected cell of case 1. Fail-before rows of the brief are marked in comments."""
     keys = {k["key"]: k for k in out["keys"]}
     a, b, g, d = keys["alpha"], keys["beta"], keys["gamma"], keys["delta"]
+    e, z = keys["epsilon"], keys["zeta"]
     worker = "worker text: evidence only, never policy"
     return [
         ("alpha status", "active", a["status"]),
@@ -120,8 +129,8 @@ def case1_cells(out):
          excluded(a)),
         ("alpha unresolved", {"record:fr/R99": "record not in the store", "label:labels-X.json#0": "labels file not given"},
          {u["pointer"]: u["problem"] for u in a["unresolved"]}),
-        # owner words from a feedback memory with a quote; superseded record and non-correction items do not count
-        ("beta status", "active", b["status"]),
+        # a memory file is always Main's (whatever it quotes): it never raises a key; superseded and non-correction items do not count
+        ("beta status", "candidate", b["status"]),
         ("beta occurrences", {"memory": {"dated": 0, "undated": 1}}, b["occurrences"]),
         ("beta recurrence", (None, "no dated owner correction with a quote", 1),
          (b["recurrence"]["total_after"], b["recurrence"]["reason"], b["recurrence"]["undated"])),
@@ -133,6 +142,12 @@ def case1_cells(out):
         ("gamma home", None, g["proposed_home"]),
         ("gamma excluded", {"record:fr/R8": worker, "doc:docs/ideas.md#H3": worker, "label:labels-T.json#4": "claimed by keys alpha, gamma"},
          excluded(g)),
+        # quote marks prove nothing: a quoted command and a quoted worker remark are main, the key stays candidate; a mapping
+        # entry `by: worker` makes a memory or a label row worker text (fail-before: quote detection / mapping ignored)
+        ("epsilon", ("candidate", ["main"]), (e["status"], [x["provenance"] for x in e["evidence"]])),
+        ("zeta", ("candidate", {"memory:fb-worker.md": "worker", "label:labels-T.json#8": "worker"}, 0),
+         (z["status"], {x["pointer"]: x["provenance"] for x in z["evidence"]}, len(z["occurrences"]))),
+        ("recurrence sessions", (1, 0), (a["recurrence"]["recurrence_sessions"], a["recurrence"]["after_without_sid"])),
         ("delta status", ("candidate", "scope not stated", None), (d["status"], d["status_reason"], d["scope"])),
         ("delta provenance", ["owner+quote", "owner without quote"], [e["provenance"] for e in d["evidence"]]),
         # grouping is by key only: R6 has R1's text and stays ungrouped (fail-before: text similarity joins it to alpha)
@@ -143,11 +158,13 @@ def case1_cells(out):
         ("conflicts", [{"pointer": "label:labels-T.json#4", "keys": ["alpha", "gamma"]}], out["conflicts"]),
         ("problems", {("label", "labels-T.json row 7"), ("label", "labels-T.json row 8"), ("label", "labels-T.json row 9"),
                       ("memory", "broken.md"), ("map", "gamma")}, {(p["source"], p["where"]) for p in out["problems"]}),
-        ("inputs", ({"records": 9, "corrections": 8, "other_kinds": {"preference": 1}}, 7, 2, 1),
+        ("inputs", ({"records": 9, "corrections": 8, "other_kinds": {"preference": 1}}, 8, 4, 1),
          ({k: out["inputs"]["records"][k] for k in ("records", "corrections", "other_kinds")}, out["inputs"]["labels"]["rows"],
           out["inputs"]["memory"]["feedback"], out["inputs"]["memory"]["other_types"].get("project"))),
-        ("contract size", [("claude/main-prompt.md", 4, 3, 12, 1), ("agent/roles/coder.md", 2, 2, 6, 0)],
+        ("contract size", [("claude/main-prompt.md", 4, 3, 12, 1), ("agent/roles/coder.md", 2, 2, 6, 0), ("agent/contract/worker.md", 2, 2, 4, 0)],
          [(r["file"], r["lines"], r["nonblank"], r["words"], r["evidence_lines"]) for r in out["contract_size"]["files"]]),
+        ("contract subtotals", ((8, 7, 22, 1), (6, 5, 18, 1)),
+         tuple(tuple(out["contract_size"][k][f] for f in ("lines", "nonblank", "words", "evidence_lines")) for k in ("total", "brief_total"))),
     ]
 
 
@@ -155,6 +172,12 @@ class FrictionReport(unittest.TestCase):
     def test_rules_table(self):
         """One row per rule input: time parsing and placement, label/memory provenance, frontmatter, evidence pointers."""
         t = report.parse_time
+        def sess(*pairs):
+            """First correction in session pairs[0][0]; each pair is (first's sid, an item after it's sid)."""
+            first = {"source": "label", "provenance": "owner+quote", "time": t("2026-11-01T00:00:00Z"), "sid": pairs[0][0]}
+            return report.recurrence([first] + [{"source": "label", "provenance": "owner+quote", "time": t("2026-11-02T00:00:00Z"),
+                                                 "sid": sid} for _, sid in pairs])
+
         rows = [
             ("time z", t("2026-11-08T08:39:04.081Z")[1], False),
             ("time date only", t("2026-11-08")[1], True),
@@ -176,6 +199,11 @@ class FrictionReport(unittest.TestCase):
             ("evidence record id", bool(report.EVIDENCE_RE.search("see hub/D12")), True),
             ("evidence prose", bool(report.EVIDENCE_RE.search("a Self-review section with evidence: the writers")), False),
             ("evidence path", bool(report.EVIDENCE_RE.search("tests/test_x.py and agent/roles/coder.md")), False),
+            # sessions: the first correction's own session and items without a sid are not counted; two sessions vs one
+            ("sessions two", sess(("a", "a"), ("a", "b"), ("a", "b"), ("a", None))["recurrence_sessions"], 1),
+            ("sessions one", sess(("a", "a"), ("a", "a"))["recurrence_sessions"], 0),
+            ("sessions both new", sess(("a", "b"), ("a", "c"), ("a", "b"))["recurrence_sessions"], 2),
+            ("sessions no sid apart", sess(("a", "b"), ("a", None))["after_without_sid"], 1),
             ("recurrence only worker-free owner", report.recurrence([])["reason"], "no dated owner correction with a quote"),
         ]
         for name, got, want in rows:
@@ -200,12 +228,35 @@ class FrictionReport(unittest.TestCase):
             after = sorted((str(f), f.stat().st_mtime_ns) for f in Path(tmp).rglob("*") if f.is_file())
         self.assertEqual(code, 0)
         self.assertIn("## alpha  [active", text.getvalue())
-        self.assertIn("recurrence after correction (2026-11-01T10:00:00Z): 2", text.getvalue())
+        self.assertIn("recurrence after correction (2026-11-01T10:00:00Z): sessions 1 ", text.getvalue())
         self.assertNotIn(SECRET, text.getvalue() + json.dumps(out))  # no quote, why, body, description or project leaves the tool
         bare = json.loads(raw.getvalue())
         self.assertEqual((bare["inputs"]["records"]["given"], bare["inputs"]["memory"]["given"], bare["ungrouped"]["label"]),
                          (False, False, []))
         self.assertEqual(before, after)  # read-only
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root reads every directory")
+    def test_unreadable_inputs_are_listed(self):
+        """An unreadable memory directory, doc directory and store: a listed problem each, every other source still reported."""
+        with tempfile.TemporaryDirectory() as tmp:
+            p = plant(tmp)
+            locked = [Path(p["memory"]), p["root"] / "docs", Path(p["store"])]
+            try:
+                for d in locked:
+                    d.chmod(0)
+                out = report.build(p["map"], p["store"], p["labels"], p["memory"], p["root"])
+            finally:
+                for d in locked:
+                    d.chmod(0o755)
+        got = {(x["source"]) for x in out["problems"]}
+        alpha = next(k for k in out["keys"] if k["key"] == "alpha")
+        self.assertIn("memory", got)
+        self.assertIn("record", got)
+        self.assertEqual(
+            {u["pointer"] for u in alpha["unresolved"] if u["pointer"].startswith("doc:docs/")},
+            {"doc:docs/ideas.md#H1", "doc:docs/ideas.md#H2"})
+        self.assertEqual(alpha["occurrences"].get("label"), {"dated": 1, "undated": 1})  # labels and contract files still reported
+        self.assertEqual(len(out["contract_size"]["files"]), 3)
 
 
 if __name__ == "__main__":

@@ -11,6 +11,11 @@ Sources (docs/plans/det-prep/hub/hb7/hb7a-brief.md):
   memory:<file>           Main's feedback memories, `metadata.type: feedback` (`--memory`, no default directory)
   doc:<repo path>#<id>    a heading in a repo doc (the brief-rule signals in loop/ideas.md), provenance main unless worker
 Grouping is by the mapping's explicit keys only; an item no key names is `ungrouped`, an item two keys name is a conflict.
+Brief rule (a), a `friction:` key on an HB3 record, is DEFERRED (Main's decision): keys come from the mapping only.
+Owner authority comes from who wrote the source, never from its text: only an HB3 record with `by: owner` and a quote, or an H48
+label row with a quote, is `owner+quote`; a memory file is always `main`; a doc is `main` or `worker`; a mapping source marked
+`by: worker` is `worker`. Only `owner+quote` can make a key `active`.
+Recurrence is reported as sessions (distinct `sid` after the first correction's session) first, then messages.
 The output holds pointers, counts, provenance and times: never a quote, a `why`, a memory body or a label's project.
 """
 import argparse
@@ -35,7 +40,6 @@ KEY_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 POINTER_RE = re.compile(r"^(record|label|memory|doc):(.+)$")
 DATE_RE = re.compile(r"^\d{4}-\d\d-\d\d$")
 HEADING_DATE_RE = re.compile(r"\((\d{4}-\d\d-\d\d)\)")
-QUOTE_RE = re.compile(r'"[^"\n]*\S[^"\n]*"|“[^”]*\S[^”]*”')
 FRONT_LINE_RE = re.compile(r"^(\s*)([A-Za-z_][\w-]*):\s*(.*)$")
 # A contract line carries evidence when it holds a pointer of the forms this report uses, or an HB3 record id; the word
 # "evidence:" in prose is not a pointer.
@@ -92,7 +96,12 @@ def load_records(store, problems):
     info = {"given": store is not None, "records": 0, "corrections": 0, "other_kinds": {}}
     if store is None:
         return {}, info
-    if not Path(store).is_dir():
+    try:
+        found = Path(store).is_dir()
+    except OSError as error:
+        problems.append({"source": "record", "where": str(store), "problem": f"store not readable: {type(error).__name__}"})
+        return {}, info
+    if not found:
         problems.append({"source": "record", "where": str(store), "problem": "store directory not found"})
         return {}, info
     import work  # noqa: E402  imported here: the store root is read from TP_WORK_DIR at call time
@@ -180,6 +189,7 @@ def load_labels(paths, problems):
             of = row.get("recurrence_of")
             pointer = f"label:{path.name}#{index}"
             out[pointer] = item("label", pointer, provenance, stamp, process, None if process else f"label {label}, not process",
+                                sid=row.get("sid") if isinstance(row.get("sid"), str) and row.get("sid") else None,
                                 process_kind=row.get("process_kind") if isinstance(row.get("process_kind"), str) else None,
                                 recurrence_of=f"label:{path.name}#{of}" if isinstance(of, int) and not isinstance(of, bool) else None)
     return out, info
@@ -216,23 +226,33 @@ def frontmatter(text):
 
 def load_memory(directory, problems):
     """Memory files: one fact per file with frontmatter `name`, `metadata.type`. A `feedback` file is a source item; its provenance is
-    owner+quote when the body holds a double-quoted span, else main (Main's paraphrase). Memory files carry no date: undated."""
+    always main (Main writes every memory file, whatever it quotes). Memory files carry no date: undated."""
     info = {"given": directory is not None, "files": 0, "feedback": 0, "other_types": {}}
     if directory is None:
         return {}, info
     folder = Path(directory)
-    if not folder.is_dir():
-        problems.append({"source": "memory", "where": folder.name, "problem": "memory directory not found"})
+    try:
+        if not folder.is_dir():
+            problems.append({"source": "memory", "where": folder.name, "problem": "memory directory not found"})
+            return {}, info
+        entries = sorted(folder.iterdir())
+    except OSError as error:
+        problems.append({"source": "memory", "where": folder.name, "problem": f"memory directory not readable: {type(error).__name__}"})
         return {}, info
     out = {}
-    for path in sorted(folder.iterdir()):
+    for path in entries:
         name = path.name
         if name.startswith(".") or not name.endswith(".md") or name == "MEMORY.md":
             continue
         if sensitive(path):
             problems.append({"source": "memory", "where": name, "problem": "sensitive file name; refused"})
             continue
-        if path.is_symlink() or not path.is_file():
+        try:
+            regular = not path.is_symlink() and path.is_file()
+        except OSError as error:
+            problems.append({"source": "memory", "where": name, "problem": f"not readable: {type(error).__name__}"})
+            continue
+        if not regular:
             problems.append({"source": "memory", "where": name, "problem": "not a regular file; skipped"})
             continue
         try:
@@ -252,8 +272,7 @@ def load_memory(directory, problems):
         else:
             info["other_types"][kind] = info["other_types"].get(kind, 0) + 1
         pointer = f"memory:{name}"
-        provenance = "owner+quote" if feedback and QUOTE_RE.search(parsed[1]) else "main"
-        out[pointer] = item("memory", pointer, provenance, None, feedback, None if feedback else f"type {kind}, not feedback")
+        out[pointer] = item("memory", pointer, "main", None, feedback, None if feedback else f"type {kind}, not feedback")
     return out, info
 
 
@@ -266,10 +285,10 @@ def resolve_doc(pointer, rest, by, root):
     path = root / path_text
     if sensitive(path):
         return None, "sensitive file name; refused"
-    if not path.is_file():
-        return None, "doc not found"
     pattern = re.compile(rf"^#+\s+{re.escape(heading)}(?![\w.-])")
     try:
+        if not path.is_file():
+            return None, "doc not found"
         line = next((l for l in path.read_text(encoding="utf-8").split("\n") if pattern.match(l)), None)
     except (OSError, UnicodeDecodeError):
         return None, "doc not readable"
@@ -335,20 +354,28 @@ def view(entry, excluded=None):
 
 def recurrence(occurrences):
     """Occurrences after the first dated owner+quote correction, per source and total; undated and same-day date-only items are
-    counted apart, never placed."""
-    firsts = [o["time"] for o in occurrences if o["provenance"] == "owner+quote" and o["time"] is not None]
+    counted apart, never placed. `recurrence_sessions`: distinct label `sid`s among the items after, not counting the first
+    correction's own session; label items without a `sid` are `after_without_sid`, never counted as a session."""
+    firsts = [o for o in occurrences if o["provenance"] == "owner+quote" and o["time"] is not None]
     if not firsts:
-        return {"first_correction": None, "after": None, "total_after": None,
+        return {"first_correction": None, "after": None, "total_after": None, "recurrence_sessions": None,
                 "reason": "no dated owner correction with a quote", "undated": sum(o["time"] is None for o in occurrences)}
-    first = min(firsts, key=lambda s: (s[0], not s[1]))
-    after, counts = {}, {"before_or_at": 0, "same_day_unordered": 0, "undated": 0}
+    start = min(firsts, key=lambda o: (o["time"][0], not o["time"][1]))
+    first = start["time"]
+    after, counts, sessions, no_sid = {}, {"before_or_at": 0, "same_day_unordered": 0, "undated": 0}, set(), 0
     for o in occurrences:
         where = "undated" if o["time"] is None else place(o["time"], first)
         if where == "after":
             after[o["source"]] = after.get(o["source"], 0) + 1
+            if o["source"] == "label":
+                if o.get("sid") is None:
+                    no_sid += 1
+                elif o["sid"] != start.get("sid"):
+                    sessions.add(o["sid"])
         else:
             counts[where] += 1
-    return {"first_correction": iso(first), "after": after, "total_after": sum(after.values()), **counts}
+    return {"first_correction": iso(first), "after": after, "total_after": sum(after.values()), "recurrence_sessions": len(sessions),
+            "after_without_sid": no_sid, **counts}
 
 
 def build(map_path, store=None, labels=None, memory=None, root=ROOT):
@@ -380,6 +407,8 @@ def build(map_path, store=None, labels=None, memory=None, root=ROOT):
             if found is None:
                 unresolved.append({"pointer": ref, "problem": reason})
                 continue
+            if by == "worker":
+                found = {**found, "provenance": "worker"}  # the mapping says a worker wrote it: evidence only, whatever the source
             excluded = found["excluded"] or (None if found["correction"] else "not a correction")
             if not excluded and found["provenance"] == "worker":
                 excluded = "worker text: evidence only, never policy"
@@ -432,12 +461,20 @@ def not_found(source, rest, store, label_info, memory):
 
 
 def contract_size(root, problems):
-    """Lines, non-blank lines, words and evidence-carrying lines of Main's prompt, each role file and the worker contract."""
+    """Lines, non-blank lines, words and evidence-carrying lines of Main's prompt, each role file and the worker contract. `total`
+    is every file; `brief_total` is the brief's population (Main's prompt and the role files) for comparison with it."""
     root = Path(root)
-    files = [root / "claude" / "main-prompt.md", *sorted((root / "agent" / "roles").glob("*.md")),
-             *sorted((root / "agent" / "contract").glob("*.md"))]
-    rows, total = [], {"lines": 0, "nonblank": 0, "words": 0, "evidence_lines": 0}
-    for path in files:
+    try:
+        files = [(root / "claude" / "main-prompt.md", True)]
+        files += [(p, True) for p in sorted((root / "agent" / "roles").glob("*.md"))]
+        files += [(p, False) for p in sorted((root / "agent" / "contract").glob("*.md"))]
+    except OSError as error:
+        problems.append({"source": "contract", "where": "agent", "problem": f"directory not readable: {type(error).__name__}"})
+        files = [(root / "claude" / "main-prompt.md", True)]
+    rows = []
+    zero = {"lines": 0, "nonblank": 0, "words": 0, "evidence_lines": 0}
+    total, brief_total = dict(zero), dict(zero)
+    for path, in_brief in files:
         try:
             lines = path.read_text(encoding="utf-8").split("\n")
         except (OSError, UnicodeDecodeError):
@@ -450,7 +487,9 @@ def contract_size(root, problems):
         rows.append(row)
         for k in total:
             total[k] += row[k]
-    return {"files": rows, "total": total}
+            if in_brief:
+                brief_total[k] += row[k]
+    return {"files": rows, "total": total, "brief_total": brief_total}
 
 
 def render(report):
@@ -474,8 +513,10 @@ def render(report):
             out.append(f"recurrence after correction: n/a ({rec_['reason']}; undated {rec_['undated']})")
         else:
             per = ", ".join(f"{s} {n}" for s, n in sorted(rec_["after"].items())) or "none"
-            out.append(f"recurrence after correction ({rec_['first_correction']}): {rec_['total_after']} ({per}); before/at "
-                       f"{rec_['before_or_at']}, same-day unordered {rec_['same_day_unordered']}, undated {rec_['undated']}")
+            out.append(f"recurrence after correction ({rec_['first_correction']}): sessions {rec_['recurrence_sessions']} "
+                       f"(label items without a session id, not counted: {rec_['after_without_sid']}); messages "
+                       f"{rec_['total_after']} ({per}); before/at {rec_['before_or_at']}, same-day unordered "
+                       f"{rec_['same_day_unordered']}, undated {rec_['undated']}")
         for ev in key["evidence"]:
             out.append(f"  - {ev['pointer']}  {ev.get('provenance', '')} {ev.get('at') or 'undated'}"
                        + (f"  EXCLUDED: {ev['excluded']}" if ev.get("excluded") else ""))
@@ -499,6 +540,9 @@ def render(report):
             for r in size["files"]]
     t = size["total"]
     out.append(f"  total: {t['lines']} lines ({t['nonblank']} non-blank), {t['words']} words, {t['evidence_lines']} with evidence")
+    b = size["brief_total"]
+    out.append(f"  brief population (main-prompt + roles): {b['lines']} lines ({b['nonblank']} non-blank), {b['words']} words, "
+               f"{b['evidence_lines']} with evidence")
     if report["problems"]:
         out.append("")
         out.append("## Inputs listed and skipped")

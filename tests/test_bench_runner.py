@@ -433,17 +433,31 @@ class Evidence(RunnerCase):
                     self.assertIn(("tp-agent", "collect"), shell.names())
 
     def test_a_result_that_is_not_utf8_or_is_empty_or_missing_is_scored_and_the_run_goes_on(self):
-        # result.md as written by a worker x the two readers of it (local answer, review findings)
+        # worker-written file x the three readers of it: result.md (local answer, review findings) and the transcript-path pointer
         good, find = f"ANSWER: {fx.EXPECTED}\n".encode(), fx.FINDINGS.encode()
         rows = [("local-q", good, "pass"), ("local-q", b"caf\xe9\n" + good, "pass"), ("local-q", b"\x80\xff\n" + good, "pass"),
                 ("local-q", b"", "fail"), ("local-q", fx.MISSING, "fail"),
                 ("review-r", find, "scored"), ("review-r", b"caf\xe9\n" + find, "scored"), ("review-r", b"\x80\n" + find, "scored"),
                 ("review-r", b"", "scored"), ("review-r", fx.MISSING, "scored")]
         for task, data, expect in rows:
-            with self.subTest(task=task, data=data):
+            with self.subTest(file="result.md", task=task, data=data):
                 shell, work, _ = self.build(result_bytes=data)
                 record = json.loads(work.run(self.only(task), 1)[0].read_text())
                 self.assertEqual(record["tasks"][0]["status"], expect)
+        # the transcript-path fallback (no explicit transcript): (pointer bytes, the transcript recorded, reader reached)
+        pointers = [(b"/t/x.jsonl\n", "/t/x.jsonl", True), (b"/t/caf\xe9.jsonl\n", "/t/caf\ufffd.jsonl", True), (b"\x80\xff", "\ufffd\ufffd", True),
+                    (b"", None, True), (fx.MISSING, None, False)]
+        for task, status in (("local-q", "pass"), ("review-r", "scored")):
+            for data, transcript, reached in pointers:
+                with self.subTest(file="transcript-path", task=task, data=data):
+                    shell, work, _ = self.build(pointer_bytes=data)
+                    seen, evidence = [], work.evidence  # the record keeps a transcript only if the file exists, so read evidence() itself
+                    with mock.patch.object(runner, "read_worker_text", wraps=runner.read_worker_text) as read, \
+                            mock.patch.object(work, "evidence", side_effect=lambda *a: seen.append(evidence(*a)) or seen[-1]):
+                        record = json.loads(work.run(self.only(task), 1)[0].read_text())
+                    self.assertEqual([Path(c.args[0]).name for c in read.call_args_list].count("transcript-path"), int(reached))
+                    self.assertEqual([e["transcript"] for e in seen], [transcript])
+                    self.assertEqual(record["tasks"][0]["status"], status)
 
     def test_a_review_that_times_out_or_errors_still_counts_its_planted_defects(self):
         shell, work, _ = self.build(running=True)

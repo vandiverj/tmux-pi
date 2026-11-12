@@ -677,17 +677,16 @@ class StatusTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        import subprocess
         sys.path.insert(0, str(ROOT / "lib"))
         sys.path.insert(0, str(ROOT / "tools" / "waits"))
+        import lane_lease
         import lanes
         import status
-        cls.lanes, cls.status = lanes, status
+        cls.lanes, cls.status, cls.lane_lease = lanes, status, lane_lease
         cls.tmp = tempfile.mkdtemp(prefix="hb6c.")
         cls.base = Path(os.path.realpath(cls.tmp))
-        cls.git = staticmethod(lambda cwd, *a: subprocess.run(
-            ["git", "-C", str(cwd), "-c", "user.name=t", "-c", "user.email=t@t"] + list(a), check=True, capture_output=True,
-            text=True).stdout.strip())
+        from lane_fixture import git
+        cls.git = staticmethod(git)
         cls.repo = cls.make_repo(cls.base / "repo")
         cls.common = lanes.git_common_dir(cls.repo)
         cls.state = cls.base / "session"
@@ -733,9 +732,13 @@ class StatusTest(unittest.TestCase):
         with cls.lanes.lane_lock(common):
             cls.lanes.write_lane(common, record)
 
-    def task(self, ident, lane, created, life="working", review_of=None, step="S1", requests=(), raw_requests=(), reply=None):
+    def task(self, ident, lane, created, life="working", review_of=None, step="S1", requests=(), raw_requests=(), reply=None, bad_meta=False):
         d = self.tasks / ident
         d.mkdir()
+        if bad_meta:  # meta.json cannot be read: the lane tag survives only in dispatch.json (or the lane's lease)
+            (d / "meta.json").write_text("{broken")
+            (d / "dispatch.json").write_text(json.dumps({"lane": lane, "lane_step": step}))
+            return
         meta = {"id": ident, "worker": "claude", "role": "code-reviewer" if review_of else "coder", "created": iso_s(created),
                 "workdir": "/nonexistent", "lane": lane, "lane_step": step}
         (d / "meta.json").write_text(json.dumps(meta))
@@ -752,14 +755,27 @@ class StatusTest(unittest.TestCase):
             rid = "req-" + "0" * 25 + "ABCDEFGH"[n]
             (d / "requests" / (rid + ".json")).write_text(json.dumps({"id": rid, "task": ident, "kind": kind, "status": "open",
                                                                       "opened": iso_s(created + 2), "summary": "s"}))
-        for text in raw_requests:
+        for n, text in enumerate(raw_requests):
             (d / "requests").mkdir(exist_ok=True)
-            (d / "requests" / ("req-" + "0" * 25 + "Z.json")).write_text(text)
+            (d / "requests" / ("req-" + "0" * 25 + "YZ"[n] + ".json")).write_text(text)
+
+    def footprint(self):
+        """Everything status.py must not change: the object listing, every index file, the lane worktrees' files and the session's."""
+        out = {}
+        for root in (Path(self.common), self.state, *self.base.glob("*-wt-*")):
+            for path in sorted(root.rglob("*")):
+                rel = str(path)
+                if path.is_file() and "/.git/lock" not in rel and not rel.endswith(".lock"):
+                    out[rel] = path.read_bytes() if "/objects/" not in rel else path.stat().st_size
+                elif path.is_dir() and "/objects" in rel:
+                    out[rel] = "dir"
+        return out
 
     def test_next_action_table(self):
         lane = type(self).lane
         for name in ("perm", "cap", "none", "run", "revrun", "final", "rc", "appr", "unusable", "incomplete", "dead", "queued",
-                     "twotasks", "chain", "olderrev", "badreq", "closedun"):
+                     "twotasks", "chain", "olderrev", "badreq", "closedun", "dirty", "undisp", "unlease", "unnewer", "idonly",
+                     "nokind", "capbad", "permbad"):
             lane(self.repo, name, commit=name == "closedun", closed="S1" if name == "closedun" else None)
         lane(self.repo, "closedmerged", closed="S1")
         lane(self.repo, "badlane", raw="{not json")
@@ -794,16 +810,37 @@ class StatusTest(unittest.TestCase):
         t("t-old-2", "olderrev", 30, life="settled")
         t("t-badreq", "badreq", 10, raw_requests=["{broken"])
         t("t-foreign", "foreign", 10)                    # a task of a lane of another repository
+        t("t-dirty", "dirty", 10, life="settled")        # finished, no review; its worktree has uncommitted work (F1)
+        (Path(self.lanes.read_lane(self.common, "dirty")["worktree"]) / "f").write_text("changed")
+        (Path(self.lanes.read_lane(self.common, "dirty")["worktree"]) / "new-file").write_text("untracked")
+        t("t-undisp", "undisp", 10, bad_meta=True)       # unreadable task the dispatch.json places in the step (F2)
+        t("t-unlease", "unlease", 10, bad_meta=True)
+        (self.tasks / "t-unlease" / "dispatch.json").unlink()   # no tag: only the lane's lease names it
+        holder = {"kind": "worker", "access": "write", "task": "t-unlease", "role": "coder", "session": str(self.state),
+                  "pid": 1, "start": "x", "pane": None, "taken": iso_s(10)}
+        with self.lanes.lane_lock(self.common):
+            self.lane_lease._write(self.common, "unlease", [holder])
+        t("t-unnew-old", "unnewer", 10, life="settled")  # an older readable task beside a newer unreadable one
+        t("t-unnew-new", "unnewer", 30, bad_meta=True)
+        os.utime(self.tasks / "t-unnew-new" / "dispatch.json", (T0 + 30, T0 + 30))
+        t("t-idonly", "idonly", 10, raw_requests=['{"id": "req-%s"}' % ("0" * 25 + "Y")])   # F3: an id and nothing else
+        t("t-nokind", "nokind", 10, raw_requests=[json.dumps({"id": "req-" + "0" * 25 + "Y", "status": "open", "opened": iso_s(12)})])
+        t("t-capbad", "capbad", 10, requests=["capability"], raw_requests=["{broken"])   # a valid request beside a corrupt one
+        t("t-permbad", "permbad", 10, requests=["permission"], raw_requests=["{broken"])  # a readable permission still decides
         (self.tasks / "no-meta").mkdir()
         status = self.status
+        before = self.footprint()
         report = status.build(self.tasks, self.repo, now=self.NOW)
+        self.assertEqual(self.footprint(), before)  # F1: read-only means no write anywhere: objects, index, source, session files
         got = {r["lane"]: r for r in report["lanes"]}
         want = {  # lane: (rule, who)
             "perm": (1, "owner"), "cap": (2, "main"), "none": (3, "main"), "run": (4, "worker"), "revrun": (5, "reviewer"),
             "final": (6, "main"), "rc": (7, "main"), "appr": (8, "main"), "closedun": (9, "main"),
             "unusable": (10, "unknown"), "incomplete": (10, "unknown"), "dead": (10, "unknown"), "queued": (10, "unknown"),
             "twotasks": (4, "worker"), "chain": (4, "worker"), "olderrev": (6, "main"), "badreq": (10, "unknown"),
-            "closedmerged": (10, "unknown"), "badlane": (10, "unknown")}
+            "closedmerged": (10, "unknown"), "badlane": (10, "unknown"), "dirty": (6, "main"),
+            "undisp": (10, "unknown"), "unlease": (10, "unknown"), "unnewer": (10, "unknown"), "idonly": (10, "unknown"),
+            "nokind": (10, "unknown"), "capbad": (10, "unknown"), "permbad": (1, "owner")}
         self.assertEqual(sorted(got), sorted(want))     # the foreign lane is left out, every other open lane has a row
         for name, (rule, who) in want.items():
             with self.subTest(lane=name):
@@ -815,12 +852,22 @@ class StatusTest(unittest.TestCase):
         self.assertEqual(got["perm"]["requests"][0]["kind"], "permission")
         self.assertEqual(got["run"]["state"]["state"], "stalled")  # timeline's word: no first prompt in 4990 s
         self.assertEqual((got["run"]["objective"], got["run"]["step"], got["run"]["age"]), ("objective of run", "S1", "2d"))
+        self.assertIn("t-cap", got["cap"]["next"])        # F5: the row's own values replace TASK, REQ, LANE and STEP
+        self.assertIn("req-" + "0" * 25 + "A", got["cap"]["next"])
+        self.assertIn("review t-final", got["final"]["next"])
+        self.assertIn("retry t-rc", got["rc"]["next"])
+        self.assertIn("lane close appr S1", got["appr"]["next"])
+        self.assertIn("lane remove closedun", got["closedun"]["next"])
+        self.assertIn("t-unnew-new", got["unnewer"]["next"])
         wheres = " ".join(p["where"] + " " + p["problem"] for p in report["problems"])
-        for word in ("no-meta", "req-", "badlane"):
+        for word in ("no-meta", "req-", "badlane", "t-undisp", "t-unnew-new"):
             self.assertIn(word, wheres)
         order = [r["who"] for r in report["lanes"]]
         self.assertEqual(order, sorted(order, key=lambda w: status.WHO_ORDER[w]))  # owner, then main, then worker/reviewer, unknown last
         text = status.render(report)
+        for name in want:
+            if name != "badlane":
+                self.assertIn("objective of " + name, text)   # F4: text mode shows every row field
         self.assertEqual(len([line for line in text.splitlines() if "  -> " in line]), len(want))
         for secret in ("done", "broken"):
             self.assertNotIn(secret, text)

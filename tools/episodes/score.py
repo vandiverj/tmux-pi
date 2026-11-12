@@ -1633,11 +1633,9 @@ def _standing(run, who, by_then, claim, final):
 # start of the stop's version, unless that version was observed before the start (the stamp then dates a rewrite). The result
 # at a moment is the set of values the consistent histories hold then; contradictory evidence (pieces of one time that
 # disagree) leaves no history: the empty set.
-# Two facts bound that freedom. (1) A withdrawal comes with a new turn (report.sh and reporter.ts unlink result.md as the turn
-# starts), which changes the worker's stamp: no withdrawal falls in [stamp, last poll] of consecutive polls with the same
-# state and a usable stamp (stable_windows). (2) A notice-only version (SETTLED: a result whose status no piece shows) is
-# bracketed by no result: it never turns into a shown status without a withdrawal, so in a stable gap a notice stands for
-# the status the next observation shows.
+# A notice-only version (SETTLED: a result whose status no piece shows) never turns into a shown status without a withdrawal.
+# Round 7 (owner, option A2): no other bound on a withdrawal. result.md's mtime is not a write time (report.sh restores with
+# `cp -p`) and a poll's whole-second stamp does not show the worker had no new turn since.
 NO_RESULT = "none"               # a piece showing the task held no result
 SETTLED = "settled"              # tmux-pi's notice: a result with a RESULT_STATUS exists; which one, the notice does not say
 TRUNCATED_RE = re.compile(r"(?i)truncated")
@@ -1703,34 +1701,14 @@ def result_evidence(run, task):
 
 
 NEG_INF = float("-inf")
-FOREVER = datetime.max.replace(tzinfo=timezone.utc)      # result.md written at W holds its result from W on
 
 
-def stable_windows(run, task):
-    """[(since, until)]: spans in which the worker had no new turn: runs of consecutive polls of the task with the same state
-    and the same usable stamp (not after its poll), each from the stamp to its last poll."""
-    out, last = [], None
-    for o in run.obs(task["id"]):
-        own = o.get("_own")
-        key = (o.get("state"), own) if own is not None and own <= o["_at"] else None
-        if key is None:
-            last = None
-        elif key == last:
-            out[-1][1] = o["_at"]
-        else:
-            # a busy poll's stamp dates a new turn that began in its second, which may have removed result.md then
-            out.append([min(own + timedelta(seconds=1), o["_at"]) if o.get("state") in BUSY_STATES + ("permission",) else own, o["_at"]])
-            last = key
-    return [(a, b) for a, b in out]
-
-
-def result_possible(pieces, at, windows=()):
+def result_possible(pieces, at):
     """(possible, why): the set of values (NO_RESULT, a status, or SETTLED for a result whose status a notice left unsaid) the
     task's result can hold at `at` in the histories consistent with every piece (the model above); empty when none is.
     Pieces of one time are one observation: it allows the values every piece there allows (a notice: any status some piece
     shows, or SETTLED). A history gives each observation one of its allowed values. Between two observations the result goes
-    from the earlier value to the later one directly, or through no result (a withdrawal and a restore) unless the gap lies in
-    a stable window; SETTLED turns into a shown status only through no result. The value at `at` between two observations is
+    from the earlier value to the later one directly, or through no result (a withdrawal and a restore). The value at `at` between two observations is
     the earlier value (kept), no result (withdrawn before `at`, restored after it), or the later value once its version may
     have started: no stop of the later observation was written after `at` (a stop's start bounds its version)."""
     statuses = {p[1] for p in pieces if p[1] not in (NO_RESULT, SETTLED)}
@@ -1745,37 +1723,20 @@ def result_possible(pieces, at, windows=()):
     if not groups:
         return frozenset({NO_RESULT}), "no dated evidence of the result"
     n = len(groups)
-    stable = [any(since <= groups[i]["at"] and groups[i + 1]["at"] <= until for since, until in windows) for i in range(n - 1)]
 
     def version_start(m, b):
-        """the latest start of a stop of status b in the version that holds observation m: its own stops and, while no
-        withdrawal or change can come between (a stable gap to an observation that allows only b), the stops after it,
-        unless the version was observed before that stop's start."""
-        out = [st for status, st in groups[m]["stops"] if status == b]
-        k = m
-        while k + 1 < n and stable[k] and groups[k + 1]["allowed"] == {b}:
-            k += 1
-            out += [st for status, st in groups[k]["stops"] if status == b and st <= groups[m]["at"]]
-        return max(out, default=None)
-
-    def direct(a, b):
-        """a changes to b without a withdrawal: a first write, or one status to another; not to no result, and not
-        between a notice's unsaid status and a shown one."""
-        return a == b or a == NO_RESULT or (b != NO_RESULT and SETTLED not in (a, b))
-
-    def step(i, a, b):
-        """a at observation i then b at observation i + 1 in some history: directly, or through no result (not in a stable
-        window)."""
-        return direct(a, b) or not stable[i]
+        """the latest start of a stop of status b in the version that holds observation m: its own stops (a withdrawal may come
+        between observations, so no later observation's stop joins this version)."""
+        return max([st for status, st in groups[m]["stops"] if status == b], default=None)
 
     left = [set(groups[0]["allowed"])]
     for i in range(1, n):
-        left.append({b for b in groups[i]["allowed"] if any(step(i - 1, a, b) for a in left[-1])})
+        left.append({b for b in groups[i]["allowed"] if bool(left[-1])})
     if not left[-1]:
         return frozenset(), "no history fits the evidence (%s)" % "; ".join(g["source"] for g in groups)
     right = [None] * (n - 1) + [set(groups[-1]["allowed"])]
     for i in range(n - 2, -1, -1):
-        right[i] = {a for a in groups[i]["allowed"] if any(step(i, a, b) for b in right[i + 1])}
+        right[i] = {a for a in groups[i]["allowed"] if bool(right[i + 1])}
     m = next((i for i, g in enumerate(groups) if g["at"] >= at), n)
     if m < n and groups[m]["at"] == at:
         return frozenset(left[m] & right[m]), groups[m]["source"]
@@ -1784,27 +1745,17 @@ def result_possible(pieces, at, windows=()):
         possible = set(left[-1])
     else:
         pairs = [(NO_RESULT, b) for b in right[0]] if m == 0 else [
-            (a, b) for a in left[m - 1] for b in right[m] if step(m - 1, a, b)]
-        def covered(x, y):
-            """no withdrawal can fall in (x, y): one stable window holds it."""
-            return any(since <= x and y <= until for since, until in windows)
-
+            (a, b) for a in left[m - 1] for b in right[m]]
         for a, b in pairs:
-            first = m == 0 or groups[m - 1]["at"] == NEG_INF
-            before = first or not covered(groups[m - 1]["at"], at)       # a withdrawal fits in (previous observation, at)
-            after = not covered(at, groups[m]["at"])                       # ... or in (at, next observation)
             if b == a:
                 possible.add(a)
-                if a != NO_RESULT and before:
+                if a != NO_RESULT:
                     possible.add(NO_RESULT)               # withdrawn before `at`, restored after it
                 continue
-            if direct(a, b) or after:
-                possible.add(a)                           # kept until after `at`
-            if a != NO_RESULT and b != NO_RESULT and before:
+            possible.add(a)                               # kept until after `at`
+            if a != NO_RESULT and b != NO_RESULT:
                 possible.add(NO_RESULT)                   # withdrawn before `at`, restored after it
             bound = version_start(m, b)
-            if not (direct(a, b) or before):
-                continue
             if bound is None or bound <= at:
                 possible.add(b)
             else:
@@ -1821,11 +1772,7 @@ def result_by(run, task, at):
     """(possible, why, seen): the task's result at `at` (result_possible over result_evidence; total, never None) and
     whether any piece is dated at or before `at`."""
     pieces = result_evidence(run, task)
-    windows = stable_windows(run, task)
-    written = [p[0] for p in pieces if p[3].startswith("result.md (")]
-    possible, why = result_possible(pieces, at, windows + [(min(written), FOREVER)] if written else windows)
-    if written and not possible:        # a record after the file's time says it was absent: the file's time is a point only
-        possible, why = result_possible(pieces, at, windows)
+    possible, why = result_possible(pieces, at)
     return possible, why, any(p[0] <= at for p in pieces)
 
 

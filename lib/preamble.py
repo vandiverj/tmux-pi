@@ -45,6 +45,27 @@ HARNESS_TOOLS = {
     "pi": {"safe_grep": "safe_grep", "safe_read": "safe_read", "read_tool": "the read tool", "shell": "bash"},
 }
 PLACEHOLDER = re.compile(r"\{([a-z_]+)\}")
+# What each harness adapter registers beyond the tools tp-spawn passes on the command line, and what it can and cannot do for
+# Main; read by lib/launch_record.py for launch.json (HB2b). Tools: tmux-pi-safe (claude/mcp/safe.mjs through claude/mcp.json;
+# agent/extensions/safe.ts), the docs and ctx servers only with TP_DOCS_TOOLS=1 / TP_CTX_TOOLS=1 (bin/tp-claude, bin/tp-pi;
+# server names in claude/mcp.docs.json, claude/mcp.ctx.json). Capabilities, from audit B-control sections 4-5:
+#   interrupt.escape  Main can stop a turn with an Escape key (bin/tp-contract pause_worker; claude needs the pane check)
+#   interrupt.rpc     a programmatic abort (pi has RPC mode, but workers run interactive; Claude has none): unsupported for both
+#   permission.state  the reporter records a permission prompt as state "permission" (claude report.sh Notification; pi none)
+#   prompt.turns      promptTurn/completedTurn counted per prompt (report.sh, reporter.ts; HB4a round 5)
+#   cost.known        the reporter knows the cost of a turn (pi byModel cost; claude reports costKnown false)
+_DOCS = ("api_signature", "docs_search")
+_CTX = ("ctx_brief", "ctx_symbol", "ctx_relations", "ctx_knowledge", "ctx_note")
+HARNESS_ADAPTER = {
+    "claude": {"tools": [HARNESS_TOOLS["claude"]["safe_grep"], HARNESS_TOOLS["claude"]["safe_read"]],
+               "docs_tools": ["mcp__tmux-pi-docs__" + t for t in _DOCS], "ctx_tools": ["mcp__tmux-pi-ctx__" + t for t in _CTX],
+               "supported": ["interrupt.escape", "permission.state", "prompt.turns"],
+               "unsupported": ["interrupt.rpc", "cost.known"]},
+    "pi": {"tools": [HARNESS_TOOLS["pi"]["safe_grep"], HARNESS_TOOLS["pi"]["safe_read"]],
+           "docs_tools": list(_DOCS), "ctx_tools": list(_CTX),
+           "supported": ["interrupt.escape", "prompt.turns", "cost.known"],
+           "unsupported": ["interrupt.rpc", "permission.state"]},
+}
 
 
 def _present(path):

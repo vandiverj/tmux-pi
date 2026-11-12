@@ -250,6 +250,20 @@ class RepeatedFamilyGateTests(RetryCase):
         for path in sorted(self.state.rglob("*")):
             if path.is_file() and not path.name.endswith(".lock"):
                 out[str(path.relative_to(self.state))] = path.read_text()
+        root = self.state.resolve()
+
+        def unhash(node):
+            """A launch.json piece {path, sha256} whose file is in the digested tree: that file's text is compared itself, and its hash
+            holds the random task ids that `clean` cannot reach inside a hash, so the hash becomes a marker naming the file."""
+            if isinstance(node, dict):
+                inside = isinstance(node.get("path"), str) and node.get("sha256") and Path(node["path"]).resolve().is_relative_to(root)
+                return {k: (f"IN-TREE:{Path(node['path']).resolve().relative_to(root)}" if k == "sha256" and inside else unhash(v))
+                        for k, v in node.items()}
+            return [unhash(v) for v in node] if isinstance(node, list) else node
+        for rel in list(out):
+            if rel.endswith("launch.json"):
+                out[rel] = json.dumps(unhash(json.loads(out[rel])), sort_keys=True)
+
         def clean(text):
             for task, name in names.items():
                 text = text.replace(task, name)

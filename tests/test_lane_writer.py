@@ -178,6 +178,14 @@ class DispatchIntoALaneTests(LaneCase):
         sys.path.insert(0, str(ROOT / "lib"))
         import preamble
         self.assertTrue(prompt.startswith(preamble.contract("pi") + "\n\n# Repository Instructions\n\nPREAMBLE-OF-THE-MAIN-TREE"), prompt[:200])
+        # HB2b: its launch record names the lane route and the main tree's preamble, hashed as delivered.
+        record = json.loads((task / "launch.json").read_text())
+        piece = next(p for p in record["instructions"] if p["name"] == "preamble")
+        self.assertEqual((record["route"], record["context"]["lane"]), ("lane", "alpha"))
+        self.assertEqual(os.path.realpath(piece["path"]), os.path.realpath(self.repo / ".tmux-pi/worker-preamble.md"))
+        start = prompt.index("# Repository Instructions")
+        end = prompt.find("\n\n# ", start + 1)
+        self.assertEqual(piece["sha256"], hashlib.sha256(prompt[start:end if end >= 0 else None].encode()).hexdigest())
 
     def test_the_lanes_own_preamble_wins_when_it_has_one(self):
         self.lane_ok()

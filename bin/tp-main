@@ -143,6 +143,13 @@ if ! [[ "$main_id" =~ $id_pattern ]]; then
 fi
 export TP_MAIN_ID="$main_id"
 core="$(cat "$ROOT/agent/orchestrator.md")"
+# Main's launch record (HB2b, lib/launch_record.py): <state dir>/main-launch.json, rewritten at every start and recovery. It
+# names what Main is given (prompt files, tp-claude's settings and plugins, the harness, model and effort when the arguments
+# name them) by path and hash only, and changes nothing Main is given. A record that cannot be written is said, not fatal.
+if [[ -n "${TP_STATE_DIR:-}" && -d "$TP_STATE_DIR" && ( "$harness" == pi || "$harness" == claude ) ]]; then
+  python3 "$ROOT/lib/launch_record.py" main --state-dir "$TP_STATE_DIR" --harness "$harness" --main-id "$main_id" --root "$ROOT" -- "$@" ||
+    echo "tp-main: could not write $TP_STATE_DIR/main-launch.json; starting without a launch record" >&2
+fi
 case "$harness" in
   pi)
     exec "$ROOT/bin/tp-pi" --append-system-prompt "$core

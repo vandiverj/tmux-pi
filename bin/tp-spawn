@@ -610,11 +610,13 @@ if [[ ${#contexts[@]} -gt 0 || ${#notes[@]} -gt 0 || -n "$context_manifest_file"
   if [[ -n "$lane_facts" ]]; then packet+=$'\n'"$lane_facts"$'\n'; fi
 fi
 screen_contexts
+evidence=()  # the --context files the packet holds (path and range, as labelled), for launch.json
 for spec in ${contexts[@]+"${contexts[@]}"}; do
   if ! read_context "$spec"; then
     notes+=("Sensitive context $spec was omitted from the packet. If this task needs specific information from it, request authorization through the worker's permission prompt before reading.")
     continue
   fi
+  evidence+=("$label")
   ext="${path##*.}"; [[ "$ext" == "$path" || "$ext" == */* ]] && ext=""
   f="$(fence "$body")"
   packet+=$'\n'"## $label"$'\n\n'"$f$ext"$'\n'"$body"$'\n'"$f"$'\n'
@@ -812,6 +814,29 @@ if [[ -n "$system_prompt" ]]; then
 else
   printf '%s\n\0' "$run_sh" | tp_write_many --root "$state_dir" --exec "$task_dir/run.sh"
 fi
+
+# launch.json (HB2b, lib/launch_record.py): what this worker is started with, written atomically now that the system prompt,
+# packet and harness command are final and before the window that starts the harness. Paths, hashes, names and versions only.
+# A failure of the record never stops the start (the record then says status error, or one stderr line).
+json_list() { jq -nc '$ARGS.positional' --args -- "$@"; }
+launch_kind="$kind"; if [[ "$contract" != null ]]; then launch_kind="${kind:-task}"; fi
+# The pane takes its environment from the tmux session, not from this process: the TP_PI_NODE bin/tp-pi will see there (the
+# session's, else the global one; "unset" when tmux has neither; empty when tmux did not answer, and then this process's is used).
+pane_pi_node=""
+if [[ "$worker" == pi ]]; then
+  pane_pi_node="$(tmux show-environment -t "=$session" TP_PI_NODE 2>/dev/null)" ||
+    pane_pi_node="$(tmux show-environment -g TP_PI_NODE 2>/dev/null)" || pane_pi_node="unset"
+fi
+jq -n --arg id "$id" --arg task_dir "$task_dir" --arg state_dir "$state_dir" --arg workdir "$workdir" --arg harness "$worker" \
+  --arg role "$role" --arg preamble_role "$preamble_role" --arg model "$model" --arg launch_model "$launch_model" \
+  --arg parent "$parent" --arg review_of "$review_of" --arg kind "$launch_kind" --arg lane "$lane" --arg lane_step "$lane_step" \
+  --arg preamble_from "$preamble_from" --arg session "$session" --arg ctx "${TP_CTX_TOOLS:-}" --arg pane_pi_node "$pane_pi_node" \
+  --argjson argv "$(json_list "${cmd[@]:1}")" --argjson worker_env "$(json_list ${worker_env[@]+"${worker_env[@]}"})" \
+  --argjson evidence "$(json_list ${evidence[@]+"${evidence[@]}"})" \
+  '{id:$id, task_dir:$task_dir, state_dir:$state_dir, workdir:$workdir, harness:$harness, role:$role, preamble_role:$preamble_role,
+    model:$model, launch_model:$launch_model, parent:$parent, review_of:$review_of, kind:$kind, lane:$lane, lane_step:$lane_step,
+    preamble_from:$preamble_from, session:$session, ctx_tools:($ctx == "1"), pane_pi_node:$pane_pi_node, argv:$argv, worker_env:$worker_env, evidence:$evidence}' |
+  python3 "$ROOT/lib/launch_record.py" worker || echo "tp-spawn: launch record failed; starting without it" >&2
 
 pane="$(tmux new-window -d -P -F '#{pane_id}' -t "=$session:" -n "sa:$id" -c "$workdir" \
   "bash $(printf %q "$task_dir/run.sh")")"

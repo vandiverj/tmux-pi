@@ -509,17 +509,30 @@ esac
         review = self.raw("review", third["id"], "--force")
         self.assertEqual(review.returncode, 0, review.stderr)
         reviewer = next(d for d in (self.state / "tasks").iterdir() if (d / "review-of").exists())
+        self.blocks = {role: preamble._parts(str(self.project), role)[1] for role in ("coder", "code-reviewer")}   # before it goes
         (self.state / "agent-tools.json").unlink()
         spawned = subprocess.run([str(ROOT / "bin/tp-spawn"), "--worker", "claude", "--model", "sonnet", "--workdir", str(self.project),
                                   "--preamble-role", "code-reviewer", "--", "t"], env=self.env, text=True, capture_output=True)
         self.assertEqual(spawned.returncode, 0, spawned.stderr)
-        rows = (("dispatch", self.task_dir(first), "pi", "# Coder", True, False),
-                ("retry", self.task_dir(second), "pi", "# Coder", True, True),
-                ("retry of a retry", self.task_dir(third), "pi", "# Coder", True, True),
-                ("review", reviewer, json.loads((reviewer / "meta.json").read_text())["worker"], "# Code reviewer", True, False),
-                ("claude, no manifest", self.state / "tasks" / spawned.stdout.strip(), "claude", "# Code reviewer", False, False))
-        for name, task, harness, role, tools, prior in rows:
+        # HB2b: the routes tp-spawn tells apart by its own inputs, each started directly (contract -k, trial, bench session).
+        direct = {}
+        for name, extra, env in (("contract", ["-k", "task"], {}), ("trial", ["--worker-env", "TP_TRIAL_ID=trial-1"], {}),
+                                 ("bench", [], {"TP_SESSION": "bench-fixture"})):
+            run = subprocess.run([str(ROOT / "bin/tp-spawn"), "--worker", "pi", "--model", MODEL, "--workdir", str(self.project),
+                                  "--role", "coder", *extra, "--", "t"], env={**self.env, **env}, text=True, capture_output=True)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            direct[name] = self.state / "tasks" / run.stdout.strip()
+        rows = (("dispatch", self.task_dir(first), "pi", "# Coder", True, False, "spawn", "coder"),
+                ("retry", self.task_dir(second), "pi", "# Coder", True, True, "retry", "coder"),
+                ("retry of a retry", self.task_dir(third), "pi", "# Coder", True, True, "retry", "coder"),
+                ("review", reviewer, json.loads((reviewer / "meta.json").read_text())["worker"], "# Code reviewer", True, False,
+                 "review", "code-reviewer"),
+                ("claude, no manifest", self.state / "tasks" / spawned.stdout.strip(), "claude", "# Code reviewer", False, False,
+                 "spawn", "code-reviewer"),
+                *((name, task, "pi", "# Coder", False, False, name, "coder") for name, task in direct.items()))
+        for name, task, harness, role, tools, prior, route, role_name in rows:
             with self.subTest(row=name):
+                self.assert_launch_record(task, harness, route, role_name, tools, prior)
                 prompt, packet = self.system_prompt(task), (task / "packet.md").read_text().split("# Context")[0]
                 self.assertTrue(prompt.startswith(CONTRACT[harness]), f"{name}: the prompt does not open with the {harness} contract")
                 self.assertEqual((prompt + packet).count("contract: worker v1"), 1, f"{name}: the contract is not there once")
@@ -539,11 +552,131 @@ esac
                 self.assertEqual("# Prior Task\n\nPrior result: " in prompt, prior, f"{name}: prior task block")
         self.assertIn(str(self.task_dir(second) / "result.md"), self.system_prompt(self.task_dir(third)))   # the nearest parent
 
+    def assert_launch_record(self, task, harness, route, role, tools, prior):
+        """HB2b: the task's launch.json names its route, role and harness, and each hash is the hash of what was delivered."""
+        import hashlib
+        import agent_tools
+        sha = lambda text: hashlib.sha256(text.encode()).hexdigest()  # noqa: E731
+        raw = (task / "launch.json").read_text()
+        record = json.loads(raw)
+        prompt, packet = self.system_prompt(task), (task / "packet.md").read_text()
+        meta = json.loads((task / "meta.json").read_text())
+        self.assertEqual((record["schema"], record["task"], record["route"], record["harness"], record["role"]),
+                         ("tp-launch:v1", task.name, route, harness, role))
+        self.assertEqual(record["model"], meta["model"] or None)
+        self.assertIn(record["status"], ("prepared", "failed"))
+        self.assertEqual(record["status"] == "failed", "failure" in record)
+        pieces = {p["name"]: p for p in record["instructions"]}
+        self.assertEqual((pieces["contract"]["sha256"], pieces["contract"]["version"]), (sha(CONTRACT[harness]), "v1"))
+        self.assertEqual(pieces["system-prompt"]["sha256"], sha(prompt))
+        self.assertEqual(pieces["packet"]["sha256"], sha(packet.rstrip("\n")))   # run.sh passes "$(cat packet.md)"
+        role_body = (ROOT / "agent/roles" / f"{role}.md").read_text().rstrip("\n")
+        self.assertIn(role_body, packet)
+        self.assertEqual(pieces["role"]["sha256"], sha(role_body))
+        block = self.blocks[role] if tools else ""
+        self.assertEqual("manifest" in pieces, tools)
+        if tools:
+            self.assertIn(block, prompt)
+            self.assertEqual(pieces["manifest"]["sha256"], sha(block))
+        self.assertEqual("prior-task" in pieces, prior)
+        if prior:
+            text = "# Prior Task\n\n" + agent_tools.prior_line(str(self.state), meta["parent"])
+            self.assertIn(text, prompt)
+            self.assertEqual(pieces["prior-task"]["sha256"], sha(text))
+            self.assertEqual(record["context"]["parent"], meta["parent"])
+        self.assertEqual("bash-suffix-rule" in pieces, harness == "claude")
+        for piece in record["instructions"]:   # a null hash always says why
+            if piece["sha256"] is None:
+                self.assertIn(f"instructions[{piece['name']}].sha256", record["null_reasons"])
+        self.assertEqual(record["capabilities"], {k: preamble.HARNESS_ADAPTER[harness][k] for k in ("supported", "unsupported")})
+        for tool in preamble.HARNESS_ADAPTER[harness]["tools"]:
+            self.assertIn(tool, record["tools"]["exposed"])
+        # No secrets or text: paths, hashes, names and versions only.
+        for line in (prompt + "\n" + packet).splitlines():
+            if len(line) > 40:
+                self.assertNotIn(line, raw)
+        self.assertNotIn("Make a focused change", raw)
+
+    def test_launch_record_of_a_missing_harness_binary_is_failed_never_prepared(self):
+        # HB2b: a harness the launcher cannot find gets a record marked failed, with why; the start itself goes on as before.
+        bare = os.pathsep.join((self.env["PATH"].split(os.pathsep)[0], "/usr/bin", "/bin"))
+        for harness, env in (("claude", {"PATH": bare}), ("pi", {"PATH": bare, "TP_PI_NODE": str(self.root / "no-node" / "node")}),
+                             ("pi", {"PATH": bare, "TP_PI_NODE": ""})):
+            with self.subTest(harness=harness, env=sorted(env)):
+                run = subprocess.run([str(ROOT / "bin/tp-spawn"), "--worker", harness, "--workdir", str(self.project), "--role", "coder",
+                                      "--", "t"], env={**self.env, **env}, text=True, capture_output=True)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                record = json.loads((self.state / "tasks" / run.stdout.strip() / "launch.json").read_text())
+                self.assertEqual(record["status"], "failed")
+                self.assertIn(f"the {harness} harness binary is missing", record["failure"])
+                self.assertIsNone(record["harness_version"])
+
+    def test_launch_record_resolves_pi_from_the_panes_tmux_environment_not_tp_spawns(self):
+        # HB2b: the pane takes TP_PI_NODE from the tmux session; the record follows what tmux says the pane will see.
+        installed = self.root / "node" / "bin"
+        installed.mkdir(parents=True)
+        for name in ("node", "pi"):
+            (installed / name).write_text("#!/bin/sh\nexit 0\n")
+            (installed / name).chmod(0o755)
+        package = self.root / "node/lib/node_modules/@earendil-works/pi-coding-agent/package.json"
+        package.parent.mkdir(parents=True)
+        package.write_text(json.dumps({"name": "@earendil-works/pi-coding-agent", "version": "9.9.9"}))
+        missing = str(self.root / "no-node" / "node")
+        for answer, own, status in ((f"TP_PI_NODE={installed / 'node'}", missing, "prepared"),
+                                    (f"TP_PI_NODE={missing}", str(installed / "node"), "failed"),
+                                    ("-TP_PI_NODE", str(installed / "node"), "failed")):
+            with self.subTest(answer=answer):
+                fake_tmux(self.root / "bin", 'case "$1" in has-session) exit 0 ;; show-options) printf "%s\\n" "$TP_STATE_DIR" ;; '
+                                             f'show-environment) printf "%s\\n" "{answer}" ;; new-window) printf "%%fake\\n" ;; *) exit 0 ;; esac\n')
+                run = subprocess.run([str(ROOT / "bin/tp-spawn"), "--worker", "pi", "--workdir", str(self.project), "--role", "coder",
+                                      "--", "t"], env={**self.env, "TP_PI_NODE": own, "HOME": str(self.root)}, text=True, capture_output=True)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                record = json.loads((self.state / "tasks" / run.stdout.strip() / "launch.json").read_text())
+                self.assertEqual(record["status"], status, record)
+                self.assertEqual(record["harness_version"], "9.9.9" if status == "prepared" else None)
+
+    def test_a_launch_record_that_cannot_be_built_never_stops_the_launch(self):
+        # HB2b round 2: the record is never what decides whether a worker starts. A copied tree with an older lib (a preamble without
+        # `contract`) and a worker whose packet is missing both end with exit 0 and an error record (or one stderr line), never a traceback.
+        import shutil
+        tree = self.root / "old-tree" / "lib"
+        tree.mkdir(parents=True)
+        for name in ("launch_record.py", "safe_write.py"):
+            shutil.copy(ROOT / "lib" / name, tree / name)
+        (tree / "preamble.py").write_text("HARNESS_ADAPTER = {'pi': {}, 'claude': {}}\n")
+        task = self.state / "tasks" / "coder-old0001"
+        task.mkdir(parents=True)
+        (task / "packet.md").write_text("x\n")
+        facts = json.dumps({"id": "coder-old0001", "task_dir": str(task), "state_dir": str(self.state), "workdir": str(self.project),
+                            "harness": "pi", "role": "coder"})
+        run = subprocess.run(["python3", str(tree / "launch_record.py"), "worker"], input=facts, text=True, capture_output=True)
+        self.assertEqual((run.returncode, run.stderr), (0, ""))
+        record = json.loads((task / "launch.json").read_text())
+        self.assertEqual((record["schema"], record["status"], record["task"], record["role"], record["harness"]),
+                         ("tp-launch:v1", "error", "coder-old0001", "coder", "pi"))
+        self.assertIn("AttributeError", record["error"])
+        # Nothing to write to (facts that are not JSON; a state dir that is gone): one stderr line, still exit 0.
+        for stdin, argv in (("not json", ["worker"]), ("", ["main", "--state-dir", str(self.root / "gone"), "--harness", "pi"])):
+            run = subprocess.run(["python3", str(ROOT / "lib/launch_record.py"), *argv], input=stdin, text=True, capture_output=True)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertTrue(run.stderr.startswith("launch record: "), run.stderr)
+            self.assertNotIn("Traceback", run.stderr)
+
+    def test_a_start_that_fails_before_the_harness_leaves_no_launch_record(self):
+        # HB2b: tp-spawn removes the task directory of a start that fails before the window (here the window itself fails).
+        fake_tmux(self.root / "bin", 'case "$1" in has-session) exit 0 ;; show-options) printf "%s\\n" "$TP_STATE_DIR" ;; '
+                                     'new-window) exit 1 ;; *) exit 0 ;; esac\n')
+        run = subprocess.run([str(ROOT / "bin/tp-spawn"), "--worker", "pi", "--workdir", str(self.project), "--role", "coder", "--", "t"],
+                             env=self.env, text=True, capture_output=True)
+        self.assertNotEqual(run.returncode, 0)
+        self.assertEqual(list((self.state / "tasks").glob("*/launch.json")), [])
+
     def test_no_launcher_starts_a_harness_without_tp_spawn(self):
         # Every route reaches the contract only through bin/tp-spawn; a launcher that ran a harness itself would skip it.
         known = {"bin/tp-spawn": "every worker", "bin/tp-main": "Main itself (HB2 step b)",
                  "bin/tp-claude-bootstrap": "the owner's folder-trust start", "tools/qual/summarize_meaning.py": "a text summary, no task",
                  "tools/qual/summarize_run.py": "a text summary, no task",
+                 "lib/launch_record.py": "reads bin/tp-pi's PI_NODE default as text for the launch record (HB2b); starts nothing",
                  "agent/extensions/assistant.ts": "ask_local, a read-only helper with its own prompt and no task (HB2 step b)"}
         forms = [form for h in ("tp-pi", "tp-claude") for form in (f'bin/{h}"', f'"bin" / "{h}"', f'bin("{h}")')]
         files = [p for d in ("bin", "lib", "tools/qual", "tools/agent", "agent/extensions", "claude/mcp")

@@ -433,7 +433,8 @@ class Realistic(Base):
         self.assertIn("outcome [", text)
         self.assertIn("acceptance [", text)
         self.assertIn("obligations (HB5): no obligation records exist yet", text)
-        self.assertIn("launch record (HB2): no launch record exists yet", text)
+        self.assertIn("launch record (HB2; tasks: [launch: ...] in active work; Main) [no record]: none (Main was started before "
+                      "launch records, or not by tp-main)", text)
         self.assertIn("provisional (not in force until the owner confirms; tp-agent work decision confirm ID --quote ...):\n  hub/R9", text)
         self.assertNotIn("a main guess", text)
         self.assertNotIn("no workspace attached", text)
@@ -464,6 +465,34 @@ class Realistic(Base):
         self.assertTrue(any(l.startswith("- coder-paused coder paused result_status: blocked") for l in lines), lines)
         self.assertTrue(any(l.startswith("- coder-running coder working") for l in lines), lines)
         self.assertNotIn("no active, paused or unreviewed tasks", text)
+
+    def test_the_brief_shows_each_tasks_launch_record_and_mains(self):
+        # HB2b: per listed task, contract version, role, route and unsupported capabilities from its launch.json; a task with none
+        # says so; a record of another schema major is refused, not read as v1; Main's own record closes the brief.
+        def record(role, route, **more):
+            return {"schema": "tp-launch:v1", "status": "prepared", "task": "t", "role": role, "route": route, "harness": "claude",
+                    "instructions": [{"name": "contract", "path": "agent/contract/worker.md", "sha256": "0" * 64, "version": "v1"}],
+                    "capabilities": {"supported": ["interrupt.escape"], "unsupported": ["interrupt.rpc", "cost.known"]},
+                    "recorded": "2026-01-01T00:00:00Z", **more}
+        (self.task("coder-new", "coder", "working") / "launch.json").write_text(json.dumps(record("coder", "retry")))
+        self.task("coder-old", "coder", "working")
+        (self.task("coder-next", "coder", "working") / "launch.json").write_text(json.dumps({**record("coder", "spawn"),
+                                                                                              "schema": "tp-launch:v2"}))
+        failed = record("code-reviewer", "review", status="failed", failure="the claude harness binary is missing: not on PATH")
+        (self.task("review-x", "code-reviewer", "working") / "launch.json").write_text(json.dumps(failed))
+        (self.state / "main-launch.json").write_text(json.dumps(record("main", "main", start="resume", model="opus", instructions=[])))
+        lines = self.brief().splitlines()
+        row = {l.split()[1]: l for l in lines if l.startswith(("- coder-", "- review-"))}
+        self.assertEqual(row["coder-new"], "- coder-new coder working [launch: contract v1, role coder, route retry, unsupported "
+                                           "interrupt.rpc+cost.known]")
+        self.assertEqual(row["coder-old"], "- coder-old coder working [launch: no record]")
+        self.assertIn("[launch: unusable: launch.json is tp-launch:v2; this reader knows tp-launch:v1 only]", row["coder-next"])
+        self.assertIn("[launch: FAILED (the claude harness binary is missing", row["review-x"])
+        main = [l for l in lines if l.startswith("launch record (HB2")]
+        self.assertEqual(main, ["launch record (HB2; tasks: [launch: ...] in active work; Main) [2026-01-01T00:00:00Z]: claude resume, "
+                                "model opus, contract none, role main, route main, unsupported interrupt.rpc+cost.known"])
+        for l in lines:
+            self.assertLessEqual(len(l), work_brief.LINE_CHARS)
 
     REVIEW = "{verdict}\nRESULT_STATUS: complete\n\nCoverage\n- lib/work_brief.py: reviewed the whole file and its callers\n"
 

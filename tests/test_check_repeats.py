@@ -500,6 +500,39 @@ class RepeatsTest(unittest.TestCase):
             self.assertIn("interpreter is not null or {path, version}", problems)
             self.assertIn("symlink skipped", problems)
 
+    def test_main_rerun_seconds_are_judged_per_main_run_against_every_earlier_worker_or_reviewer_run(self):
+        """HB5b round 2 F1: one scenario per row; each Main run's seconds count when an earlier (by end time) successful worker
+        or reviewer run of the same tree, runner and interpreter holds its tests (all seconds), or lies inside them (the
+        smaller time, estimated); other Main runs never cover a Main run."""
+        xy, x, y = PY + ["tests.test_x", "tests.test_y"], PY + ["tests.test_x"], PY + ["tests.test_y"]
+        I14, I39 = (P314, "3.14.0"), (P39, "3.9.6")
+        # name, runs in time order: (who, cmd, tree, seconds, interp), expected main_rerun of the lane
+        rows = [
+            ("worker xy, Main x, Main x: each judged against the worker", [("w", xy, T, 3, I14), ("m", x, T, 4, I14), ("m", x, T, 5, I14)], 9),
+            ("Main xy, worker xy, Main x: the later Main run is covered; the first is before any worker", [
+                ("m", xy, T, 7, I14), ("w", xy, T, 3, I14), ("m", x, T, 4, I14)], 4),
+            ("a reviewer is the earlier run", [("r", xy, T, 3, I14), ("m", x, T, 4, I14)], 4),
+            ("a covering run on another tree", [("w", xy, T2, 3, I14), ("m", x, T, 4, I14)], 0),
+            ("a covering run with another interpreter", [("w", xy, T, 3, I39), ("m", x, T, 4, I14)], 0),
+            ("a partial cover: the worker's tests lie inside Main's", [("w", x, T, 3, I14), ("m", xy, T, 8, I14)], 3),
+            ("no cover: disjoint tests", [("w", y, T, 3, I14), ("m", x, T, 4, I14)], 0),
+            ("Main before any worker run", [("m", x, T, 4, I14), ("w", x, T, 3, I14)], 0),
+            ("a failed worker run covers nothing", [("w", x, T, 3, I14, 1), ("m", x, T, 4, I14)], 0),
+        ]
+        for name, runs, want in rows:
+            with self.subTest(name), tempfile.TemporaryDirectory() as tmp:
+                session = Path(tmp) / "session"
+                s, m = Tasks(session / "tasks"), Tasks(session)
+                s.task("coder-1")
+                s.task("review-coder-1-1", review_of="coder-1")
+                for at, (who, cmd, tree, sec, interp, *rc) in enumerate(runs, 1):
+                    if who == "m":
+                        m.run(".", cmd, tree, 0, sec, at=at, interp=interp, dirname="main-runs", extra={"role": "main", "lane": "ln", "step": "S1"})
+                    else:
+                        s.run("coder-1" if who == "w" else "review-coder-1-1", cmd, tree, rc[0] if rc else 0, sec, at=at, interp=interp)
+                per = {(r["lane"], r["step"]): r for r in repeats.build(str(session / "tasks"))["per_lane_step"]}
+                self.assertAlmostEqual(per[("ln", "S1")]["main_rerun"], want)
+
     def test_case1_planted_schedule(self):
         """Case 1: the brief's planted schedule, scored over every pair of runs, then the CLI over the same directory."""
         with tempfile.TemporaryDirectory() as tmp:

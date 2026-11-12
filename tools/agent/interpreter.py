@@ -7,7 +7,7 @@ object {path, version}, or null when the command starts no python or it cannot b
 way tools/checks/repeats.py reads wrappers: leading NAME=VALUE words, `env [-i] [-u NAME]... [NAME=VALUE]...` and
 `perl -e 'alarm N; exec @ARGV'` are skipped (a PATH they set or remove is the PATH the command sees); the next word is
 the interpreter when its name is python, python3, python3.14 ... Without a `/` it is looked up on that PATH (os.defpath
-when PATH is unset, as exec does), with a `/` it is relative to WORKTREE. path is the real path (links followed); version
+when PATH is unset, as exec does; a relative or empty entry is relative to WORKTREE, the cmd's cwd), with a `/` it is relative to WORKTREE. path is the real path (links followed); version
 is what that interpreter reports (one `python -I -c` start, about 20-40 ms). A shell, a `bash -c` text or any other head
 is not read: null.
 """
@@ -64,7 +64,7 @@ def resolve(worktree, cmd, base_env):
     if "/" in head:
         found = [head if os.path.isabs(head) else os.path.join(worktree, head)]
     else:
-        found = [os.path.join(d or ".", head) for d in env.get("PATH", os.defpath).split(os.pathsep)]
+        found = [os.path.join(worktree, d, head) for d in env.get("PATH", os.defpath).split(os.pathsep)]  # "" and relative: the cmd's cwd
     path = next((p for p in found if os.path.isfile(p) and os.access(p, os.X_OK)), None)
     if path is None:
         return None

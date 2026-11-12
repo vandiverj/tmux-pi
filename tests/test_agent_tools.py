@@ -3,6 +3,7 @@ import session_env  # noqa: F401  first: removes the caller's session, however t
 import json
 import os
 import re
+import select
 import shutil
 import stat
 import subprocess
@@ -1517,8 +1518,11 @@ class TestRunTests(ScriptCase):
         wt = self.tmp / "wt"
         (wt / "venv" / "bin").mkdir(parents=True)
         os.symlink(sys.executable, wt / "venv" / "bin" / "python3")
+        os.symlink(sys.executable, wt / "python3")  # what an empty PATH entry finds
         self.stub("python3", exit_code=1, where=self.tmp / "broken")  # starts, cannot report a version
         sys_python = os.path.realpath("/usr/bin/python3")
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(self.tmp)  # the caller's cwd holds pybin/python3; the worktree (the command's cwd) does not
         alarm = ["perl", "-e", "alarm 60; exec @ARGV"]
         path_env = {"PATH": f"{pybin}:/usr/bin:/bin"}
         rows = [  # name, cmd, PATH the command sees, expected (path, version) or None
@@ -1532,6 +1536,15 @@ class TestRunTests(ScriptCase):
             ("perl alarm then env -u", alarm + ["env", "-u", "FOO", "python3.14"], path_env, (real, version)),
             ("a shell prefix assignment", ["X=1", "python3"], path_env, (real, version)),
             ("relative path in the worktree", ["venv/bin/python3", "-m", "unittest"], path_env, (real, version)),
+            # F2: a relative or empty PATH entry is the command's cwd (the worktree), never the caller's
+            ("a relative PATH entry", ["python3"], {"PATH": "venv/bin:/nonexistent"}, (real, version)),
+            ("a ./ PATH entry", ["python3"], {"PATH": "./venv/bin:/nonexistent"}, (real, version)),
+            ("a leading empty PATH entry", ["python3"], {"PATH": ":/nonexistent"}, (real, version)),
+            ("a trailing empty PATH entry", ["python3"], {"PATH": "/nonexistent:"}, (real, version)),
+            ("an empty entry between colons", ["python3"], {"PATH": "/nonexistent::/nonexistent2"}, (real, version)),
+            ("env PATH= a relative entry", ["env", "PATH=venv/bin:/usr/bin", "python3"], {"PATH": "/nonexistent"}, (real, version)),
+            ("./ head", ["./venv/bin/python3"], path_env, (real, version)),
+            ("a relative entry the caller's cwd does not hold", ["python3"], {"PATH": "pybin:/nonexistent"}, None),
             ("a non-python cmd", ["bash", "x.sh"], path_env, None),
             ("bash -c is not read", ["bash", "-c", "python3 -m unittest"], path_env, None),
             ("missing interpreter", ["python3.99", "-m", "unittest"], path_env, None),
@@ -1588,14 +1601,38 @@ class TestRunTests(ScriptCase):
         self.assertEqual((record["role"], record["lane"], record["step"], record["exit"]), ("main", "ln", "S1", 0))
         self.assertEqual(record["interpreter"], {"path": os.path.realpath(sys.executable), "version": "%d.%d.%d" % sys.version_info[:3]})
         self.assertEqual(list((session / "tasks").iterdir()), [])
-        # without lane/step they are absent; two Mains at the same moment take distinct numbers and lose nothing
-        procs = [subprocess.Popen([str(TOOLS / "test-run.sh"), str(repo), "--main", "--", "true"], env=dict(self.env, **env),
-                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for _ in range(4)]
+        # without lane/step they are absent; two Mains at the same moment take distinct numbers and lose nothing. Both are held
+        # at the claim of number 2 (a mkdir shim on PATH: it reports its arrival on one fifo and waits for the release on
+        # another, no sleep) until both have arrived, then released together: the two claims truly overlap.
+        gate_dir = self.tmp / "barrier"
+        shim = self.tmp / "shim"
+        gate_dir.mkdir()
+        shim.mkdir()
+        os.mkfifo(gate_dir / "arrive")
+        os.mkfifo(gate_dir / "go")
+        (shim / "mkdir").write_text('#!/bin/sh\nfor last; do :; done\ncase "$last" in */2.lock) echo x >"$BARRIER/arrive"; read -r _ <"$BARRIER/go";; esac\n'
+                                    'exec /bin/mkdir "$@"\n')
+        (shim / "mkdir").chmod(0o755)
+        arrive, go = os.open(gate_dir / "arrive", os.O_RDWR), os.open(gate_dir / "go", os.O_RDWR)  # our own end keeps each open
+        self.addCleanup(os.close, arrive)
+        self.addCleanup(os.close, go)
+        both = {**self.env, **env, "BARRIER": str(gate_dir), "PATH": f"{shim}:{env['PATH']}"}
+        procs = [subprocess.Popen([str(TOOLS / "test-run.sh"), str(repo), "--main", "--", "true"], env=both,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for _ in range(2)]
+        arrived = b""
+        while arrived.count(b"\n") < 2:
+            ready = select.select([arrive], [], [], 60)[0]
+            if not ready:
+                for p in procs:
+                    p.kill()
+                self.fail("the two runs did not both reach the claim of number 2")
+            arrived += os.read(arrive, 16)
+        os.write(go, b"go\ngo\n")
         outs = [p.communicate(timeout=60) for p in procs]
-        self.assertEqual([p.returncode for p in procs], [0] * 4, outs)
+        self.assertEqual([p.returncode for p in procs], [0] * 2, outs)
         runs = session / "main-runs"
-        self.assertEqual(sorted(p.name for p in runs.iterdir()), [f"{n}.json" for n in range(1, 6)])  # no lock left
-        later = [json.loads((runs / f"{n}.json").read_text()) for n in range(2, 6)]
+        self.assertEqual(sorted(p.name for p in runs.iterdir()), [f"{n}.json" for n in range(1, 4)])  # no lock left
+        later = [json.loads((runs / f"{n}.json").read_text()) for n in range(2, 4)]
         self.assertTrue(all("lane" not in r and "step" not in r and r["role"] == "main" and r["interpreter"] is None for r in later))
 
     def test_every_byte_of_an_argument_survives_into_the_record(self):

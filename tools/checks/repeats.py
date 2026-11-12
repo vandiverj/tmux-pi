@@ -857,26 +857,34 @@ def main_runs_dir(tasks_dir):
     return tasks_dir.parent / "main-runs" if tasks_dir.name == "tasks" else None
 
 
-def _main_rerun(run):
-    """HB5b: the seconds of a Main run that repeats a check a worker or reviewer already ran on the same tree: a duplicate of
-    an earlier worker/reviewer run, or one covered by one."""
-    if run["role"] != "main":
+def _main_rerun(run, earlier):
+    """HB5b: the seconds of one Main run spent on a check a worker or reviewer had already run on the same tree. Each Main run
+    is judged alone against every earlier (by end time) successful worker or reviewer run `earlier` (other Main runs never
+    cover it). The same check (key, tree, interpreters that do not differ) counts all its seconds; else the largest cover of
+    its test set by one run of the same runner and tree: an earlier run that holds its tests, all its seconds (measured); one
+    that lies inside it, the smaller of the two times (estimated), nothing when that run timed out (unknown)."""
+    if run["role"] != "main" or run["never"] or run["outside"]:
         return 0.0
-    if run["class"] == "duplicate" and any(m["role"] not in ("main", "unknown") for m in run["same_check_before"]):
-        return run["seconds"]
-    if run["class"] == "first" and run["covered"] and run["covered_by_role"] not in ("main", "unknown"):
-        return run["covered"]["seconds"] or 0.0
-    return 0.0
+    best = 0.0
+    for a in earlier:
+        if a["tree"] != run["tree"] or _interp_differs(a, run) or _order(a) >= _order(run):
+            continue
+        if a["canon"]["key"] == run["canon"]["key"]:
+            return run["seconds"]
+        at, rt = a["canon"]["tests"], run["canon"]["tests"]
+        if at is None or rt is None or a["canon"]["runner"] != run["canon"]["runner"]:
+            continue
+        if _covers(at, rt):
+            best = max(best, run["seconds"])
+        elif _covers(rt, at) and not a["timed_out"]:
+            best = max(best, min(a["seconds"], run["seconds"]))
+    return best
 
 
 def build(tasks_dir, lane=None, main_dir="auto"):
     runs, jsonl, problems = load(tasks_dir, lane, main_runs_dir(tasks_dir) if main_dir == "auto" else main_dir)
     groups, pairs = classify(runs)
-    for r in runs:
-        r["covered_by_role"] = None
-    for p in pairs:
-        if p["kind"] == "covered":
-            p["later"]["covered_by_role"] = p["earlier"]["role"]
+    others = [r for r in runs if r["role"] not in ("main", "unknown") and not (r["never"] or r["outside"]) and r["exit"] == 0]
     per = {}
     for r in runs:
         row = per.setdefault((r["lane"], r["step"]), {"lane": r["lane"], "step": r["step"], "runs": 0, "total": 0.0,
@@ -885,7 +893,7 @@ def build(tasks_dir, lane=None, main_dir="auto"):
         row["runs"] += 1
         row["total"] += r["seconds"]
         rep = repeated_seconds(r)
-        row["main_rerun"] += _main_rerun(r)
+        row["main_rerun"] += _main_rerun(r, others)
         if r["class"] == "duplicate":
             row["duplicate"] += rep
         elif r["class"] == "first":

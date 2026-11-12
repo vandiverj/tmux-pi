@@ -255,17 +255,15 @@ def resolve(task_dir, req_id, by, how, ref, actor, source, confidence="exact", s
         return _close(task_dir, record, status, by, how, ref, actor, source, confidence, detail), True
 
 
-AUTOMATIC_CLOSERS = frozenset({"worker", "hook"})  # who closes a request by a state change (pi_state, claude_hook)
-
-
 def answer(task_dir, req_id, by, ref, actor, source, quote=None):
     """(record, changed): an explicit answer (tp-agent message --resolves, by main or owner, how message, ref the confirmed
     delivery) to a request that was OPEN when the answer was sent. Open now: it is closed by the answer (as resolve). Closed
-    since by a state change (by worker or hook: pi's agent_start, a Claude hook leaving `permission`, often the delivery
-    itself): that close stays as it was written and the answer is recorded against the same id, as resolution.answer
-    {by, how, ref, at, quote?} and one request.resolved event naming it (detail.answer: true; request_log does not count
-    it as a second close). Any other close (an earlier answer, superseded, withdrawn) is kept unchanged: an answer never
-    replaces another answer, and a state change never replaces an answer (it closes only open requests). HB6b1 round 2."""
+    since by ANY other writer (a state change: pi's agent_start, a Claude hook leaving `permission`; a newer prompt that
+    superseded it; withdrawn; whatever the status): that close, its status and writer stay as written and the answer is
+    recorded beside them, as resolution.answer {by, how, ref, at, quote?} and one request.resolved event naming it
+    (detail.answer: true; request_log does not count it as a second close). Only a request an answer already closed (or
+    was recorded on) is unchanged: an answer never replaces another answer. The rule never looks at the close status.
+    HB6b1 round 3."""
     detail = {"quote": quote} if quote else None
     with _locked(task_dir):
         record = find_request(task_dir, req_id)
@@ -274,12 +272,12 @@ def answer(task_dir, req_id, by, ref, actor, source, quote=None):
         if record.get("status") == "open":
             return _close(task_dir, record, "resolved", by, "message", ref, actor, source, detail=detail), True
         resolution = record.get("resolution") if isinstance(record.get("resolution"), dict) else {}
-        if record.get("status") != "resolved" or resolution.get("by") not in AUTOMATIC_CLOSERS or "answer" in resolution:
+        if "answer" in resolution or resolution.get("how") == "message":  # an answer never replaces an answer
             return record, False
         given = dict({"by": by, "how": "message", "ref": ref, "at": utc_now()}, **(detail or {}))
         record = dict(record, resolution=dict(resolution, answer=given))
         _save(task_dir, record)
-        event(task_dir, "request.resolved", actor, source, "exact", ref=record["id"], state="resolved",
+        event(task_dir, "request.resolved", actor, source, "exact", ref=record["id"], state=str(record.get("status")),
               detail=dict({"kind": record["kind"], "by": by, "how": "message", "resolution_ref": ref, "answer": True},
                           **(detail or {})))
         return record, True
@@ -355,7 +353,7 @@ PERMISSION = re.compile(r"permission", re.I)
 TOOL_IN_MESSAGE = re.compile(r"permission to use (\S+)", re.I)
 
 
-def permission_how(hook, asked_call):
+def permission_how(hook, asked_call, calls_dropped=False):
     """HB6b1 rule 3 (round 2: by call identity, never by tool name): how the hook that ends a permission prompt answered it.
     `asked_call` is the tool_use_id of the call that asked (claude_hook records it when the prompt opens; None when it could
     not be told). Claude Code fires PostToolUse or PostToolUseFailure for a call only after it ran, PermissionDenied when a
@@ -363,8 +361,9 @@ def permission_how(hook, asked_call):
     call's PostToolUse/PostToolUseFailure is `approved` (it ran; the approval instant itself is not seen by any hook: the
     request closes when the approved call ENDS), the asked call's PermissionDenied is `denied`. Everything else that ends
     `permission` (another call's hook, even one with the same tool name; an unknown asked call; a new prompt; Stop) is
-    `left`: whether the prompt was approved is not known from that hook."""
-    if not isinstance(hook, dict) or not isinstance(asked_call, str) or not asked_call or hook.get("tool_use_id") != asked_call:
+    `left`: whether the prompt was approved is not known from that hook. `calls_dropped` (round 3): the calls-in-flight
+    list evicted an entry (report.sh caps it at 16) and has not emptied since, so no identity is proof: `left`."""
+    if calls_dropped or not isinstance(hook, dict) or not isinstance(asked_call, str) or not asked_call or hook.get("tool_use_id") != asked_call:
         return "left"
     name = hook.get("hook_event_name")
     if name == "PermissionDenied":
@@ -398,7 +397,7 @@ def _asked_calls(task_dir):
     return out
 
 
-def claude_hook(task_dir, hook, prev_state, new_state, prev_tool="", calls=None):
+def claude_hook(task_dir, hook, prev_state, new_state, prev_tool="", calls=None, calls_dropped=False):
     """report.sh's request bookkeeping, after state.json was written. A permission Notification that put the worker in
     `permission` opens (or finds) the permission request for its message, with the asking call's tool_use_id when it can be
     told (asking_call over `calls`, the calls in flight before this hook); leaving `permission` for any other state, or a
@@ -411,7 +410,7 @@ def claude_hook(task_dir, hook, prev_state, new_state, prev_tool="", calls=None)
         if PERMISSION.search(message):
             found = TOOL_IN_MESSAGE.search(message)
             tool = found.group(1).rstrip(".,;:") if found else (prev_tool.split(" ", 1)[0] if prev_tool else "")
-            asked = asking_call(calls, tool)
+            asked = None if calls_dropped else asking_call(calls, tool)
             detail = dict({"tool": tool} if tool else {}, **({"tool_use_id": asked} if asked else {}))
             record, created = open_request(task_dir, "permission", message, message, "hook", "hook", supersede=True,
                                            detail=detail or None)
@@ -423,7 +422,7 @@ def claude_hook(task_dir, hook, prev_state, new_state, prev_tool="", calls=None)
         with _locked(task_dir):
             for record in requests(task_dir):
                 if record.get("status") == "open" and record.get("kind") == "permission":
-                    how = permission_how(hook, asked.get(record["id"]))
+                    how = permission_how(hook, asked.get(record["id"]), calls_dropped)
                     _close(task_dir, record, "resolved", "hook", how, None, "hook", "hook",
                            detail={"hook": name, "state": new_state})
                     done["resolved"].append(record["id"])
@@ -453,6 +452,7 @@ def main(argv=None):
     c.add_argument("--prev-state", default="")
     c.add_argument("--new-state", default="")
     c.add_argument("--prev-tool", default="")
+    c.add_argument("--calls-dropped", default="false", help="true: state.json calls_dropped (an entry was evicted)")
     c.add_argument("--calls", default="[]", help="JSON: the calls in flight before this hook (state.json calls)")
     p = sub.add_parser("pi-state")
     p.add_argument("--task-dir", required=True)
@@ -471,7 +471,8 @@ def main(argv=None):
                 calls = json.loads(args.calls)
             except ValueError:
                 calls = None
-            out = claude_hook(args.task_dir, hook, args.prev_state, args.new_state, args.prev_tool, calls)
+            out = claude_hook(args.task_dir, hook, args.prev_state, args.new_state, args.prev_tool, calls,
+                                args.calls_dropped == "true")
         else:
             text = ""
             if args.text_file:

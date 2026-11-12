@@ -200,16 +200,24 @@ class TpAgentRequestTests(AgentCase):
                                         self.legacy()["id"])[1]}
         pi_working = lambda: hub_records.pi_state(self.task, "working")  # noqa: E731  reporter.ts:217-227 agent_start
         ran = lambda: hook(hook_event_name="PostToolUse", tool_use_id="tu1", prev="permission", new="working")  # noqa: E731
+        superseded = lambda: hub_records.open_request(self.task, "permission", "other prompt", "other prompt", "hook", "hook",  # noqa: E731
+                                                       supersede=True)
+        withdrawn = lambda: hub_records.resolve(self.task, current[0], "main", "withdrawn", None, "main", "file",  # noqa: E731
+                                                status="withdrawn")
         races = [
-            # (name, kind, during, confirmed, resolution without answer, answer by or None, resolved?, closes in request_log)
-            ("pi input closed by agent_start while typed", "input", pi_working, True, ("worker", "left-state"), "owner", True, 1),
-            ("claude permission closed by PostToolUse while typed", "permission", ran, True, ("hook", "approved"), "owner", True, 1),
-            ("unconfirmed delivery invents no answer", "input", pi_working, False, ("worker", "left-state"), None, False, 1),
+            # (name, kind, during, confirmed, (status, by, how) the other writer left, answer by or None, resolved?, closes in
+            # request_log). Round 3: the answer is recorded whatever closed the request (resolved, superseded, withdrawn).
+            ("pi input closed by agent_start while typed", "input", pi_working, True, ("resolved", "worker", "left-state"), "owner", True, 1),
+            ("claude permission closed by PostToolUse while typed", "permission", ran, True, ("resolved", "hook", "approved"), "owner", True, 1),
+            ("claude permission superseded by a newer prompt while typed", "permission", superseded, True,
+             ("superseded", "hook", "superseded"), "owner", True, 1),
+            ("input withdrawn by Main while typed", "input", withdrawn, True, ("withdrawn", "main", "withdrawn"), "owner", True, 1),
+            ("unconfirmed delivery invents no answer", "input", pi_working, False, ("resolved", "worker", "left-state"), None, False, 1),
             ("capability answered by Main meanwhile: an answer never replaces an answer", "capability",
              lambda: hub_records.resolve(self.task, current[0], "main", "message", "[tp:other]", "main", "file"), True,
-             ("main", "message"), None, False, 1),
+             ("resolved", "main", "message"), None, False, 1),
             ("no race: the owner's answer closes it; a state change after never overwrites it", "input", None, True,
-             ("owner", "message"), None, True, 1),
+             ("resolved", "owner", "message"), None, True, 1),
         ]
         for name, kind, during, confirmed, closed, answered, resolved, closes in races:
             with self.subTest(name):
@@ -222,7 +230,7 @@ class TpAgentRequestTests(AgentCase):
                     pi_working()
                 record = self.requests()[current[0]]
                 resolution = record["resolution"]
-                self.assertEqual((record["status"], resolution["by"], resolution["how"]), ("resolved",) + closed)
+                self.assertEqual((record["status"], resolution["by"], resolution["how"]), closed)
                 given = resolution.get("answer")
                 self.assertEqual(given and (given["by"], given["how"], given["ref"], given["quote"]),
                                  answered and (answered, "message", value["delivery"], "go"))

@@ -239,6 +239,33 @@ class ClaudeReportTests(unittest.TestCase):
         self.hook("PostToolUse", tool_name="Bash", tool_use_id="tu3")
         self.assertEqual((self.requests()[-1]["status"], self.requests()[-1]["resolution"]["how"]), ("resolved", "left"))
         self.assertEqual([c["id"] for c in self.state()["calls"]], ["tu2"])
+        # HB6b1 round 3 (F2): the calls list is capped at 16; once an entry was evicted, identity is uncertain until the list
+        # is empty again (state.json calls_dropped), so every permission close is `left`, even a unique match and a denial.
+        def seed(calls, dropped):
+            self.task.joinpath("state.json").write_text(json.dumps(dict(self.state(), calls=calls, calls_dropped=dropped)))
+        def ask_and_end(tool_id, end):
+            self.hook("PreToolUse", tool_name="Write", tool_use_id=tool_id)
+            self.hook("Notification", message="Claude needs your permission to use Write")
+            asked = "tool_use_id" in self.journal()[-1]["detail"]
+            self.hook(end, tool_name="Write", tool_use_id=tool_id)
+            return asked, self.requests()[-1]["resolution"]["how"]
+        full = [{"id": "c%d" % i, "name": "Bash"} for i in range(16)]
+        seed(full, False)
+        self.hook("PreToolUse", tool_name="Write", tool_use_id="w1")  # the 17th evicts c0
+        self.assertEqual((len(self.state()["calls"]), self.state()["calls_dropped"]), (16, True))
+        self.hook("Notification", message="Claude needs your permission to use Write")
+        self.hook("PostToolUse", tool_name="Write", tool_use_id="w1")  # the one Write in flight, but the list is lossy
+        self.assertEqual((self.requests()[-1]["resolution"]["how"], "tool_use_id" in self.journal()[-2]["detail"]), ("left", False))
+        self.assertTrue(self.state()["calls_dropped"])  # still 15 entries in flight
+        self.assertEqual(ask_and_end("w2", "PermissionDenied"), (False, "left"))
+        self.assertEqual(ask_and_end("w3", "PostToolUseFailure"), (False, "left"))
+        seed(full[:1], True)  # the last entry ends: the list is empty, identity is known again
+        self.hook("PostToolUse", tool_name="Bash", tool_use_id="c0")
+        self.assertEqual((self.state()["calls"], self.state()["calls_dropped"]), ([], False))
+        self.assertEqual(ask_and_end("w4", "PostToolUse"), (True, "approved"))
+        seed(full, True)
+        self.hook("Stop", last_assistant_message="settled")  # a Stop clears the list and the flag
+        self.assertEqual((self.state()["calls"], self.state()["calls_dropped"]), ([], False))
 
     def test_a_turn_with_no_permission_prompt_writes_no_request_records(self):
         self.at_tool()

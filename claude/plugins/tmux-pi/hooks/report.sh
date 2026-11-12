@@ -255,7 +255,10 @@ jq -n --argjson prev "$prev" --argjson in "$input" --argjson usage "$usage" \
   # {id, name} (id null when its input has none: that call can then never be told apart), the other three remove their id,
   # Stop clears the list; at most the last 16 are kept.
   def calls: ($prev.calls | if type == "array" then . else [] end);
-  def done_call: { calls: (if ($in.tool_use_id | type) == "string" then [calls[] | select(.id != $in.tool_use_id)] else calls end) };
+  # calls_dropped (round 3): the cap evicted an entry, so no match is proof of identity until the list is empty again.
+  def dropped: ($prev.calls_dropped == true);
+  def done_call: (if ($in.tool_use_id | type) == "string" then [calls[] | select(.id != $in.tool_use_id)] else calls end)
+    | { calls: ., calls_dropped: (if length == 0 then false else dropped end) };
   # Transcripts carry no cost. cost stays numeric 0 because lib/goal.py treats a
   # non-numeric cost as unmetered and fails closed; costKnown:false marks it unknown.
   { id: $id, harness: "claude", state: "starting", tool: "", model: "", turns: 0, tools: 0, toolErrors: 0,
@@ -270,7 +273,8 @@ jq -n --argjson prev "$prev" --argjson in "$input" --argjson usage "$usage" \
       elif $in.hook_event_name == "PreToolUse" and active then
         { state: "tool", tool: ("\($in.tool_name) \($in | hint)" | clip), tools: (($prev.tools // 0) + 1),
           calls: ((calls + [{ id: (if ($in.tool_use_id | type) == "string" then $in.tool_use_id else null end),
-                              name: (if ($in.tool_name | type) == "string" then $in.tool_name else null end) }]) | .[-16:]) }
+                              name: (if ($in.tool_name | type) == "string" then $in.tool_name else null end) }]) | .[-16:]),
+          calls_dropped: (dropped or ((calls | length) >= 16)) }
       elif $in.hook_event_name == "PostToolUse" and active then { state: "working", tool: "", toolErrors: 0 } + done_call
       elif $in.hook_event_name == "PostToolUseFailure" and active then
         { state: "working", tool: "", toolErrors: (($prev.toolErrors // 0) + 1) } + done_call
@@ -278,7 +282,7 @@ jq -n --argjson prev "$prev" --argjson in "$input" --argjson usage "$usage" \
         (if ($in.message // "" | test("permission"; "i")) then { state: "permission", tool: ($in.message | clip) } else {} end)
       elif $in.hook_event_name == "PermissionDenied" and active then { state: "working", tool: "" } + done_call
       elif $in.hook_event_name == "Stop" and active then
-        { state: "waiting", tool: "", promptTurn: turn, settledTurn: turn, calls: [],
+        { state: "waiting", tool: "", promptTurn: turn, settledTurn: turn, calls: [], calls_dropped: false,
           completedTurn: (if $done == "yes" then ([completed, reply] | max) else completed end) }
       else {} end )
   + ( if ($in.hook_event_name == "UserPromptSubmit" or ($in.hook_event_name == "Stop" and active)) and $usage != null
@@ -303,6 +307,7 @@ if [[ "$prev_state" == permission || "$new_state" == permission || "$event" == P
   py=/usr/bin/python3; [[ -x "$py" ]] || py=python3
   [[ -f "$hub_py" ]] && "$py" "$hub_py" claude-hook --task-dir "$TP_TASK_DIR" --prev-state "$prev_state" \
     --new-state "$new_state" --prev-tool "$(jq -r '.tool // empty' <<<"$prev" 2>/dev/null)" \
+    --calls-dropped "$(jq -r '.calls_dropped == true' <<<"$prev" 2>/dev/null || echo false)" \
     --calls "$(jq -c '.calls | if type == "array" then . else [] end' <<<"$prev" 2>/dev/null || echo '[]')" <<<"$input" >/dev/null 2>&1
 fi
 exit 0

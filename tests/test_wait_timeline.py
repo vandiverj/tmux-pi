@@ -209,7 +209,7 @@ def case1(root):
                                     (16, "text", "m2"), (20, "use", ("m2", [("a2", "Bash")])), (115, "result", ["a2"]),
                                     (130, "text", "m3")])
     s.test_run("coder-a", 1, 112, 90)
-    s.finish("coder-a", result=130, collected=305, reaped=305, exit_at=305)
+    s.finish("coder-a", result=130, collected=305, reaped=138, exit_at=138)  # tp-review ends the author first, uncollected
     truth += [("coder-a", "starting", 0, 2), ("coder-a", "model", 2, 10), ("coder-a", "tool", 10, 12), ("coder-a", "model", 12, 20),
               ("coder-a", "tool", 20, 22), ("coder-a", "test", 22, 112), ("coder-a", "tool", 112, 115),
               ("coder-a", "model", 115, 130), ("coder-a", "waiting:main", 130, 140), ("coder-a", "waiting:review", 140, 300),
@@ -320,6 +320,10 @@ class WaitTimelineTest(unittest.TestCase):
     def test_rules(self):
         done = {"result": 20, "collected": 30, "exit_at": 30}
         talk = [(2, "prompt", None), (5, "use", ("m1", [("t1", "Bash")])), (15, "result", ["t1"]), (20, "text", "m2")]
+        held = [(2, "prompt", None), (5, "use", ("m1", [("t1", "Bash")])), (50, "result", ["t1"]), (60, "text", "m2")]
+        # bin/tp-review's order: the author is reaped (not collected), then the review is spawned
+        review = lambda s: (s.task("rev", 31, "pi", role="code-reviewer", review_of="w"),  # noqa: E731
+                            s.finish("rev", result=70, collected=80, exit_at=80))
 
         def at(report, t, task="w"):
             return state_at(report, task, T0 + t)
@@ -361,11 +365,20 @@ class WaitTimelineTest(unittest.TestCase):
              lambda r: one(r, worker="pi", lines=[(2, "prompt", None), (5, "call", (2, [("p1", "bash"), ("p2", "read")])),
                                                  (6, "result", "p2"), (15, "result", "p1"), (20, "text", 15)], finish=done), 100,
              [(lambda x: at(x, 10), "tool"), (lambda x: at(x, 3), "model"), (lambda x: x["tasks"][0]["by_state"]["tool"], 10.0)]),
-            ("D2 review holds its coder: waiting:review (naive: waiting:main)",
-             lambda r: one(r, lines=talk, finish={"result": 20, "collected": 90, "exit_at": 90},
-                           extra=lambda s: (s.task("rev", 40, "pi", role="code-reviewer", review_of="w"),
-                                            s.finish("rev", result=70, collected=80, exit_at=80))), 100,
-             [(lambda x: at(x, 30), "waiting:main"), (lambda x: at(x, 50), "waiting:review"), (lambda x: at(x, 85), "waiting:main")]),
+            ("D2 review holds its coder: waiting:review (naive: waiting:main); reaped before the review, collected after",
+             lambda r: one(r, lines=talk, finish={"result": 20, "reaped": 30, "exit_at": 30, "collected": 90}, extra=review), 100,
+             [(lambda x: at(x, 25), "waiting:main"), (lambda x: at(x, 50), "waiting:review"), (lambda x: at(x, 85), "waiting:main"),
+              (lambda x: x["tasks"][0]["end_source"], "collected.json")]),
+            ("D1/D2 reaped before its review and never collected: a reap ends the process, not the task; ends with the review",
+             lambda r: one(r, lines=talk, finish={"result": 20, "reaped": 30, "exit_at": 30}, extra=review), 100,
+             [(lambda x: at(x, 50), "waiting:review"), (lambda x: x["tasks"][0]["end"] - T0, 80),
+              (lambda x: x["tasks"][0]["by_state"]["waiting:review"], 49.0),
+              (lambda x: x["tasks"][0]["end_source"], "review rev collected.json")]),
+            ("D1/D2 reaped, review still running: the coder is open on waiting:review",
+             lambda r: one(r, lines=talk, finish={"result": 20, "reaped": 30, "exit_at": 30}, extra=review), 60,
+             [(lambda x: at(x, 50), "waiting:review"), (lambda x: x["tasks"][0]["running"], True),
+              (lambda x: (x["tasks"][0]["intervals"][-1]["state"], x["tasks"][0]["intervals"][-1].get("open")),
+               ("waiting:review", True))]),
             ("D2 a request open while the worker works: activity wins; idle seconds wait",
              lambda r: one(r, lines=talk, finish={"result": 20, "collected": 60, "exit_at": 60},
                            extra=lambda s: s.request("w", REQ, "capability", 6, resolved=50)), 100,
@@ -377,11 +390,31 @@ class WaitTimelineTest(unittest.TestCase):
                            extra=lambda s: (s.request("w", REQ, "permission", 21, resolved=40),
                                             s.request("w", REQ2, "input", 41, resolved=60, by="owner"))), 100,
              [(lambda x: at(x, 30), "waiting:permission"), (lambda x: at(x, 50), "waiting:owner-input")]),
+            ("R11 permission inside a tool call waits until resolved (naive: tool); a capability request beside work stays work",
+             lambda r: one(r, lines=held, finish={"result": 60, "collected": 70, "exit_at": 70},
+                           extra=lambda s: (s.request("w", REQ, "permission", 6, resolved=50, by="hook"),
+                                            s.request("w", REQ2, "capability", 52, resolved=65))), 100,
+             [(lambda x: at(x, 5.5), "tool"), (lambda x: at(x, 30), "waiting:permission"), (lambda x: at(x, 55), "model"),
+              (lambda x: x["tasks"][0]["by_state"]["waiting:permission"], 44.0)]),
+            ("R11 running tail: an open permission request in an open call is waiting:permission to now, open",
+             lambda r: one(r, lines=held[:2], extra=lambda s: s.request("w", REQ, "permission", 6)), 40,
+             [(lambda x: at(x, 30), "waiting:permission"),
+              (lambda x: (x["tasks"][0]["intervals"][-1]["state"], x["tasks"][0]["intervals"][-1].get("open")),
+               ("waiting:permission", True))]),
+            ("R4 running tail with no request record: state.json permission (the hook's state now) waits from its update",
+             lambda r: one(r, lines=held[:2], extra=lambda s: s.put(8, "tasks/w/state.json", json.dumps(
+                 {"id": "w", "harness": "claude", "state": "permission", "tool": "x", "updated": iso_s(8)}))), 40,
+             [(lambda x: at(x, 6), "tool"), (lambda x: at(x, 30), "waiting:permission")]),
             ("R10 events.jsonl stands in for a missing request record",
              lambda r: one(r, lines=talk, finish={"result": 20, "collected": 90, "exit_at": 90},
                            extra=lambda s: s.events("w", [(21, "request.opened", REQ, {"kind": "permission"}),
                                                           (40, "request.resolved", REQ, {"kind": "permission", "by": "hook"})])), 100,
              [(lambda x: at(x, 30), "waiting:permission")]),
+            ("R10 events.jsonl permission inside a tool call (naive: tool)",
+             lambda r: one(r, lines=held, finish={"result": 60, "collected": 70, "exit_at": 70},
+                           extra=lambda s: s.events("w", [(6, "request.opened", REQ, {"kind": "permission"}),
+                                                          (50, "request.resolved", REQ, {"kind": "permission", "by": "hook"})])), 100,
+             [(lambda x: at(x, 30), "waiting:permission"), (lambda x: at(x, 5.5), "tool")]),
             ("R12 pause.confirmed: paused by Main until activity",
              lambda r: one(r, prompts=(2, 50), lines=talk + [(50, "prompt", None), (60, "text", "m3")],
                            finish={"result": 60, "collected": 70, "exit_at": 70},
@@ -417,14 +450,22 @@ class WaitTimelineTest(unittest.TestCase):
                                                                         s.finish("v", result=35, collected=40, exit_at=40))), 100,
              [(lambda x: x["totals"]["elapsed"], 40.0), (lambda x: x["totals"]["busy"], 40.0),
               (lambda x: x["totals"]["accumulated"], 60.0)]),
-            ("D9 critical path: gap between tasks is unknown; review hold names the focus",
-             lambda r: one(r, lines=talk, finish={"result": 20, "collected": 300, "exit_at": 300},
+            ("D9 critical path: gap between tasks is unknown; review hold names the focus; an overlapping predecessor counts,"
+             " so the path tiles the whole window from the first created",
+             lambda r: one(r, lines=talk, finish={"result": 20, "reaped": 30, "exit_at": 30, "collected": 300},
                            extra=lambda s: (s.task("rev", 40, "pi", role="code-reviewer", review_of="w"),
                                             s.finish("rev", result=290, collected=295, exit_at=295),
+                                            s.task("early", -50, "claude"), s.claude_state("early", [-49]),
+                                            s.finish("early", result=10, collected=20, exit_at=20),
                                             s.task("next", 330, "claude"), s.claude_state("next", [331]),
                                             s.finish("next", result=340, collected=350, exit_at=350))), 400,
-             [(lambda x: x["critical_path"]["tasks"], ["w", "next"]), (lambda x: x["critical_path"]["focus"]["state"], "waiting:review"),
-              (lambda x: x["critical_path"]["by_state"]["unknown"] >= 30, True)]),
+             [(lambda x: x["critical_path"]["tasks"], ["early", "w", "next"]),
+              (lambda x: x["critical_path"]["focus"]["state"], "waiting:review"),
+              (lambda x: x["critical_path"]["by_state"]["unknown"] >= 30, True),
+              (lambda x: [(i["start"] - T0, i["end"] - T0) for i in x["critical_path"]["intervals"]][0][0], -50),
+              (lambda x: all(abs(a["end"] - b["start"]) < 1e-9 for a, b in zip(x["critical_path"]["intervals"],
+                                                                               x["critical_path"]["intervals"][1:])), True),
+              (lambda x: sum(i["end"] - i["start"] for i in x["critical_path"]["intervals"]), 400.0)]),
             ("R22 a queued task waits by its reason (lane, slots, dependency)",
              lambda r: one(r, lines=talk, finish=done, extra=lambda s: (s.queued("q1", 5, None, "waiting for lane x's writer w"),
                                                                         s.queued("q2", 5, None, "global worker slots full"),

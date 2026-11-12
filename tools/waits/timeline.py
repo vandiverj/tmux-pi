@@ -361,18 +361,32 @@ def load_task(reader, task_dir):
             "review_of": review_of, "marks": marks}
 
 
-def span_end(task, now):
-    """D1: (end, source, running)."""
+def span_end(task, now, by_review=None):
+    """D1: (end, source, running, process_end). The logical end is the earliest of collected.json and stopped.json. A reap
+    or an exit only ends the process (process_end: reaped.json, else the exit mtime): bin/tp-review ends the author before
+    its review without collecting it (tp-agent end-author). So a task with no Main marker whose review runs past its process
+    end waits on that review and ends with it (running while the review runs); with no such review the process end is the
+    end; with no process end either, the task is running and ends now."""
     m = task["marks"]
+    proc = (m["reaped"], "reaped.json") if "reaped" in m else (
+        (m["exit"], "exit (mtime)") if m.get("exit") is not None else None)
     main = [(m[k], k + ".json") for k in ("collected", "stopped") if k in m]
     if main:
         t, src = min(main)
-        return t, src, False
-    if "reaped" in m:
-        return m["reaped"], "reaped.json", False
-    if m.get("exit") is not None:
-        return m["exit"], "exit (mtime)", False
-    return now, "now (running)", True
+        return t, src, False, (min(proc[0], t) if proc else None)
+    if proc is None:
+        return now, "now (running)", True, None
+    held = []
+    for review in (by_review or {}).get(task["id"], []):
+        r_end, r_src, r_running, _ = span_end(review, now)
+        if review["created"] >= task["created"] and (r_running or r_end > proc[0]):
+            held.append((r_running, r_end, review["id"], r_src))
+    if any(h[0] for h in held):
+        return now, "now (review {} running)".format(next(h[2] for h in held if h[0])), True, proc[0]
+    if held:
+        _, r_end, rid, r_src = max(held, key=lambda h: h[1])
+        return r_end, "review {} {}".format(rid, r_src), False, proc[0]
+    return proc[0], proc[1], False, proc[0]
 
 
 def clock_check(reader, task, where, t, end):
@@ -395,7 +409,8 @@ def request_state(kind, by):
 def build_task(reader, task, tasks_by_review, now, lanes_cache, lanes_override):
     tdir = task["dir"]
     start = task["created"]
-    end, end_source, running = span_end(task, now)
+    end, end_source, running, proc_end = span_end(task, now, tasks_by_review)
+    live = running and proc_end is None  # the worker process itself is still there
     if end < start:
         reader.problem(tdir, "end ({}) before created; span set to zero".format(end_source))
         end = start
@@ -444,7 +459,7 @@ def build_task(reader, task, tasks_by_review, now, lanes_cache, lanes_override):
             canvas.paint(a, b, payload("waiting:main", "turn ended; next prompt from Main", "transcript", "inferred"))
     reply = task["marks"].get("result")
     reply_src = "result.md (mtime)"
-    if reply is None and tail is not None and tail[1] == "idle" and not running:
+    if reply is None and tail is not None and tail[1] == "idle" and not live:
         reply, reply_src = tail[0], "transcript last line"
     if reply is not None and reply >= start:
         canvas.paint(reply, end, payload("waiting:main", "reply waits for Main ({})".format(end_source), reply_src, "derived"))
@@ -452,7 +467,7 @@ def build_task(reader, task, tasks_by_review, now, lanes_cache, lanes_override):
         reader.problem(tdir / "result.md", "result.md mtime before created; not used")
     # layer 4: review holds the coder
     for review in tasks_by_review.get(task["id"], []):
-        r_end, r_src, r_running = span_end(review, now)
+        r_end, r_src, r_running, _ = span_end(review, now)
         canvas.paint(review["created"], r_end, payload("waiting:review", "review {} running".format(review["id"]),
                                                        review["id"] + " meta.json created, " + r_src, "exact"))
     # layer 5/6 from events.jsonl and requests
@@ -470,7 +485,7 @@ def build_task(reader, task, tasks_by_review, now, lanes_cache, lanes_override):
             canvas.paint(t, nxt, payload("waiting:main", "paused by Main", "events.jsonl pause.confirmed", "exact"))
         elif kind.startswith(("correction.", "pause.", "hold.")):
             instants.append({"at": iso(t), "what": kind, "source": "events.jsonl", "confidence": ev.get("confidence") or "exact"})
-    req_ids, cap_opened = set(), []
+    req_ids, cap_opened, permission = set(), [], []  # permission: (opened, resolved or None, source)
     folder = tdir / "requests"
     if folder.is_dir() and not folder.is_symlink():
         for path in sorted(folder.glob("req-*.json")):
@@ -487,6 +502,8 @@ def build_task(reader, task, tasks_by_review, now, lanes_cache, lanes_override):
             kind = record.get("kind")
             if kind == "capability":
                 cap_opened.append(opened)
+            elif kind == "permission":
+                permission.append((opened, closed, "requests/" + path.name))
             clock_check(reader, task, path, opened, end)
             canvas.paint(opened, closed if closed is not None else end,
                          payload(request_state(kind, by), "request {} {}".format(kind, "open" if closed is None else "resolved"),
@@ -507,11 +524,20 @@ def build_task(reader, task, tasks_by_review, now, lanes_cache, lanes_override):
                                            "events.jsonl request.*", "exact"))
                 if kind == "capability":
                     cap_opened.append(o)
+                elif kind == "permission":
+                    permission.append((o, t, "events.jsonl request.*"))
     for ref, (o, kind) in opened_ev.items():
         canvas.paint(o, end, payload(request_state(kind, None), "request {} open".format(kind), "events.jsonl request.opened",
                                      "exact"))
         if kind == "capability":
             cap_opened.append(o)
+        elif kind == "permission":
+            permission.append((o, None, "events.jsonl request.opened"))
+    snapshot = task["state"]
+    if live and snapshot.get("state") == "permission" and not any(c is None for o, c, src in permission):
+        since = parse_time(snapshot.get("updated"))
+        if since is not None:  # the hook writes state permission on a permission Notification; it is the state now
+            permission.append((since, None, "state.json state permission"))
     cap = reader.json(tdir / "capability-request.json", "capability-request.json")
     if cap is not None:
         asked = parse_time(cap.get("requested"))
@@ -523,21 +549,43 @@ def build_task(reader, task, tasks_by_review, now, lanes_cache, lanes_override):
                          payload("waiting:main", "capability request {}".format("answered" if answered else "pending"),
                                  "capability-request.json", "exact"))
     # layer 7: transcript activity
+    calls = []  # the seconds some tool call is open: merged tool segments, plus the tail when a call is open at the end
     for a, b, state, name, cid in segments:
         if state in ("model", "tool"):
+            if state == "tool":
+                if calls and abs(calls[-1][1] - a) < 1e-9:
+                    calls[-1][1] = b
+                else:
+                    calls.append([a, b])
             if state == "tool" and (cid in orphans or cid in abandoned):
                 state = "interrupted"
             reason = hub_records.normalize_tool(name)["tool"] if state in ("tool", "interrupted") else ""
             canvas.paint(a, b, payload(state, reason, "transcript", "derived", actor=_actor(task)))
     if tail is not None and tail[1] in ("model", "tool"):
-        state = tail[1] if running else "interrupted"
+        state = tail[1] if live else "interrupted"
         reason = hub_records.normalize_tool(tail[2])["tool"] if tail[1] == "tool" else "model"
-        if not running:
-            reason = (reason + ": no result before " + end_source)
-        canvas.paint(tail[0], end, payload(state, reason, "transcript", "derived", actor=_actor(task)))
+        tail_end = min(end, proc_end) if proc_end is not None else end
+        if not live:
+            reason = (reason + ": no result before " + ("reaped.json or exit" if proc_end is not None else end_source))
+        canvas.paint(tail[0], tail_end, payload(state, reason, "transcript", "derived", actor=_actor(task)))
+        if tail[1] == "tool":
+            if calls and abs(calls[-1][1] - tail[0]) < 1e-9:
+                calls[-1][1] = tail_end
+            else:
+                calls.append([tail[0], tail_end])
+    # layer 7b (D2): a permission prompt opened inside an open tool call blocks that call: an open call is not proof of
+    # work. It waits on permission from its opening until it is resolved or the call ends, over the call's tool seconds.
+    # A permission request outside any call, and every other request kind, stays below activity (layer 6).
+    for opened, closed, source in permission:
+        for a, b in calls:
+            if a - TOL <= opened < b:
+                stop = b if closed is None else min(closed, b)
+                canvas.paint(max(opened, a), stop, payload("waiting:permission", "permission prompt inside a tool call {}".format(
+                    "open" if closed is None else "resolved"), source, "exact" if source.startswith(("req", "ev")) else "derived"))
+                break
     # layer 8: tests (D5)
     shell = [(a, b) for a, b, s, n, c in segments if s == "tool" and hub_records.normalize_tool(n)["tool"] == "shell"]
-    if tail is not None and tail[1] == "tool" and running and hub_records.normalize_tool(tail[2])["tool"] == "shell":
+    if tail is not None and tail[1] == "tool" and live and hub_records.normalize_tool(tail[2])["tool"] == "shell":
         shell.append((tail[0], end))
     tests = []
     runs = tdir / "test-runs"
@@ -672,32 +720,35 @@ def by_state(intervals):
 
 
 def critical_path(rows):
-    """D9: delayed completion runs from the first created to the last collected: walk back from the last-collected task
-    (the last-ending one when nothing was collected) through the latest-ending predecessor; gaps are `unknown`."""
+    """D9: delayed completion runs from the first created to the last collected (the last-ending task when nothing was
+    collected). Walk back from that task: the predecessor is a task created earlier, the one reaching furthest toward this
+    task's created (overlap allowed; ties: the later created). Each task holds the path from its created to its successor's
+    created; seconds no task covers there are `unknown`. So the path tiles the whole window, overlap or not."""
     if not rows:
         return {"tasks": [], "intervals": [], "by_state": {}, "interval": None, "focus": None}
     done = [r for r in rows if r["end_source"] == "collected.json"] or rows
     cur = max(done, key=lambda r: (r["end"], r["start"]))
     chain, used = [cur], {cur["task"]}
     while True:
-        cands = [r for r in rows if r["task"] not in used and r["end"] <= cur["start"] + TOL]
+        cands = [r for r in rows if r["task"] not in used and r["start"] < cur["start"]]
         if not cands:
             break
-        cur = max(cands, key=lambda r: (r["end"], r["start"]))
+        limit = cur["start"]
+        cur = max(cands, key=lambda r: (min(r["end"], limit), r["start"]))
         chain.append(cur)
         used.add(cur["task"])
     chain.reverse()
-    path, cursor = [], None
-    for row in chain:
-        if cursor is not None and row["start"] > cursor:
-            path.append({"task": "-", "actor": "", "state": "unknown", "start": cursor, "end": row["start"],
+    path = []
+    for k, row in enumerate(chain):
+        stop = chain[k + 1]["start"] if k + 1 < len(chain) else row["end"]
+        for i in row["intervals"]:
+            a, b = max(i["start"], row["start"]), min(i["end"], stop)
+            if b > a:
+                path.append(dict(i, start=a, end=b))
+        if row["end"] < stop:
+            path.append({"task": "-", "actor": "", "state": "unknown", "start": max(row["end"], row["start"]), "end": stop,
                          "wait_reason": "between tasks: no record (Main's turn or a queue wait)", "source": "-",
                          "confidence": "inferred"})
-        for i in row["intervals"]:
-            a = max(i["start"], cursor) if cursor is not None else i["start"]
-            if i["end"] > a:
-                path.append(dict(i, start=a))
-        cursor = max(cursor or row["end"], row["end"])
     totals = by_state(path)
     longest = max(path, key=lambda i: i["end"] - i["start"]) if path else None
     top = max(totals, key=totals.get) if totals else None

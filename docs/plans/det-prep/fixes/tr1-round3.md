@@ -4,6 +4,10 @@ Review review-coder-6fe2ad8835-140331: REQUEST_CHANGES F1. Read its result.md, r
 Main's diagnosis: this is a real test gap, and the round-2 brief asked for it ("the request fallback"). Round 2's production fix
 is correct (the reviewer agrees). Only the table is short: if the old extractor is restored, every row still passes.
 
+0. **The rule (family verbatim-newline-loss, named by both reviews):** every field task_record keeps verbatim has a byte-exact
+   row through every public path that reads it back. List in report.md each kept field (legacy request.md copy, fenced
+   request, request fallback, stop-mode output) x each public reader, and point to the row that covers each pair. A pair with
+   no row is a gap. Close it here.
 1. **Tests only:** extend the existing table with rows where request.md is absent, so the request comes from the canonical
    task.md fenced block. Use CRLF, bare CR, each with a bad byte, and the six byte shapes. Assert the exact bytes returned by
    the public fallback the callers use (`request_text` or whatever the reviewer's fallback.py calls).

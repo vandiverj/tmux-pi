@@ -538,7 +538,9 @@ class NoticeRulesTests(AgentCase):
                 if route == "none":
                     self.assertIn("no command can answer it now", text)
                     # The prerequisite the notice names is the retry command's own refusal, word for word (the real guard).
-                    needs = self.row(t)["answer_route"]["needs"]
+                    # needs is data (HB4b rule 3): its text is the command's refusal, and the notice prints that text.
+                    from worker_process import needs_text
+                    needs = needs_text(self.row(t)["answer_route"]["needs"])
                     refused = self.runs(t, f'tp-agent retry {name} --reason "answer"')
                     self.assertEqual(needs, refused)
                     self.assertIn(f"First: {needs}", text)
@@ -556,43 +558,55 @@ class NoticeRulesTests(AgentCase):
         # unedited), carries the task's session in the form tp-agent's refusals print (lib/lane_lease.py in_session); run as
         # typed in main's pane (TMUX, TMUX_PANE, TP_SESSION and main's TP_STATE_DIR set), tp-agent takes it and it acts on
         # that task, never the local one. At b317e77 `needs` said a bare `tp-agent stop failed-alive`: main's own task.
+        # HB4b rule 3 (K3), the hard-path row: a session path with two spaces and a quote ("remote  it's"). `needs` is data
+        # (prose and tp-agent argument lists); the notice quotes each command once with the row's session, so shlex.split of
+        # every suggested command gives back that exact path. At main the notice collapsed the two spaces: another directory.
         import lane_lease
+        from worker_process import needs_text
         sessions = self.state.parent / "workspace" / ".tmux-pi" / "sessions"
-        local, remote = sessions / "local", sessions / "remote one"
-        made = {}
-        for session, pane, state in ((remote, "%41", "error"), (local, "%43", "working")):
-            t = session / "tasks" / "failed-alive"
-            t.mkdir(parents=True)
-            tree = sessions.parent.parent / "trees" / session.name
-            tree.mkdir(parents=True)
-            (t / "meta.json").write_text(json.dumps({"id": "failed-alive", "worker": "pi", "pane": pane, "workdir": str(tree),
-                                                     "created": "2026-01-01T00:00:00Z"}))
-            (t / "state.json").write_text(json.dumps({"state": state, "harness": "pi"}))
-            (t / "request.md").write_text("Fix the thing.\n")
-            (t / "dispatch.json").write_text(json.dumps({"context": [], "notes": [], "tests": "affected", "main": "sess-1"}))
-            made[session] = t
-        env = self.env
-        self.env = {**env, "TP_STATE_DIR": str(remote)}
-        try:
-            req = self.ask(made[remote], "browser")
-        finally:
-            self.env = env
-        rows, _ = self.tp.main_rows(local, "sess-1")
-        (row,) = [json.loads(json.dumps(r, default=str)) for r in rows if r.get("state_dir")]
-        self.assertEqual([row["id"], row["state_dir"], row["answer_route"]["by"]], ["failed-alive", str(remote), "none"])
-        prefix = lane_lease.in_session({"session": str(remote)}, local)
-        self.assertEqual(prefix, f"env -u TMUX -u TMUX_PANE -u TP_SESSION TP_STATE_DIR='{remote}' ")
-        text = self.notifier({"external": [{"start": [row], "rows": [row]}]})["external"][0]["submitted"]
-        self.assertIn(req, text)
-        self.assertIn(f"First: {row['answer_route']['needs']}", text)
-        commands = re.findall(r"(?:env (?:-u \S+ )+TP_STATE_DIR=(?:'[^']*'|\S+) )?tp-agent [a-z-]+ [A-Za-z0-9._-]+", text)
-        self.assertEqual(sorted({c.split("tp-agent ")[1].split()[0] for c in commands}), ["inspect", "stop"], text)
-        typed_in_main = {**self.env, "TP_STATE_DIR": str(local), "TMUX": "/private/tmp/tmux-0/default,1,0",
-                         "TMUX_PANE": "%1", "TP_SESSION": "main"}
-        for command in commands:
-            with self.subTest(external=command):
-                self.assertTrue(command.startswith(prefix + "tp-agent "), command)
-                self.assertEqual(self.acts_on(command, typed_in_main), made[remote].resolve())
+        local = sessions / "local"
+        for name in ("remote one", "remote  it's"):
+            remote = sessions / name
+            made = {}
+            for session, pane, state in ((remote, "%41", "error"), (local, "%43", "working")):
+                t = session / "tasks" / "failed-alive"
+                made[session] = t
+                if t.exists():  # main's own same-named task, made by the first row
+                    continue
+                t.mkdir(parents=True)
+                tree = sessions.parent.parent / "trees" / session.name
+                tree.mkdir(parents=True)
+                (t / "meta.json").write_text(json.dumps({"id": "failed-alive", "worker": "pi", "pane": pane, "workdir": str(tree),
+                                                         "created": "2026-01-01T00:00:00Z"}))
+                (t / "state.json").write_text(json.dumps({"state": state, "harness": "pi"}))
+                (t / "request.md").write_text("Fix the thing.\n")
+                (t / "dispatch.json").write_text(json.dumps({"context": [], "notes": [], "tests": "affected", "main": "sess-1"}))
+            env = self.env
+            self.env = {**env, "TP_STATE_DIR": str(remote)}
+            try:
+                req = self.ask(made[remote], "browser")
+            finally:
+                self.env = env
+            rows, _ = self.tp.main_rows(local, "sess-1")
+            (row,) = [json.loads(json.dumps(r, default=str)) for r in rows if r.get("state_dir") == str(remote)]
+            self.assertEqual([row["id"], row["state_dir"], row["answer_route"]["by"]], ["failed-alive", str(remote), "none"])
+            prefix = lane_lease.in_session({"session": str(remote)}, local)
+            self.assertEqual(prefix, f"env -u TMUX -u TMUX_PANE -u TP_SESSION TP_STATE_DIR={shlex.quote(str(remote))} ")
+            needs = row["answer_route"]["needs"]
+            self.assertIn(["stop", "failed-alive"], needs)  # a command is an argument list, never text
+            text = self.notifier({"external": [{"start": [row], "rows": [row]}]})["external"][0]["submitted"]
+            self.assertIn(req, text)
+            self.assertIn(f"First: {needs_text(needs, prefix)}", text)  # the command's own words, with the task's session
+            commands = re.findall(r"(?:env (?:-u \S+ )+TP_STATE_DIR=(?:(?:'[^']*'|\"'\")+|\S+) )?tp-agent [a-z-]+ [A-Za-z0-9._-]+",
+                                  text)
+            self.assertEqual(sorted({c.split("tp-agent ")[1].split()[0] for c in commands}), ["inspect", "stop"], text)
+            typed_in_main = {**self.env, "TP_STATE_DIR": str(local), "TMUX": "/private/tmp/tmux-0/default,1,0",
+                             "TMUX_PANE": "%1", "TP_SESSION": "main"}
+            for command in commands:
+                with self.subTest(external=command, session=name):
+                    self.assertTrue(command.startswith(prefix + "tp-agent "), command)
+                    self.assertEqual(shlex.split(command)[7], f"TP_STATE_DIR={remote}")  # the exact path, two spaces and all
+                    self.assertEqual(self.acts_on(command, typed_in_main), made[remote].resolve())
 
     def acts_on(self, command, env):
         """Runs a suggested command as a shell would in a pane with environment `env` (its `env -u ... VAR=value` prefix

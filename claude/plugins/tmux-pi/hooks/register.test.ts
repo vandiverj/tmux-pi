@@ -1762,6 +1762,25 @@ test('an open request left by a finished task suggests retry, or no command, nev
   expect(w.submitted.join('\n')).not.toContain('tp-agent message')
 })
 
+// HB4b rule 3: `needs` is data (prose and argument lists), quoted once here; an argument holding a newline is refused.
+test('a structured needs is quoted once, with the hard path intact; a newline argument gives no command', async ($, on) => {
+  const w = world(on, MAIN)
+  w.rows = [{ id: 'coder-1', status: 'working' }, { id: 'coder-2', status: 'working' }]
+  await $.session.start(start(true))
+  const why = 'its process is still running'
+  w.rows = [
+    { id: 'coder-1', status: 'needs_input', state_dir: "/s/remote  it's", request_log: logOf([REQ_A, 'opened', 'capability']),
+      answer_route: { by: 'none', why, needs: ['end ', ['stop', "a  b's\tc"], ' first'] } },
+    { id: 'coder-2', status: 'needs_input', request_log: logOf([REQ_B, 'opened', 'input']),
+      answer_route: { by: 'none', why, needs: ['end ', ['stop', 'x\ny'], ' first'] } },
+  ]
+  await w.clock.advance(5000)
+  const lines = w.submitted.join('\n').split('\n')
+  const prefix = `env -u TMUX -u TMUX_PANE -u TP_SESSION TP_STATE_DIR='/s/remote  it'"'"'s' `
+  expect(lines).toContain(`coder-1: capability request ${REQ_A} (capability 0) is open, but no command can answer it now (${why}). First: end \`${prefix}tp-agent stop 'a  b'"'"'s\tc'\` first. Then retry it, or ${prefix}tp-agent inspect coder-1`)
+  expect(lines).toContain(`coder-2: input request ${REQ_B} (input 1) is open, but no command can answer it now (${why}): tp-agent inspect coder-2`)
+})
+
 test('a held opening whose request closed before the submit is told as opened, then closed', async ($, on) => {
   const w = world(on, MAIN)
   w.rows = [{ id: 'coder-1', status: 'working' }]

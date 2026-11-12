@@ -171,6 +171,27 @@ async function readTasks($: EngineInterface): Promise<Read> {
 // A row's request transition log and answer route (bin/tp-agent record `request_log`, `answer_route`; lib/hub_records.py
 // request_log): only well-formed entries, and no key at all for a task that has none, so its row is what it was before.
 // The row's `requests` (row_requests) is a display window and is never read here: nothing that delivers notices reads it.
+// `needs` (bin/tp-agent answer_route) is data: prose strings and commands, each a list of tp-agent arguments (HB4b rule 3).
+// It becomes text here, once, as lib/worker_process.py needs_text writes it: each argument quoted once (shellQuote), the row's
+// session before each command (sessionPrefix, as agent() does), in backticks. Prose is display text (whitespace made one line);
+// no command text is ever split back into arguments. A part of another shape, or an argument or session with a control
+// character other than a tab (a newline or carriage return would break the one-line notice; a tab stays inside its quotes),
+// is refused: no `needs`, so the hint says inspect instead.
+function needsText(needs: unknown, stateDir: unknown): string | undefined {
+  const CONTROL = /[\x00-\x08\x0a-\x1f\x7f]/
+  if (!Array.isArray(needs) || needs.length === 0) return undefined
+  if (stateDir !== undefined && (typeof stateDir !== 'string' || CONTROL.test(stateDir))) return undefined
+  const prefix = sessionPrefix(stateDir as string | undefined)
+  let out = ''
+  for (const part of needs) {
+    if (typeof part === 'string') out += part.replace(/\s+/g, ' ')
+    else if (Array.isArray(part) && part.length > 0 && part.every((arg) => typeof arg === 'string' && !CONTROL.test(arg))) {
+      out += `\`${prefix}tp-agent ${(part as string[]).map(shellQuote).join(' ')}\``
+    } else return undefined
+  }
+  return out.trim() === '' ? undefined : out.trim()
+}
+
 function requestFields(row: unknown): { requestLog?: RequestEvent[]; answerRoute?: AnswerRoute } {
   const { request_log: log, answer_route: route } = (row ?? {}) as Record<string, unknown>
   const events: RequestEvent[] = []
@@ -190,7 +211,7 @@ function requestFields(row: unknown): { requestLog?: RequestEvent[]; answerRoute
   const { by, why, needs } = (typeof route === 'object' && route !== null ? route : {}) as Record<string, unknown>
   const isRoute = by === 'message' || by === 'retry' || by === 'none'
   const text = (value: unknown) => (typeof value === 'string' && value.trim() !== '' ? value.replace(/\s+/g, ' ').trim() : undefined)
-  const [said, first] = [text(why), text(needs)]
+  const [said, first] = [text(why), needsText(needs, (row as Record<string, unknown>).state_dir)]
   return {
     ...(events.length === 0 ? {} : { requestLog: events }),
     ...(isRoute ? { answerRoute: { by, ...(said === undefined ? {} : { why: said }), ...(first === undefined ? {} : { needs: first }) } } : {}),
@@ -255,8 +276,12 @@ function shellQuote(text: string): string {
 // A task in another session's state directory is reached in the form tp-agent's own refusals print (lib/lane_lease.py
 // in_session): the pane's own session is dropped (it would win over TP_STATE_DIR) and that directory is exported. A task in
 // main's own session (no state_dir) gets the plain command. HB4a round 5 rule 3.
+function sessionPrefix(stateDir: string | undefined): string {
+  return stateDir === undefined ? '' : `env -u TMUX -u TMUX_PANE -u TP_SESSION TP_STATE_DIR=${shellQuote(stateDir)} `
+}
+
 function agent(row: TaskRow, verb: string): string {
-  return `${row.state_dir === undefined ? '' : `env -u TMUX -u TMUX_PANE -u TP_SESSION TP_STATE_DIR=${shellQuote(row.state_dir)} `}tp-agent ${verb} ${row.id}`
+  return `${sessionPrefix(row.state_dir)}tp-agent ${verb} ${row.id}`
 }
 
 function hint(row: TaskRow): string {

@@ -17,7 +17,8 @@ next round is the change from that tree to the tree now.
       when that commit is an ancestor of HEAD, else from the lane base; the text names which ("base: last closed step S at SHA"
       or "base: lane base SHA") and says closed steps are out of scope except where the new lines change or call them.
 
-  review_rounds.py timers <workdir> <lane> <out-file>
+  review_rounds.py timers <workdir> <lane> <out-file> [--input <scope-input.json>]
+      (--input: the file prepare wrote; its paths are used only when it is the round-1 plan, the one timers makes without it.)
       writes the `Timer waits in added test lines` file: the added lines of that same diff, in files whose path matches
       test, spec, e2e or __tests__, that contain setTimeout(, sleep(, delay(, Deno.sleep( or waitForTimeout(, as path:line: text
       (a line carrying `timer-ok:` is marked `(timer-ok)`); facts only. Withheld paths are never read. Every match is kept: the
@@ -315,7 +316,11 @@ def blob_patch(top, oldid, newid):
                           oldid, newid], capture_output=True)
     if run.returncode:
         raise Refused(f"cannot diff blobs {oldid}..{newid}: {run.stderr.decode('utf-8', 'replace').strip()}")
-    text = run.stdout.decode("utf-8", "surrogateescape")
+    return hunks_of(run.stdout.decode("utf-8", "surrogateescape"))
+
+
+def hunks_of(text):
+    """blob_patch's answer for the diff text of one pair: its lines from the first hunk on, None for a binary pair, "" for none."""
     at = text.find("\n@@")
     if text.startswith("@@"):
         at = -1
@@ -324,12 +329,142 @@ def blob_patch(top, oldid, newid):
     return text[at + 1:]
 
 
+BATCH_MIN = 5  # pairs: below this the batch (two check-attr, one mktree, one diff) starts no fewer processes than one diff per pair
+
+
+def attributes(top, names, index=True):
+    """{name: the attributes git gives it, as a sorted tuple of (attribute, value)} for names at the repository root, or None when
+    git cannot say. `index=False` reads them with an empty index (only the work tree's, $GIT_DIR/info/attributes and the global
+    and system files): `git diff` of two blobs does not read the index for attributes, `git check-attr` does, so blob_patches asks
+    both ways."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = None if index else {**os.environ, "GIT_INDEX_FILE": str(Path(tmp) / "no-index")}
+        run = subprocess.run(["git", "-C", top, "check-attr", "-z", "--stdin", "--all"], capture_output=True, env=env,
+                             input="".join(f"{name}\0" for name in names).encode())
+    fields = run.stdout.split(b"\0")
+    if run.returncode or fields.pop() != b"" or len(fields) % 3:
+        return None
+    found = {name: [] for name in names}
+    for name, attribute, value in zip(fields[::3], fields[1::3], fields[2::3]):
+        if name.decode() not in found:
+            return None
+        found[name.decode()].append((attribute, value))
+    return {name: tuple(sorted(values)) for name, values in found.items()}
+
+
+def blob_patches(top, pairs):
+    """[blob_patch(top, old, new) for old, new in pairs], the same text, from one `git diff` of two trees for most pairs.
+
+    No path is given to git here either. Pair k becomes the entry named k (its index, a name this code chooses) of two trees made
+    by one `git mktree --batch` from the pairs' blob ids alone: the old blob in the first, the new in the second, both mode 100644.
+    Git's attributes are matched against a name (blob_patch's diff matches each side's against its blob id: `* -diff`, a funcname
+    driver or `diff=x` with `diff.x.binary` change the output), so a pair goes into the trees only when its old id, its new id
+    and k have the same attributes, read both with and without the index (attributes); any other pair, every pair when the
+    attributes cannot be read, and every pair of a list shorter than BATCH_MIN, is diffed alone by blob_patch.
+    The output is split back by structure only: a `diff --git a/k b/k` line counts only outside a hunk body, whose length its
+    `@@` header gives (as outside_hunks reads it), and only for a name not yet seen; a file line inside a hunk is never read
+    as a boundary. Anything else raises Refused, as does a git call that fails: nothing is guessed or attached in part."""
+    if len(pairs) < BATCH_MIN:
+        return [blob_patch(top, old, new) for old, new in pairs]
+    names = [str(k) for k in range(len(pairs))]
+    asked = sorted({blob for pair in pairs for blob in pair} | set(names))
+    views = [attributes(top, asked, index) for index in (True, False)]
+    batch = [] if None in views else [k for k, (old, new) in enumerate(pairs)
+                                      if all(view[old] == view[new] == view[names[k]] for view in views)]
+    found = {k: blob_patch(top, *pairs[k]) for k in range(len(pairs)) if k not in set(batch)}
+    if batch:
+        listing = "".join(f"100644 blob {pairs[k][0]}\t{names[k]}\n" for k in batch) + "\n" + \
+                  "".join(f"100644 blob {pairs[k][1]}\t{names[k]}\n" for k in batch)
+        made = subprocess.run(["git", "-C", top, "mktree", "--batch"], input=listing.encode(), capture_output=True)
+        trees = made.stdout.decode("ascii", "replace").split()
+        if made.returncode or len(trees) != 2:
+            raise Refused(f"cannot diff blobs {pairs[batch[0]][0]}..{pairs[batch[0]][1]} and {len(batch) - 1} more pairs: "
+                          f"the trees holding them cannot be made ({made.stderr.decode('utf-8', 'replace').strip()})")
+        run = subprocess.run(["git", "-C", top, "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames",
+                              "--src-prefix=a/", "--dst-prefix=b/", *trees], capture_output=True)
+        if run.returncode:
+            raise Refused(f"cannot diff blobs {pairs[batch[0]][0]}..{pairs[batch[0]][1]} and {len(batch) - 1} more pairs "
+                          f"(trees {trees[0]}..{trees[1]}): {run.stderr.decode('utf-8', 'replace').strip()}")
+        sections = split_sections(run.stdout.decode("utf-8", "surrogateescape"), [names[k] for k in batch])
+        for k in batch:
+            if names[k] not in sections and pairs[k][0] != pairs[k][1]:
+                raise Refused(f"the diff of blobs {pairs[k][0]}..{pairs[k][1]} is missing from the batched diff")
+            found[k] = hunks_of(sections.get(names[k], ""))
+    return [found[k] for k in range(len(pairs))]
+
+
+def split_sections(text, names):
+    """{name: its section of text, from its `diff --git a/name b/name` line to the next}: the diff of two trees whose entries are
+    `names`. A header counts only outside a hunk body and only once per name; the body of a hunk is as long as its header says (a
+    space line uses one old and one new line, `-` one old, `+` one new, a backslash line neither). Raises Refused for anything else:
+    a line before the first header, an `@@` line that is not a hunk header, a body cut short or too long, an unknown or repeated
+    header, a text that does not end at a line end."""
+    headers = {f"diff --git a/{name} b/{name}": name for name in names}
+    lines = text.split("\n")
+    if lines.pop() != "":
+        raise Refused("the batched diff does not end with a line end")
+    sections, current, old, new = {}, None, 0, 0
+    for at, line in enumerate(lines):
+        if old or new:
+            kind = line[:1]
+            if kind == " ":
+                old, new = old - 1, new - 1
+            elif kind == "-":
+                old -= 1
+            elif kind == "+":
+                new -= 1
+            elif kind != "\\":
+                raise Refused(f"the batched diff has a hunk cut short at line {at + 1}")
+            if old < 0 or new < 0:
+                raise Refused(f"the batched diff has a hunk longer than its header says at line {at + 1}")
+        elif line.startswith("diff --git "):
+            current = headers.get(line)
+            if current is None or current in sections:
+                raise Refused(f"the batched diff has a header this code did not write at line {at + 1}: {line[:60]!r}")
+            sections[current] = []
+        elif line.startswith("@@"):
+            head = HUNK_HEAD.match(line)
+            if not head:
+                raise Refused(f"the batched diff has an @@ line that is not a hunk header at line {at + 1}")
+            old, new = int(head.group(1) or 1), int(head.group(2) or 1)
+        if current is None:
+            raise Refused("the batched diff does not start with a header")
+        sections[current].append(line)
+    if old or new:
+        raise Refused("the batched diff ends inside a hunk")
+    return {name: "\n".join(lines) + "\n" for name, lines in sections.items()}
+
+
 def blob_text(top, blobid):
     """The text of a blob, decoded the way blob_patch decodes a diff."""
     run = subprocess.run(["git", "-C", top, "cat-file", "blob", blobid], capture_output=True)
     if run.returncode:
         raise Refused(f"cannot read blob {blobid}: {run.stderr.decode('utf-8', 'replace').strip()}")
     return run.stdout.decode("utf-8", "surrogateescape")
+
+
+def blob_texts(top, blobids):
+    """{blob id: blob_text(top, blob id)} for every id, from one `git cat-file --batch`; split by the size git gives for each
+    object, never by its content. Raises Refused as blob_text does when git fails or an id is not a blob there."""
+    blobids = list(dict.fromkeys(blobids))
+    if not blobids:
+        return {}
+    run = subprocess.run(["git", "-C", top, "cat-file", "--batch"], input="".join(f"{b}\n" for b in blobids).encode(),
+                         capture_output=True)
+    if run.returncode:
+        raise Refused(f"cannot read blob {blobids[0]} and {len(blobids) - 1} more: {run.stderr.decode('utf-8', 'replace').strip()}")
+    out, at, found = run.stdout, 0, {}
+    for blobid in blobids:
+        end = out.find(b"\n", at)
+        head = out[at:end].decode("ascii", "replace").split() if end >= 0 else []
+        if head[:1] != [blobid] or len(head) != 3 or head[1] != "blob" or not head[2].isdigit():
+            raise Refused(f"cannot read blob {blobid}: git says {' '.join(head[1:]) or 'nothing'}")
+        size = int(head[2])
+        if out[end + 1 + size:end + 2 + size] != b"\n":
+            raise Refused(f"cannot read blob {blobid}: git gave fewer bytes than its size")
+        found[blobid] = out[end + 1:end + 1 + size].decode("utf-8", "surrogateescape")
+        at = end + 2 + size
+    return found
 
 
 def whole_file_section(top, path, label, old, new, hunks, text):
@@ -352,10 +487,39 @@ def whole_file_section(top, path, label, old, new, hunks, text):
     return "".join(out)
 
 
-def entry_patch(top, empty, entry, old, new):
+READ = object()  # entry_patch: the hunks are read here
+
+
+def entry_pair(empty, entry):
+    """The two blob ids an entry's hunks are made from (the empty blob for the missing side of an added or deleted file), or None for
+    a submodule, which has no blob in this repository."""
+    _, (oldmode, newmode, oldid, newid, status) = entry
+    if "160000" in (oldmode, newmode):
+        return None
+    return empty if status == "A" else oldid, empty if status == "D" else newid
+
+
+def may_go_whole(entry, hunks):
+    """True when entry_patch weighs the entry's hunks against the file shown whole, and so needs the new blob's text."""
+    _, (oldmode, newmode, _, _, status) = entry
+    return bool(hunks) and status == "M" and oldmode == newmode and "160000" not in (oldmode, newmode)
+
+
+def entry_patches(top, empty, entries, old, new):
+    """[entry_patch(top, empty, entry, old, new) for entry in entries], the same text, with the git work done once for all of them:
+    every entry's hunks from blob_patches, then the text of each new blob a whole-file section may need from one blob_texts."""
+    pairs = [entry_pair(empty, entry) for entry in entries]
+    made = iter(blob_patches(top, [pair for pair in pairs if pair]))
+    hunks = [next(made) if pair else None for pair in pairs]
+    texts = blob_texts(top, [entry[1][3] for entry, found in zip(entries, hunks) if may_go_whole(entry, found)])
+    return [entry_patch(top, empty, entry, old, new, found, texts.__getitem__) for entry, found in zip(entries, hunks)]
+
+
+def entry_patch(top, empty, entry, old, new, hunks=READ, text_of=None):
     """The diff text of one checked entry, with a header this code writes from the entry's own path and modes. `old` and `new` are
     the trees (or commits) the entry was listed between; the note of a whole-file section names them in the command that prints the
-    real diff.
+    real diff. `hunks` and `text_of` (a blob id to its text) are what blob_patch and blob_text give, when the caller has them
+    (entry_patches); without them they are read here.
 
     A modified text file whose hunk section (the `---`/`+++` lines and the hunks) is longer than its whole-file section (the note, the
     same two lines, an `@@` line and the file as it is now, marked +; whole_file_section) is shown whole: a rewrite's hunks repeat
@@ -376,15 +540,16 @@ def entry_patch(top, empty, entry, old, new):
     if "160000" in (oldmode, newmode):  # a submodule commit is not a blob in this repository
         out.append(f"Submodule entry ({oldid[:12]}..{newid[:12]}); no content shown.\n")
         return "".join(out)
-    hunks = blob_patch(top, empty if status == "A" else oldid, empty if status == "D" else newid)
+    if hunks is READ:
+        hunks = blob_patch(top, *entry_pair(empty, entry))
     if hunks is None:
         out.append(f"Binary files a/{label} and b/{label} differ\n")
     elif hunks:
         hunks = hunks if hunks.endswith("\n") else hunks + "\n"
         plain = (f"--- {'/dev/null' if status == 'A' else 'a/' + label}\n+++ {'/dev/null' if status == 'D' else 'b/' + label}\n"
                  + hunks)
-        if status == "M" and oldmode == newmode:
-            whole = whole_file_section(top, path, label, old, new, hunks, blob_text(top, newid))
+        if may_go_whole(entry, hunks):
+            whole = whole_file_section(top, path, label, old, new, hunks, (text_of or (lambda blob: blob_text(top, blob)))(newid))
             if len(whole) < len(plain):
                 plain = whole
         out.append(plain)
@@ -681,7 +846,9 @@ def safe_diff(top, old, new, only=None, anchor=None):
     Renames are split into a deletion and an addition (--no-renames) so each side is judged by its own path.
     The listing is of leaf entries (blobs, links, submodules) with their blob ids; each safe entry's patch is made from
     its own two blob ids, never from a path given to git, so a path that turned into a directory (or the reverse) cannot
-    pull in entries that were not checked. gate() then verifies the finished text.
+    pull in entries that were not checked. The pairs are diffed together (blob_patches: one git diff of two trees this code
+    makes from the safe entries' blob ids under names it chooses) and the texts a whole-file section needs are read together
+    (blob_texts); the text is the same as one call per entry. gate() then verifies the finished text.
 
     An added or modified file that a `frozen-copies.json` manifest declares a byte-identical copy of a file of an older commit, and
     that passes every check (frozen_copies), is named in a note with its commit, source and blob id and left out of the body. The
@@ -729,7 +896,7 @@ def safe_diff(top, old, new, only=None, anchor=None):
             safe.append((path, record))
     anchor = commit_of(top, old) or (commit_of(top, anchor) if anchor else None)
     safe, left, problems = frozen_copies(top, new, safe, listed, anchor, check)
-    body = "".join(entry_patch(top, empty, entry, old, new) for entry in safe)
+    body = "".join(entry_patches(top, empty, safe, old, new))
     labels = {"A": "added", "M": "modified", "D": "deleted", "T": "type changed"}
     notes = "".join(f"{json.dumps(p)} ({labels[r[4]]}): sensitive path, its contents were withheld from this diff\n"
                     for p, r in withheld)
@@ -1375,14 +1542,30 @@ def added_lines(top, base, path, untracked):
     return found
 
 
-def timer_waits(workdir, lane=""):
+def round_one_plan(source):
+    """The plan prepare wrote (`source`, its scope-input.json) when it is the one scope_lines makes without a plan, else None.
+    That is a plan from diff_now (round 1, or a later round with no usable reviewed state): `previous` 0, made by the same rule as
+    plan_for. A later round's plan is of the diff since the reviewed tree (`previous` > 0), which the timer waits do not cover; an
+    unreadable one is not used either, so the timer waits are then computed as they were without it."""
+    if source is None:
+        return None
+    try:
+        plan = load_plan(source)
+    except Refused:
+        return None
+    return plan if plan["previous"] == 0 else None
+
+
+def timer_waits(workdir, lane="", plan=None):
     """The text of the packet's `Timer waits in added test lines` file: every added line of the review diff, in a file whose
     path matches a test pattern, that contains one of TIMER_CALLS, as `path:line: text`, a line carrying `timer-ok:` marked
     `(timer-ok)`; one line saying none were found when there are none. Facts only. Withheld (sensitive) paths are never read, a
-    listed line goes through the redaction pass, and the text is never an error: what cannot be computed is said in one line."""
+    listed line goes through the redaction pass, and the text is never an error: what cannot be computed is said in one line.
+    The changed paths are the round-1 plan's (scope_lines): `plan` is the scope-input.json prepare wrote, used only when it is
+    that plan (round_one_plan), so it is not made a second time."""
     head = f"# {TIMER_TITLE}: not computed\n\n"  # the first line carries the title and the counts together
     try:
-        found = scope_lines(workdir, lane)
+        found = scope_lines(workdir, lane, round_one_plan(plan))
         if found is None:
             return head + "Not computed: the working directory is not a git repository.\n"
         base, top, safe = found[:3]
@@ -1413,9 +1596,10 @@ def timer_waits(workdir, lane=""):
 
 
 def main(argv):
-    if len(argv) == 5 and argv[1] == "timers":  # timers <workdir> <lane> <out-file>
+    if len(argv) in (5, 7) and argv[1] == "timers" and (len(argv) == 5 or argv[5] == "--input"):
+        # timers <workdir> <lane> <out-file> [--input <scope-input.json written by prepare>]
         try:
-            write_list_file(argv[4], timer_waits(argv[2], argv[3]))
+            write_list_file(argv[4], timer_waits(argv[2], argv[3], argv[6] if len(argv) == 7 else None))
         except OSError as exc:
             print(f"review_rounds: cannot write {argv[4]}: {exc}", file=sys.stderr)
             sys.exit(1)

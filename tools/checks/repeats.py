@@ -35,6 +35,8 @@ SECRET_NAME = re.compile(r"KEY|TOKEN|SECRET|PASSWORD|PASS|CREDENTIAL|AUTH", re.I
 # and an unterminated quote to the end of the text.
 ASSIGN_IN_TEXT = re.compile(r"(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]*)=((?:\"[^\"]*\"|'[^']*'|\\.|[^\s;&|()<>\"'\\])*"
                             r"(?:\"[^\"]*$|'[^']*$)?)", re.S)
+WORD = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.,:/+-]*")  # R4: the only shape of a word the tool reads
+ASSIGN_START = re.compile(r"(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]*)=")  # where an assignment in shell text begins
 SHELLS = ("bash", "sh", "zsh", "dash", "ksh")
 SHELL_C = re.compile(r"-[A-Za-z]*c[A-Za-z]*")
 INTERP = re.compile(r"python[0-9.]*")
@@ -143,6 +145,20 @@ def _assign(a):
     return ("set", name, "<set>" if name == "TMUX_TMPDIR" else value)
 
 
+def _word_ok(word):
+    """R4 grammar for a word the tool reads: plain path characters only (no `~ $ ` quote glob brace = leading / or leading
+    dot) and no `..` segment. Checked on the word as written."""
+    return bool(WORD.fullmatch(word)) and ".." not in word.split("/")
+
+
+def _assign_ok(word):
+    """R4: a NAME=VALUE the tool reads: an empty value or a grammar word; TMUX_TMPDIR (keyed by presence) may be absolute."""
+    name, value = word.split("=", 1)
+    if name == "TMUX_TMPDIR":
+        return bool(re.fullmatch(r"/?[A-Za-z0-9_][A-Za-z0-9_.,:/+-]*", value)) and ".." not in value.split("/")
+    return value == "" or _word_ok(value)
+
+
 def _shell_words(text):
     """The words of a shell string with operators as words of their own (`ls;` is `ls` and `;`); text.split() when the
     quoting is broken."""
@@ -172,20 +188,36 @@ def _scan_shell(text, depth=0):
     return out, texts
 
 
+def _quoted(text, tokens):
+    """True when the quoting or escaping of a shell text changes a word (its words differ from the characters written). The
+    one exception is the program text handed to a nested `sh -c`, which is read again on its own."""
+    raw = text.split()
+    if raw == tokens:
+        return False
+    if len(tokens) >= 3 and os.path.basename(tokens[-3]) in SHELLS and SHELL_C.fullmatch(tokens[-2]):
+        return raw[:len(tokens) - 1] != tokens[:-1]
+    return True
+
+
 def _plain_shell(text):
-    """The tokens of a `bash -c` string that is one plain command (no operator, redirection or expansion), else None."""
+    """(tokens, None) of a `bash -c` string that is one plain command (no operator, redirection, quoting or expansion), else
+    (None, why)."""
     try:
         lexer = shlex.shlex(text, posix=True, punctuation_chars=True)
         lexer.whitespace_split = True
         if any(t and all(c in "();<>|&" for c in t) for t in lexer):
-            return None
+            return None, "operator"
         tokens = shlex.split(text)
     except ValueError:
-        return None
-    return tokens if tokens and not any("$" in t or "`" in t for t in tokens) else None
+        return None, "quoting"
+    if not tokens:
+        return None, "empty"
+    if _quoted(text, tokens):
+        return None, "quoting"
+    return (None, "expansion") if any("$" in t or "`" in t for t in tokens) else (tokens, None)
 
 
-def _shell_opaque(args, words):
+def _shell_opaque(args, words, why):
     """What in a `-c` program the tool does not read, for the reason `not understood`."""
     if len(args) != 3 or args[1] != "-c":
         return "shell options or arguments (%s)" % args[1]
@@ -194,12 +226,13 @@ def _shell_opaque(args, words):
     for w in words:
         if w and all(c in "();<>|&" for c in w):
             return "shell operator %s" % w
-    return "shell expansion in a program"
+    return "quoted word in a program" if why == "quoting" else "shell expansion in a program"
 
 
 def _top(arg, cwd):
-    """N1: an argument naming the worktree or a path in it, spelt relative to the top."""
-    if not cwd or not arg.startswith("/"):
+    """N1: an argument naming the worktree or a path in it, spelt relative to the top. A word with a `..` component is left
+    as written (it is checked, never resolved)."""
+    if not cwd or not arg.startswith("/") or ".." in arg.split("/"):
         return arg
     norm = os.path.normpath(arg)
     if norm == cwd:
@@ -224,37 +257,47 @@ def canonical(cmd, cwd):
     cwd = os.path.normpath(cwd) if isinstance(cwd, str) and cwd.startswith("/") else ""
     args = [_top(a, cwd) for a in cmd]
     rel, wrappers, env = ".", [], []
-    tokens, shell_texts, opaque = list(args), [], None
+    tokens, shell_texts, opaque, unread = list(args), [], None, None
     while args:
         base = os.path.basename(args[0])
+        consumed = []  # the wrapper words read as written (R4)
         if base == "env":
             parsed = _env_ops(args)
             if parsed is None:
                 opaque = "an env option the parser does not read"
                 break
             env += parsed[0]
+            consumed = args[:len(args) - len(parsed[1])]
             args = parsed[1]
         elif base == "perl" and len(args) >= 3 and args[1] == "-e" and ALARM.fullmatch(args[2]):
             wrappers.append("alarm " + ALARM.fullmatch(args[2]).group(1))
             args = args[3:]
         elif _assign(args[0]):  # a shell prefix assignment: NAME=VALUE CMD
             env.append(_assign(args[0]))
+            consumed = args[:1]
             args = args[1:]
         elif base in SHELLS and len(args) >= 3 and SHELL_C.fullmatch(args[1]):
             text = args[2]
             if text in tokens:
                 tokens.remove(text)  # the program text is not a path; its words are the tokens (F3)
-            inner = _plain_shell(text) if len(args) == 3 and args[1] == "-c" else None
+            inner, why = _plain_shell(text) if len(args) == 3 and args[1] == "-c" else (None, "")
             words, texts = _scan_shell(text)
             shell_texts += texts
             if inner is None:  # opaque: kept as written; its words still count for D4
                 tokens += [_top(w, cwd) for w in words]
-                opaque = _shell_opaque(args, words)
+                opaque = _shell_opaque(args, words, why)
                 break
             args = [_top(a, cwd) for a in inner]
             tokens += args
         else:
             break
+        # R4: a value the grammar does not name is not understood
+        for w in consumed:
+            if unread is None and _assign(w) and not _assign_ok(w):
+                unread = "an environment value outside the grammar"
+        for op in env:
+            if unread is None and op[0] == "-u" and not ENV_NAME.fullmatch(op[1]):
+                unread = "an env -u operand outside the grammar"
     for tok in [t for t in tokens if re.search(r"\s", t) and t not in shell_texts]:  # text a wrapper passes on (timeout, eval, env -S)
         words, texts = _scan_shell(tok)
         if len(words) > 1:
@@ -271,7 +314,7 @@ def canonical(cmd, cwd):
     body = list(args) if tests is None else opts + [tests]
     return {"key": json.dumps([head, body]), "runner": json.dumps([head, opts]) if tests is not None else None,
             "tests": tests, "interp": interp, "env": env, "tokens": tokens, "shell_texts": shell_texts, "cwd": cwd,
-            "argv": args, "opaque": opaque,
+            "argv": args, "opaque": opaque, "unread": unread,
             "no_interp": json.dumps([head, (["<py>"] + body[1:]) if interp else body])}
 
 
@@ -284,7 +327,7 @@ def _tests(args):
             a = args[i]
             if a in UNITTEST_FLAGS:
                 opts.append(a)
-            elif a == "-k" and i + 1 < len(args):
+            elif a == "-k" and i + 1 < len(args) and _word_ok(args[i + 1]):
                 opts += [a, args[i + 1]]
                 i += 1
             else:
@@ -298,7 +341,7 @@ def _tests(args):
         opts, names, i = [args[0], "tests/run_bounded.py"], [], 2
         while i < len(args):
             a = args[i]
-            if a in ("--timeout", "--grace", "--durations") and i + 1 < len(args):
+            if a in ("--timeout", "--grace", "--durations") and i + 1 < len(args) and re.fullmatch(r"[0-9]+(\.[0-9]+)?", args[i + 1]):
                 opts += [a, args[i + 1]]
                 i += 1
             elif a.startswith("-"):
@@ -400,7 +443,10 @@ def outside_reason(canon):
     names is a relative path in the worktree with no `..` component (an absolute path outside is `input outside the tree`;
     shell program text is never a path, its words are), and (2) after the wrappers it reads (env -u/NAME=VALUE, perl alarm,
     a shell prefix assignment, a plain `bash -c` of one command) it is an interpreter (python*) running `-m unittest NAMES`
-    or a script in the tree, a shell running a script in the tree, or an executable at a relative path in the tree. Anything
+    or a script in the tree, a shell running a script in the tree, or an executable at a relative path in the tree (R4: the
+    words are checked as written against WORD, with no quoting, `~`, `$`, glob, brace, `=`, leading `/` or `..`; a script
+    takes no operand and no option value, since it may read outside the tree through them; only unittest names, the known
+    unittest flags and run_bounded files and numbers are operands). Anything
     else (cd, an operator, an unknown env option, an unknown wrapper, python -c, a runner such as node or deno, git, whose
     output reads refs and the index the record does not hold) is `not understood: WHAT`. The never-reused scan runs before
     this, over every word, so a live or network run is `never` even when not understood."""
@@ -412,37 +458,44 @@ def outside_reason(canon):
     for tok in canon["tokens"]:
         if any(".." in part.split("/") for part in (tok, tok.split("=", 1)[1] if "=" in tok else "")):
             return "not understood: a .. component in a path"
+    if canon["unread"]:
+        return "not understood: " + canon["unread"]
     args = canon["argv"]
     if not args:
         return "not understood: an empty command"
     head = os.path.basename(args[0])
     i = 1
     if INTERP.fullmatch(head):
+        if canon["tests"] is not None:
+            return None  # `-m unittest FLAGS NAMES` or run_bounded.py FILES: names, flags and numbers were read by _tests
         while i < len(args) and args[i] in PY_FLAGS:
             i += 1
         if i >= len(args):
             return "not understood: python without a script"
         if args[i] == "-m":
-            return None if canon["tests"] is not None else "not understood: python -m other than unittest with named tests"
+            return "not understood: python -m other than unittest with named tests"
     elif head in SHELLS:
         if i >= len(args):
             return "not understood: a shell without a script"
-    elif not ("/" in args[0] and not args[0].startswith("/")):
+    elif "/" not in args[0] or args[0].startswith("/"):
         return "not understood: command %s" % head
     else:
-        return None
+        i = 0  # an executable at a relative path in the tree: it is the script itself
     a = args[i]
     if a.startswith("-"):
-        return "not understood: %s option %s" % (head, a)
-    return None if not a.startswith("/") else "not understood: %s script outside the tree" % head
+        return "not understood: %s option %s" % (head, a.split("=", 1)[0])
+    if not _word_ok(a):
+        return "not understood: %s script not a plain path in the tree" % head
+    if len(args) > i + 1:
+        return "not understood: operands of a %s script (it may read outside the tree through them)" % head
+    return None
 
 
 def shown_cmd(cmd):
     """The cmd for printing: the value of a NAME=VALUE with a secret-like name is hidden (D6). A cmd element that is itself
-    NAME=VALUE is hidden whole; in shell text the value is hidden through the end of the shell word. Other secret forms
-    (the value of a --token flag) are not recognised."""
-    def hide(match):
-        return match.group(1) + "=<hidden>" if SECRET_NAME.search(match.group(1)) else match.group(0)
+    NAME=VALUE is hidden whole; in shell text, everything from the first secret-looking assignment to the end of the text is
+    hidden (a value's quoting, escapes and substitutions are not parsed). Other secret forms (the value of a `--token V`
+    flag) are not recognised."""
     out = []
     for a in cmd:
         name = a.split("=", 1)[0]
@@ -451,7 +504,11 @@ def shown_cmd(cmd):
         elif ENV_NAME.fullmatch(name) and SECRET_NAME.search(name):
             out.append(name + "=<hidden>")
         else:
-            out.append(ASSIGN_IN_TEXT.sub(hide, a))
+            for m in ASSIGN_START.finditer(a):  # R4: from the first secret-looking assignment, everything to the end goes
+                if SECRET_NAME.search(m.group(1)):
+                    a = a[:m.start()] + m.group(1) + "=<hidden>"
+                    break
+            out.append(a)
     return out
 
 
@@ -516,7 +573,7 @@ def load(tasks_dir, lane=None):
                     continue  # missing / not_applicable: the check did not run
                 key, outside = _gate_key(check["name"], record)
                 canon = {"key": key, "runner": None, "tests": None, "interp": "", "env": [], "tokens": [], "no_interp": key,
-                         "shell_texts": [], "cwd": "", "argv": [], "opaque": None}
+                         "shell_texts": [], "cwd": "", "argv": [], "opaque": None, "unread": None}
                 runs.append(dict(info, kind="gate", label=check["name"], cmd=["<gate>", check["name"]] + record["files"],
                                  tree=record["tree"], exit=check["exit"], timed_out=False, seconds=float(check["seconds"]),
                                  end=_iso_epoch(record["finished"]), path=str(path), n=0, canon=canon, never=None,

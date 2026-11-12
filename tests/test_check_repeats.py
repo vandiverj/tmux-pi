@@ -204,7 +204,50 @@ class RepeatsTest(unittest.TestCase):
             ("R3 in-tree script with a prefix assignment and perl alarm", (["perl", "-e", "alarm 9; exec @ARGV", "X=1", "python3", "tools/x.py"], T, 0, 1),
              (["perl", "-e", "alarm 9; exec @ARGV", "X=1", "python3", "tools/x.py"], T, 0, 1), "duplicate", 1, {}),
             ("R3 in-tree shell script", (["bash", "tests/x.sh"], T, 0, 1), (["bash", "tests/x.sh"], T, 0, 1), "duplicate", 1, {}),
-            ("R3 in-tree executable path", (["tools/agent/x.sh", "a"], T, 0, 1), (["tools/agent/x.sh", "a"], T, 0, 1), "duplicate", 1, {}),
+            ("R3 in-tree executable path", (["tools/agent/x.sh"], T, 0, 1), (["tools/agent/x.sh"], T, 0, 1), "duplicate", 1, {}),
+            # R4: a strict grammar on the words as written; a script takes no operand or option value, nothing is normalised first
+            ("R4 option value outside the tree (review F2)", (["python3", "tools/waits/timeline.py", ".", "--lanes-dir=/tmp/lanes"], T, 0, 1),
+             (["python3", "tools/waits/timeline.py", ".", "--lanes-dir=/tmp/lanes"], T, 0, 1), "outside", 0,
+             {"outside": 2, "reason": "not understood: operands of a python3 script"}),
+            ("R4 option and value as two words", (["python3", "tools/x.py", "--out", "/tmp/o"], T, 0, 1),
+             (["python3", "tools/x.py", "--out", "/tmp/o"], T, 0, 1), "outside", 0, {"outside": 2, "reason": "input outside the tree"}),
+            ("R4 a relative operand of a script", (["python3", "tools/x.py", "sub"], T, 0, 1), (["python3", "tools/x.py", "sub"], T, 0, 1),
+             "outside", 0, {"outside": 2, "reason": "not understood: operands"}),
+            ("R4 operand of a shell script", (["bash", "tests/x.sh", "a"], T, 0, 1), (["bash", "tests/x.sh", "a"], T, 0, 1),
+             "outside", 0, {"outside": 2, "reason": "not understood: operands of a bash script"}),
+            ("R4 operand of a relative executable", (["tools/agent/x.sh", "a"], T, 0, 1), (["tools/agent/x.sh", "a"], T, 0, 1),
+             "outside", 0, {"outside": 2, "reason": "not understood: operands"}),
+            ("R4 tilde in a shell program (review F3)", (["bash", "-c", "python3 tools/checks/repeats.py ~/session-tasks"], T, 0, 1),
+             (["bash", "-c", "python3 tools/checks/repeats.py ~/session-tasks"], T, 0, 1), "outside", 0, {"outside": 2, "reason": "not understood: operands"}),
+            ("R4 quoted tilde differs in meaning, not understood", (["bash", "-c", "python3 tools/checks/repeats.py '~/session-tasks'"], T, 0, 1),
+             (["bash", "-c", "python3 tools/checks/repeats.py '~/session-tasks'"], T, 0, 1), "outside", 0,
+             {"outside": 2, "reason": "not understood: quoted word"}),
+            ("R4 quoted unittest name", (["bash", "-c", "python3 -m unittest 'tests.test_x'"], T, 0, 1),
+             (["bash", "-c", "python3 -m unittest 'tests.test_x'"], T, 0, 1), "outside", 0, {"outside": 2, "reason": "not understood: quoted word"}),
+            ("R4 escaped space is quoting", (["bash", "-c", "python3 -m unittest tests.test_x\\ y"], T, 0, 1),
+             (["bash", "-c", "python3 -m unittest tests.test_x\\ y"], T, 0, 1), "outside", 0, {"outside": 2, "reason": "not understood: quoted word"}),
+            ("R4 tilde as a unittest name", (PY + ["~/t"], T, 0, 1), (PY + ["~/t"], T, 0, 1), "outside", 0, {"outside": 2}),
+            ("R4 glob and brace as unittest names", (PY + ["tests/test_*.py"], T, 0, 1), (PY + ["tests.{a,b}"], T, 0, 1), "outside", 0, {"outside": 2}),
+            ("R4 -k pattern with a glob", (PY + ["-k", "a*", "tests.test_x"], T, 0, 1), (PY + ["-k", "a*", "tests.test_x"], T, 0, 1), "outside", 0, {"outside": 2}),
+            ("R4 -k pattern is a word", (PY + ["-k", "test_a", "tests.test_x"], T, 0, 1), (PY + ["-k", "test_a", "tests.test_x"], T, 0, 1), "duplicate", 1, {}),
+            ("R4 absolute .. path is not normalised (review F2)", (["python3", WT + "/tools/../tools/checks/repeats.py"], T, 0, 1),
+             (["python3", WT + "/tools/../tools/checks/repeats.py"], T, 0, 1), "outside", 0, {"outside": 2, "reason": "input outside the tree"}),
+            ("R4 absolute .. in a unittest path", (PY + [WT + "/tests/../tests/test_x.py"], T, 0, 1),
+             (PY + [WT + "/tests/../tests/test_x.py"], T, 0, 1), "outside", 0, {"outside": 2}),
+            ("R4 leading dot script", (["python3", "./tools/x.py"], T, 0, 1), (["python3", "./tools/x.py"], T, 0, 1), "outside", 0,
+             {"outside": 2, "reason": "not understood: python3 script not a plain path"}),
+            ("R4 env value with a tilde", (["env", "X=~/a"] + ut, T, 0, 1), (["env", "X=~/a"] + ut, T, 0, 1), "outside", 0,
+             {"outside": 2, "reason": "not understood: an environment value"}),
+            ("R4 env value with an absolute path", (["env", "X=/etc/a"] + ut, T, 0, 1), (["env", "X=/etc/a"] + ut, T, 0, 1), "outside", 0,
+             {"outside": 2}),
+            ("R4 shell prefix value with a glob in bash -c", (["bash", "-c", "X=a* python3 -m unittest tests.test_x"], T, 0, 1),
+             (["bash", "-c", "X=a* python3 -m unittest tests.test_x"], T, 0, 1), "outside", 0, {"outside": 2}),
+            ("R4 env -u operand outside the grammar", (["env", "-u", "A-B"] + ut, T, 0, 1), (["env", "-u", "A-B"] + ut, T, 0, 1), "outside", 0,
+             {"outside": 2, "reason": "not understood: an env -u operand"}),
+            ("R4 run_bounded option value", (["python3", "tests/run_bounded.py", "--timeout", "$X", "tests/test_x.py"], T, 0, 1),
+             (["python3", "tests/run_bounded.py", "--timeout", "$X", "tests/test_x.py"], T, 0, 1), "outside", 0, {"outside": 2}),
+            ("R4 git fetch behind env -i bash -c (review probe)", (["env", "-i", "bash", "-c", "git -C /work/wt fetch"], T, 0, 1),
+             (["env", "-i", "bash", "-c", "git -C /work/wt fetch"], T, 0, 1), "never", 0, {"never": 2}),
             # R3: the never scan reads every word, so a run that is not understood is still never counted
             ("R3 never behind an unknown wrapper", (["timeout", "60", "env", "TP_LIVE_LMSTUDIO=1"] + ut, T, 0, 1),
              (["timeout", "60", "env", "TP_LIVE_LMSTUDIO=1"] + ut, T, 0, 1), "never", 0, {"never": 2}),
@@ -288,33 +331,49 @@ class RepeatsTest(unittest.TestCase):
             g3 = [r for r in rep["runs"] if r["task"] == "coder-3"]
             def classes(label):
                 return [r["class"] for r in sorted((r for r in g3 if r["label"] == label), key=lambda r: r["end"])]
-            for label in ("gitleaks", "gitleaks-dirty"):
-                self.assertEqual(classes(label)[:4], ["first", "duplicate", "first", "first"], label)  # head, then base changed
-            for label in ("typecheck:web", "eslint:web", "newcheck"):
-                self.assertEqual(classes(label), ["outside"] * 4, label)
-            self.assertEqual(classes("prettier:web"), ["first", "duplicate", "duplicate", "duplicate"])  # files+tree only
-            self.assertEqual(classes("gitleaks")[4:], ["outside", "outside"])  # head or base.sha not recorded
-            self.assertTrue(all("head/base" in r["outside"] for r in g3 if r["label"] == "gitleaks" and r["class"] == "outside"))
-            self.assertTrue(all(r["outside"].startswith("not understood: ") for r in g3 if r["class"] == "outside"))
-            self.assertEqual(rep["totals"]["not_understood"], len([r for r in rep["runs"] if r["class"] == "outside" and r["task"] == "coder-3"]))
-            shown = " ".join(" ".join(repeats.shown_cmd(c)) for c in (
-                ["env", "API_TOKEN=s3cret", "python3"], ["bash", "-c", "export DB_PASSWORD='p w' X=1; API_KEY=abc cmd"],
-                ["bash", "-c", "AUTH_HEADER=zzz python3 -m unittest"],
-                # R3 F1: an argv element NAME=VALUE is hidden whole; shell text hides through the end of the shell word
-                ["env", "API_TOKEN=dummy firstw secondw", "python3"], ["env", "DB_PASSWORD=semi;colonw 'quotew\"", "python3"],
-                ["bash", "-c", "export API_KEY=a\"qb cw\"dw ew; true"], ["bash", "-c", "echo x; AUTH_X=esc\\ apedw fw"],
-                ["bash", "-c", "SECRET_Y='open quoted w"]))
-            for leaked in ("s3cret", "p w", "abc", "zzz", "firstw", "secondw", "colonw", "quotew", "qb", "cw", "dw", "apedw", "open", "quoted"):
-                self.assertNotIn(leaked, shown)
-            for kept in ("X=1", "ew;", "fw"):
-                self.assertIn(kept, shown)
-            self.assertEqual({r["task"]: r["role"] for r in rep["runs"] if r["kind"] == "test-run"},
-                             {"main-like": "main", "no-meta": "unknown"})
-            self.assertEqual(rep["totals"]["main_visible"], 1)
-            self.assertEqual(rep["tests_jsonl"]["lines"], 1)                 # counted apart, never a run
-            problems = " | ".join(p["problem"] for p in rep["problems"])
-            for want in ("malformed test-run record", "invalid test-run record", "symlink skipped", "malformed tests.jsonl"):
-                self.assertIn(want, problems)
+            with self.subTest("gate checks"):
+                for label in ("gitleaks", "gitleaks-dirty"):
+                    self.assertEqual(classes(label)[:4], ["first", "duplicate", "first", "first"], label)  # head, then base changed
+                for label in ("typecheck:web", "eslint:web", "newcheck"):
+                    self.assertEqual(classes(label), ["outside"] * 4, label)
+                self.assertEqual(classes("prettier:web"), ["first", "duplicate", "duplicate", "duplicate"])  # files+tree only
+                self.assertEqual(classes("gitleaks")[4:], ["outside", "outside"])  # head or base.sha not recorded
+                self.assertTrue(all("head/base" in r["outside"] for r in g3 if r["label"] == "gitleaks" and r["class"] == "outside"))
+                self.assertTrue(all(r["outside"].startswith("not understood: ") for r in g3 if r["class"] == "outside"))
+                self.assertEqual(rep["totals"]["not_understood"], len([r for r in rep["runs"] if r["class"] == "outside" and r["task"] == "coder-3"]))
+            # R4 F1: each masking row is its own subTest, independent of the gate assertions above. An argv element NAME=VALUE
+            # is hidden whole; shell text is hidden from its first secret-looking assignment to the end of the text.
+            masking = [  # cmd, words that must not show, words that must (the text before the assignment)
+                (["env", "API_TOKEN=s3cret", "python3"], ("s3cret",), ("API_TOKEN=<hidden>", "python3")),
+                (["bash", "-c", "export DB_PASSWORD='p w' X=1; API_KEY=abc cmd"], ("p w", "X=1", "abc", "cmd"), ("export DB_PASSWORD=<hidden>",)),
+                (["bash", "-c", "AUTH_HEADER=zzz python3 -m unittest"], ("zzz", "unittest"), ("AUTH_HEADER=<hidden>",)),
+                (["env", "API_TOKEN=dummy firstw secondw", "python3"], ("firstw", "secondw"), ("API_TOKEN=<hidden>",)),
+                (["env", "DB_PASSWORD=semi;colonw 'quotew\"", "python3"], ("colonw", "quotew"), ("DB_PASSWORD=<hidden>",)),
+                (["bash", "-c", "export API_KEY=a\"qb cw\"dw ew; true"], ("qb", "cw", "dw", "ew", "true"), ("export API_KEY=<hidden>",)),
+                (["bash", "-c", "echo x; AUTH_X=esc\\ apedw fw"], ("apedw", "fw"), ("echo x;", "AUTH_X=<hidden>")),
+                (["bash", "-c", "SECRET_Y='open quoted w"], ("open", "quoted"), ("SECRET_Y=<hidden>",)),
+                # the review's probes: an escaped double quote inside the value, and a command substitution in the value
+                (["bash", "-c", "export API_KEY=\"abc\\\"defw ghiw\"; true"], ("abc", "defw", "ghiw", "true"), ("export API_KEY=<hidden>",)),
+                (["bash", "-c", "echo ok; API_KEY=\"abc\\\"defw ghiw\" cmd"], ("defw", "ghiw", "cmd"), ("echo ok;", "API_KEY=<hidden>")),
+                (["bash", "-c", "export API_KEY=$(printf \"dummyw wordsw\") cmd"], ("printf", "dummyw", "wordsw", "cmd"), ("export API_KEY=<hidden>",)),
+                (["bash", "-c", "echo x; MY_TOKEN=`cat tokenfilew`; true"], ("tokenfilew", "true"), ("echo x;", "MY_TOKEN=<hidden>")),
+            ]
+            for cmd, leaked, kept in masking:
+                shown = " ".join(repeats.shown_cmd(cmd))
+                for word in leaked:
+                    with self.subTest("masking: %s must not show %s" % (cmd[-1][:40], word)):
+                        self.assertNotIn(word, shown)
+                for word in kept:
+                    with self.subTest("masking: %s keeps %s" % (cmd[-1][:40], word)):
+                        self.assertIn(word, shown)
+            with self.subTest("roles, tests.jsonl, bad records"):
+                self.assertEqual({r["task"]: r["role"] for r in rep["runs"] if r["kind"] == "test-run"},
+                                 {"main-like": "main", "no-meta": "unknown"})
+                self.assertEqual(rep["totals"]["main_visible"], 1)
+                self.assertEqual(rep["tests_jsonl"]["lines"], 1)                 # counted apart, never a run
+                problems = " | ".join(p["problem"] for p in rep["problems"])
+                for want in ("malformed test-run record", "invalid test-run record", "symlink skipped", "malformed tests.jsonl"):
+                    self.assertIn(want, problems)
 
     def test_case1_planted_schedule(self):
         """Case 1: the brief's planted schedule, scored over every pair of runs, then the CLI over the same directory."""

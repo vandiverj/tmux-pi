@@ -1,4 +1,4 @@
-# HB3b: owner decision (adopt rules in worker packets?), lane hub-packet head f749c16
+# HB3b: owner decision (adopt rules in worker packets?), lane hub-packet head 0f07089
 
 The brief says "Adoption is the owner's", so Main stopped before the close and merge. Nothing from this lane is in main.
 
@@ -23,13 +23,15 @@ decision). A coder in lane hub-packet gets a 5-line section. Cost per start: one
 |---|---|---|---|
 | 1 (Opus) | coder-9c299c1e6e, 41bc936 | review-coder-9c299c1e6e-115737 | REQUEST_CHANGES: rule text clipped at 240 chars (lost a prohibition); separate-git-dir worktrees missed project rules; missing store silent; omission count included conflict lines |
 | 2 (Sonnet) | coder-8c0089d198, f749c16 | review-coder-8c0089d198-121035 | APPROVED, no new defects |
+| 3 (Main) | 0f07089, comment only | review-coder-8c0089d198-134156 | APPROVED (the full suite's refusal audit read "tp-agent omits" in a new tp-spawn comment as a command) |
 
 **Checks:** cells on main + f749c16: test_session_env, test_work_brief, test_lane_other_paths, test_work_decisions,
 test_worker_env, 82 tests x 4, 0 failures. Every new row fails on the base. Private-name check: 1 line, config/routines.json:42.
-Full suite: batched with lane perf-review before any merge.
+Full suite on main + PF1c + HB3b (2026-11-12, 5546 tests): 2 failures, one from this lane (the comment, fixed in round 3; cells
+141 tests x 4, 0 failures) and one already on main (test_local_provider, fixed by LP2, merged 0f82f94).
 
 ## Not in this lane (follow-ups)
-1. Reviewers get no section yet: `bin/tp-review` was lane perf-review's; after it merges, one call passes `--rules-file`. Main
+1. Reviewers get no section yet: `bin/tp-review` was lane perf-review's (PF1c, merged ab722a0); one call passes `--rules-file`. Main
    recommends reviewers get it (some owner rules are about reviews).
 2. Shadow trials and other direct `tp-spawn` callers get no section.
 3. `lib/launch_record.py:271` still says owner records are not applied at launch (stale comment).

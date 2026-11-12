@@ -12,7 +12,10 @@ and the HB5a report.
 
 Read-only: it opens files for reading only, writes nothing, never opens a log, skips symlinked records and prints no file
 content beyond the recorded cmd, label, tree, exit and seconds. A missing or malformed record is listed under `problems` and
-skipped; it never raises. Main's own verification leaves no record in task dirs and is not guessed.
+skipped; it never raises. Main's own runs are counted only when they were run with `test-run.sh --main` (HB5b): those
+records sit in SESSION/main-runs/ (read when the tasks dir is named `tasks`, or with --main-runs DIR), role `main`, lane and
+step from the record; any other run of Main leaves no record and is not guessed. A record may carry the interpreter that ran
+it ({path, version}, or null); two runs that both carry one are the same check only when they agree.
 """
 import argparse
 import json
@@ -599,7 +602,60 @@ def _sort_n(path):
     return int(path.stem) if path.stem.isdigit() else 0
 
 
-def load(tasks_dir, lane=None):
+def _interp(reader, path, record):
+    """(ok, (path, version) or None): the interpreter a record names. A record without the field, or with null, names none."""
+    value = record.get("interpreter")
+    if value is None:
+        return True, None
+    if isinstance(value, dict) and isinstance(value.get("path"), str) and isinstance(value.get("version"), str):
+        return True, (value["path"], value["version"])
+    reader.problem(path, "invalid test-run record: interpreter is not null or {path, version}")
+    return False, None
+
+
+def _test_run(reader, path, record, info):
+    ok, interp = _interp(reader, path, record)
+    if not ok:
+        return None
+    canon = canonical(record["cmd"], record["cwd"])
+    return dict(info, kind="test-run", label=record["label"], cmd=record["cmd"], tree=record["tree"],
+                exit=record["exit"], timed_out=record["timed_out"] or record["exit"] == 124,
+                seconds=float(record["seconds"]), end=reader.mtime(path), path=str(path), n=_sort_n(path),
+                canon=canon, never=never_reason(canon, record["label"]), outside=outside_reason(canon), interp=interp)
+
+
+def _load_main(reader, main_dir, lane):
+    """The runs of `test-run.sh --main` in SESSION/main-runs: role main, lane and step as the record says."""
+    runs = []
+    if main_dir is None or not Path(main_dir).is_dir():
+        return runs
+    if Path(main_dir).is_symlink():
+        reader.problem(main_dir, "symlink skipped")
+        return runs
+    try:
+        paths = sorted((p for p in Path(main_dir).iterdir() if TEST_RUN_NAME.fullmatch(p.name)), key=_sort_n)
+    except OSError:
+        reader.problem(main_dir, "cannot list the main runs dir")
+        return runs
+    for path in paths:
+        record = reader.json(path, "test-run record")
+        if record is None:
+            continue
+        bad = gate_record.validate(record)
+        if bad or record.get("schema") != gate_record.TEST_RUN_SCHEMA:
+            reader.problem(path, "invalid test-run record: " + "; ".join(bad or ["not tp-test-run:v1"]))
+            continue
+        name = lambda key: record[key] if isinstance(record.get(key), str) and record[key] else "(none)"
+        info = {"task": "main", "role": "main", "lane": name("lane"), "step": name("step"), "review_of": ""}
+        if lane is not None and info["lane"] != lane:
+            continue
+        run = _test_run(reader, path, record, info)
+        if run:
+            runs.append(run)
+    return runs
+
+
+def load(tasks_dir, lane=None, main_dir=None):
     reader = Reader()
     tasks_dir = Path(tasks_dir)
     runs, jsonl = [], {"lines": 0, "seconds": 0.0, "same_cmd_tree_unknown": 0, "other_shape": 0}
@@ -622,11 +678,9 @@ def load(tasks_dir, lane=None):
                 if bad or record.get("schema") != gate_record.TEST_RUN_SCHEMA:
                     reader.problem(path, "invalid test-run record: " + "; ".join(bad or ["not tp-test-run:v1"]))
                     continue
-                canon = canonical(record["cmd"], record["cwd"])
-                runs.append(dict(info, kind="test-run", label=record["label"], cmd=record["cmd"], tree=record["tree"],
-                                 exit=record["exit"], timed_out=record["timed_out"] or record["exit"] == 124,
-                                 seconds=float(record["seconds"]), end=reader.mtime(path), path=str(path), n=_sort_n(path),
-                                 canon=canon, never=never_reason(canon, record["label"]), outside=outside_reason(canon)))
+                run = _test_run(reader, path, record, info)
+                if run:
+                    runs.append(run)
         for path in sorted(p for p in task_dir.iterdir() if GATE_NAME.fullmatch(p.name)) if task_dir.is_dir() else []:
             record = reader.json(path, "gate record")
             if record is None:
@@ -644,7 +698,7 @@ def load(tasks_dir, lane=None):
                 runs.append(dict(info, kind="gate", label=check["name"], cmd=["<gate>", check["name"]] + record["files"],
                                  tree=record["tree"], exit=check["exit"], timed_out=False, seconds=float(check["seconds"]),
                                  end=_iso_epoch(record["finished"]), path=str(path), n=0, canon=canon, never=None,
-                                 outside=outside))
+                                 outside=outside, interp=None))
         if (task_dir / "tests.jsonl").exists():
             seen = set()
             for line in reader.jsonl(task_dir / "tests.jsonl"):
@@ -657,6 +711,7 @@ def load(tasks_dir, lane=None):
                 k = json.dumps(line["cmd"])
                 jsonl["same_cmd_tree_unknown"] += k in seen
                 seen.add(k)
+    runs += _load_main(reader, main_dir, lane)
     if jsonl["other_shape"]:
         reader.problem(tasks_dir, "%d tests.jsonl line(s) of another shape skipped" % jsonl["other_shape"])
     return runs, jsonl, reader.problems
@@ -707,6 +762,35 @@ def _covers(big, small):
     return all(any(s == b or s.startswith(b + ".") for b in big) for s in small)
 
 
+def _interp_differs(a, b):
+    """HB5b: two runs that both carry an interpreter and name different ones are never the same check. A record without
+    one (before the field, or null: no python, or not resolved) keeps the rule that does not read it."""
+    return a["interp"] is not None and b["interp"] is not None and a["interp"] != b["interp"]
+
+
+def _cluster_interp(cluster):
+    return next((m["interp"] for m in cluster if m["interp"] is not None), None)
+
+
+def _by_interpreter(members):
+    """Split the runs of one key+tree (in time order) into clusters of the same interpreter. A run with an interpreter joins
+    the cluster of that interpreter, else a cluster that has none yet (which then has it); a run with none joins the cluster
+    whose last run is the latest. No interpreter anywhere: one cluster, as before the field."""
+    clusters = []
+    for r in members:
+        pick = None
+        if r["interp"] is not None:
+            pick = next((c for c in clusters if _cluster_interp(c) == r["interp"]), None) or \
+                next((c for c in clusters if _cluster_interp(c) is None), None)
+        elif clusters:
+            pick = clusters[-1] if len(clusters) == 1 else max(clusters, key=lambda c: _order(c[-1]))
+        if pick is None:
+            clusters.append([r])
+        else:
+            pick.append(r)
+    return clusters
+
+
 def classify(runs):
     """Sets run['class'] (first | duplicate | retry | never | outside) and, for covered runs, run['covered'] = {by, seconds, how}.
     Returns the groups (key+tree with more than one counted run) and the covered pairs."""
@@ -717,8 +801,10 @@ def classify(runs):
     groups = {}
     for r in counted:
         groups.setdefault((r["canon"]["key"], r["tree"]), []).append(r)
+    groups = {(k, i): c for k, members in groups.items() for i, c in enumerate(_by_interpreter(members))}
     for members in groups.values():
         for i, r in enumerate(members):
+            r["same_check_before"] = members[:i]
             if i == 0:
                 r["class"] = "first"
             elif members[i - 1]["exit"] != 0:
@@ -733,6 +819,8 @@ def classify(runs):
         best = None
         for a in counted[:j]:
             if (a["tree"], a["canon"]["runner"]) != (b["tree"], b["canon"]["runner"]) or a["canon"]["tests"] is None:
+                continue
+            if _interp_differs(a, b):
                 continue
             if _covers(a["canon"]["tests"], b["canon"]["tests"]):
                 cand = (b["seconds"], "measured")
@@ -762,17 +850,52 @@ def repeated_seconds(run):
     return 0.0
 
 
-def build(tasks_dir, lane=None):
-    runs, jsonl, problems = load(tasks_dir, lane)
+def main_runs_dir(tasks_dir):
+    """Where `test-run.sh --main` writes for the session whose tasks dir this is: its sibling main-runs, when the tasks dir
+    is named `tasks`; None for any other name (a dir of task records that is not a session's)."""
+    tasks_dir = Path(tasks_dir)
+    return tasks_dir.parent / "main-runs" if tasks_dir.name == "tasks" else None
+
+
+def _main_rerun(run, earlier):
+    """HB5b: the seconds of one Main run spent on a check a worker or reviewer had already run on the same tree. Each Main run
+    is judged alone against every earlier (by end time) successful worker or reviewer run `earlier` (other Main runs never
+    cover it). The same check (key, tree, interpreters that do not differ) counts all its seconds; else the largest cover of
+    its test set by one run of the same runner and tree: an earlier run that holds its tests, all its seconds (measured); one
+    that lies inside it, the smaller of the two times (estimated), nothing when that run timed out (unknown).
+    "Earlier" is strict: the end time of the worker run is a number less than Main's. Equal end times, or one missing on
+    either side, never make a rerun (the display order `_order` breaks ties by name; this does not)."""
+    if run["role"] != "main" or run["never"] or run["outside"] or run["end"] is None:
+        return 0.0
+    best = 0.0
+    for a in earlier:
+        if a["end"] is None or not a["end"] < run["end"] or a["tree"] != run["tree"] or _interp_differs(a, run):
+            continue
+        if a["canon"]["key"] == run["canon"]["key"]:
+            return run["seconds"]
+        at, rt = a["canon"]["tests"], run["canon"]["tests"]
+        if at is None or rt is None or a["canon"]["runner"] != run["canon"]["runner"]:
+            continue
+        if _covers(at, rt):
+            best = max(best, run["seconds"])
+        elif _covers(rt, at) and not a["timed_out"]:
+            best = max(best, min(a["seconds"], run["seconds"]))
+    return best
+
+
+def build(tasks_dir, lane=None, main_dir="auto"):
+    runs, jsonl, problems = load(tasks_dir, lane, main_runs_dir(tasks_dir) if main_dir == "auto" else main_dir)
     groups, pairs = classify(runs)
+    others = [r for r in runs if r["role"] not in ("main", "unknown") and not (r["never"] or r["outside"]) and r["exit"] == 0]
     per = {}
     for r in runs:
         row = per.setdefault((r["lane"], r["step"]), {"lane": r["lane"], "step": r["step"], "runs": 0, "total": 0.0,
                                                        "first": 0.0, "duplicate": 0.0, "covered": 0.0, "retry": 0.0,
-                                                       "never": 0.0, "outside": 0.0, "covered_unknown": 0})
+                                                       "never": 0.0, "outside": 0.0, "covered_unknown": 0, "main_rerun": 0.0})
         row["runs"] += 1
         row["total"] += r["seconds"]
         rep = repeated_seconds(r)
+        row["main_rerun"] += _main_rerun(r, others)
         if r["class"] == "duplicate":
             row["duplicate"] += rep
         elif r["class"] == "first":
@@ -805,8 +928,8 @@ def build(tasks_dir, lane=None):
                    "interpreter_spelling_only": sum(1 for keys in spelling.values() if len(keys) > 1),
                    "main_visible": sum(r["role"] == "main" for r in runs)},
         "tests_jsonl": jsonl,
-        "main": "Main's own verification runs outside test-run.sh (or without TP_TASK_DIR) and leaves no record in task "
-                "dirs: not counted, not guessed.",
+        "main": "Main's own runs are counted only when run with test-run.sh --main (records in the session's main-runs/); "
+                "any other run of Main leaves no record: not counted, not guessed.",
         "problems": problems,
     }
 
@@ -814,6 +937,13 @@ def build(tasks_dir, lane=None):
 # ------------------------------------------------------------------ output
 
 def _run_json(r):
+    out = _run_json_base(r)
+    if r.get("interp"):
+        out["interpreter"] = {"path": r["interp"][0], "version": r["interp"][1]}
+    return out
+
+
+def _run_json_base(r):
     return {"task": r["task"], "role": r["role"], "lane": r["lane"], "step": r["step"], "kind": r["kind"], "label": r["label"],
             "cmd": shown_cmd(r["cmd"]), "tree": r["tree"], "exit": r["exit"], "seconds": r["seconds"], "record": r["path"],
             "class": r["class"], "never": r["never"], "outside": r["outside"], "covered": r["covered"], "outcome_differs": r["outcome_differs"]}
@@ -865,6 +995,10 @@ def render(report):
     j = report["tests_jsonl"]
     out.append("\ntests.jsonl (run_bounded, no tree, not compared): %d lines, %.1f s, %d repeat a cmd of the same task "
                "(tree unknown)" % (j["lines"], j["seconds"], j["same_cmd_tree_unknown"]))
+    if t["main_visible"]:
+        out.append("\nMain's reruns of checks a worker or reviewer already ran on the same tree (seconds), per lane and step:")
+        out += ["  %-20s %-8s %9.1f" % (row["lane"][:20], row["step"][:8], row["main_rerun"])
+                for row in report["per_lane_step"] if row["main_rerun"]] or ["  none"]
     out.append("interpreter-spelling-only groups (would merge if the interpreter were ignored; not counted): %d"
                % t["interpreter_spelling_only"])
     if report["problems"]:
@@ -878,11 +1012,13 @@ def main(argv=None):
     parser.add_argument("tasks_dir", help="a session's tasks directory")
     parser.add_argument("--lane", help="only the tasks of this lane (meta.json lane)")
     parser.add_argument("--json", action="store_true", help="print the report as JSON")
+    parser.add_argument("--main-runs", help="the directory of `test-run.sh --main` records (default: main-runs beside a tasks dir "
+                                            "named `tasks`)")
     args = parser.parse_args(argv)
     if not Path(args.tasks_dir).is_dir():
         print("repeats: not a directory: %s" % args.tasks_dir, file=sys.stderr)
         return 2
-    report = build(args.tasks_dir, args.lane)
+    report = build(args.tasks_dir, args.lane, args.main_runs if args.main_runs else "auto")
     print(json.dumps(to_json(report), indent=1, sort_keys=True) if args.json else render(report))
     return 0
 

@@ -143,6 +143,24 @@ tp_json_write() {
   python3 -I "$TP_TOOLS_DIR/json_record.py" "$1"
 }
 
+# tp_session_dir — print the session directory, the way bin/tp-agent state_dir finds it: TP_STATE_DIR, else the
+# @tp_state_dir option of the tmux session (this pane's, or TP_SESSION, default tmux-pi). Fails, printing nothing, when there
+# is none or it is not a directory holding tasks/.
+tp_session_dir() {
+  local dir="${TP_STATE_DIR:-}" session target=()
+  if [ -z "$dir" ]; then
+    if [ -n "${TMUX:-}" ]; then
+      [ -z "${TMUX_PANE:-}" ] || target=(-t "$TMUX_PANE")
+      session="$(tmux display-message -p ${target[@]+"${target[@]}"} '#S' 2>/dev/null)" || return 1
+    else
+      session="${TP_SESSION:-tmux-pi}"
+    fi
+    dir="$(tmux show-options -qv -t "=$session:" @tp_state_dir 2>/dev/null)" || return 1
+  fi
+  [ -n "$dir" ] && [ -d "$dir/tasks" ] || return 1
+  (cd "$dir" && pwd -P)
+}
+
 # tp_now — UTC time, ISO 8601.
 tp_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 

@@ -814,7 +814,7 @@ def ledger_row(task_dir, now):
             "artifact_chars": art["size"] if art else None,
             "source_urls": art["urls"] if art else None,
             "checkpoints": [e["action"] for e in events], "stop": stop,
-            "escalated_to": (d / "escalated").read_text().strip() if (d / "escalated").exists() else None,
+            "escalated_to": (d / "escalated").read_text(encoding="utf-8", errors="replace").strip() if (d / "escalated").exists() else None,
             "recorded": datetime.datetime.fromtimestamp(now, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "escalation": escalations[-1] if escalations else None}
 

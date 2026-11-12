@@ -186,7 +186,7 @@ def record(path, include_result=False, here=None):
         "id": meta.get("id", path.name), "role": meta.get("role", "generic"),
         "harness": meta.get("worker", "unknown"), "model": state.get("model") or meta.get("model"),
         "effort": meta.get("thinking"), "status": lifecycle(path),
-        "assignment": (path / "request.md").read_text() if (path / "request.md").exists() else "",
+        "assignment": (path / "request.md").read_text(encoding="utf-8", errors="replace") if (path / "request.md").exists() else "",
         "deliverable": meta.get("deliverable", ""), "parent": meta.get("parent", ""),
         "route": meta.get("route_info", {}), "task_dir": str(path),
         "packet": str(path / "packet.md"), "result_path": str(result_path) if result_path.exists() else None,
@@ -1692,7 +1692,7 @@ def _main(argv):
         if repeated and args.route == "park":  # starts nothing, so a process alive on the tree does not stop it
             print(json.dumps(park_retry(base, previous, args.id, *repeated), indent=2))
             return
-        original = (previous / "request.md").read_text().strip()
+        original = (previous / "request.md").read_text(encoding="utf-8", errors="replace").strip()
         # Replay only admitted context and notes; spawn re-applies the sensitive-read omission. Skip
         # prior retry notes (rebuilt below) and dependencies (stale; the prior packet records them).
         kept, problem = prior_dispatch(previous)

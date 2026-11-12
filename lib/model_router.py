@@ -454,7 +454,7 @@ def review_plan(task_dir, force=False, level=None, thinking=None, approve_effort
     meta = _read_json(Path(task_dir) / "meta.json")
     if not meta.get("task"):  # the request text lives beside meta.json; the card is rebuilt from it for the record
         try:
-            meta["task"] = (Path(task_dir) / "request.md").read_text(encoding="utf-8").strip()
+            meta["task"] = (Path(task_dir) / "request.md").read_text(encoding="utf-8", errors="replace").strip()
         except OSError:
             pass
     route = meta.get("route_info") or {}

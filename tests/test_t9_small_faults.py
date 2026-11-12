@@ -1,5 +1,6 @@
 """T9: the small orchestration faults, one test each (see report in the task directory)."""
 import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
+import hashlib
 import importlib.machinery
 import importlib.util
 import json
@@ -8,6 +9,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from unittest import mock
 import unittest
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -91,6 +93,28 @@ class T9Tests(unittest.TestCase):
         self.assertIsNone(ledger_row(task, 0)["cost"])
         (task / "state.json").write_text(json.dumps({"state": "working", "tokens": {}, "cost": 0.25}))
         self.assertEqual(ledger_row(task, 0)["cost"], 0.25)
+
+    # TR2: the readers of worker-written task files outside task_record never raise on bytes that are not UTF-8
+    def test_task_file_readers_survive_bytes_that_are_not_utf8(self):
+        import model_router
+        from contract import ledger_row
+        agent = load_agent()
+        for label, raw, shown in (("lone 0xFF", b"fix \xff here", "fix � here"),
+                                  ("Latin-1", "caf\xe9 \xfcber".encode("latin-1"), "caf� �ber")):
+            with self.subTest(label):
+                task = self.state / "tasks" / ("bad-" + label.replace(" ", "-"))
+                task.mkdir(parents=True)
+                (task / "meta.json").write_text(json.dumps({"id": task.name, "worker": "claude", "model": "claude-sonnet-5-5"}))
+                (task / "state.json").write_text(json.dumps({"state": "working", "tokens": {}}))
+                (task / "request.md").write_bytes(raw)
+                (task / "escalated").write_bytes(raw)
+                self.assertEqual(agent.record(task)["assignment"], shown)            # tp-agent status / list
+                with mock.patch.object(model_router, "write_selection") as logged:   # the record that carries the request text
+                    plan = model_router.review_plan(task, base=self.state, log=True, files_touched=1, force=True)
+                self.assertEqual(plan["review"], "forced")                           # a review of that task can be planned
+                self.assertEqual(logged.call_args[0][0]["task_sha256"], hashlib.sha256(shown.encode()).hexdigest())  # of the replaced text
+                (task / "request.md").write_text("fix it")   # ledger_row's own request read is task_record's (lane task-record-utf8)
+                self.assertEqual(ledger_row(task, 0)["escalated_to"], shown)         # tp-contract, tp-ledger
 
     # (c) a queue entry's reason is the current one
     def test_a_waiting_queue_entry_gets_the_current_reason(self):

@@ -112,10 +112,16 @@ class Records:
         self.step(seconds, step, "owner", tag=tag, text=text, rule=rule)
 
     def observe(self, seconds, task, state, result=None, stamp=None, role=None):
+        """stamp: the worker's `updated` in seconds (None: the poll's whole second); a string is written as is, "" leaves
+        `updated` out."""
         role = role or self.tasks.get(task, {}).get("role", "coder")
         lane = self.tasks.get(task, {}).get("lane")
-        self.log.append({"at": at(seconds), "kind": "observe", "task": task, "role": role, "lane": lane, "state": state,
-                         "result": result, "tool": "", "updated": whole(seconds if stamp is None else stamp), "pane": "%9"})
+        entry = {"at": at(seconds), "kind": "observe", "task": task, "role": role, "lane": lane, "state": state,
+                 "result": result, "tool": "", "updated": stamp if isinstance(stamp, str) else whole(seconds if stamp is None else stamp),
+                 "pane": "%9"}
+        if entry["updated"] == "":
+            del entry["updated"]
+        self.log.append(entry)
 
     def task(self, ident, role="coder", lane=None, created=0, packet="Do the task.", messages=(), test_runs=(), transcript=(),
              events=None, requests=None, result=None, workdir=(), parent=None):
@@ -1483,7 +1489,7 @@ class ClaimTimeTests(ScorerCase):
         r.write()
         worker = score.score(r.root)["measures"]["false_claims"]["workers"][0]
         self.assertIsNone(worker["false"])
-        self.assertIn("within the second", worker["why"])
+        self.assertIn("undecided span", worker["why"])
         result_md = r.state / "tasks/coder-1/result.md"
         for written, false in ((9.7, False), (9.2, True)):                   # the pass ended at 9.5
             stamp = (T0 + timedelta(seconds=written)).timestamp()
@@ -1512,6 +1518,36 @@ class ClaimTimeTests(ScorerCase):
             stamp = (T0 + timedelta(seconds=9.2)).timestamp()
             os.utime(result_md, (stamp, stamp))
             self.assertEqual(score.score(r.root)["measures"]["verification"]["stale"], stale, end)
+        # HB8b round 2 (review F1, fail-before on 56506c7): the span comes from source fields only (worker stamp, poll,
+        # previous polls, result.md mtime); the age filter only widens it. Records: a t1 failure ending 3, a t0 pass
+        # ending 4, a t1 pass ending E. Both consumers per row: (stale, worker false); before (0, False), after (1, True),
+        # undecided (None, None). The poll at 9.3 already held the result; the poll at 1 did not.
+        rows = [  # (held poll, stamp, result.md written, pass end E, expected)
+            (9.4, 9, 9.2, 9.25, (1, True)),          # stamp trusted: 9.2 lies in [9, 10): exact
+            (15.1, 9, 9.2, 9.25, (1, True)),         # F1: stamp 6.1 s old widens to [9, 15.1]; 9.2 still exact (was stale 0)
+            (14.0, 9, 30, 10.5, (1, True)),          # 5.0 s: trusted, [9, 10); rewritten later: 10.5 is after
+            (14.1, 9, 30, 10.5, (None, None)),       # 5.1 s: [9, 14.1], never "the poll 14.1" (was decided before)
+            (39, 9, 50, 10.5, (None, None)),         # 30 s: [9, 39] (result.md rewritten after the poll)
+            (39, 9, 30, 10.5, (0, False)),           # 30 s: result.md written at 30 lies in [9, 39]: exact, 10.5 before
+            (9.4, "", 9.2, 9.25, (1, True)),         # no stamp: after the poll at 1 (last without the result), by 9.4
+            (9.4, "", 30, 9.25, (None, None)),       # no stamp, rewritten: (1, 9.4] holds every record: undecided
+            (9.4, "not-a-time", 9.2, 9.25, (1, True)),   # unparsable: as no stamp
+            (9.4, 10, 9.2, 9.25, (1, True)),         # stamp after the poll: as no stamp
+        ]
+        for poll, own, written, end, expected in rows:
+            r.log = [o for o in r.log if o.get("task") != "coder-1"]
+            r.observe(1, "coder-1", "working")
+            r.observe(9.3, "coder-1", "working", result="complete", stamp=9)
+            r.observe(poll, "coder-1", "waiting", result="complete", stamp=own)
+            r.tasks["coder-1"]["test_runs"] = [(2, 1, {"cmd": ["npm", "test"], "tree": "t1", "exit": 1}),
+                                               (3, 1, {"cmd": ["npm", "run", "lint"], "tree": "t0", "exit": 0}),
+                                               (8, end - 8, {"cmd": ["npm", "test"], "tree": "t1", "exit": 0})]
+            r.write()
+            stamp = (T0 + timedelta(seconds=written)).timestamp()
+            os.utime(result_md, (stamp, stamp))
+            m = score.score(r.root)["measures"]
+            got = (m["verification"]["stale"], m["false_claims"]["workers"][0]["false"])
+            self.assertEqual(got, expected, (poll, own, written, end))
 
     def test_rewritten_result_is_judged_when_the_worker_last_stopped_with_it(self):
         """Fake E2 (pass): the worker wrote a result, took a message and wrote result.md again. The claim is the result.md

@@ -40,9 +40,10 @@ One owner for each record fact (round 9); every reader calls it:
     test-runs/: that task). A `record: PATH` line in a tool result is a reference, never ownership: it names a record to
     read, and one it names that is absent is lost. A record outside every record directory has an unknown producer.
   - before_result(record, moment): a record backs a result or a claim only when it ended by it (record end <= result.md
-    mtime, full precision; the worker's whole-second stamp when result.md was rewritten outside it, then a record ending in
-    that second is undecided). result_moment reads the observation's raw stamp (`_stamp`), never the poll clamp (`_t`):
-    a clamp only widens the undecided span (HB8b K3).
+    mtime, full precision, when the mtime lies in the span result_moment derives; else a record ending inside that span
+    is undecided). result_moment derives the span from source fields only (HB8b round 2): the worker's `updated`
+    (`_own`), the poll's `at` (`_at`), the previous poll (`_prev`), result.md's mtime. A stamp too far from its poll to
+    trust widens the span to the poll; it never becomes the poll. The ordering point `_t` is never read there.
   - Run.request_ids(): request ids are enumerated only through the tracked reader of the requests/ files and the task and
     session event journals: one of them not ok makes the measure unknown.
   - record_pointers(text): the pointer path is the rest of the `record:` line (spaces included), or a JSON `record` field.
@@ -82,7 +83,9 @@ BUSY_STATES = ("starting", "working", "tool")
 NEGATION_RE = re.compile(r"(?i)\b(not|isn't|aren't|wasn't|no|never|incomplete|yet|unless|once|when|if|will|until|before)\b|\?$")
 NA = "n/a"
 STAMP = timedelta(seconds=1)      # a worker's `updated` stamp: whole seconds, never later than the change
+TRUST = timedelta(seconds=5)      # a stamp at most this long before its poll dates the change to the stamp's second
 SKEW = timedelta(seconds=2)       # records written by different processes: allow this much clock/ordering slack
+NOT_BEFORE = datetime.min.replace(tzinfo=timezone.utc)   # an undecided span with no lower bound
 
 
 def _unknown(reason, **extra):
@@ -130,19 +133,37 @@ def before_result(record, moment):
     return True if record["end"] <= lo else False if record["end"] > hi else None
 
 
+def trusted_stamp(own, at):
+    """The age filter: the worker's own stamp dates the change to its second when it is at most TRUST before the poll."""
+    return own is not None and at is not None and timedelta(0) <= at - own <= TRUST
+
+
 def result_moment(run, task):
-    """(lo, hi) when the task's result was written, or None. result.md's mtime (full precision) when it lies in the
-    second of the raw stamp of the worker's last stop with the result (HB8b K3: the raw stamp, never the poll clamp);
-    else that stamp's whole second, widened (never moved) to the clamp when the clamp is later."""
+    """(lo, hi) when the task's result was written, or None, from source fields only (HB8b round 2): the observation of
+    the worker's last stop with the result (result_held), its worker stamp `_own`, poll `_at` and previous poll `_prev`,
+    and result.md's mtime. A usable stamp (not after the poll) is a lower bound: the change is in its second when the
+    stamp is trusted (trusted_stamp), else anywhere up to the poll (a far stamp widens; it never becomes the poll). No
+    usable stamp: the change is after the last poll that showed another result (none: unbounded) and by this poll. A
+    previous poll after the span widens it. result.md's mtime inside the span is the exact time."""
     obs = run.result_held(task["id"])
     if obs is None:
         return None
-    stamp = obs.get("_stamp") or obs["_at"]
-    clamp = obs.get("_t") or stamp
+    own, at, prev = obs.get("_own"), obs["_at"], obs.get("_prev")
+    if own is not None and own <= at:
+        lo = own
+        hi = own + STAMP - timedelta(microseconds=1) if trusted_stamp(own, at) else at
+        hi = max(hi, prev) if prev else hi
+    else:
+        lo, hi = NOT_BEFORE, at
+        for earlier in run.obs(task["id"]):
+            if earlier is obs:
+                break
+            if earlier.get("result") != obs.get("result"):
+                lo = earlier["_at"]
     written = task["result_written"]
-    if written is not None and stamp <= written < stamp + STAMP:
+    if written is not None and lo <= written <= hi:
         return written, written
-    return stamp, max(stamp + STAMP - timedelta(microseconds=1), clamp)
+    return lo, hi
 
 
 
@@ -344,14 +365,15 @@ class Run:
                 # The runner polls; the worker's own stamp (whole seconds, never later than the change) dates the change
                 # when it is close to the observation, so Main reacting between change and poll is not read as waiting.
                 # Never earlier than the poll that still saw the previous state.
-                # HB8b K3: _stamp keeps the raw time (the worker's stamp, else the poll) apart from that clamp (_t): a
-                # clamp orders states between polls; it never moves the stamp before_result compares (result_moment).
+                # HB8b round 2: the source fields are kept as read (_own: the worker's stamp, _at: this poll, _prev: the
+                # previous poll of the task); result_moment derives its span from them. _t is an ordering point for the
+                # state readers only (entered, state_at, result_at), never read by a before/after-result comparison.
                 own = el.parse_time(entry.get("updated"))
                 at = entry["_at"]
-                t = own if own and at and timedelta(0) <= at - own <= timedelta(seconds=5) else at
                 prev = seen_before.get(entry.get("task"))
-                entry["_stamp"] = t
-                entry["_t"] = max(t, prev) if t and prev else t
+                entry["_own"], entry["_prev"] = own, prev
+                point = own if trusted_stamp(own, at) else at
+                entry["_t"] = max(point, prev) if point and prev else point
                 if at:
                     seen_before[entry.get("task")] = at
         self._obs = [e for e in self._log if e.get("kind") == "observe"]
@@ -758,7 +780,7 @@ class Run:
     def result_held(self, task_id):
         """The observation of the worker's last stop (left working/tool/permission) holding a result, else its first
         observed result, else None. A worker that wrote result.md, took a message and wrote it again claims what
-        result.md now holds. Its `_stamp` is the raw time, its `_t` the poll clamp (result_moment reads both)."""
+        result.md now holds. result_moment reads its source fields (`_own`, `_at`, `_prev`), never `_t`."""
         stops, last, first = [], None, None
         for obs in self.obs(task_id):
             key = (obs.get("state"), obs.get("result"))
@@ -1556,7 +1578,7 @@ def check_standing(run, who, moment):
         return early
     late = _standing(run, who, sure + maybe, moment[1], final)
     if (early[0], early[1]) != (late[0], late[1]):
-        return [], early[1], early[2] + ["a check ended within the second the result was stamped"]
+        return [], early[1], early[2] + ["a check ended within the result's undecided span"]
     return early
 
 
@@ -1703,7 +1725,7 @@ def _stale(run, runs):
             continue
         verdicts = {None if not rows else rows[-1]["tree"] != final for rows in (sure, maybe)}
         if len(verdicts) > 1:
-            stale_unknown.append("%s: a pass ended within the second the result was stamped" % task["id"])
+            stale_unknown.append("%s: a pass ended within the result's undecided span" % task["id"])
             continue
         stale_known += 1
         if verdicts.pop():

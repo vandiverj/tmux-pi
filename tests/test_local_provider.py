@@ -185,10 +185,16 @@ class SpawnLaunchTests(unittest.TestCase):
         alias, none = self.out["alias"]["argv"], self.out["none"]["argv"]
         self.assertEqual(self.model(alias), CODEX_SOL)
         self.assertEqual(self.model(none), SOL)
-        at, prompt = alias.index("--model") + 1, alias.index("--append-system-prompt") + 1
-        # the aliased launch's config also adds SOL's standing prompt at the end of the system prompt; nothing else differs
-        self.assertEqual(alias[prompt], none[prompt] + "\n\n" + PROMPTS[SOL])
-        self.assertEqual(alias[:at] + alias[at + 1:prompt] + alias[prompt + 1:], none[:at] + none[at + 1:prompt] + none[prompt + 1:])
+        # pi gets the system prompt as a file (e97296d), so each launch passes its own task's system-prompt.md path
+        for name, argv in (("alias", alias), ("none", none)):
+            task = self.out[name]["task"]
+            self.assertEqual(argv[argv.index("--append-system-prompt") + 1],
+                             str(task / "system-prompt.md").replace(str(self.out[name]["root"]), "<root>"))
+        # the aliased launch's config also adds SOL's standing prompt at the end of the system prompt file's text
+        self.assertEqual(self.out["alias"]["system"], self.out["none"]["system"] + "\n\n" + PROMPTS[SOL])
+        # nothing else differs: the prompt slot is a path now, equal after the <root> rewrite, so no slot needs excluding
+        at = alias.index("--model") + 1
+        self.assertEqual(alias[:at] + alias[at + 1:], none[:at] + none[at + 1:])
 
     def test_each_launch_gets_its_models_standing_prompt_from_the_same_config(self):
         for name in ("alias", "claude", "other"):

@@ -1091,3 +1091,9 @@ Each lane: checkpoint, Main's evidence, openai-codex review, notes closed, `lane
     lanes still open (perf-spawn, hub-correct, others) keep broad touches (tools/, tests/) that overlap every new lane;
     (3) a request from a worker that has ended can only be answered by a retry; (4) review panes stay after collect.
     Candidates for HUB work, not fixed here.
+  - HB6a (lane hub-waits) merged bf76186: tools/waits/timeline.py, where work waits from existing task records (WT1 arm A).
+    Three rounds (Opus, Opus, Sonnet rule-first); review-coder-248931aa5b-231733 APPROVED_WITH_NOTES. Full run on the
+    merged tree 7bdba44: 5533 tests OK (skipped 78). Measures: case-1 attribution 74.2% (bar 90%: not met, misses are the
+    --after queue wait and owner input recorded as by: main); real runs 1.2% unknown on critical paths. Decision: arm B
+    (HB6b) needed, recording who answered and the approval instant. Smoke run on HB6a's own rounds: 0% unknown inside tasks,
+    28% of the critical path is Main's time between tasks (verification, diagnosis), which no record covers yet.

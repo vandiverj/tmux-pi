@@ -92,6 +92,7 @@ import shutil
 import signal
 import stat
 import subprocess
+import tempfile
 import sys
 import time
 from pathlib import Path
@@ -100,6 +101,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import lane_deps  # noqa: E402
 import lanes  # noqa: E402
 import trial_session  # noqa: E402
+import work_brief  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 IDENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -406,6 +408,34 @@ def other_lane_section(packet_text):
     return ""
 
 
+RULES_START, RULES_END = "\n\n" + work_brief.PACKET_HEADING + "\n\n", "\n\n\n# Local Task Artifacts\n\n"
+
+
+def rules_section(packet, request):
+    """(the `# Rules in force` section the source coder's packet held, why it could not be taken): ("", "") when the packet has none.
+    The section is cut out of packet.md, byte for byte, where bin/tp-spawn put it: it appends `\\n\\n` + the text (trailing newlines
+    cut) + `\\n` right after `# Task` (and `# Test Scope`, whose block ends in a newline of its own), and every packet then goes on with `\\n\\n# Local Task Artifacts\\n\\n`. So the
+    section starts where `\\n\\n# Rules in force\\n\\n` stands right after the task text (the task is request.md, so a task that holds
+    the heading itself cannot start it; the optional `# Test Scope` block is skipped) and ends at the first `\\n\\n\\n# Local Task Artifacts\\n\\n` after that. The builder's lines are
+    list items with all whitespace collapsed, so no record text makes a blank line, a heading or that end; a section that did
+    not end where tp-spawn ends it is not guessed at."""
+    if work_brief.PACKET_HEADING not in packet:
+        return "", ""
+    head = "# Task\n\n" + request.rstrip("\n")  # tp-spawn's `$(...)` cuts the newline that printf put after the task
+    if not packet.startswith(head):
+        return "", "the packet does not start with the request text, so its rules section could not be found"
+    start = len(head)  # the next block opens with `\\n\\n`
+    if packet.startswith("\n\n# Test Scope\n\n", start):  # a fixed text with no blank line in it, then one newline
+        start = packet.find("\n\n", start + 2 + len("# Test Scope\n\n"))  # the end of the text; the block's own newline comes next
+        start = start + 1 if start >= 0 else start
+    if start < 0 or not packet.startswith(RULES_START, start):
+        return "", ""  # the heading is only inside other text (a context file, a note), not the section right after the task
+    end = packet.find(RULES_END, start)
+    if end < 0:
+        return "", "the packet's rules section has no end where tp-spawn puts one"
+    return packet[start + 2:end] + "\n", ""
+
+
 def read_source(main_state, task_id):
     """What a normal coder was given, from its task dir in Main's state dir (read only): the request, the context specs, notes and
     test scope of dispatch.json, the base commit, and the packet's `Paths other lanes own` section, re-extracted (the packet
@@ -428,9 +458,13 @@ def read_source(main_state, task_id):
             raise ShadowError("task '{}': dispatch.json {} is not a list of text".format(task_id, name))
     tests = dispatch.get("tests") if dispatch.get("tests") in TESTS else None
     packet = _text(path / "packet.md")
+    try:  # the one read that says why: an unreadable packet is not "no section"
+        rules, rules_why = rules_section(trial_session.read_text(path / "packet.md"), request)
+    except OSError as error:
+        rules, rules_why = "", "the source packet could not be read ({}), so the shadow starts without the rules section".format(error.__class__.__name__)
     workdir = meta.get("workdir") if isinstance(meta.get("workdir"), str) else ""
     return {"task_id": task_id, "task_dir": str(path), "request": request, "base_commit": base, "context": list(contexts), "notes": list(notes),
-            "tests": tests, "other_lane_paths": other_lane_section(packet), "role": meta.get("role") if isinstance(meta.get("role"), str) else "",
+            "tests": tests, "other_lane_paths": other_lane_section(packet), "rules": rules, "rules_why": rules_why, "role": meta.get("role") if isinstance(meta.get("role"), str) else "",
             "deliverable": meta.get("deliverable") if isinstance(meta.get("deliverable"), str) else "", "workdir": workdir,
             "reviewer_model": (meta.get("reviewer") or {}).get("model") if isinstance(meta.get("reviewer"), dict) else None}
 
@@ -452,7 +486,7 @@ def remap_context(specs, source_workdir, worktree):
     return out
 
 
-def spawn_args(source, run, worktree, project, trial, request_file, task_id, docs_tools=True):
+def spawn_args(source, run, worktree, project, trial, request_file, task_id, docs_tools=True, rules_file=None):
     """The tp-spawn argv for the shadow worker: explicit model and thinking (so the router, the coder floor and the escalation
     rule are never consulted), the worktree as workdir, the preamble read from the main checkout, the trial's two worker env
     values, and the same request, context, notes and test scope the normal coder got."""
@@ -466,6 +500,8 @@ def spawn_args(source, run, worktree, project, trial, request_file, task_id, doc
         args += ["--tests", source["tests"]]
     if source["deliverable"]:
         args += ["--deliverable", source["deliverable"]]
+    if rules_file:  # the section's text is in a file (records are data, never on a command line)
+        args += ["--rules-file", str(rules_file)]
     if source["other_lane_paths"]:
         args += ["--other-lane-paths", source["other_lane_paths"]]
     for spec in remap_context(source["context"], source["workdir"], worktree):
@@ -767,9 +803,23 @@ class Run:
         self.recheck_capacity()
         source = self.source()
         trial = {"model": self.info["model"], "thinking": self.info["thinking"]}
-        args = spawn_args(source, self.run, self.worktree, self.project, trial, self.rdir / "request.md", self.task_id)
-        self.require_time("tp-spawn")
-        run = self.command(args)
+        rules_path = None
+        if source.get("rules"):
+            with tempfile.NamedTemporaryFile("w", suffix=".md", prefix="tp-rules-", delete=False) as made:
+                made.write(source["rules"])
+            rules_path = made.name
+        elif source.get("rules_why"):
+            self.note(rules_skipped=source["rules_why"])
+        try:
+            args = spawn_args(source, self.run, self.worktree, self.project, trial, self.rdir / "request.md", self.task_id, rules_file=rules_path)
+            self.require_time("tp-spawn")
+            run = self.command(args)
+        finally:
+            if rules_path:
+                try:
+                    os.unlink(rules_path)
+                except OSError:
+                    pass
         if run.returncode:
             raise ShadowError("tp-spawn refused: {}".format(run.stderr.strip()[-600:] or "exit {}".format(run.returncode)))
         spawned = run.stdout.strip().splitlines()

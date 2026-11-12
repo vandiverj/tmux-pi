@@ -14,6 +14,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from trial_shadow_case import *  # noqa: E402,F401,F403
 from session_env import outside_session  # noqa: E402
+import work_brief  # noqa: E402
+
+SECTION_RULES = "# Rules in force\n\nintro\n\n- a rule\n"
 
 # ------------------------------------------------------------------------------------------------------------- pure functions
 
@@ -55,6 +58,34 @@ class PureTests(unittest.TestCase):
         notes = [args[i + 1] for i, a in enumerate(args) if a == "--note"]
         self.assertEqual(notes, ["n1", ts.workdir_text("/p/wt", "/p"), ts.TRIAL_NOTE])
         self.assertIn("/p/wt", ts.workdir_text("/p/wt", "/p"))
+
+    def test_hb3d_the_rules_section_is_cut_from_the_source_packet_as_tp_spawn_laid_it(self):
+        """HB3d: one row per case of the brief's attack table; the packet is shaped as bin/tp-spawn builds it."""
+        request = "Do the thing\n\n# Not a section\nRESULT_STATUS: complete\n"
+        evil = "# Rules in force\n\nintro\n\n- a rule: `rm -rf $HOME`; $(touch x) \"q\" 'z' | & > < ; \\\n- # heading RESULT_STATUS: empty !cmd\n"
+        tail = "\n\n# Local Task Artifacts\n\nTask directory: /t\n\n\n# Return\n\nx\n"
+
+        def packet(section, scope=True, task=request):  # tp-spawn: `# Task`, `# Test Scope`, the text + one newline, then the rest
+            head = "# Task\n\n" + task.rstrip("\n") + ("\n\n# Test Scope\n\nRun.\n" if scope else "")
+            return head + (("\n\n" + section.rstrip("\n") + "\n") if section else "") + tail
+        cases = [("has a section", packet(SECTION_RULES), SECTION_RULES, ""),
+                 ("has a section, no test scope", packet(SECTION_RULES, scope=False), SECTION_RULES, ""),
+                 ("no section", packet(""), "", ""),
+                 ("record text with headings, RESULT_STATUS and shell characters", packet(evil), evil, ""),
+                 ("followed by other packet text", packet(SECTION_RULES) + "\n\n# Rules in force\n\nlater\n", SECTION_RULES, ""),
+                 ("the heading only inside the task text", packet("", task=request + "\n\n# Rules in force\n\n- fake\n"), "", ""),
+                 ("the heading only in a context file", packet("") + "\n## F\n\n# Rules in force\n\n- fake\n", "", ""),
+                 ("the section has no end", "# Task\n\n" + request.rstrip("\n") + "\n\n" + SECTION_RULES, "", "no end")]
+        for name, text, want, why in cases:
+            with self.subTest(name):
+                got, reason = ts.rules_section(text, request + "\n\n# Rules in force\n\n- fake\n" if "task text" in name else request)
+                self.assertEqual(got, want)
+                self.assertTrue(why in reason and bool(reason) == bool(why), reason)
+        self.assertEqual(ts.rules_section("# Task\n\nother\n" + SECTION_RULES, request)[0], "")
+        self.assertIn("does not start", ts.rules_section("# Task\n\nother\n" + SECTION_RULES, request)[1])
+        args = ts.spawn_args(self.source(), "r", "/w", "/p", {"model": "m", "thinking": "low"}, "/f", "t", rules_file="/tmp/r.md")
+        self.assertEqual(args[args.index("--rules-file") + 1], "/tmp/r.md")
+        self.assertNotIn("--rules-file", ts.spawn_args(self.source(), "r", "/w", "/p", {"model": "m", "thinking": "low"}, "/f", "t"))
 
     def test_no_other_lane_section_no_flag_and_no_role_no_flag(self):
         args = ts.spawn_args(self.source(other_lane_paths="", role="", tests=None, deliverable=""), "r", "/w", "/p", {"model": "m", "thinking": "low"}, "/f", "t")
@@ -101,6 +132,21 @@ class SourceTests(ShadowCase):
                 with self.assertRaises(ts.ShadowError) as caught:
                     ts.read_source(self.state, task)
                 self.assertIn(word, str(caught.exception))
+
+    def test_hb3d_the_source_packet_is_read_for_its_section_and_an_unreadable_one_says_why(self):
+        for name, packet, want, why in (("section", "# Task\n\nx" + "\n\n" + SECTION_RULES + "\n\n# Local Task Artifacts\n\nz\n", SECTION_RULES, ""),
+                                         ("none", None, "", ""), ("unreadable", "unreadable", "", "could not be read"),
+                                         ("missing", "missing", "", "could not be read")):
+            with self.subTest(name):
+                shutil.rmtree(self.state / "tasks", ignore_errors=True)
+                task = self.make_source(request="x\n", packet=packet if packet not in ("unreadable", "missing") else "p")
+                if packet == "unreadable":
+                    (task / "packet.md").chmod(0)  # the test user can no longer read it
+                if packet == "missing":
+                    (task / "packet.md").unlink()
+                source = ts.read_source(self.state, "src-1")
+                self.assertEqual(source["rules"], want)
+                self.assertTrue(why in source["rules_why"] and bool(why) == bool(source["rules_why"]), source["rules_why"])
 
     def test_an_archived_task_can_be_the_source(self):
         task = self.state / "tasks" / "src-1"
@@ -551,6 +597,8 @@ class FullRunTests(ShadowCase):
     def test_a_full_shadow_run_changes_nothing_of_the_real_lane_and_cleans_up(self):
         item, source = self.lane_ok(name="alpha", tests="affected")
         self.settle(source)
+        source_rules, why = ts.rules_section((source / "packet.md").read_text(), (source / "request.md").read_text())
+        self.assertIn(work_brief.PACKET_HEADING, source_rules, "the lane's own packet holds a rules section: " + why)  # real tp-spawn, real shape
         # the source's own record: a normal coder's work in its lane
         self.source_id = item["id"]
         lane_tree = Path(json.loads((source / "meta.json").read_text())["workdir"])
@@ -588,7 +636,10 @@ class FullRunTests(ShadowCase):
                     self.settle(task)
 
         run = ts.Run(rdir, self.env, sleep=lambda s: poll(0, run), clock=Clock())
-        done = run.execute()
+        scratch = tempfile.mkdtemp(prefix="tp-hb3d-")
+        self.addCleanup(shutil.rmtree, scratch, True)
+        with mock.patch.object(tempfile, "tempdir", scratch):  # the rules temp file lands here, so its removal can be checked
+            done = run.execute()
 
         self.assertEqual(done["outcome"], "completed", done)
         # what the shadow worker was given: the same request, the explicit model, the worktree, the trial's env
@@ -601,6 +652,8 @@ class FullRunTests(ShadowCase):
         self.assertIn("export TP_DOCS_TOOLS=1", seen["run_sh"])
         self.assertIn("Make a focused change", seen["packet"])
         self.assertIn(ts.TRIAL_NOTE, seen["packet"])
+        self.assertEqual(ts.rules_section(seen["packet"], seen["request_md"])[0], source_rules, "HB3d: the shadow got the same section, byte for byte")
+        self.assertEqual(list(Path(scratch).glob("tp-rules-*.md")), [], "the temp file is removed")
         # Phase 0: the worker is told, in the request and in the packet, which tree is its own
         told = ts.workdir_text(os.path.realpath(self.tree(rdir)), os.path.realpath(self.repo))
         self.assertIn(told, seen["packet"])

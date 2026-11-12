@@ -31,6 +31,7 @@ class PureTests(unittest.TestCase):
         self.assertEqual(trial_session.tp_command([agent, "stop", "t-1"]), ("tp-agent stop", "t-1"))
         self.assertEqual(trial_session.tp_command([agent, "review", "--force", "t-1"]), ("tp-agent review", "t-1"))
         self.assertEqual(trial_session.tp_command([spawn, "--task-id", "t-1", "--note", "--view", "--file", "f"]), ("tp-spawn", "t-1"))
+        self.assertEqual(trial_session.tp_command([spawn, "--task-id", "t-1", "--rules-file", "/tmp/r.md", "--file", "f"]), ("tp-spawn", "t-1"))  # HB3d
         self.assertEqual(trial_session.tp_command([sys.executable, trial, "run", "--run-dir", "/x"]), ("tp-trial run", None))
         self.assertEqual({k for k, v in trial_session.TP.items() if v == "ends"},
                          {"tp-agent end-author", "tp-agent stop", "tp-agent review", "tp-spawn"})

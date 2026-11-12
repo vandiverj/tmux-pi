@@ -380,8 +380,12 @@ redactions="$(jq -r '.redactions' <<<"$rounds")"
 if (( redactions > 0 )); then echo "tp-review: $redactions secret-like value(s) in the earlier findings and diff were replaced with placeholders" >&2; fi
 while IFS= read -r f; do add_segments "$f" "$(basename "$f" .md)"; done < <(jq -r '.contexts[]' <<<"$rounds")
 # (e) The added test lines that wait on a clock (a research report has no diff). Computed here, never by the reviewer; facts only.
+# The changed-file list prepare computed with the diffs (scope-input.json): the scope (b) and the timer waits read it, never
+# working it out again (timers uses it only when it is the round-1 plan it would make itself).
+scope_input=(); scope_file="$(jq -r '.scope_input // empty' <<<"$rounds")"
+if [[ -n "$scope_file" ]]; then scope_input=(--input "$scope_file"); fi
 if [[ -z "${extra[*]+x}" ]]; then
-  python3 "$ROOT/lib/review_rounds.py" timers "$author_workdir" "$author_lane" "$excerpt_dir/timer-waits.md" || die "cannot compute the timer waits for '$id'"
+  python3 "$ROOT/lib/review_rounds.py" timers "$author_workdir" "$author_lane" "$excerpt_dir/timer-waits.md" ${scope_input[@]+"${scope_input[@]}"} || die "cannot compute the timer waits for '$id'"
   add_segments "$excerpt_dir/timer-waits.md" timer-waits
   review_task="$review_task The context file headed 'Timer waits in added test lines' lists the added test lines that wait on a clock, as path:line: text; they are facts only, and you judge whether each is a defect."
 fi
@@ -445,9 +449,7 @@ if [[ -z "${extra[*]+x}" ]]; then  # a research report has no diff
     scope_budget=$(( scope_budget - $(wc -c < "$f") - per_file_overhead ))
   done
   (( scope_budget >= 0 )) || scope_budget=0
-  # The changed-file list is the one prepare computed with the diffs above (scope-input.json), never worked out again.
-  scope_input=(); scope_file="$(jq -r '.scope_input // empty' <<<"$rounds")"
-  if [[ -n "$scope_file" ]]; then scope_input=(--input "$scope_file"); fi
+  # The changed-file list is the one prepare computed with the diffs above (scope_input, set after prepare), never worked out again.
   scope="$(python3 "$ROOT/lib/review_rounds.py" scope "$author_workdir" "$author_lane" "$dir/review-changed-files.txt" "$scope_budget" ${scope_input[@]+"${scope_input[@]}"} 2>/dev/null | jq -r '.text' 2>/dev/null)" || scope=""
   [[ -n "$scope" ]] || scope="Diff scope: the changed-file list could not be computed; inspect the files you need directly."
   printf '%s%s\n' "$scope_heading" "$scope" > "$excerpt_dir/diff-scope.md" || die "cannot write the scope of '$id'"

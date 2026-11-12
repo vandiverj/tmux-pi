@@ -1,6 +1,7 @@
 """lib/review_rounds.py: earlier review rounds along the retry lineage, and the diff since the last reviewed tree."""
 import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -1032,6 +1033,8 @@ class WholeFileTests(unittest.TestCase):
     from it; both come from safe_diff, so every assertion about a section is made on both."""
     SECRET = "madeup-WHOLE-90qz"
 
+    TRICKY = "diff --git a/.env b/.env\n@@ -1 +1 @@\nBinary files a/x and b/x differ\n--- a/.env\n+++ b/.env\n"
+
     @staticmethod
     def lines(word, count=30):
         return "".join(f"{word} line {i} " + "x" * 60 + "\n" for i in range(count))
@@ -1048,10 +1051,17 @@ class WholeFileTests(unittest.TestCase):
         old = cls.lines("old")
         files = {"small-change.txt": cls.lines("keep", 60), "rewritten.txt": old, "no-newline.txt": old.rstrip("\n"),
                  "to-empty.txt": old, "forged.txt": old, "notes.txt": old, "mode-and-rewrite.sh": old, "deleted.txt": old,
-                 "binary.bin": b"\0" + b"A" * 600}
+                 "binary.bin": b"\0" + b"A" * 600,
+                 # small edits (their hunks stay) of the other kinds the batched diff (blob_patches) must split back the same way
+                 "crlf.txt": cls.lines("crlf", 60).replace("\n", "\r\n"), "latin.txt": "caf\xe9\n".encode("latin-1") + cls.lines("keep", 60).encode(),
+                 "tricky.txt": cls.lines("keep", 60) + cls.TRICKY, "grows.txt": "", "to-link.txt": old,
+                 # blank context lines, which git writes as an empty line under diff.suppressBlankEmpty: at the end of a rewrite (a small edit's hunk with one is refused by gate on main too)
+                 "blank-end.txt": old + "\n"}
         for name, content in files.items():
             (cls.work / name).write_bytes(content if isinstance(content, bytes) else content.encode())
+        os.symlink("somewhere/else", cls.work / "to-file")
         run_git(cls.work, "add", "-A")
+        run_git(cls.work, "update-index", "--add", "--cacheinfo", "160000,1234567890abcdef1234567890abcdef12345678,sub")  # no directory: deleted
         run_git(cls.work, "commit", "-q", "-m", "base")
         # round 1 reviewed this commit
         cls.review = cls.state / "tasks" / "r-a"
@@ -1074,6 +1084,16 @@ class WholeFileTests(unittest.TestCase):
         (cls.work / "deleted.txt").unlink()
         (cls.work / "binary.bin").write_bytes(b"\0" + b"B" * 600)
         (cls.work / "added.txt").write_text(cls.lines("add"))
+        (cls.work / "crlf.txt").write_bytes(cls.lines("crlf", 60).replace("\n", "\r\n").replace("crlf line 9 ", "CRLF line 9 ").encode())
+        (cls.work / "latin.txt").write_bytes("CAF\xc9\n".encode("latin-1") + cls.lines("keep", 60).encode())
+        (cls.work / "tricky.txt").write_text(cls.lines("keep", 60) + cls.TRICKY.replace(".env", ".envx") + "diff --git a/3 b/3\n")
+        (cls.work / "grows.txt").write_text("one line\n")
+        (cls.work / "blank-end.txt").write_text(cls.lines("new") + "\n")
+        (cls.work / "empty-added.txt").write_text("")
+        (cls.work / "to-link.txt").unlink()
+        os.symlink("target", cls.work / "to-link.txt")
+        (cls.work / "to-file").unlink()
+        (cls.work / "to-file").write_text("now a file\n")
         cls.round1 = cls.packet(cls.task("w-fresh"), cls.out / "one")  # no earlier review: the tree against HEAD
         cls.round2 = cls.packet(cls.task("w-again", reviews=["r-a"]), cls.out / "two")  # the tree against the reviewed tree
 
@@ -1087,7 +1107,7 @@ class WholeFileTests(unittest.TestCase):
     @classmethod
     def packet(cls, ident, out):
         got = review_rounds.prepare(cls.state, ident, str(cls.work), out)
-        return {"text": Path(got["contexts"][0]).read_text(), "got": got}
+        return {"text": Path(got["contexts"][0]).read_text(errors="surrogateescape"), "got": got}  # written so (latin.txt)
 
     def texts(self):
         """The diff text of round 1 (against HEAD) and of round 2 (since the reviewed tree)."""
@@ -1170,7 +1190,7 @@ class WholeFileTests(unittest.TestCase):
         self.assertGreaterEqual(self.round2["got"]["redactions"], 1)
         for f in self.out.rglob("*"):
             if f.is_file():
-                self.assertNotIn(self.SECRET, f.read_text(), f)
+                self.assertNotIn(self.SECRET, f.read_text(errors="surrogateescape"), f)
 
     def test_every_other_kind_of_entry_keeps_its_diff(self):
         for text in self.texts():
@@ -1182,7 +1202,7 @@ class WholeFileTests(unittest.TestCase):
             moded = self.section(text, "mode-and-rewrite.sh")  # a mode change with a rewrite: not a plain modification
             self.assertTrue(moded.startswith("old mode 100644\nnew mode 100755\n--- a/mode-and-rewrite.sh\n"), moded[:120])
             self.assertIn("-old line 0 ", moded)
-            self.assertEqual(text.count("Whole file shown"), 5)  # rewritten, no-newline, to-empty, forged and secret: nothing else
+            self.assertEqual(text.count("Whole file shown"), 6)  # rewritten, blank-end, no-newline, to-empty, forged and secret: nothing else
 
     def test_the_boundary_a_tie_keeps_the_hunks_and_one_char_shorter_goes_whole(self):
         # entry_patch compares the hunk section with the whole-file section as attached, in characters. Git is stubbed (two blob
@@ -1206,6 +1226,119 @@ class WholeFileTests(unittest.TestCase):
         self.assertEqual(patch, "diff --git a/p.txt b/p.txt\n" + review_rounds.whole_file_section("/repo", "p.txt", "p.txt", "OLD", "NEW", hunks, text))  # one longer: whole
         patch, hunks = attach(tie - 1)
         self.assertEqual(patch, "diff --git a/p.txt b/p.txt\n" + head + hunks)  # shorter: the hunks
+
+    def safe_diff_counted(self, old, per_file=False, top=None, new=None):
+        """(safe_diff text and withheld paths, the git subcommands it started). per_file: main's form, one blob_patch (and blob_text)
+        per entry, which is entry_patch reading its own hunks."""
+        argvs, real = [], subprocess.Popen
+
+        class Counting(real):
+            def __init__(inner, argv, *args, **kwargs):
+                if isinstance(argv, list) and argv[:2] == ["git", "-C"]:
+                    argvs.append(argv[3])
+                super().__init__(argv, *args, **kwargs)
+        alone = (lambda top, empty, entries, old, new: [review_rounds.entry_patch(top, empty, e, old, new) for e in entries])
+        with mock.patch.object(subprocess, "Popen", Counting), \
+                mock.patch.object(review_rounds, "entry_patches", alone if per_file else review_rounds.entry_patches):
+            got = review_rounds.safe_diff(top or self.round1["got"]["snapshot"]["top"], old, new or self.round1["got"]["snapshot"]["tree"])
+        return got, argvs
+
+    def test_the_batched_text_is_main_s_per_file_text_at_every_size(self):
+        # PF1c: 0, 1 and 3 changed files stay one diff each (under BATCH_MIN); 200 go in one batch; the text is the same.
+        for size in (0, 1, 3, 200):
+            with self.subTest(size=size), tempfile.TemporaryDirectory() as tmp:
+                work = Path(tmp)
+                run_git(work, "init", "-q")
+                (work / "keep.txt").write_text("keep\n")
+                for k in range(size):
+                    (work / f"f{k:03d}.txt").write_text(f"one {k}\ntwo\nthree\n")
+                run_git(work, "add", "-A")
+                run_git(work, "commit", "-q", "-m", "base")
+                for k in range(size):
+                    (work / f"f{k:03d}.txt").write_text(f"one {k}\nTWO\nthree\n" if k % 3 else f"rewritten {k}\n")
+                now = review_rounds.snapshot(str(work))
+                main, main_calls = self.safe_diff_counted("HEAD", per_file=True, top=now["top"], new=now["tree"])
+                got, calls = self.safe_diff_counted("HEAD", top=now["top"], new=now["tree"])
+                self.assertEqual(got, main)
+                self.assertEqual(main[0].count("diff --git"), size)
+                batched = size >= review_rounds.BATCH_MIN
+                self.assertEqual(calls.count("diff"), 2 if batched else main_calls.count("diff"), calls)
+                self.assertEqual((calls.count("mktree"), calls.count("check-attr")), (1, 2) if batched else (0, 0))
+
+    def test_the_batched_text_is_main_s_per_file_text_for_every_kind_and_attribute_form(self):
+        # PF1c: every entry kind of this repository (added, deleted, small edit, rewrite, mode, type change both ways, binary,
+        # submodule, empty, CRLF, non-UTF-8, header-like lines, a header for one of the batch's own names) diffed in one batch is
+        # byte for byte the text of one diff per entry, under each attribute and config form git's diff reads. Attributes are
+        # matched against names (each blob id per file, the batch's own names in the trees): a form that gives some names other
+        # attributes sends those pairs to their own diff, so `diff` runs more than twice there and the text is still the same.
+        info = self.work / ".git" / "info" / "attributes"
+        info.parent.mkdir(exist_ok=True)
+        self.addCleanup(lambda: info.unlink(missing_ok=True))
+        global_file = Path(self.tmp.name) / "global-attributes"
+        index = Path(self.tmp.name) / "index-with-attributes"  # an index holding `.gitattributes` that the work tree does not have
+        blob = subprocess.run(["git", "-C", str(self.work), "hash-object", "-w", "--stdin"], input="* diff\n", capture_output=True, text=True).stdout.strip()
+        env = {**os.environ, "GIT_INDEX_FILE": str(index)}
+        subprocess.run(["git", "-C", str(self.work), "update-index", "--add", "--cacheinfo", f"100644,{blob},.gitattributes"], env=env, check=True)
+        HEAD, REVIEWED = "HEAD", self.reviewed_tree
+        (Path(self.tmp.name) / "order").write_text("small-change.txt\n")
+        rows = (  # name, info/attributes, global attributes file, config, extra environment, old side, batched (diff runs twice)
+            ("none, round 1", "", None, {}, {}, HEAD, True),
+            ("none, round 2 (since the reviewed tree)", "", None, {}, {}, REVIEWED, True),
+            ("* binary", "* binary\n", None, {}, {}, HEAD, True),
+            ("* -diff", "* -diff\n", None, {}, {}, HEAD, True),
+            ("* diff: binary files shown as text", "* diff\n", None, {}, {}, HEAD, True),
+            ("*.txt diff=x with a textconv and an external driver", "*.txt diff=x\n", None,
+             {"diff.x.textconv": "tr a-z A-Z <", "diff.x.command": "false"}, {}, HEAD, True),
+            ("* diff=x, binary=true", "* diff=x\n", None, {"diff.x.binary": "true", "diff.x.textconv": "tr a-z A-Z <"}, {}, HEAD, True),
+            ("* diff=python: the funcname is the driver's", "* diff=python\n", None, {}, {}, REVIEWED, True),
+            ("diff.external", "", None, {"diff.external": "false"}, {}, HEAD, True),
+            ("core.attributesFile with * -diff", "", "* -diff\n", {}, {}, HEAD, True),
+            ("[0-7]* -diff matches some blob ids only", "[0-7]* -diff\n", None, {}, {}, HEAD, False),
+            ("[0-9] -diff matches the batch's one-digit names only", "[0-9] -diff\n", None, {}, {}, HEAD, False),
+            ("* diff in the index only, over [0-7]* -diff in core.attributesFile: git diff does not read the index",
+             "", "[0-7]* -diff\n", {}, {"GIT_INDEX_FILE": str(index)}, HEAD, False),
+            ("diff.suppressBlankEmpty: blank context is an empty line", "", None, {"diff.suppressBlankEmpty": "true"}, {}, HEAD, True),
+            ("diff.suppressBlankEmpty, round 2", "", None, {"diff.suppressBlankEmpty": "true"}, {}, REVIEWED, True),
+            ("diff.context=0 and diff.interHunkContext=5", "", None, {"diff.context": "0", "diff.interHunkContext": "5"}, {}, HEAD, True),
+            ("diff.algorithm patience with diff.indentHeuristic=false", "", None,
+             {"diff.algorithm": "patience", "diff.indentHeuristic": "false"}, {}, REVIEWED, True),
+            ("diff.orderFile, diff.relative, diff.wsErrorHighlight=all, color.diff=always, core.quotePath=false", "", None,
+             {"diff.orderFile": str(Path(self.tmp.name) / "order"), "diff.relative": "true", "diff.wsErrorHighlight": "all", "color.diff": "always", "color.ui": "always",
+              "core.quotePath": "false"}, {}, HEAD, True),
+            ("core.autocrlf=true, core.eol=crlf, core.whitespace, diff.renames=false, core.abbrev=40", "", None,
+             {"core.autocrlf": "true", "core.eol": "crlf", "core.whitespace": "trailing-space,cr-at-eol", "diff.renames": "false",
+              "core.abbrev": "40"}, {}, HEAD, True),
+            ("diff.outputIndicatorContext=_, diff.outputIndicatorNew=> (git 2.x does not read them from config: no change)", "", None,
+             {"diff.outputIndicatorContext": "_", "diff.outputIndicatorNew": ">"}, {}, HEAD, True),
+            ("diff.noprefix, diff.mnemonicPrefix, diff.context=1, diff.algorithm=histogram", "", None,
+             {"diff.noprefix": "true", "diff.mnemonicPrefix": "true", "diff.context": "1", "diff.algorithm": "histogram"}, {}, REVIEWED, True),
+        )
+        for name, attributes, global_attributes, config, extra, old, batched in rows:
+            with self.subTest(name):
+                info.write_text(attributes)
+                if global_attributes is not None:
+                    global_file.write_text(global_attributes)
+                    config = {**config, "core.attributesFile": str(global_file)}
+                variables = {"GIT_CONFIG_COUNT": str(len(config)), **extra}
+                for n, (key, value) in enumerate(config.items()):
+                    variables.update({f"GIT_CONFIG_KEY_{n}": key, f"GIT_CONFIG_VALUE_{n}": value})
+                with mock.patch.dict(os.environ, variables):
+                    main, main_calls = self.safe_diff_counted(old, per_file=True)
+                    got, calls = self.safe_diff_counted(old)
+                self.assertEqual(got, main)
+                if old == HEAD:
+                    self.assertIn("Submodule entry", main[0])
+                self.assertGreater(main_calls.count("diff"), 15)  # the listing, then one per pair
+                self.assertEqual(calls.count("diff") == 2, batched, calls)  # the listing and the batch, or pairs diffed alone too
+                self.assertEqual((calls.count("mktree"), calls.count("check-attr")), (1 if batched else calls.count("mktree"), 2))
+                self.assertLessEqual(calls.count("mktree"), 1)
+                self.assertEqual(calls.count("cat-file"), min(1, main_calls.count("cat-file")))  # the texts a whole-file section may need, together
+        with self.subTest("a batched text of a shape split_sections refuses: every pair is diffed alone, the same text"):
+            main, _ = self.safe_diff_counted(HEAD, per_file=True)
+            with mock.patch.object(review_rounds, "split_sections", side_effect=review_rounds.Refused("unknown shape")):
+                got, calls = self.safe_diff_counted(HEAD)
+            self.assertEqual(got, main)
+            self.assertGreater(calls.count("diff"), 15)
 
 
 class TimerWaitsTests(unittest.TestCase):
@@ -1330,6 +1463,60 @@ class TimerWaitsTests(unittest.TestCase):
         run = subprocess.run([sys.executable, str(ROOT / "lib/review_rounds.py"), "timers", str(self.work), "", str(out)], capture_output=True, text=True)
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertIn("src/foo_test.ts:1: await sleep(50)", out.read_text())
+        # with prepare's round-1 scope input the command writes the same file
+        own = tempfile.TemporaryDirectory()
+        self.addCleanup(own.cleanup)
+        plan = Path(own.name) / "scope-input.json"
+        plan.write_text(json.dumps(review_rounds.plan_for(review_rounds.snapshot(str(self.work)), "")))
+        again = Path(own.name) / "timers-input.md"
+        run = subprocess.run([sys.executable, str(ROOT / "lib/review_rounds.py"), "timers", str(self.work), "", str(again), "--input", str(plan)],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(again.read_text(), out.read_text())
+
+    def test_the_timer_waits_reuse_prepares_round_one_scope_and_no_other(self):
+        """PF1c: the plan prepare wrote is used only when it is the round-1 plan (previous 0); the text is the same either way."""
+        own = tempfile.TemporaryDirectory()
+        self.addCleanup(own.cleanup)
+        state, out = Path(own.name) / "state", Path(own.name) / "out"
+        (state / "tasks").mkdir(parents=True)
+
+        def task(ident, **meta):
+            (state / "tasks" / ident).mkdir(exist_ok=True)
+            (out / ident).mkdir(parents=True, exist_ok=True)
+            (state / "tasks" / ident / "meta.json").write_text(json.dumps({"id": ident, **meta}))
+            return ident
+
+        task("r-state", reviews=[])
+        (state / "tasks" / "r-state" / "result.md").write_text("RC")
+        task("r-none")
+        (state / "tasks" / "r-none" / "result.md").write_text("RC")  # reviewed, but no reviewed state was kept
+        probe = review_rounds.prepare(state, task("probe"), str(self.work), out / "probe")
+        (state / "tasks" / "r-state" / "reviewed-state.json").write_text(json.dumps(probe["snapshot"]))
+        self.put("src/foo_test.ts", "const a = 1\nawait sleep(50)\n")
+        self.put("old_test.ts", "await sleep(1)\nconst a = 1\ndelay(7)\n")
+        bad = Path(own.name) / "bad.json"
+        bad.write_text("{}")
+        rows = (("round 1", task("w-one"), True, 0),
+                ("later round without a reviewed state", task("w-none", reviews=["r-none"]), True, 0),
+                ("later round with a reviewed state", task("w-state", reviews=["r-state"]), False, 1),
+                ("an unreadable plan", None, False, None))
+        expected = review_rounds.timer_waits(str(self.work), "")
+        self.assertIn("src/foo_test.ts:2: await sleep(50)", expected)
+        for name, ident, reused, previous in rows:
+            with self.subTest(name):
+                if ident is None:
+                    source = str(bad)
+                else:
+                    got = review_rounds.prepare(state, ident, str(self.work), out / ident)
+                    source = got["scope_input"]
+                    self.assertEqual(json.loads(Path(source).read_text())["previous"] > 0, bool(previous))
+                calls = []
+                real = review_rounds.snapshot
+                with mock.patch.object(review_rounds, "snapshot", side_effect=lambda *a, **k: calls.append(a) or real(*a, **k)):
+                    text = review_rounds.timer_waits(str(self.work), "", source)
+                self.assertEqual(text, expected)
+                self.assertEqual(calls == [], reused, calls)
 
 class FrozenCopiesTests(unittest.TestCase):
     """FC1: a file a `frozen-copies.json` manifest declares a byte-identical copy of an older commit's file is named, not repeated.

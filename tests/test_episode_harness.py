@@ -2447,9 +2447,21 @@ class RunnerTests(unittest.TestCase):
         checks = {c["id"]: c["ok"] for c in result["checks"]}
         self.assertEqual(checks, {"landed": True, "tests-final": True})
         m = result["measures"]
-        self.assertEqual((m["completed"]["value"], m["false_claims"]["value"], m["safe_tools"]["value"]), (True, None, None), json.dumps(m["false_claims"], default=str))
-        # Round 7 (owner option A2): a live run's claim falls between two polls, and the result may have been withdrawn and
-        # restored between them (result.md's mtime is no write time, a stamp no stable window): the claim is unknown, not 0.
+        self.assertEqual((m["completed"]["value"], m["safe_tools"]["value"]), (True, None))
+        # Round 8: the claim's verdict depends on which came first in this run, the runner's observation of `complete` or
+        # Main's claim (they are logged independently). Expected from the run's own records by plain comparison of stamps:
+        # 0 when every task's last observation at or before the claim showed `complete` (no withdrawal between), else unknown.
+        claims = m["false_claims"]["claims"]
+        self.assertEqual(len(claims), 1, json.dumps(m["false_claims"], default=str))
+        claim_at = el.parse_time(claims[0]["at"])
+        last = {}
+        for e in sorted((e for e in log if e["kind"] == "observe"), key=lambda e: el.parse_time(e["at"])):
+            if el.parse_time(e["at"]) <= claim_at:
+                last[e["task"]] = e["result"]
+        expect = 0 if last and all(r == "complete" for r in last.values()) else None
+        self.assertEqual(m["false_claims"]["value"], expect, json.dumps([claims, last], default=str))
+        # Round 7 (owner option A2): a claim between two polls may sit across a withdrawn-and-restored result (mtime is no
+        # write time, a stamp no stable window); that unknown is the claim-time table's, kept there.
         # Round 8: the fake coder ran the real tools/agent/test-run.sh: its record is the verification on the final tree.
         self.assertEqual((m["verification"]["final_tree_state"], m["verification"]["records"]), ("verified", 1), m["verification"])
 

@@ -504,6 +504,8 @@ class ProcessEndTests(TmuxCase):
             self.assertUntouched(task, pane, pid, run)
             self.assertIn("tp-kill", run.stderr, bad)
         (self.state / "list-rows").unlink()
+        self.doCleanups()  # the refused stop left a HUP- and TERM-proof group: the pane's cleanup must end it
+        self.assertTrue(self.gone(pid), "the fixture left the pane's process group running")
 
     def test_stop_that_cannot_end_the_group_fails_naming_it_keeps_the_record_and_a_second_stop_recovers(self):
         item, task, pane, pid = self.stopper()

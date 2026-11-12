@@ -28,6 +28,23 @@ def git(cwd, *args):
     return run.stdout.strip()
 
 
+def process_start(pid):
+    """The start time `ps` shows for `pid` ('' when it is gone): tells the process from a later one that reuses the pid."""
+    return subprocess.run(["/bin/ps", "-o", "lstart=", "-p", str(pid)], text=True, capture_output=True).stdout.strip()
+
+
+def end_group(pid, start):
+    """SIGKILL the process group `pid` leads, when `pid` still is the process that started at `start` and still leads its own group.
+    A HUP-ignoring pane command survives its server's death; this ends it. Never signals another group."""
+    if not start or process_start(pid) != start:
+        return
+    try:
+        if os.getpgid(pid) == pid:
+            os.killpg(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
 def write_wrappers(fake, sock):
     """Write the fake `tmux` and `ps` into `fake`; the tmux wrapper reaches the private server on `sock`."""
     wrapper = fake / "tmux"
@@ -161,6 +178,7 @@ class TmuxCase(unittest.TestCase):
         out = self.tmux("new-window", "-d", "-P", "-F", "#{pane_id} #{pane_pid}", command)
         pane, pid = out.split()
         self.tmux("set-option", "-p", "-t", pane, "remain-on-exit", "on")
+        self.addCleanup(end_group, int(pid), process_start(int(pid)))  # LIFO: runs before the server teardown, whatever that does
         return pane, int(pid)
 
     @staticmethod

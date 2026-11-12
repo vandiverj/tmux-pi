@@ -1108,3 +1108,8 @@ Each lane: checkpoint, Main's evidence, openai-codex review, notes closed, `lane
   - Tool gap: the trust-store guard refuses read-only analysis and edits whose text contains "tmux" or session paths; HB5a
     workers worked around it once (round 1 rewrote refused analyses as scripts; round 3 edited through a heredoc), both
     disclosed. Main authorised one narrow case (the reviewer's in-process probes from its own evidence dir).
+  - HB5a approved at 7a97277 after 6 rounds (rounds 3-6 Sonnet rule-first); review-coder-abcd34fd0b-034623
+    APPROVED_WITH_NOTES. The rule that held: one strict grammar over every original command word in every role before any
+    recognition (round 4's gap was Main's brief wording). Full run on the merged tree 8d4af09: 5535 OK (skipped 78), 546 s.
+    Real session: 7 duplicates + 2 covered = 92.5 s (0.5%); Main's reruns invisible. Stopped before merge for the owner
+    (hub/hb5/hb5a-decision.md). HB7 waits on HB8 (hb8b-decision), so the HUB queue now waits on the owner.

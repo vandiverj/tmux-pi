@@ -1145,3 +1145,8 @@ Each lane: checkpoint, Main's evidence, openai-codex review, notes closed, `lane
   review-coder-1653d423f5-100210 APPROVED_WITH_NOTES. Real data: 97 contract lines need a reason, 0 have one (all provenance
   only). Cleanup: 23 merged lanes removed with `tp-agent lane remove` after collecting 16 finished reviewers; 7 HB7a preview
   worktrees removed. Not merged: options in docs/plans/det-prep/hub/hb7/hb7b-decision.md.
+- HB7b adopted (owner "use recommendation for decision" = A): `tp-agent lane close hub-prune HB7b` passed; merged 00bee5c
+  (after pulling the work-Mac tp-pi long-argv fix as 05c3aa6). Full run on preview be588cd: 5539 tests OK (skipped 78), 553 s;
+  after the merge test_friction_report, test_session_env, test_docs_wiring 42 OK. Ledger written:
+  docs/plans/det-prep/hub/hb7/contract-ledger.json, 97 entries, 0 problems, 0 unresolved pointers: 53 justified on the owner's
+  words, 20 on Main's docs/keys, 24 provenance only (owner list in hb7b-decision.md "Ledger result"). No contract line changed.

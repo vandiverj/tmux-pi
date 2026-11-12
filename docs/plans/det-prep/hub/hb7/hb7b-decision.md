@@ -36,3 +36,33 @@ line, config/routines.json:42 (owner-kept). Real data round trip: 97 provenance 
   oldest first. No contract line changes without the owner's OK.
 - **B. Adopt, ledger for Main's prompt only first** (23 lines), roles after.
 - **C. Park:** keep the lane; the skeleton numbers above stand as the measure.
+
+## Owner choice and ledger result (2026-11-12)
+The owner said "use recommendation for decision" (A). Closed and merged as 00bee5c. Main wrote `contract-ledger.json` from the
+skeleton: each entry keeps its `commit:` pointer as provenance and gains reasons that resolve (owner label rows, friction keys,
+Main's feedback memories, plan-doc headings). Check: `python3 tools/friction/report.py --map .../frictions.json --ledger
+.../contract-ledger.json --labels .tmux-pi/il1/labels-A.json .tmux-pi/il1/labels-B.json --memory <Main's memory dir>`.
+
+| measure | value |
+|---|---|
+| justified, owner-stated (a label row of the owner's own words) | 53 |
+| justified, Main (a key, memory or plan doc) | 20 |
+| provenance only (no written reason found) | 24 |
+| problems, unresolved pointers, stale entries | 0 |
+
+**For the owner: the 24 lines with no written reason, oldest first.** None is proposed for removal; each needs the owner's
+word to keep (Main then records it as the reason) or to remove (a removal reason). No contract line changes without it.
+- claude/main-prompt.md, 7a22c8f (2026-10-01, first Claude-as-main commit), 10 lines: the opening paragraph; "+here"; no edits
+  for question/plan requests; ask on material ambiguity; a subagent sees only its packet; tell workers to ask; a worker at a
+  prompt -> tell the user; route follow-ups with send_to_subagent; report faithfully; kill_subagent only on request.
+- agent/roles architect, data-flow-reviewer, infrastructure, vulnerability-reviewer, 911d22f (2026-10-04): each role's opening
+  line (the line that defines the role).
+- claude/main-prompt.md, 2659b4b (2026-10-04): pass the user's own request in `request` (the commit body gives the why: the
+  router misjudged long packets; no doc holds it).
+- claude/main-prompt.md, 9f3deed (2026-10-22): the end-of-case `/case-handoff` paragraph (a work-case procedure).
+- claude/main-prompt.md, 80568c2 (2026-10-27): the APPROVED_WITH_NOTES disposition rule.
+- reviewer roles, 03e3b1d (2026-10-27), 3 lines: `Closes by:` labels (code-reviewer, data-flow, vulnerability).
+- claude/main-prompt.md, a1f0de8 (2026-10-08): a failing test reported as pre-existing gets an investigation.
+- code-reviewer.md, 2ea63b9 (2026-11-01): a fixed wait in a test is a defect.
+- coder.md, 5ca1176 (2026-11-11): do not decide a compliance, security or data-handling rule; ask.
+- researcher.md, 5ca1176 (2026-11-11): the role's opening line.

@@ -1,0 +1,1162 @@
+{
+ "schema": "tp-contract-ledger:v1",
+ "entries": [
+  {
+   "file": "claude/main-prompt.md",
+   "sha": "94a581eef8bd",
+   "prefix": "You are the main agent in a tmux-pi",
+   "reasons": [
+    "commit:7a22c8f8ce96"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "claude/main-prompt.md",
+   "sha": "40ddfbfb9150",
+   "prefix": "- Do small, quick, or conversational work yourself.",
+   "reasons": [
+    "commit:7a22c8f8ce96",
+    "key:dispatch-via-tmux-pi-workers",
+    "label:labels-A.json#29",
+    "label:labels-B.json#98"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "claude/main-prompt.md",
+   "sha": "0453ec8ad9ef",
+   "prefix": "- If the user says \"+here\", do the",
+   "reasons": [
+    "commit:7a22c8f8ce96"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "claude/main-prompt.md",
+   "sha": "b0f8d6cc435e",
+   "prefix": "- Do not edit files or spawn workers",
+   "reasons": [
+    "commit:7a22c8f8ce96"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "claude/main-prompt.md",
+   "sha": "c80ef19867c6",
+   "prefix": "- If ambiguity would materially change files, behavior,",
+   "reasons": [
+    "commit:7a22c8f8ce96"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "claude/main-prompt.md",
+   "sha": "214f2b543663",
+   "prefix": "- A subagent sees only its packet: your",
+   "reasons": [
+    "commit:7a22c8f8ce96"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "claude/main-prompt.md",
+   "sha": "20490ffde312",
+   "prefix": "- Leave `model` and `thinking` unset so the",
+   "reasons": [
+    "commit:7a22c8f8ce96",
+    "key:model-choice",
+    "label:labels-A.json#3",
+    "label:labels-A.json#66"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "claude/main-prompt.md",
+   "sha": "d3c7d92b225b",
+   "prefix": "- Pass the user's own request, unedited, in",
+   "reasons": [
+    "commit:2659b4b0588f"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "claude/main-prompt.md",
+   "sha": "d52cc40fab4d",
+   "prefix": "- Tell workers to ask if the task",
+   "reasons": [
+    "commit:7a22c8f8ce96"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "claude/main-prompt.md",
+   "sha": "2e0e4930ba21",
+   "prefix": "- spawn_subagent returns immediately. Use collect_result with wait_seconds",
+   "reasons": [
+    "commit:7a22c8f8ce96",
+    "key:orchestrate-in-parallel",
+    "label:labels-A.json#25",
+    "label:labels-B.json#210"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "claude/main-prompt.md",
+   "sha": "7b6bcf69ac52",
+   "prefix": "- If collect_result shows a worker stopped at",
+   "reasons": [
+    "commit:7a22c8f8ce96"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "claude/main-prompt.md",
+   "sha": "e0efe1ac519c",
+   "prefix": "- Route follow-ups for a running worker with",
+   "reasons": [
+    "commit:7a22c8f8ce96"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "claude/main-prompt.md",
+   "sha": "7042daf70eb8",
+   "prefix": "- Required or risky work (security, PII, data",
+   "reasons": [
+    "commit:7a22c8f8ce96",
+    "doc:docs/plans/det-prep/README.md#Deterministic"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "claude/main-prompt.md",
+   "sha": "eea43cfac03f",
+   "prefix": "- Report results to the user faithfully, including",
+   "reasons": [
+    "commit:7a22c8f8ce96"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "claude/main-prompt.md",
+   "sha": "b12e6d636d7c",
+   "prefix": "- After APPROVED_WITH_NOTES, close the step, then give",
+   "reasons": [
+    "commit:80568c212d7f"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "claude/main-prompt.md",
+   "sha": "a661a3f135d2",
+   "prefix": "- A failing test a worker reports as",
+   "reasons": [
+    "commit:a1f0de8e948c"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "claude/main-prompt.md",
+   "sha": "6aa7b6483589",
+   "prefix": "- When the user corrects how you work",
+   "reasons": [
+    "commit:8724e391bc1e",
+    "doc:docs/plans/det-prep/hub/README.md#HB3",
+    "doc:docs/plans/det-prep/hub/README.md#HB7"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "claude/main-prompt.md",
+   "sha": "fca9c4fe0a09",
+   "prefix": "- Use kill_subagent only for workers the user",
+   "reasons": [
+    "commit:7a22c8f8ce96"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "claude/main-prompt.md",
+   "sha": "8ee49b966180",
+   "prefix": "- Tests for a change are judged by",
+   "reasons": [
+    "commit:2ea63b99bb2d",
+    "key:tests-earn-their-place",
+    "memory:tests-earn-their-place.md",
+    "label:labels-B.json#136",
+    "memory:workers-test-once.md"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "claude/main-prompt.md",
+   "sha": "0d101f770ac4",
+   "prefix": "When the case's steps are reviewed and the",
+   "reasons": [
+    "commit:9f3deed90c39"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "claude/main-prompt.md",
+   "sha": "9c06f9c571fc",
+   "prefix": "- For two or more substantial streams of",
+   "reasons": [
+    "commit:6593822bc19e",
+    "key:orchestrate-in-parallel",
+    "doc:docs/lanes.md#When"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "claude/main-prompt.md",
+   "sha": "b6e23fc4e738",
+   "prefix": "- `tp-agent lanes` lists each lane's `waiting_on`: `worker`",
+   "reasons": [
+    "commit:6593822bc19e",
+    "doc:docs/lanes.md#Lane"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "claude/main-prompt.md",
+   "sha": "81f24713e487",
+   "prefix": "- Lanes are merged by hand for now:",
+   "reasons": [
+    "commit:6593822bc19e",
+    "doc:docs/lanes.md#Not"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/architect.md",
+   "sha": "a65b21071d51",
+   "prefix": "Analyze a specific design decision against the existing",
+   "reasons": [
+    "commit:911d22ffc1a3"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/code-reviewer.md",
+   "sha": "ab4fc8581e47",
+   "prefix": "Review the assigned change for correctness, regressions, structure,",
+   "reasons": [
+    "commit:5ca1176475e3",
+    "doc:docs/plans/det-prep/hub/hb2/hb2a-brief.md#Why"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/code-reviewer.md",
+   "sha": "b361aa61704c",
+   "prefix": "Claims last. The packet gives you the request,",
+   "reasons": [
+    "commit:cbf045bf357f",
+    "doc:docs/plans/det-prep/d1-claims-last.md#Why"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/code-reviewer.md",
+   "sha": "4472b68d4f5d",
+   "prefix": "Diagnose, do not only list. For each defect",
+   "reasons": [
+    "commit:da62e3b26ee8",
+    "key:fix-brief-states-the-rule",
+    "doc:docs/plans/det-prep/loop/ideas.md#H12"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/code-reviewer.md",
+   "sha": "e6b635a55753",
+   "prefix": "Review everything, every time. Cover every changed file",
+   "reasons": [
+    "commit:adee8712593d",
+    "key:workers-cover-whole-scope",
+    "label:labels-A.json#31",
+    "memory:workers-attack-own-rule.md"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/code-reviewer.md",
+   "sha": "f79bd8a51b47",
+   "prefix": "Tests for a change. Every change to behaviour",
+   "reasons": [
+    "commit:2ea63b99bb2d",
+    "key:tests-earn-their-place",
+    "memory:tests-earn-their-place.md",
+    "label:labels-B.json#136"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/code-reviewer.md",
+   "sha": "2612d28fb3d5",
+   "prefix": "1. an existing test that already fails without",
+   "reasons": [
+    "commit:2ea63b99bb2d",
+    "key:tests-earn-their-place",
+    "memory:tests-earn-their-place.md",
+    "label:labels-B.json#136"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/code-reviewer.md",
+   "sha": "e41445d3abb4",
+   "prefix": "2. else extend the nearest existing test (a",
+   "reasons": [
+    "commit:2ea63b99bb2d",
+    "key:tests-earn-their-place",
+    "memory:tests-earn-their-place.md",
+    "label:labels-B.json#136"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/code-reviewer.md",
+   "sha": "a4d7a539192a",
+   "prefix": "3. else add a test, and say why",
+   "reasons": [
+    "commit:2ea63b99bb2d",
+    "key:tests-earn-their-place",
+    "memory:tests-earn-their-place.md",
+    "label:labels-B.json#136"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/code-reviewer.md",
+   "sha": "55ec1a505bf2",
+   "prefix": "No test is needed ONLY for:",
+   "reasons": [
+    "commit:2ea63b99bb2d",
+    "key:tests-earn-their-place",
+    "memory:tests-earn-their-place.md",
+    "label:labels-B.json#136"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/code-reviewer.md",
+   "sha": "41a3b1b8f16e",
+   "prefix": "a. comments, docs, prompt or message text that",
+   "reasons": [
+    "commit:2ea63b99bb2d",
+    "key:tests-earn-their-place",
+    "memory:tests-earn-their-place.md",
+    "label:labels-B.json#136"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/code-reviewer.md",
+   "sha": "4f857732ccea",
+   "prefix": "b. a pure refactor: behaviour unchanged and the",
+   "reasons": [
+    "commit:2ea63b99bb2d",
+    "key:tests-earn-their-place",
+    "memory:tests-earn-their-place.md",
+    "label:labels-B.json#136"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/code-reviewer.md",
+   "sha": "2dc4917446d4",
+   "prefix": "c. renames or moves that tests already reach;",
+   "reasons": [
+    "commit:2ea63b99bb2d",
+    "key:tests-earn-their-place",
+    "memory:tests-earn-their-place.md",
+    "label:labels-B.json#136"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/code-reviewer.md",
+   "sha": "ea6f085ca44b",
+   "prefix": "d. config values (not config logic).",
+   "reasons": [
+    "commit:2ea63b99bb2d",
+    "key:tests-earn-their-place",
+    "memory:tests-earn-their-place.md",
+    "label:labels-B.json#136"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/code-reviewer.md",
+   "sha": "40e2c921e7fe",
+   "prefix": "State the letter in the report, for example",
+   "reasons": [
+    "commit:2ea63b99bb2d",
+    "key:tests-earn-their-place",
+    "memory:tests-earn-their-place.md",
+    "label:labels-B.json#136"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/code-reviewer.md",
+   "sha": "0597a804d026",
+   "prefix": "Review the tests as code. A fixed wait",
+   "reasons": [
+    "commit:2ea63b99bb2d"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/code-reviewer.md",
+   "sha": "1d9688223dad",
+   "prefix": "Stay on the task. Judge the work against",
+   "reasons": [
+    "commit:05e65f5a4860",
+    "key:rigor-matches-real-use",
+    "label:labels-B.json#161",
+    "memory:realistic-use-bar.md"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/code-reviewer.md",
+   "sha": "086e15e97bf9",
+   "prefix": "Label how each finding closes: end it with",
+   "reasons": [
+    "commit:03e3b1de60b5"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/code-reviewer.md",
+   "sha": "59b59d8f4a6f",
+   "prefix": "`SLOW_TESTS:` (only if any). One line per file:",
+   "reasons": [
+    "commit:c3aeeaa6f860",
+    "key:run-only-affected-tests",
+    "memory:workers-test-once.md",
+    "label:labels-B.json#131"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/coder.md",
+   "sha": "f10d6c3de1b9",
+   "prefix": "Make the requested code change within the assigned",
+   "reasons": [
+    "commit:5ca1176475e3",
+    "doc:docs/plans/det-prep/hub/hb2/hb2a-brief.md#Why"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/coder.md",
+   "sha": "f4c053c993f9",
+   "prefix": "Before editing, restate the assignment, list its acceptance",
+   "reasons": [
+    "commit:80568c212d7f",
+    "key:workers-cover-whole-scope",
+    "label:labels-A.json#31",
+    "memory:workers-attack-own-rule.md"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/coder.md",
+   "sha": "f79bd8a51b47",
+   "prefix": "Tests for a change. Every change to behaviour",
+   "reasons": [
+    "commit:2ea63b99bb2d",
+    "key:tests-earn-their-place",
+    "memory:tests-earn-their-place.md",
+    "label:labels-B.json#136"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/coder.md",
+   "sha": "2612d28fb3d5",
+   "prefix": "1. an existing test that already fails without",
+   "reasons": [
+    "commit:2ea63b99bb2d",
+    "key:tests-earn-their-place",
+    "memory:tests-earn-their-place.md",
+    "label:labels-B.json#136"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/coder.md",
+   "sha": "e41445d3abb4",
+   "prefix": "2. else extend the nearest existing test (a",
+   "reasons": [
+    "commit:2ea63b99bb2d",
+    "key:tests-earn-their-place",
+    "memory:tests-earn-their-place.md",
+    "label:labels-B.json#136"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/coder.md",
+   "sha": "a4d7a539192a",
+   "prefix": "3. else add a test, and say why",
+   "reasons": [
+    "commit:2ea63b99bb2d",
+    "key:tests-earn-their-place",
+    "memory:tests-earn-their-place.md",
+    "label:labels-B.json#136"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/coder.md",
+   "sha": "55ec1a505bf2",
+   "prefix": "No test is needed ONLY for:",
+   "reasons": [
+    "commit:2ea63b99bb2d",
+    "key:tests-earn-their-place",
+    "memory:tests-earn-their-place.md",
+    "label:labels-B.json#136"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/coder.md",
+   "sha": "41a3b1b8f16e",
+   "prefix": "a. comments, docs, prompt or message text that",
+   "reasons": [
+    "commit:2ea63b99bb2d",
+    "key:tests-earn-their-place",
+    "memory:tests-earn-their-place.md",
+    "label:labels-B.json#136"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/coder.md",
+   "sha": "4f857732ccea",
+   "prefix": "b. a pure refactor: behaviour unchanged and the",
+   "reasons": [
+    "commit:2ea63b99bb2d",
+    "key:tests-earn-their-place",
+    "memory:tests-earn-their-place.md",
+    "label:labels-B.json#136"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/coder.md",
+   "sha": "2dc4917446d4",
+   "prefix": "c. renames or moves that tests already reach;",
+   "reasons": [
+    "commit:2ea63b99bb2d",
+    "key:tests-earn-their-place",
+    "memory:tests-earn-their-place.md",
+    "label:labels-B.json#136"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/coder.md",
+   "sha": "ea6f085ca44b",
+   "prefix": "d. config values (not config logic).",
+   "reasons": [
+    "commit:2ea63b99bb2d",
+    "key:tests-earn-their-place",
+    "memory:tests-earn-their-place.md",
+    "label:labels-B.json#136"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/coder.md",
+   "sha": "40e2c921e7fe",
+   "prefix": "State the letter in the report, for example",
+   "reasons": [
+    "commit:2ea63b99bb2d",
+    "key:tests-earn-their-place",
+    "memory:tests-earn-their-place.md",
+    "label:labels-B.json#136"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/coder.md",
+   "sha": "c8e050250930",
+   "prefix": "The measure is correct coverage of the application",
+   "reasons": [
+    "commit:2ea63b99bb2d",
+    "key:tests-earn-their-place",
+    "memory:tests-earn-their-place.md",
+    "label:labels-B.json#136"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/coder.md",
+   "sha": "0a1d817fdd4e",
+   "prefix": "Before adding a test, find the tests that",
+   "reasons": [
+    "commit:5ca1176475e3",
+    "key:tests-earn-their-place",
+    "memory:tests-earn-their-place.md",
+    "label:labels-B.json#136"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/coder.md",
+   "sha": "f04f100932d9",
+   "prefix": "Test cost budget: a test you add should",
+   "reasons": [
+    "commit:a7d4256f23ea",
+    "key:run-only-affected-tests",
+    "memory:workers-test-once.md",
+    "label:labels-B.json#131"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/coder.md",
+   "sha": "92f990a53e2b",
+   "prefix": "Do not decide a rule that affects compliance,",
+   "reasons": [
+    "commit:5ca1176475e3"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/coder.md",
+   "sha": "aa23d13acedb",
+   "prefix": "Fix a cause, not a site: find every",
+   "reasons": [
+    "commit:80568c212d7f",
+    "key:fix-brief-states-the-rule",
+    "doc:docs/plans/det-prep/loop/ideas.md#H12"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/coder.md",
+   "sha": "a2479f938f8a",
+   "prefix": "In the report, copy counts as the log",
+   "reasons": [
+    "commit:5ca1176475e3",
+    "doc:docs/plans/det-prep/b1-gate-record-and-test-run.md#Why"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/coder.md",
+   "sha": "cd9b46efd834",
+   "prefix": "Attack your own rule before you report; a",
+   "reasons": [
+    "commit:53c40526a2c6",
+    "key:workers-cover-whole-scope",
+    "label:labels-A.json#31",
+    "memory:workers-attack-own-rule.md"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/coder.md",
+   "sha": "59b59d8f4a6f",
+   "prefix": "`SLOW_TESTS:` (only if any). One line per file:",
+   "reasons": [
+    "commit:c3aeeaa6f860",
+    "key:run-only-affected-tests",
+    "memory:workers-test-once.md",
+    "label:labels-B.json#131"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/data-flow-reviewer.md",
+   "sha": "e08aa4fe757c",
+   "prefix": "Trace what sensitive information enters, moves through, is",
+   "reasons": [
+    "commit:911d22ffc1a3"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/data-flow-reviewer.md",
+   "sha": "e0cc451d7f05",
+   "prefix": "Review everything in scope, every time: every place",
+   "reasons": [
+    "commit:adee8712593d",
+    "key:workers-cover-whole-scope",
+    "label:labels-A.json#31",
+    "memory:workers-attack-own-rule.md"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/data-flow-reviewer.md",
+   "sha": "1d9688223dad",
+   "prefix": "Stay on the task. Judge the work against",
+   "reasons": [
+    "commit:05e65f5a4860",
+    "key:rigor-matches-real-use",
+    "label:labels-B.json#161",
+    "memory:realistic-use-bar.md"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/data-flow-reviewer.md",
+   "sha": "086e15e97bf9",
+   "prefix": "Label how each finding closes: end it with",
+   "reasons": [
+    "commit:03e3b1de60b5"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/infrastructure.md",
+   "sha": "2d049394bf65",
+   "prefix": "Work on the assigned runtime, deployment, or operations",
+   "reasons": [
+    "commit:911d22ffc1a3"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/researcher.md",
+   "sha": "63e1a1fed5b8",
+   "prefix": "Answer the assigned question from relevant evidence. Record",
+   "reasons": [
+    "commit:5ca1176475e3"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/researcher.md",
+   "sha": "7d0778a23847",
+   "prefix": "If you run tests, run each file once,",
+   "reasons": [
+    "commit:c3aeeaa6f860",
+    "key:run-only-affected-tests",
+    "memory:workers-test-once.md",
+    "label:labels-B.json#131"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/researcher.md",
+   "sha": "59b59d8f4a6f",
+   "prefix": "`SLOW_TESTS:` (only if any). One line per file:",
+   "reasons": [
+    "commit:c3aeeaa6f860",
+    "key:run-only-affected-tests",
+    "memory:workers-test-once.md",
+    "label:labels-B.json#131"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/tester.md",
+   "sha": "90aacb046620",
+   "prefix": "Check the assigned behavior and nearby regressions. Tests",
+   "reasons": [
+    "commit:5ca1176475e3",
+    "key:tests-earn-their-place",
+    "memory:tests-earn-their-place.md",
+    "label:labels-B.json#136"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/tester.md",
+   "sha": "2612d28fb3d5",
+   "prefix": "1. an existing test that already fails without",
+   "reasons": [
+    "commit:2ea63b99bb2d",
+    "key:tests-earn-their-place",
+    "memory:tests-earn-their-place.md",
+    "label:labels-B.json#136"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/tester.md",
+   "sha": "e41445d3abb4",
+   "prefix": "2. else extend the nearest existing test (a",
+   "reasons": [
+    "commit:2ea63b99bb2d",
+    "key:tests-earn-their-place",
+    "memory:tests-earn-their-place.md",
+    "label:labels-B.json#136"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/tester.md",
+   "sha": "a4d7a539192a",
+   "prefix": "3. else add a test, and say why",
+   "reasons": [
+    "commit:2ea63b99bb2d",
+    "key:tests-earn-their-place",
+    "memory:tests-earn-their-place.md",
+    "label:labels-B.json#136"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/tester.md",
+   "sha": "55ec1a505bf2",
+   "prefix": "No test is needed ONLY for:",
+   "reasons": [
+    "commit:2ea63b99bb2d",
+    "key:tests-earn-their-place",
+    "memory:tests-earn-their-place.md",
+    "label:labels-B.json#136"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/tester.md",
+   "sha": "41a3b1b8f16e",
+   "prefix": "a. comments, docs, prompt or message text that",
+   "reasons": [
+    "commit:2ea63b99bb2d",
+    "key:tests-earn-their-place",
+    "memory:tests-earn-their-place.md",
+    "label:labels-B.json#136"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/tester.md",
+   "sha": "4f857732ccea",
+   "prefix": "b. a pure refactor: behaviour unchanged and the",
+   "reasons": [
+    "commit:2ea63b99bb2d",
+    "key:tests-earn-their-place",
+    "memory:tests-earn-their-place.md",
+    "label:labels-B.json#136"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/tester.md",
+   "sha": "2dc4917446d4",
+   "prefix": "c. renames or moves that tests already reach;",
+   "reasons": [
+    "commit:2ea63b99bb2d",
+    "key:tests-earn-their-place",
+    "memory:tests-earn-their-place.md",
+    "label:labels-B.json#136"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/tester.md",
+   "sha": "ea6f085ca44b",
+   "prefix": "d. config values (not config logic).",
+   "reasons": [
+    "commit:2ea63b99bb2d",
+    "key:tests-earn-their-place",
+    "memory:tests-earn-their-place.md",
+    "label:labels-B.json#136"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/tester.md",
+   "sha": "40e2c921e7fe",
+   "prefix": "State the letter in the report, for example",
+   "reasons": [
+    "commit:2ea63b99bb2d",
+    "key:tests-earn-their-place",
+    "memory:tests-earn-their-place.md",
+    "label:labels-B.json#136"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/tester.md",
+   "sha": "c8e050250930",
+   "prefix": "The measure is correct coverage of the application",
+   "reasons": [
+    "commit:2ea63b99bb2d",
+    "key:tests-earn-their-place",
+    "memory:tests-earn-their-place.md",
+    "label:labels-B.json#136"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/tester.md",
+   "sha": "ba00589ac554",
+   "prefix": "Run the narrowest relevant checks, cheapest first (in-process,",
+   "reasons": [
+    "commit:074a518b7760",
+    "key:run-only-affected-tests",
+    "memory:workers-test-once.md",
+    "label:labels-B.json#131"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/tester.md",
+   "sha": "59b59d8f4a6f",
+   "prefix": "`SLOW_TESTS:` (only if any). One line per file:",
+   "reasons": [
+    "commit:c3aeeaa6f860",
+    "key:run-only-affected-tests",
+    "memory:workers-test-once.md",
+    "label:labels-B.json#131"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/vulnerability-reviewer.md",
+   "sha": "d491a8abbfbd",
+   "prefix": "Inspect the assigned code or flow for exploitable",
+   "reasons": [
+    "commit:911d22ffc1a3"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/vulnerability-reviewer.md",
+   "sha": "e8051af53b8d",
+   "prefix": "Review everything in scope, every time: every changed",
+   "reasons": [
+    "commit:adee8712593d",
+    "key:workers-cover-whole-scope",
+    "label:labels-A.json#31",
+    "memory:workers-attack-own-rule.md"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/vulnerability-reviewer.md",
+   "sha": "1d9688223dad",
+   "prefix": "Stay on the task. Judge the work against",
+   "reasons": [
+    "commit:05e65f5a4860",
+    "key:rigor-matches-real-use",
+    "label:labels-B.json#161",
+    "memory:realistic-use-bar.md"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/roles/vulnerability-reviewer.md",
+   "sha": "086e15e97bf9",
+   "prefix": "Label how each finding closes: end it with",
+   "reasons": [
+    "commit:03e3b1de60b5"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/contract/worker.md",
+   "sha": "5f0538a9a3b0",
+   "prefix": "contract: worker v1",
+   "reasons": [
+    "commit:5ca1176475e3",
+    "doc:docs/plans/det-prep/hub/hb2/hb2a-brief.md#Why"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/contract/worker.md",
+   "sha": "d5e5fb3cc929",
+   "prefix": "These rules hold for every tmux-pi worker, whatever",
+   "reasons": [
+    "commit:5ca1176475e3",
+    "doc:docs/plans/det-prep/hub/hb2/hb2a-brief.md#Why"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/contract/worker.md",
+   "sha": "5873d8520eb4",
+   "prefix": "- Scope: do the task you were given",
+   "reasons": [
+    "commit:5ca1176475e3",
+    "doc:docs/plans/det-prep/hub/hb2/hb2a-brief.md#Why"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/contract/worker.md",
+   "sha": "265cae47b885",
+   "prefix": "- Search file contents with {safe_grep} (pattern, path).",
+   "reasons": [
+    "commit:5ca1176475e3",
+    "key:safe-search-from-start",
+    "label:labels-A.json#41",
+    "label:labels-A.json#78"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/contract/worker.md",
+   "sha": "a07bd3aac9df",
+   "prefix": "- Do not re-request an unchanged range you",
+   "reasons": [
+    "commit:5ca1176475e3",
+    "doc:docs/plans/det-prep/hub/hb2/hb2a-brief.md#Why"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/contract/worker.md",
+   "sha": "875356c4e001",
+   "prefix": "- At a permission prompt, or when a",
+   "reasons": [
+    "commit:5ca1176475e3",
+    "doc:docs/plans/det-prep/hub/hb2/hb2a-brief.md#Why",
+    "doc:docs/plans/det-prep/loop/ideas.md#H27"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/contract/worker.md",
+   "sha": "ad11fd572648",
+   "prefix": "- Keep durable findings in the task directory",
+   "reasons": [
+    "commit:5ca1176475e3",
+    "doc:docs/plans/det-prep/hub/hb2/hb2a-brief.md#Why"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/contract/worker.md",
+   "sha": "92ec33a213f5",
+   "prefix": "- Your final reply holds a line of",
+   "reasons": [
+    "commit:5ca1176475e3",
+    "doc:docs/plans/det-prep/hub/hb2/hb2a-brief.md#Why"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/contract/worker.md",
+   "sha": "dc660d7655f5",
+   "prefix": "- Reach Main with tp-agent request --kind skill|tool|context",
+   "reasons": [
+    "commit:5ca1176475e3",
+    "doc:docs/plans/det-prep/hub/hb2/hb2a-brief.md#Why",
+    "doc:docs/plans/det-prep/loop/ideas.md#H24"
+   ],
+   "by": "main",
+   "status": "keep"
+  },
+  {
+   "file": "agent/contract/worker.md",
+   "sha": "accbd1a25e1a",
+   "prefix": "- Run and record a check with {tp_root}/tools/agent/test-run.sh",
+   "reasons": [
+    "commit:5ca1176475e3",
+    "doc:docs/plans/det-prep/b1-gate-record-and-test-run.md#Why",
+    "key:worker-tests-isolate-tmux"
+   ],
+   "by": "main",
+   "status": "keep"
+  }
+ ]
+}

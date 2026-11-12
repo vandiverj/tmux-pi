@@ -1814,7 +1814,9 @@ class FrozenCopiesTests(unittest.TestCase):
         head = "diff --git a/ok b/ok\n--- a/ok\n+++ b/ok\n"
         for text in (head + "@@ -1,3 +1,3 @@\n-a\n+b\n",                                  # a hunk cut short by the end of the text
                      head + "@@ -1,3 +1,3 @@\n-a\n+b\ndiff --git a/ok b/ok\n",             # cut short by a header
-                     head + "@@ -1,3 +1,3 @@\n-a\n+b\n\n c\n d\n",                        # an empty line is not a diff line
+                     head + "@@ -1,4 +1,4 @@\n-a\n+b\n\n c\n",                           # a hunk one line short: the empty line is context, the end is not
+                     head + "@@ -1,2 +1,1 @@\n a\n\n\n",                                   # an empty line counted as one old and one new: longer than the header
+                     head + "@@ -1,3 +1,3 @@\n-a\n+b\n\n",                                 # one line short at the end: the end piece is not blank context
                      head + "@@ -0,0 +1 @@\n-a\n+b\n",                                    # more old lines than the header says
                      head + "@@ -1 +1 @@\n+a\n+b\n",                                      # more new lines than the header says
                      head + "@@ nonsense @@\n+a\n", head + "@@ -1 +1\n-a\n+b\n", head + "@@ whole file, x line(s) @@\n"):  # not hunk headers
@@ -1823,9 +1825,23 @@ class FrozenCopiesTests(unittest.TestCase):
         # what is followed: a missing count is 1, a backslash line uses neither count (mid-hunk or after), and the whole-file header
         for text in (head + "@@ -1 +1 @@\n-a\n\\ No newline at end of file\n+a\n\\ No newline at end of file\n",
                      head + "@@ -1,2 +1,2 @@\n a\n-b\n+c\n@@ -9 +9 @@\n-x\n+y\n",
-                     head + "@@ -0,0 +1,2 @@\n+a\n+b\n@@ whole file, 1 line(s) @@\n+z\n", head + "@@ -1 +1 @@\n-a\n+b\n"):
+                     head + "@@ -0,0 +1,2 @@\n+a\n+b\n@@ whole file, 1 line(s) @@\n+z\n", head + "@@ -1 +1 @@\n-a\n+b\n",
+                     head + "@@ -1,4 +1,4 @@\n-a\n+b\n\n c\n\n",                          # blank context lines (diff.suppressBlankEmpty), the last one a line, not the end
+                     head + "@@ -1 +1 @@\n-a\n+b\n\nnot in a hunk\n"):                   # an empty line outside any hunk: yielded, as before
             with self.subTest(text=text[len(head):]):
                 review_rounds.gate(text, ["ok"], [])
+        with self.assertRaises(review_rounds.Refused):  # a list ending in a real empty line is cut short too: only the last piece is the end
+            list(review_rounds.outside_hunks([*head.split("\n")[:-1], "@@ -1,3 +1,3 @@", " a", ""]))
+        # the real path: a small edit with a blank context line under diff.suppressBlankEmpty goes through safe_diff and its gate
+        # (fails on main: Refused "hunk cut short")
+        self.put("later.txt", "a\n\nb\n")
+        old = review_rounds.snapshot(self.work)["tree"]
+        self.put("later.txt", "a\n\nc\n")
+        run_git(self.work, "config", "diff.suppressBlankEmpty", "true")
+        self.addCleanup(run_git, self.work, "config", "--unset", "diff.suppressBlankEmpty")
+        text, withheld = review_rounds.safe_diff(self.top, old, review_rounds.snapshot(self.work)["tree"])
+        self.assertIn("\n a\n\n-b\n+c\n", text)  # the blank context line is an empty line
+        self.assertEqual(withheld, [])
 
     def test_a_removed_line_and_an_added_line_that_read_like_headers_do_not_make_safe_diff_refuse(self):
         """The reviewer's case at 321568c: another file's hunk changes `-- a/copy` to `++ b/copy`, and `copy` is a verified copy."""

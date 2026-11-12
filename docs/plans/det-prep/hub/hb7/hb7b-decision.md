@@ -37,7 +37,7 @@ line, config/routines.json:42 (owner-kept). Real data round trip: 97 provenance 
 - **B. Adopt, ledger for Main's prompt only first** (23 lines), roles after.
 - **C. Park:** keep the lane; the skeleton numbers above stand as the measure.
 
-## Owner choice and ledger result (2026-11-12)
+## Adoption and ledger result (2026-11-12)
 The owner said "use recommendation for decision" (A). Closed and merged as 00bee5c. Main wrote `contract-ledger.json` from the
 skeleton: each entry keeps its `commit:` pointer as provenance and gains reasons that resolve (owner label rows, friction keys,
 Main's feedback memories, plan-doc headings). Check: `python3 tools/friction/report.py --map .../frictions.json --ledger
@@ -67,8 +67,8 @@ word to keep (Main then records it as the reason) or to remove (a removal reason
 - coder.md, 5ca1176 (2026-11-11): do not decide a compliance, security or data-handling rule; ask.
 - researcher.md, 5ca1176 (2026-11-11): the role's opening line.
 
-**Owner decision (2026-11-12):** "use recommendation for decision" = keep all 24 (Main recommended no removal). Recorded as HB3
-record `det-prep/R1` (kind design, by owner, with the quote); the 24 entries point to `record:det-prep/R1`. Ledger now: 97
-justified (77 owner-stated, 20 Main), 0 provenance only, 0 problems. The record lives in this Mac's work store
-(`~/.config/tmux-pi/work`), so check with `--store` there; on another machine those 24 pointers resolve only after the record
-is copied or re-recorded (known limit: HB3 records are machine-local).
+## Owner decision on the 24 lines (2026-11-12)
+"use recommendation for decision" = keep all 24 (Main recommended no removal). The 24 ledger entries point here
+(`doc:docs/plans/det-prep/hub/hb7/hb7b-decision.md#Owner`), so the committed ledger resolves on any machine. This Mac's work
+store also holds it as HB3 record `det-prep/R1` (machine-local history; the ledger does not depend on it). Ledger: 97
+justified (53 owner-stated, 44 Main), 0 provenance only, 0 problems.

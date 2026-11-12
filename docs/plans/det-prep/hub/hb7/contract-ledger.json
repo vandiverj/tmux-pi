@@ -7,7 +7,7 @@
    "prefix": "You are the main agent in a tmux-pi",
    "reasons": [
     "commit:7a22c8f8ce96",
-    "record:det-prep/R1"
+    "doc:docs/plans/det-prep/hub/hb7/hb7b-decision.md#Owner"
    ],
    "by": "main",
    "status": "keep"
@@ -31,7 +31,7 @@
    "prefix": "- If the user says \"+here\", do the",
    "reasons": [
     "commit:7a22c8f8ce96",
-    "record:det-prep/R1"
+    "doc:docs/plans/det-prep/hub/hb7/hb7b-decision.md#Owner"
    ],
    "by": "main",
    "status": "keep"
@@ -42,7 +42,7 @@
    "prefix": "- Do not edit files or spawn workers",
    "reasons": [
     "commit:7a22c8f8ce96",
-    "record:det-prep/R1"
+    "doc:docs/plans/det-prep/hub/hb7/hb7b-decision.md#Owner"
    ],
    "by": "main",
    "status": "keep"
@@ -53,7 +53,7 @@
    "prefix": "- If ambiguity would materially change files, behavior,",
    "reasons": [
     "commit:7a22c8f8ce96",
-    "record:det-prep/R1"
+    "doc:docs/plans/det-prep/hub/hb7/hb7b-decision.md#Owner"
    ],
    "by": "main",
    "status": "keep"
@@ -64,7 +64,7 @@
    "prefix": "- A subagent sees only its packet: your",
    "reasons": [
     "commit:7a22c8f8ce96",
-    "record:det-prep/R1"
+    "doc:docs/plans/det-prep/hub/hb7/hb7b-decision.md#Owner"
    ],
    "by": "main",
    "status": "keep"
@@ -88,7 +88,7 @@
    "prefix": "- Pass the user's own request, unedited, in",
    "reasons": [
     "commit:2659b4b0588f",
-    "record:det-prep/R1"
+    "doc:docs/plans/det-prep/hub/hb7/hb7b-decision.md#Owner"
    ],
    "by": "main",
    "status": "keep"
@@ -99,7 +99,7 @@
    "prefix": "- Tell workers to ask if the task",
    "reasons": [
     "commit:7a22c8f8ce96",
-    "record:det-prep/R1"
+    "doc:docs/plans/det-prep/hub/hb7/hb7b-decision.md#Owner"
    ],
    "by": "main",
    "status": "keep"
@@ -123,7 +123,7 @@
    "prefix": "- If collect_result shows a worker stopped at",
    "reasons": [
     "commit:7a22c8f8ce96",
-    "record:det-prep/R1"
+    "doc:docs/plans/det-prep/hub/hb7/hb7b-decision.md#Owner"
    ],
    "by": "main",
    "status": "keep"
@@ -134,7 +134,7 @@
    "prefix": "- Route follow-ups for a running worker with",
    "reasons": [
     "commit:7a22c8f8ce96",
-    "record:det-prep/R1"
+    "doc:docs/plans/det-prep/hub/hb7/hb7b-decision.md#Owner"
    ],
    "by": "main",
    "status": "keep"
@@ -156,7 +156,7 @@
    "prefix": "- Report results to the user faithfully, including",
    "reasons": [
     "commit:7a22c8f8ce96",
-    "record:det-prep/R1"
+    "doc:docs/plans/det-prep/hub/hb7/hb7b-decision.md#Owner"
    ],
    "by": "main",
    "status": "keep"
@@ -167,7 +167,7 @@
    "prefix": "- After APPROVED_WITH_NOTES, close the step, then give",
    "reasons": [
     "commit:80568c212d7f",
-    "record:det-prep/R1"
+    "doc:docs/plans/det-prep/hub/hb7/hb7b-decision.md#Owner"
    ],
    "by": "main",
    "status": "keep"
@@ -178,7 +178,7 @@
    "prefix": "- A failing test a worker reports as",
    "reasons": [
     "commit:a1f0de8e948c",
-    "record:det-prep/R1"
+    "doc:docs/plans/det-prep/hub/hb7/hb7b-decision.md#Owner"
    ],
    "by": "main",
    "status": "keep"
@@ -201,7 +201,7 @@
    "prefix": "- Use kill_subagent only for workers the user",
    "reasons": [
     "commit:7a22c8f8ce96",
-    "record:det-prep/R1"
+    "doc:docs/plans/det-prep/hub/hb7/hb7b-decision.md#Owner"
    ],
    "by": "main",
    "status": "keep"
@@ -226,7 +226,7 @@
    "prefix": "When the case's steps are reviewed and the",
    "reasons": [
     "commit:9f3deed90c39",
-    "record:det-prep/R1"
+    "doc:docs/plans/det-prep/hub/hb7/hb7b-decision.md#Owner"
    ],
    "by": "main",
    "status": "keep"
@@ -271,7 +271,7 @@
    "prefix": "Analyze a specific design decision against the existing",
    "reasons": [
     "commit:911d22ffc1a3",
-    "record:det-prep/R1"
+    "doc:docs/plans/det-prep/hub/hb7/hb7b-decision.md#Owner"
    ],
    "by": "main",
    "status": "keep"
@@ -459,7 +459,7 @@
    "prefix": "Review the tests as code. A fixed wait",
    "reasons": [
     "commit:2ea63b99bb2d",
-    "record:det-prep/R1"
+    "doc:docs/plans/det-prep/hub/hb7/hb7b-decision.md#Owner"
    ],
    "by": "main",
    "status": "keep"
@@ -483,7 +483,7 @@
    "prefix": "Label how each finding closes: end it with",
    "reasons": [
     "commit:03e3b1de60b5",
-    "record:det-prep/R1"
+    "doc:docs/plans/det-prep/hub/hb7/hb7b-decision.md#Owner"
    ],
    "by": "main",
    "status": "keep"
@@ -700,7 +700,7 @@
    "prefix": "Do not decide a rule that affects compliance,",
    "reasons": [
     "commit:5ca1176475e3",
-    "record:det-prep/R1"
+    "doc:docs/plans/det-prep/hub/hb7/hb7b-decision.md#Owner"
    ],
    "by": "main",
    "status": "keep"
@@ -760,7 +760,7 @@
    "prefix": "Trace what sensitive information enters, moves through, is",
    "reasons": [
     "commit:911d22ffc1a3",
-    "record:det-prep/R1"
+    "doc:docs/plans/det-prep/hub/hb7/hb7b-decision.md#Owner"
    ],
    "by": "main",
    "status": "keep"
@@ -797,7 +797,7 @@
    "prefix": "Label how each finding closes: end it with",
    "reasons": [
     "commit:03e3b1de60b5",
-    "record:det-prep/R1"
+    "doc:docs/plans/det-prep/hub/hb7/hb7b-decision.md#Owner"
    ],
    "by": "main",
    "status": "keep"
@@ -808,7 +808,7 @@
    "prefix": "Work on the assigned runtime, deployment, or operations",
    "reasons": [
     "commit:911d22ffc1a3",
-    "record:det-prep/R1"
+    "doc:docs/plans/det-prep/hub/hb7/hb7b-decision.md#Owner"
    ],
    "by": "main",
    "status": "keep"
@@ -819,7 +819,7 @@
    "prefix": "Answer the assigned question from relevant evidence. Record",
    "reasons": [
     "commit:5ca1176475e3",
-    "record:det-prep/R1"
+    "doc:docs/plans/det-prep/hub/hb7/hb7b-decision.md#Owner"
    ],
    "by": "main",
    "status": "keep"
@@ -1025,7 +1025,7 @@
    "prefix": "Inspect the assigned code or flow for exploitable",
    "reasons": [
     "commit:911d22ffc1a3",
-    "record:det-prep/R1"
+    "doc:docs/plans/det-prep/hub/hb7/hb7b-decision.md#Owner"
    ],
    "by": "main",
    "status": "keep"
@@ -1062,7 +1062,7 @@
    "prefix": "Label how each finding closes: end it with",
    "reasons": [
     "commit:03e3b1de60b5",
-    "record:det-prep/R1"
+    "doc:docs/plans/det-prep/hub/hb7/hb7b-decision.md#Owner"
    ],
    "by": "main",
    "status": "keep"

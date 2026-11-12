@@ -1153,3 +1153,7 @@ Each lane: checkpoint, Main's evidence, openai-codex review, notes closed, `lane
 - HB7b ledger, owner decision (2026-11-12, "use recommendation for decision"): keep the 24 provenance-only lines; HB3 record
   det-prep/R1 (first record in the work store; workspace det-prep created). Ledger: 97 justified (77 owner-stated / 20 Main),
   0 problems with `--store ~/.config/tmux-pi/work`.
+- HB7b ledger correction (owner question 2026-11-12: why copy a record between machines): the committed ledger must not
+  point at a machine-local HB3 record. The 24 entries now point to hb7b-decision.md "Owner decision on the 24 lines"; the
+  check resolves with no `--store` (97 justified: 53 owner-stated / 44 Main, 0 problems). Gap noted for HB7: a doc pointer
+  counts as Main even when it quotes the owner, so portable owner-stated reasons exist only as H48 label rows today.

@@ -1199,3 +1199,14 @@ Each lane: checkpoint, Main's evidence, openai-codex review, notes closed, `lane
   with the interpreter, read by repeats.py as role main.
 - SN1 (lane small-notes, brief fixes/sn1-brief.md, Sonnet coder-21c3cc49a8): lib/bench/runner.py result readers tolerate
   non-UTF-8 (TR2 note); HB8b stale comments in tests/test_episode_harness.py.
+- Pushed c8deb43 on the owner's word ("push changes") after a full run on it: 5548 tests OK (skipped 78), 2982 s; origin had
+  nothing new (837c31c..c8deb43). HB3c 4866ff1 and later merges stay local until a batched full run and a new owner word.
+- SN1 round 1 (a3c0424): F1, the transcript-path reader (:281) had no row. Round 2 (coder-e36c24e8f3, d53cf0f) cells 79 x 4 OK;
+  review-coder-e36c24e8f3-162958 APPROVED_WITH_NOTES; merged 4cb62e1.
+- FL1 (lane episode-flake, Sonnet coder-b0a7770546): SN1's py39-out cell failed test_fake_pass_plays_scores_and_tears_down
+  once under load (main: 0 of 20). Origin: the test's oracle said 0 when the scorer says unknown (claim strictly between two
+  polls, result write time known only to the whole second). The oracle now states the scorer's rule; the scorer is unchanged
+  (owner option A2). Cells 136 x 4 OK; review-coder-b0a7770546-163623 APPROVED_WITH_NOTES; merged 76ee86f.
+- HB5b round 1 (0fd8e0e) REQUEST_CHANGES: Main reruns undercounted, relative PATH resolved against the caller's cwd, no real
+  overlap in the concurrency test. Round 2 (ee7cbef) fixed F2/F3; F1 recurred: equal end times broke by task name, so Main was
+  charged a rerun on a tie. Round 3 rule-first (hb5b-round3.md): strictly earlier end time only, coder-5243a36008.

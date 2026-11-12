@@ -569,22 +569,24 @@ WHOLE_HEAD = re.compile(r"@@ whole file, (\d+) line\(s\) @@$")  # the header who
 def outside_hunks(lines):
     """(index, line) for each line of the diff `lines` (a list, split at newlines) that is not in a hunk body, in order: the file
     header lines (`diff --git`, `---`, `+++`) can only be there. After an `@@ -a,b +c,d @@` line the next lines are the body until its
-    old and new counts are used up: a space line uses one of each, `-` one old, `+` one new, a backslash line (`\\ No newline at end of
+    old and new counts are used up: a space line (or an empty line, which is how git writes a blank context line under `diff.suppressBlankEmpty`) uses one of each, `-` one old, `+` one new, a backslash line (`\\ No newline at end of
     file`) neither. A line in a body that begins `--- a/x` is therefore a removed line that reads `-- a/x`, not a header.
     A diff this cannot follow raises Refused (as soon as it is reached, so the lines yielded before it are checked first): an `@@` line
     outside a body that is not a hunk header, a body line that is not a diff line (including a header or the end of the text: a hunk
-    cut short), or a line that uses more than the count has left."""
+    cut short), or a line that uses more than the count has left.
+    The last element of `lines` is the empty piece after the final newline (the end of the text, not a line): it is never counted
+    as a blank context line, so a hunk one line short at the end of the text still refuses."""
     old = new = 0
     for at, line in enumerate(lines):
         if old or new:
             kind = line[:1]
-            if kind == " ":
+            if kind == " " or (kind == "" and at < len(lines) - 1):  # blank context under diff.suppressBlankEmpty, never the end piece
                 old, new = old - 1, new - 1
             elif kind == "-":
                 old -= 1
             elif kind == "+":
                 new -= 1
-            elif kind != "\\":  # (an empty line has no first character, so it is not one either)
+            elif kind != "\\":
                 raise Refused(f"the diff has a hunk cut short: line {at + 1} is {line[:60]!r}, which is not a line of a hunk")
             if old < 0 or new < 0:
                 raise Refused(f"the diff has a hunk longer than its header says: line {at + 1} is {line[:60]!r}")

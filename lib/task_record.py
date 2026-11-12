@@ -44,9 +44,12 @@ def is_canonical(text):
 
 def _read(path, errors="replace"):
     """Text of a task file, "" when unreadable. Never raises on bad bytes: errors="replace" (default) is for text shown to
-    a person, parsed or compared; errors="surrogateescape" keeps every byte for a field written back verbatim (see _clean)."""
+    a person, parsed or compared (newlines normalised); errors="surrogateescape" keeps every byte, CR and CRLF too, for a field
+    written back verbatim (see _clean)."""
     try:
-        return Path(path).read_text(encoding="utf-8", errors=errors)
+        # surrogateescape is the verbatim read: no newline translation either, so CR and CRLF survive
+        with open(path, encoding="utf-8", errors=errors, newline="" if errors == "surrogateescape" else None) as f:
+            return f.read()
     except OSError:
         return ""
 
@@ -73,7 +76,7 @@ def _fence(text):
 
 
 def _extract_fenced_request(record):
-    lines = record.splitlines()
+    lines = record.splitlines(keepends=True)  # the payload is rejoined with its own line ends: CR and CRLF stay
     in_summary = False
     fence = ""
     body = []
@@ -93,7 +96,7 @@ def _extract_fenced_request(record):
         if line.strip() == fence:
             break
         body.append(line)
-    return "\n".join(body).strip()
+    return "".join(body).strip()
 
 
 def request_text(task_dir, errors="replace"):

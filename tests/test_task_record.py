@@ -46,7 +46,9 @@ class TaskRecordTests(unittest.TestCase):
         self.assertEqual((rec["ticket"], rec["pinned"]), ("ABC-42", True))
 
     BYTE_SHAPES = (("lone continuation", b"\x80"), ("truncated sequence", b"\xe2\x82"), ("latin-1", "caf\xe9".encode("latin-1")),
-                   ("0xFF", b"\xff"), ("NUL", b"\x00"), ("valid UTF-8 control", "café".encode("utf-8")))
+                   ("0xFF", b"\xff"), ("NUL", b"\x00"), ("valid UTF-8 control", "café".encode("utf-8")),
+                   ("CRLF lines", b"a\r\nb\r\nc"), ("bare CR lines", b"a\rb\rc"),
+                   ("CRLF lines + bad byte", b"a\r\n\x80\r\nc"), ("bare CR lines + bad byte", b"a\r\xffb\rc"))
 
     def test_task_files_that_are_not_utf8_never_raise_and_verbatim_fields_keep_their_bytes(self):
         for name, shape in self.BYTE_SHAPES:
@@ -75,6 +77,12 @@ class TaskRecordTests(unittest.TestCase):
                 write_record(d, lifecycle_state="settled")
                 self.assertIn(b"Answer " + shape + b" done", (d / "task.md").read_bytes())  # captured stop-mode output: verbatim
                 self.assertIn("Resume output from result.md", format_record_for_resume(d))
+            with self.subTest(shape=name, file="contract artifact"):
+                art = self.root / ("art-" + name.replace(" ", "-").replace("+", "p") + ".md")
+                art.write_bytes(b"Status: final\n" + shape + b"\n")  # status header first: _artifact_status still finds it
+                d = self.task(task_id="art-" + name.replace(" ", "-"), contract={"kind": "research", "artifact": str(art)})
+                write_record(d, lifecycle_state="settled")
+                self.assertIn(b"(final)", (d / "task.md").read_bytes())
             with self.subTest(shape=name, file="canonical task.md"):
                 d = self.task(task_id="can-" + name.replace(" ", "-"))
                 write_record(d, lifecycle_state="working")

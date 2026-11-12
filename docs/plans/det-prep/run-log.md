@@ -1086,3 +1086,8 @@ Each lane: checkpoint, Main's evidence, openai-codex review, notes closed, `lane
     while the pid still leads its group and has the recorded start time). Review review-coder-ce153756f1-212530
     APPROVED_WITH_NOTES; Main's dispositions for the other launch sites are in the task evidence (each has its own cleanup
     or a bound). Cells 164 x 4 OK, 0 leftover loops; on merged main test_process_end + test_session_env 57 OK, 0 loops.
+  - HB6a (lane hub-waits) tool gaps seen: (1) the round-1 worker's lane-ownership request sat unseen ~20 min because
+    Main's watcher only waited for result.md (Main now also watches for a pending capability-request.json); (2) merged
+    lanes still open (perf-spawn, hub-correct, others) keep broad touches (tools/, tests/) that overlap every new lane;
+    (3) a request from a worker that has ended can only be answered by a retry; (4) review panes stay after collect.
+    Candidates for HUB work, not fixed here.

@@ -3,7 +3,7 @@
 standard library and lib/ only; nothing here writes a contract, prompt, role, memory or record.
 
   python3 tools/friction/report.py --map docs/plans/det-prep/hub/hb7/frictions.json [--store DIR] [--labels FILE ...]
-                                   [--memory DIR] [--json]
+                                   [--memory DIR] [--ledger FILE] [--ledger-skeleton] [--json]
 
 Sources (docs/plans/det-prep/hub/hb7/hb7a-brief.md):
   record:<ws>/<id>        HB3 decision records of kind `correction`, read through lib.work.all_records (`--store` sets TP_WORK_DIR)
@@ -17,11 +17,15 @@ label row with a quote, is `owner+quote`; a memory file is always `main`; a doc 
 `by: worker` is `worker`. Only `owner+quote` can make a key `active`.
 Recurrence is reported as sessions (distinct `sid` after the first correction's session) first, then messages.
 The output holds pointers, counts, provenance and times: never a quote, a `why`, a memory body or a label's project.
+HB7b (hb7b-brief.md): `--ledger` checks a contract ledger (the evidence of each contract line, kept beside the contract) against
+the contract files; `--ledger-skeleton` prints one for Main to fill. Both read only; git is run read-only for `commit:` pointers.
 """
 import argparse
+import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -44,6 +48,21 @@ FRONT_LINE_RE = re.compile(r"^(\s*)([A-Za-z_][\w-]*):\s*(.*)$")
 # A contract line carries evidence when it holds a pointer of the forms this report uses, or an HB3 record id; the word
 # "evidence:" in prose is not a pointer.
 EVIDENCE_RE = re.compile(r"(?<![\w/-])(?:(?:record|label|memory|doc):[\w./#-]*\w|[a-z0-9][a-z0-9-]*/[DRL]\d+\b)")
+# HB7b contract ledger (docs/plans/det-prep/hub/hb7/hb7b-brief.md)
+LEDGER_SCHEMA = "tp-contract-ledger:v1"
+LEDGER_BY = ("main", "owner", "worker")
+LEDGER_STATUS = ("keep", "remove-candidate")
+LEDGER_SHA_RE = re.compile(r"^[0-9a-f]{12}$")
+LEDGER_POINTER_RE = re.compile(r"^(record|label|memory|doc|key|commit):(.+)$")
+COMMIT_RE = re.compile(r"^[0-9a-f]{7,40}$")
+POPULATION_RE = re.compile(r"^(?:claude/main-prompt\.md|agent/(?:roles|contract)/[^/]+\.md)$")
+HEADING_RE = re.compile(r"^ {0,3}#{1,6}(?:[ \t]|$)")
+FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+BLAME_RE = re.compile(r"^([0-9a-f]{40}) \d+ (\d+)(?: \d+)?$")
+GIT_ENV_DROP = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                "GIT_COMMON_DIR", "GIT_NAMESPACE", "GIT_PREFIX")
+LEDGER_COUNTS = ("justified_owner", "justified_main", "provenance_only", "worker_evidence_only", "no_resolved_reason", "no_entry",
+                 "stale_entries", "removal_with_reason", "removal_without_reason", "problems")
 CLOSED = {"withdrawn": "withdrawn", "superseded": "superseded", None: "open question (not a record in force)"}
 
 
@@ -93,7 +112,7 @@ def sensitive(path):
 
 def load_records(store, problems):
     """HB3 records through lib.work (no second parser): every record becomes an item; only kind `correction` is a source item."""
-    info = {"given": store is not None, "records": 0, "corrections": 0, "other_kinds": {}}
+    info = {"given": store is not None, "readable": False, "records": 0, "corrections": 0, "other_kinds": {}}
     if store is None:
         return {}, info
     try:
@@ -113,6 +132,7 @@ def load_records(store, problems):
             problems.append({"source": "record", "where": sub or str(store), "problem": f"store not readable: {type(error).__name__}"})
             return {}, info
     import work  # noqa: E402  imported here: the store root is read from TP_WORK_DIR at call time
+    info["readable"] = True
     old = os.environ.get("TP_WORK_DIR")
     os.environ["TP_WORK_DIR"] = str(store)
     skipped = []
@@ -120,7 +140,7 @@ def load_records(store, problems):
         records = work.all_records(skipped=skipped)
     except Exception as error:  # noqa: BLE001 - an unreadable store is listed, never a crash
         problems.append({"source": "record", "where": str(store), "problem": f"store not readable: {type(error).__name__}"})
-        records = []
+        records, info["readable"] = [], False
     finally:
         if old is None:
             os.environ.pop("TP_WORK_DIR", None)
@@ -235,7 +255,7 @@ def frontmatter(text):
 def load_memory(directory, problems):
     """Memory files: one fact per file with frontmatter `name`, `metadata.type`. A `feedback` file is a source item; its provenance is
     always main (Main writes every memory file, whatever it quotes). Memory files carry no date: undated."""
-    info = {"given": directory is not None, "files": 0, "feedback": 0, "other_types": {}}
+    info = {"given": directory is not None, "readable": False, "files": 0, "feedback": 0, "other_types": {}}
     if directory is None:
         return {}, info
     folder = Path(directory)
@@ -247,6 +267,7 @@ def load_memory(directory, problems):
     except OSError as error:
         problems.append({"source": "memory", "where": folder.name, "problem": f"memory directory not readable: {type(error).__name__}"})
         return {}, info
+    info["readable"] = True
     out = {}
     for path in entries:
         name = path.name
@@ -386,13 +407,14 @@ def recurrence(occurrences):
             "after_without_sid": no_sid, **counts}
 
 
-def build(map_path, store=None, labels=None, memory=None, root=ROOT):
+def build(map_path, store=None, labels=None, memory=None, root=ROOT, ledger=None):
     import work  # noqa: E402  SCOPE_RE: the closed scope list of HB3
     problems = []
     keys = load_map(map_path, problems)
     records, record_info = load_records(store, problems)
     label_items, label_info = load_labels(labels, problems)
     memory_items, memory_info = load_memory(memory, problems)
+    readable = {"record": record_info.pop("readable"), "memory": memory_info.pop("readable")}
     items = {**records, **label_items, **memory_items}
     claims = {}
     for key in keys:
@@ -453,9 +475,18 @@ def build(map_path, store=None, labels=None, memory=None, root=ROOT):
                 if len(owners) == 1:
                     row["hint"] = f"recurrence_of is in key {owners[0]}"
         ungrouped[found["source"]].append(row)
-    return {"schema": SCHEMA, "inputs": {"records": record_info, "labels": label_info, "memory": memory_info, "keys": len(keys)},
-            "keys": out_keys, "ungrouped": ungrouped, "conflicts": conflicts, "contract_size": contract_size(root, problems),
-            "problems": problems}
+    files, unreadable_dirs = read_contract(root, problems)
+    out = {"schema": SCHEMA, "inputs": {"records": record_info, "labels": label_info, "memory": memory_info, "keys": len(keys)},
+           "keys": out_keys, "ungrouped": ungrouped, "conflicts": conflicts}
+    justified = None
+    if ledger is not None:
+        ctx = {"root": Path(root), "items": items, "keys": {k["key"]: k for k in keys}, "label_files": set(label_info["files"]),
+               "store_given": store is not None, "store_readable": readable["record"], "memory_given": memory is not None,
+               "memory_readable": readable["memory"]}
+        out["contract_ledger"], justified = ledger_report(ledger, files, unreadable_dirs, ctx, problems)
+    out["contract_size"] = contract_size(files, justified)
+    out["problems"] = problems
+    return out
 
 
 def sort_key(pointer):
@@ -471,11 +502,12 @@ def not_found(source, rest, store, label_info, memory):
     return "no --memory given" if memory is None else "memory file not found, malformed or refused"
 
 
-def contract_size(root, problems):
-    """Lines, non-blank lines, words and evidence-carrying lines of Main's prompt, each role file and the worker contract. `total`
-    is every file; `brief_total` is the brief's population (Main's prompt and the role files) for comparison with it."""
+def read_contract(root, problems):
+    """The contract population: Main's prompt, each role file and the worker contract, as {file, in_brief, lines, error} (lines
+    is None when the file could not be read; error is `missing` or `not readable`), and the set of unreadable directories."""
     root = Path(root)
-    files = [(root / "claude" / "main-prompt.md", True)]
+    paths = [(root / "claude" / "main-prompt.md", True)]
+    unreadable = set()
     for sub, in_brief in (("roles", True), ("contract", False)):
         folder = root / "agent" / sub
         try:  # os.listdir raises on every Python; Path.glob skips an unreadable directory silently from 3.13
@@ -484,27 +516,340 @@ def contract_size(root, problems):
             names = []
         except OSError as error:
             problems.append({"source": "contract", "where": f"agent/{sub}", "problem": f"directory not readable: {type(error).__name__}"})
+            unreadable.add(f"agent/{sub}")
             continue
-        files += [(folder / n, in_brief) for n in names]
-    rows = []
-    zero = {"lines": 0, "nonblank": 0, "words": 0, "evidence_lines": 0}
-    total, brief_total = dict(zero), dict(zero)
-    for path, in_brief in files:
+        paths += [(folder / n, in_brief) for n in names]
+    files = []
+    for path, in_brief in paths:
+        rel = str(path.relative_to(root))
         try:
             lines = path.read_text(encoding="utf-8").split("\n")
-        except (OSError, UnicodeDecodeError):
-            problems.append({"source": "contract", "where": str(path.relative_to(root)), "problem": "not readable"})
+        except (OSError, UnicodeDecodeError) as error:
+            problems.append({"source": "contract", "where": rel, "problem": "not readable"})
+            files.append({"file": rel, "in_brief": in_brief, "lines": None,
+                          "error": "missing" if isinstance(error, FileNotFoundError) else "not readable"})
             continue
         if lines and lines[-1] == "":
             lines.pop()
-        row = {"file": str(path.relative_to(root)), "lines": len(lines), "nonblank": sum(bool(l.strip()) for l in lines),
-               "words": sum(len(l.split()) for l in lines), "evidence_lines": sum(bool(EVIDENCE_RE.search(l)) for l in lines)}
+        files.append({"file": rel, "in_brief": in_brief, "lines": lines, "error": None})
+    return files, unreadable
+
+
+def contract_size(files, justified=None):
+    """Lines, non-blank lines, words and evidence-carrying lines of each readable contract file. `total` is every file;
+    `brief_total` is the brief's population (Main's prompt and the role files). With a ledger, `justified` maps a file to the
+    line indexes a justified entry covers, and those lines carry evidence too."""
+    rows = []
+    zero = {"lines": 0, "nonblank": 0, "words": 0, "evidence_lines": 0}
+    total, brief_total = dict(zero), dict(zero)
+    for f in files:
+        lines = f["lines"]
+        if lines is None:
+            continue
+        covered = (justified or {}).get(f["file"], set())
+        row = {"file": f["file"], "lines": len(lines), "nonblank": sum(bool(l.strip()) for l in lines),
+               "words": sum(len(l.split()) for l in lines),
+               "evidence_lines": sum(bool(EVIDENCE_RE.search(l)) or n in covered for n, l in enumerate(lines))}
         rows.append(row)
         for k in total:
             total[k] += row[k]
-            if in_brief:
+            if f["in_brief"]:
                 brief_total[k] += row[k]
     return {"files": rows, "total": total, "brief_total": brief_total}
+
+
+# ------------------------------------------------------------------ contract ledger (HB7b)
+
+def needing(lines):
+    """Indexes of the lines that need a reason: non-blank and not an ATX heading. A fence (``` or ~~~, closed by the same character
+    at least as long, or the end of the file) holds no headings: its lines, delimiters included, count like prose."""
+    out, fence = [], None
+    for n, text in enumerate(lines):
+        if not text.strip():
+            continue
+        opener = FENCE_RE.match(text)
+        if fence is None:
+            if opener:
+                fence = opener.group(1)
+            elif HEADING_RE.match(text):
+                continue
+        elif opener and opener.group(1)[0] == fence[0] and len(opener.group(1)) >= len(fence) and not text.strip().strip(fence[0]):
+            fence = None
+        out.append(n)
+    return out
+
+
+def line_sha(text):
+    return hashlib.sha256(text.strip().encode("utf-8")).hexdigest()[:12]
+
+
+def prefix(text):
+    return " ".join(text.split()[:8])
+
+
+def load_ledger(path, problems):
+    """(valid entries, every (file, sha) any entry names). A ledger that cannot be read, parsed or is of another schema is one
+    problem and yields no entries; each faulty entry is one problem per fault and is skipped."""
+    name = Path(path).name
+
+    def fail(problem):
+        problems.append({"source": "ledger", "where": name, "problem": problem})
+        return [], set()
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except OSError as error:
+        return fail(f"ledger not readable: {type(error).__name__}")
+    except ValueError as error:
+        return fail(f"ledger not JSON: {type(error).__name__}")
+    if not isinstance(data, dict) or data.get("schema") != LEDGER_SCHEMA:
+        return fail(f"schema is not {LEDGER_SCHEMA}; ledger not read")
+    if not isinstance(data.get("entries"), list):
+        return fail("ledger has no `entries` list; ledger not read")
+    valid, named = [], set()
+    for position, entry in enumerate(data["entries"]):
+        where = f"{name} entry {position}"
+        if not isinstance(entry, dict):
+            problems.append({"source": "ledger", "where": where, "problem": "entry is not an object; skipped"})
+            continue
+        if isinstance(entry.get("file"), str) and isinstance(entry.get("sha"), str):
+            named.add((entry["file"], entry["sha"]))
+            where = f"{where} ({entry['file']} {entry['sha'][:12]})"
+        faults = []
+        need = ["file", "sha", "prefix", "reasons", "by", "status"]
+        if entry.get("status") == "remove-candidate":
+            need.append("removal_reasons")
+        for field in need:
+            if field not in entry:
+                faults.append(f"missing field {field}")
+        for field, value in entry.items():
+            if field in ("file", "prefix") and not isinstance(value, str):
+                faults.append(f"{field} must be a string")
+            elif field == "sha" and not (isinstance(value, str) and LEDGER_SHA_RE.match(value)):
+                faults.append("sha must be 12 lowercase hex")
+            elif field in ("reasons", "removal_reasons") and not (isinstance(value, list) and all(isinstance(r, str) for r in value)):
+                faults.append(f"{field} must be a list of strings")
+            elif field in ("by", "status"):
+                allowed = LEDGER_BY if field == "by" else LEDGER_STATUS
+                if not isinstance(value, str):
+                    faults.append(f"{field} must be a string")
+                elif value not in allowed:
+                    faults.append(f"unknown {field} {value[:40]}")
+        if isinstance(entry.get("file"), str) and not POPULATION_RE.match(entry["file"]):
+            faults.append("file outside the contract population")
+        for fault in faults:
+            problems.append({"source": "ledger", "where": where, "problem": fault + "; entry skipped"})
+        if not faults:
+            valid.append({**entry, "where": where, "removal_reasons": entry.get("removal_reasons") or []})
+    return valid, named
+
+
+def git(root, args, stdin=None):
+    """A read-only git call with the repo root as cwd; inherited repository variables (a hook's GIT_DIR) are dropped."""
+    env = {k: v for k, v in os.environ.items() if k not in GIT_ENV_DROP}
+    return subprocess.run(["git", "-c", "core.fsmonitor=false", *args], cwd=str(root), input=stdin, capture_output=True,
+                          encoding="utf-8", errors="replace", env=env, timeout=120, check=False)
+
+
+def check_commits(hexes, root, problems):
+    """{hex: True/False} for each commit pointer, or None (with one `commit` problem) when git is missing or fails."""
+    if not hexes:
+        return {}
+    order = sorted(hexes)
+    try:
+        done = git(root, ["cat-file", "--batch-check"], "".join(f"{h}^{{commit}}\n" for h in order))
+    except (OSError, subprocess.SubprocessError) as error:
+        problems.append({"source": "commit", "where": str(root), "problem": f"git not usable: {type(error).__name__}; commit pointers unchecked"})
+        return None
+    out = done.stdout.split("\n")
+    if done.returncode != 0 or len(out) < len(order):
+        problems.append({"source": "commit", "where": str(root),
+                         "problem": f"git cat-file failed (exit {done.returncode}, not a git repository?); commit pointers unchecked"})
+        return None
+    return {h: line.split(" ")[1:2] == ["commit"] for h, line in zip(order, out)}
+
+
+def resolve_reason(pointer, ctx):
+    """(state, provenance, why): state is resolved, unresolved or unchecked (the source was not given or not readable)."""
+    match = LEDGER_POINTER_RE.match(pointer)
+    if not match:
+        return "unresolved", None, "malformed pointer"
+    source, rest = match.groups()
+    if source == "commit":
+        if not COMMIT_RE.match(rest):
+            return "unresolved", None, "malformed pointer (commit:<7-40 lowercase hex>)"
+        if ctx["commits"] is None:
+            return "unchecked", None, "git not usable (problem listed)"
+        return ("resolved", "commit", None) if ctx["commits"][rest] else ("unresolved", None, "commit not in the repository")
+    if source == "key":
+        if not KEY_RE.match(rest):
+            return "unresolved", None, "malformed pointer (key:<friction key>)"
+        key = ctx["keys"].get(rest)
+        if key is None:
+            return "unresolved", None, "key not in the mapping"
+        return "resolved", "worker" if key["by"] == "worker" else "main", None
+    if source == "doc":
+        found, why = resolve_doc(pointer, rest, None, ctx["root"])
+        return ("resolved", found["provenance"], None) if found else ("unresolved", None, why)
+    if source == "label":
+        file_name, sep, index = rest.rpartition("#")
+        if not sep or not file_name or not index.isdigit():
+            return "unresolved", None, "malformed pointer (label:<file>#<i>)"
+        if file_name not in ctx["label_files"]:
+            return "unchecked", None, "labels file not given (or not readable)"
+    elif source == "record":
+        if not ctx["store_given"]:
+            return "unchecked", None, "no --store given"
+        if not ctx["store_readable"]:
+            return "unchecked", None, "store not readable (problem listed)"
+    elif source == "memory":
+        if not ctx["memory_given"]:
+            return "unchecked", None, "no --memory given"
+        if not ctx["memory_readable"]:
+            return "unchecked", None, "memory directory not readable (problem listed)"
+    if source == "label":
+        pointer = f"label:{file_name}#{int(index)}"  # the row's own `i`, as load_labels keys it
+    found = ctx["items"].get(pointer)
+    if found is None:
+        return "unresolved", None, {"record": "record not in the store", "label": "row not in the file",
+                                    "memory": "memory file not found, malformed or refused"}[source]
+    return "resolved", found["provenance"], None
+
+
+def classify(entry, reasons):
+    """The line category of a matched entry from its `by` and its resolved reasons [(pointer, provenance)]."""
+    own = [prov for _, prov in reasons if prov != "commit"]
+    backing = [prov for prov in own if prov != "worker"]
+    if entry["by"] == "worker":
+        return "worker_evidence_only"
+    if backing:
+        return "justified_owner" if "owner+quote" in backing and "worker" not in own else "justified_main"
+    if own:
+        return "worker_evidence_only"
+    return "provenance_only" if reasons else "no_resolved_reason"
+
+
+def ledger_report(path, files, unreadable_dirs, ctx, problems):
+    """The ledger check (HB7b rules 2-9). Returns (section, {file: justified line indexes})."""
+    entries, _ = load_ledger(path, problems)
+    hexes = set()
+    for entry in entries:
+        for pointer in entry["reasons"] + entry["removal_reasons"]:
+            if pointer.startswith("commit:") and COMMIT_RE.match(pointer[7:]):
+                hexes.add(pointer[7:])
+    ctx = {**ctx, "commits": check_commits(hexes, ctx["root"], problems)}
+    by_file = {f["file"]: f for f in files}
+    counts = {f["file"]: dict.fromkeys(LEDGER_COUNTS, 0) for f in files if f["lines"] is not None}
+    lines_of = {}
+    for name, row in counts.items():
+        need = needing(by_file[name]["lines"])
+        row["needing"] = len(need)
+        for n in need:
+            lines_of.setdefault((name, line_sha(by_file[name]["lines"][n])), []).append(n)
+    keys = {}
+    for entry in entries:
+        keys.setdefault((entry["file"], entry["sha"]), []).append(entry)
+    section = {"given": True, "ledger": Path(path).name, "entries": len(entries), "matched": [], "stale": [], "worker": [], "removal": [],
+               "unresolved": [], "unchecked": []}
+    justified, matched = {}, set()
+
+    def problem(entry, text):
+        problems.append({"source": "ledger", "where": entry["where"], "problem": text})
+        if entry["file"] in counts:
+            counts[entry["file"]]["problems"] += 1
+    for entry in entries:
+        ident = (entry["file"], entry["sha"])
+        if len(keys[ident]) > 1:
+            problem(entry, "duplicate (file, sha): neither entry counts")
+            continue
+        folder = entry["file"].rpartition("/")[0]
+        if entry["file"] not in counts:
+            state = by_file.get(entry["file"], {}).get("error")
+            problem(entry, "directory not readable; entry not checked" if folder in unreadable_dirs else
+                    "file not readable; entry not checked" if state == "not readable" else "file not found")
+            continue
+        view_ = {"file": entry["file"], "sha": entry["sha"], "prefix": entry.get("prefix")}
+        covered = lines_of.get(ident)
+        if not covered:
+            counts[entry["file"]]["stale_entries"] += 1
+            section["stale"].append(view_)
+            continue
+        matched.add(ident)
+        resolved = []
+        for role, pointers in (("reason", entry["reasons"]), ("removal", entry["removal_reasons"])):
+            good = []
+            for pointer in pointers:
+                state, prov, why = resolve_reason(pointer, ctx)
+                if state == "resolved":
+                    good.append((pointer, prov))
+                else:
+                    section[state].append({**view_, "role": role, "pointer": pointer[:120], "why": why})
+            if role == "reason":
+                resolved = good
+            elif entry["status"] == "remove-candidate":
+                with_reason = any(prov not in ("commit", "worker") for _, prov in good)
+                counts[entry["file"]]["removal_with_reason" if with_reason else "removal_without_reason"] += 1
+                section["removal"].append({**view_, "lines": len(covered),
+                                           "removal": "removal with a reason" if with_reason else "removal without a reason"})
+        category = classify(entry, resolved)
+        counts[entry["file"]][category] += len(covered)
+        section["matched"].append({**view_, "lines": len(covered), "category": category})
+        if category.startswith("justified"):
+            justified.setdefault(entry["file"], set()).update(covered)
+        if category == "worker_evidence_only":
+            section["worker"].append({**view_, "lines": len(covered)})
+    for (name, _), covered in lines_of.items():
+        if (name, _) not in matched:
+            counts[name]["no_entry"] += len(covered)
+    rows = [{"file": name, **row} for name, row in counts.items()]
+    section["files"] = rows
+    section["total"] = {k: sum(r[k] for r in rows) for k in ("needing",) + LEDGER_COUNTS}
+    return section, justified
+
+
+def skeleton(root=ROOT, ledger=None):
+    """(ledger document, problems): one entry per (file, sha) of a needing line that no ledger entry names, reasons from
+    `git blame --porcelain` of the working-tree file against HEAD (uncommitted lines add nothing). Writes nothing."""
+    problems = []
+    files, _ = read_contract(root, problems)
+    named = load_ledger(ledger, problems)[1] if ledger else set()
+    blame_ok = True
+    try:
+        head = git(root, ["rev-parse", "--verify", "-q", "HEAD^{commit}"])
+        if head.returncode != 0:
+            problems.append({"source": "commit", "where": str(root), "problem": "not a git repository or no commit at HEAD; every entry gets reasons []"})
+            blame_ok = False
+    except (OSError, subprocess.SubprocessError) as error:
+        problems.append({"source": "commit", "where": str(root), "problem": f"git not usable: {type(error).__name__}; every entry gets reasons []"})
+        blame_ok = False
+    entries, index = [], {}
+    for f in files:
+        if f["lines"] is None:
+            continue
+        blamed = {}
+        if blame_ok:
+            try:
+                done = git(root, ["blame", "--porcelain", "--", f["file"]])
+                if done.returncode != 0:
+                    problems.append({"source": "commit", "where": f["file"], "problem": "git blame failed (not committed?); reasons []"})
+                for out in done.stdout.split("\n") if done.returncode == 0 else []:
+                    match = BLAME_RE.match(out)
+                    if match:
+                        blamed[int(match.group(2)) - 1] = match.group(1)
+            except (OSError, subprocess.SubprocessError) as error:
+                problems.append({"source": "commit", "where": f["file"], "problem": f"git blame not usable: {type(error).__name__}"})
+        for n in needing(f["lines"]):
+            text = f["lines"][n]
+            ident = (f["file"], line_sha(text))
+            if ident in named:
+                continue
+            if ident not in index:
+                index[ident] = {"file": ident[0], "sha": ident[1], "prefix": prefix(text), "reasons": [], "by": "main", "status": "keep"}
+                entries.append(index[ident])
+            commit = blamed.get(n)
+            pointer = f"commit:{commit[:12]}" if commit and commit.strip("0") else None
+            if pointer and pointer not in index[ident]["reasons"]:
+                index[ident]["reasons"].append(pointer)
+    return {"schema": LEDGER_SCHEMA, "entries": entries}, problems
 
 
 def render(report):
@@ -558,6 +903,8 @@ def render(report):
     b = size["brief_total"]
     out.append(f"  brief population (main-prompt + roles): {b['lines']} lines ({b['nonblank']} non-blank), {b['words']} words, "
                f"{b['evidence_lines']} with evidence")
+    if "contract_ledger" in report:
+        out += render_ledger(report["contract_ledger"])
     if report["problems"]:
         out.append("")
         out.append("## Inputs listed and skipped")
@@ -565,9 +912,38 @@ def render(report):
     return "\n".join(out)
 
 
+def render_ledger(led):
+    def counts(r):
+        return (f"{r['needing']} need a reason: justified {r['justified_owner']} owner-stated / {r['justified_main']} main, "
+                f"provenance only {r['provenance_only']}, worker text {r['worker_evidence_only']}, no resolved reason "
+                f"{r['no_resolved_reason']}, no entry {r['no_entry']}; stale entries {r['stale_entries']}; removal candidates "
+                f"{r['removal_with_reason']} with / {r['removal_without_reason']} without a reason; problems {r['problems']}")
+    out = ["", f"## Contract ledger ({led['ledger']}, {led['entries']} valid entries)"]
+    out += [f"  {r['file']}: {counts(r)}" for r in led["files"]]
+    out.append(f"  total: {counts(led['total'])}")
+    for title, rows, fmt in (
+            ("stale (no current line has this sha)", led["stale"], lambda r: ""),
+            ("worker text, evidence only", led["worker"], lambda r: f"  ({r['lines']} line(s))"),
+            ("removal candidates (listed, never applied)", led["removal"], lambda r: f"  {r['removal']} ({r['lines']} line(s))"),
+            ("unresolved pointers (count for nothing)", led["unresolved"], lambda r: f"  {r['role']} {r['pointer']}: {r['why']}"),
+            ("unchecked pointers (source not given; count for nothing)", led["unchecked"],
+             lambda r: f"  {r['role']} {r['pointer']}: {r['why']}")):
+        if rows:
+            out.append(f"  {title}:")
+            out += [f"    - {r['file']} {r['sha']}{fmt(r)}" for r in rows]
+    return out
+
+
 EPILOG = ("Grouping comes from the mapping only. A record-local `friction` key is not read: that is deferred (it needs lib/work.py "
           "and interfaces.md section 5). Attribution has two levels: a key or a source pointer marked `by: worker` is worker text and "
-          "never makes a key active.")
+          "never makes a key active. "
+          "Contract ledger (--ledger, tp-contract-ledger:v1): a non-blank, non-heading line of main-prompt, roles or the worker "
+          "contract is matched by (file, sha12 of the stripped line); every pointer (record:, label:, memory:, doc:, key:, "
+          "commit:) is resolved, or listed as unresolved or unchecked (source not given) and counts for nothing; commit: alone is "
+          "provenance only; by worker is never justified; owner-stated needs a resolved owner record or label row with a quote; "
+          "remove-candidate needs a resolved non-commit removal reason or is listed without one; an entry matching no line is "
+          "stale. The report never edits a contract file. --ledger-skeleton prints a ledger for lines with no entry (reasons from "
+          "git blame) and writes nothing.")
 
 
 def main(argv=None, root=ROOT):
@@ -576,9 +952,18 @@ def main(argv=None, root=ROOT):
     parser.add_argument("--store", help="HB3 work store directory (sets TP_WORK_DIR for lib.work); not read when absent")
     parser.add_argument("--labels", nargs="*", default=[], help="H48 labels JSON files")
     parser.add_argument("--memory", help="a memory directory (no default)")
+    parser.add_argument("--ledger", help="a contract ledger JSON (tp-contract-ledger:v1); read only")
+    parser.add_argument("--ledger-skeleton", action="store_true",
+                        help="print a ledger skeleton for every needing line with no --ledger entry; writes nothing")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
-    report = build(args.map, args.store, args.labels, args.memory, root)
+    if args.ledger_skeleton:
+        doc, problems = skeleton(root, args.ledger)
+        print(json.dumps(doc, indent=1, ensure_ascii=False))
+        for p in problems:
+            print(f"problem: {p['source']} {p['where']}: {p['problem']}", file=sys.stderr)
+        return 0
+    report = build(args.map, args.store, args.labels, args.memory, root, args.ledger)
     print(json.dumps(report, indent=1, ensure_ascii=False) if args.json else render(report))
     return 0
 

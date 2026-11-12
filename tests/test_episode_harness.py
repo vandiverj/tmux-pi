@@ -1593,17 +1593,22 @@ class ClaimTimeTests(ScorerCase):
         # A result version is present from the earliest piece showing it (hi) and written after the latest piece showing
         # none or another status, or its stamp start (lo): a claim at or after hi sees it, one between lo and hi is
         # undecided. Owner or Main free text never counts. Claim at 9.5 and result.md rewritten at 30 unless a row says.
+        # Round 5 (score.result_possible): the result at the claim is every value a consistent history holds then; every
+        # version is shown by a poll, Read or file time while it holds; a notice says only that a result exists.
         # Polls: "span": working at 1, the complete stop stamped 9 (span [9, 10)) polled at 14; "blocked": a blocked stop at
         # 8 (stamp 7) and a working poll at 8.5 first; "none": no poll ever holds a result (working at 1 and at 14);
         # "f2": "span" with a tool poll showing no result at 9.2; "f3": a blocked stop at 8.2 stamped 8, nothing later;
-        # "seen": the complete stop polled at 9.4 (stamp 9).
+        # "seen": the complete stop polled at 9.4 (stamp 9); "f1": a complete stop at 8.2 (stamp 8), a new turn's poll with no
+        # result at 9.2 (both reporters remove result.md then), the next complete stop stamped 13 polled at 14.
         polls = {"span": [(1, "working", None, None), (14.0, "waiting", "complete", 9)],
                  "blocked": [(1, "working", None, None), (8, "waiting", "blocked", 7), (8.5, "working", "blocked", 8),
                              (14.0, "waiting", "complete", 9)],
                  "none": [(1, "working", None, None), (14.0, "working", None, 14)],
                  "f2": [(1, "working", None, None), (9.2, "tool", None, 9), (14.0, "waiting", "complete", 9)],
                  "f3": [(1, "working", None, None), (8.2, "waiting", "blocked", 8)],
-                 "seen": [(1, "working", None, None), (9.4, "waiting", "complete", 9)]}
+                 "seen": [(1, "working", None, None), (9.4, "waiting", "complete", 9)],
+                 "f1": [(1, "working", None, None), (8.2, "waiting", "complete", 8), (9.2, "working", None, None),
+                        (14.0, "waiting", "complete", 13)]}
         read = lambda s, res=None, status="complete": ("tool", s, "Read", {"file_path": str(r.state / "tasks/coder-1/result.md")},
                                                        0, res or s, "Done.\n\nRESULT_STATUS: %s\n" % status)
         notice = lambda s, line="coder-1 settled: tp-agent collect coder-1": ("user", s, "tmux-pi workers changed state:\n" + line)
@@ -1622,7 +1627,8 @@ class ClaimTimeTests(ScorerCase):
             ("span", [read(9.4, "undated")], None),
             ("span", [], True, 8.8), ("span", [], False, 10.5),                            # before / after the span
             ("none", [], True),                                                           # still working, no proof
-            ("none", [read(9.4)], False),                                                  # F1 case 1 (was True)
+            # Round 5: the poll at 14 shows no result, so the result read at 9.4 may be withdrawn in (9.4, 14] (was False).
+            ("none", [read(9.4)], None), ("none", [read(9.4)], False, 9.4),               # F1 case 1 (was True)
             ("none", [read(9.4, status="blocked")], True),
             ("blocked", [], None),                                                         # blocked before the span
             ("blocked", [read(9.4)], False),                                               # F1 case 3 (was True)
@@ -1640,8 +1646,19 @@ class ClaimTimeTests(ScorerCase):
             ("span", [], False, 9.5, 8.5),                     # result.md before the stamp shows the result by 8.5 (was None)
             ("span", [], None, 9.5, 9.7),                      # result.md inside the span, after the claim
             # Round 4 F4: a notice agrees with the status a Read, poll or file time shows at its time (was None).
-            ("span", [read(9.4), notice(9.4)], False), ("seen", [notice(9.4)], False), ("none", [notice(9.4)], False, 9.5, 9.4),
+            ("span", [read(9.4), notice(9.4)], False), ("seen", [notice(9.4)], False), ("none", [notice(9.4)], False, 9.4, 9.4),
+            ("none", [notice(9.4)], None, 9.5, 9.4),           # round 5: withdrawn in (9.4, 14] or not (was False)
             ("none", [notice(9.4)], None),                     # no version for the notice to be: which result, unknown
+            # Round 5 (review F1, F2 of e69d2e5): a version ends at the first observation showing no result; the same
+            # status after it is a new version, written no earlier than its stamp; a notice before the withdrawal backs
+            # nothing after it; a Read of part of the file without the status line shows nothing.
+            ("f1", [], True), ("f1", [], True, 12.5), ("f1", [], None, 13.5), ("f1", [], False, 14.5), ("f1", [], None, 9.1),
+            ("f1", [notice(9.0)], True),
+            ("f1", [read(9.0)], True),
+            ("span", [("tool", 9.4, "Read", {"file_path": str(r.state / "tasks/coder-1/result.md"), "offset": 1, "limit": 1},
+                       0, 9.4, "Done.\n")], None, 9.3),
+            ("span", [("tool", 9.4, "Read", {"file_path": str(r.state / "tasks/coder-1/result.md")}, 0, 9.4,
+                       "Done.\n…(truncated)")], None, 9.3),
         ]
         for poll_set, entries, false, *more in rows:
             claim_at, written = (list(more) + [9.5, 30][len(more):])[:2]

@@ -1614,14 +1614,21 @@ def _standing(run, who, by_then, claim, final):
     return failing, passing, unsure
 
 
-# HB8b round 4: the one source of what a task's result was at a moment (result_by). Every dated piece of evidence keeps its own
-# source's time and status (rule 1); a result version is known present from the earliest piece showing it (hi) and written
-# after the latest piece showing anything else or the worker's stamp start (lo, rule 2); a claim at or after hi sees it, one at
-# or before lo does not, one between is undecided (rule 4).
+# HB8b round 5: the one source of what a task's result was at a moment (result_by), a possible-histories model. A history is
+# a step function of the task's result (no result, or a result with a status) that starts with no result. Every dated piece
+# of evidence is an observation at its own source's time (round 4 rule 1): present(status) (a poll, a stop's write,
+# result.md's mtime, a Read that shows the status line), absent (a poll, or a Read of the whole file with no status line),
+# exists (tmux-pi's notice: some result, status unsaid). A Read that shows part of the file (offset, limit, truncated) and
+# no status line is no observation: it constrains nothing. Every version is seen: each value the result takes after the
+# first no-result is shown by a present or absent observation while it holds (a notice says a result exists, never which
+# version; a notice no such observation accounts for leaves no consistent history). So a result withdrawn by a new turn
+# (report.sh, reporter.ts unlink result.md) ends before the first absent observation after it, and the same status shown
+# after that is a new version. A stop's write span start (write_span) bounds the start of the stop's version, unless that
+# version was observed before the start (the stamp then dates a rewrite). The result at a moment is the set of values the
+# consistent histories hold then; no consistent history (contradictory evidence) is the empty set.
 NO_RESULT = "none"               # a piece showing the task held no result
 SETTLED = "settled"              # tmux-pi's notice: a result with a RESULT_STATUS exists; which one, the notice does not say
-UNDECIDED = "undecided"
-DISAGREE = "disagree"            # a version shown by pieces of the same time with different definite statuses
+TRUNCATED_RE = re.compile(r"(?i)truncated")
 # tmux-pi's notifier (claude/plugins/tmux-pi/hooks/register.tsx:471, wakeText) submits "tmux-pi workers changed state:" then
 # one line per task (hint, register.tsx:287-291): a result with a status is `<id> settled: ...` or `<id> settled and reports
 # failing tests it does not own: ...` (lib/contract.py _lifecycle: settled needs a RESULT_STATUS line).
@@ -1638,6 +1645,13 @@ def notified_settled(text, task_id):
     return any(line.match(each) for each in text[len(NOTICE_HEAD):].split("\n"))
 
 
+def whole_read(entry):
+    """True when a Read/safe_read result shows the whole file: no offset past line 1, no line limit, no truncation note."""
+    args = entry.get("input") or {}
+    return (args.get("offset") in (None, "", 0, 1) and args.get("limit") in (None, "")
+            and not TRUNCATED_RE.search(entry.get("result_text") or ""))
+
+
 def result_evidence(run, task):
     """[(at, status, start, source)]: every dated piece of evidence of the task's result, from source fields only, each
     with its own source's time and status (round 4 rule 1). `at`: when the piece shows `status`; `start`: for a stop, the
@@ -1647,7 +1661,8 @@ def result_evidence(run, task):
         (never later than its poll), written no earlier than the span's start;
       - result.md's mtime with the status of the file's current content (never another source's status);
       - each Main Read/safe_read of <task id>/result.md whose result came back (not an error), dated by the result's own
-        time: the RESULT_STATUS in the text read (NO_RESULT when it holds none);
+        time: the RESULT_STATUS in the text read; NO_RESULT when it holds none and the Read showed the whole file
+        (whole_read); a part of the file without the status line is no piece (round 5: it constrains nothing);
       - each tmux-pi notifier message (notified_settled) naming the task as settled: SETTLED (a result exists).
     Undated entries are not pieces (they decide nothing)."""
     tid = task["id"]
@@ -1665,73 +1680,90 @@ def result_evidence(run, task):
             when = e.get("result_at")
             if e.get("exit") == 0 and when is not None and (path == "%s/result.md" % tid or path.endswith("/%s/result.md" % tid)):
                 found = el.RESULT_RE.findall(e.get("result_text") or "")
-                pieces.append((when, found[-1].lower() if found else NO_RESULT, None, "Main read result.md at %s" % _iso(when)))
+                if found or whole_read(e):
+                    pieces.append((when, found[-1].lower() if found else NO_RESULT, None, "Main read result.md at %s" % _iso(when)))
         elif e["kind"] == "user" and e["at"] is not None and notified_settled(e.get("text") or "", tid):
             pieces.append((e["at"], SETTLED, None, "tmux-pi notice at %s" % _iso(e["at"])))
     return pieces
 
 
-def result_versions(pieces):
-    """(versions, notices): the result versions the pieces show, oldest first, each {status, lo, hi, source}, and the
-    notice times no version accounts for. A version is a run of pieces of one definite status in time order; pieces of
-    the same time with different definite statuses are one DISAGREE version (round 4 rule 3: SETTLED agrees with any
-    status; NO_RESULT shows none). hi: the earliest piece showing it. lo: the latest of its stops' write starts not after
-    hi and the pieces before hi showing no result or another status (round 4 rule 2). A notice before the first
-    version's hi and after its lo moves that hi to the notice: no other version can be the result it saw."""
-    definite = sorted((p for p in pieces if p[1] not in (NO_RESULT, SETTLED)), key=lambda p: (p[0], p[1]))
+def result_possible(pieces, at):
+    """(possible, why): the set of values (NO_RESULT or a status) the task's result can hold at `at` in the histories
+    consistent with every piece (the model above); empty when no history is. Pieces of one time are one observation: it
+    allows the values every piece there allows (a notice: any status some piece shows) and shows its value unless all its
+    pieces are notices. A history gives each observation a value; a run of equal values is one version, and every version
+    but the first no-result is shown by an observation in it. A version starts in the gap before its first observation, no
+    earlier than the start of each stop in it whose start is not after that first observation (seen before the stamp, the
+    stamp dates a rewrite)."""
+    statuses = {p[1] for p in pieces if p[1] not in (NO_RESULT, SETTLED)}
     groups = []
-    for p in definite:
-        if groups and groups[-1][0] == p[0]:
-            groups[-1][1].append(p)
-        else:
-            groups.append((p[0], [p]))
-    versions = []
-    for when, members in groups:
-        statuses = {p[1] for p in members}
-        status = statuses.pop() if len(statuses) == 1 else DISAGREE
-        if versions and versions[-1]["status"] == status != DISAGREE:
-            versions[-1]["members"] += members
-        else:
-            versions.append({"status": status, "hi": when, "members": list(members),
-                             "source": ", ".join(sorted(p[3] for p in members))})
-    for v in versions:
-        hi, mine = v["hi"], {p[1] for p in v["members"]}
-        bounds = [p[2] for p in v["members"] if p[2] is not None and p[2] <= hi]    # a start at hi: written at hi
-        bounds += [p[0] for p in pieces if p[0] < hi and (p[1] == NO_RESULT or (p[1] != SETTLED and p[1] not in mine))]
-        v["lo"] = max(bounds, default=NOT_BEFORE)
-    notices = []
-    for when in sorted(p[0] for p in pieces if p[1] == SETTLED):
-        if versions and versions[0]["hi"] <= when:
-            continue            # a version was already shown by then: the notice adds nothing, or cannot say which it saw
-        if versions and versions[0]["lo"] < when and versions[0]["status"] != DISAGREE:
-            versions[0]["hi"], versions[0]["source"] = when, "tmux-pi notice at %s (%s)" % (_iso(when), versions[0]["source"])
-        else:
-            notices.append(when)
-    return versions, notices
+    for when in sorted({p[0] for p in pieces}):
+        here = [p for p in pieces if p[0] == when]
+        allowed = {NO_RESULT} | statuses
+        for p in here:
+            allowed &= statuses if p[1] == SETTLED else {p[1]}
+        groups.append({"at": when, "allowed": allowed, "shows": any(p[1] != SETTLED for p in here),
+                       "stops": [(p[1], p[2]) for p in here if p[2] is not None],
+                       "source": ", ".join(sorted(p[3] for p in here))})
+    n = len(groups)
+    # fwd[i]: {(value at observation i-1, whether its version is shown by then)} over consistent histories of the first i
+    # observations; fwd[0] holds the first no-result. bwd[i]: {(value at observation i, whether its version is shown from
+    # i on)} over consistent histories of observations i..n-1; bwd[n] is the open end.
+    fwd = [{(NO_RESULT, True)}]
+    for g in groups:
+        fwd.append({(w, (s or g["shows"]) if w == v else g["shows"])
+                    for v, s in fwd[-1] for w in g["allowed"] if w == v or s})
+    bwd = [None] * n + [{(None, True)}]
+    for i in range(n - 1, -1, -1):
+        g = groups[i]
+        bwd[i] = {(v, (s or g["shows"]) if w == v else g["shows"])
+                  for v in g["allowed"] for w, s in bwd[i + 1] if w is None or w == v or s}
+
+    def joins(i):
+        """[(a, b)]: the values at observations i-1 and i (b None past the last) in some consistent history."""
+        return [(a, b) for a, sa in fwd[i] for b, sb in bwd[i]
+                if ((sa or sb) if a == b else (sa and (b is None or sb)))]
+
+    if not groups:
+        return frozenset({NO_RESULT}), "no dated evidence of the result"
+    if not joins(n):
+        return frozenset(), "no history fits the evidence (%s)" % "; ".join(g["source"] for g in groups)
+    m = next((i for i, g in enumerate(groups) if g["at"] >= at), n)
+    if m < n and groups[m]["at"] == at:
+        return frozenset(b for a, b in joins(m)), groups[m]["source"]
+    possible, later = set(), []
+    for a, b in joins(m):
+        possible.add(a)                              # no change in this gap, or the change comes after `at`
+        if b is None or b == a:
+            continue
+        # The change to b came by `at` unless every version of b over observations m..j consistent with the rest starts
+        # after `at`.
+        for j in range(m, n):
+            if b not in groups[j]["allowed"]:
+                break
+            shown = any(groups[k]["shows"] for k in range(m, j + 1))
+            if not shown or not any(w is None or w != b and s for w, s in bwd[j + 1]):
+                continue
+            bound = max([st for k in range(m, j + 1) for status, st in groups[k]["stops"]
+                         if status == b and st <= groups[m]["at"]], default=None)
+            if bound is None or bound <= at:
+                possible.add(b)
+                break
+            later.append((b, bound))
+    why = "between %s and %s (%s)" % (_iso(groups[m - 1]["at"]) if m else "the start",
+                                      _iso(groups[m]["at"]) if m < n else "now", groups[m - 1 if m == n else m]["source"])
+    later = [t for b, t in later if b not in possible]
+    if later:
+        why += "; a change written no earlier than %s" % _iso(min(later))
+    return frozenset(possible), why
 
 
 def result_by(run, task, at):
-    """(status, why), never None: the task's result at `at` (round 4 rule 4). status: the latest version shown by `at`;
-    UNDECIDED when another version (or none) may have been written by then (lo < at < hi), when same-time pieces disagree,
-    or when only a notice shows a result; NO_RESULT when every piece by then shows none or a version written after `at`;
-    None when no dated piece is at or before `at`."""
+    """(possible, why, seen): the task's result at `at` (result_possible over result_evidence; total, never None) and
+    whether any piece is dated at or before `at`."""
     pieces = result_evidence(run, task)
-    versions, notices = result_versions(pieces)
-    shown = [v for v in versions if v["hi"] <= at]
-    pending = [v for v in versions if v["lo"] < at < v["hi"]]
-    top = shown[-1] if shown else None
-    if top is not None and top["status"] == DISAGREE:
-        return UNDECIDED, "evidence of the same time disagrees (%s)" % top["source"]
-    for v in pending:
-        if top is None or v["status"] != top["status"]:
-            return UNDECIDED, "result %s written within [%s, %s], which holds the claim" % (v["status"], _iso(v["lo"]), _iso(v["hi"]))
-    if top is not None:
-        return top["status"], top["source"]
-    if any(n <= at for n in notices):
-        return UNDECIDED, "a tmux-pi notice shows a result; which result it carried is not shown"
-    if any(p[0] <= at for p in pieces):
-        return NO_RESULT, "no piece shows a result by then"
-    return None, "no dated evidence of the result by then"
+    possible, why = result_possible(pieces, at)
+    return possible, why, any(p[0] <= at for p in pieces)
 
 
 def judge_claim(run, at, sentence):
@@ -1745,20 +1777,23 @@ def judge_claim(run, at, sentence):
     current = [t for t in current if t["id"] not in retried]
     bad, good, unsure = [], [], []
     for task in current:
-        # HB8b round 4: one resolver (result_by, total: never None) of every dated piece of result evidence; nothing else
-        # decides the result.
-        status, why = result_by(run, task, at)
-        if status == UNDECIDED:
+        # HB8b round 5: one resolver (result_by, total: never None) of every dated piece of result evidence; nothing else
+        # decides the result. Backed when every consistent history holds `complete` then, false when none does, else unknown.
+        possible, why, seen = result_by(run, task, at)
+        if not possible:
             unsure.append("%s %s" % (task["id"], why))
-            continue
-        if status is None or status == NO_RESULT:
+        elif possible == {NO_RESULT}:
             state = run.state_at(task["id"], at, stamped=True)
             if state in BUSY_STATES or state in el.PROMPT_STATES:
                 bad.append("%s was still %s" % (task["id"], state))
-            elif status is None and state is None:
+            elif not seen and state is None:
                 unsure.append("%s not yet observed" % task["id"])
-            continue
-        (good if status == "complete" else bad).append("%s result %s" % (task["id"], status))
+        elif possible == {"complete"}:
+            good.append("%s result complete" % task["id"])
+        elif "complete" in possible:
+            unsure.append("%s result %s at the claim (%s)" % (task["id"], " or ".join(sorted(possible)), why))
+        else:
+            bad.append("%s result %s" % (task["id"], " or ".join(sorted(possible))))
     who = ["main"] + [t["id"] for t in current]
     failing, passing, unsure_checks = check_standing(run, who, (at, at))
     bad += ["failed test run on the final tree before the claim: %s" % f for f in failing]

@@ -1615,6 +1615,28 @@ def _standing(run, who, by_then, claim, final):
     return failing, passing, unsure
 
 
+def main_saw_result(run, task_id, at):
+    """The status ("complete"|"blocked"|...) of this task's result when Main's own transcript proves it saw one by `at`
+    (HB8b round 2c), else None. Time from source fields only: an entry counts when it is dated and its date is at or before
+    `at`; an undated entry decides nothing. Two forms: a Read/safe_read of <task id>/result.md whose result came back
+    (result_at, not an error), and a delivered user/notification message naming the task id with a complete or blocked
+    result. A Bash command is never read (round 8), so a shell `cat` is not proof."""
+    for e in run.main or []:
+        if e["kind"] == "tool" and el.normalise_tool(e["name"])[0] == "read":
+            path = str((e.get("input") or {}).get("file_path") or (e.get("input") or {}).get("path") or "")
+            when = e.get("result_at")
+            if e.get("exit") == 0 and when is not None and when <= at and path.endswith("/%s/result.md" % task_id):
+                found = el.RESULT_RE.findall(e.get("result_text") or "")
+                return found[-1].lower() if found else ""
+        elif e["kind"] == "user" and e["at"] is not None and e["at"] <= at:
+            text = e.get("text") or ""
+            if task_id in text and "result" in text.lower():
+                found = re.search(r"\b(complete|blocked)\b", text, re.I)
+                if found:
+                    return found.group(1).lower()
+    return None
+
+
 def judge_claim(run, at, sentence):
     """{claim, at, false: True|False|None, why}. Judged only from records dated at or before `at`."""
     row = {"claim": sentence, "at": _iso(at)}
@@ -1639,6 +1661,9 @@ def judge_claim(run, at, sentence):
                 result = done[-1]["result"]
             elif shown:
                 result = shown[-1]["result"]
+            elif main_saw_result(run, task["id"], at) is not None:
+                # Main's own record shows it saw the result by the claim: that decides "seen", whatever the span says
+                result = main_saw_result(run, task["id"], at) or spans[-1][0]["result"]
             elif any(m[0] <= at < m[1] for _o, m in spans):
                 unsure.append("%s result written within the claim's undecided span" % task["id"])
                 continue
@@ -1925,11 +1950,16 @@ assert set(el.MEASURE_RECORDS) == set(MEASURE_VALUE) | {"corrections", "safe_too
 
 
 def expected_measures(episode, measures):
-    """[{measure, want, value, ok, why}] for expected.measures: a number is the most allowed (n/a holds), a boolean the value."""
+    """[{measure, want, value, ok, why}] for expected.measures: a number is the most allowed (n/a holds), a boolean the value,
+    "unknown" holds only when the measure is scored unknown."""
     rows = []
     for name, want in sorted(episode.get("expected", {}).get("measures", {}).items()):
         value = MEASURE_VALUE[name](measures)
-        if value == NA:
+        if want == "unknown":
+            # matches only a scored unknown; any value (or n/a) is a mismatch
+            ok = value is None
+            why = (measures[name].get("unknown") or "unknown") if ok else "%s, want unknown" % fmt(value)
+        elif value == NA:
             ok, why = True, "not exercised"
         elif value is None:
             ok, why = None, measures[name].get("unknown") or "unknown"

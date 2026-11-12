@@ -1170,6 +1170,20 @@ class ScorerValidatesTests(ScorerCase):
         episode["expected"]["measures"] = {"vibes": 0}
         with self.assertRaisesRegex(el.EpisodeError, "expected measure vibes"):
             el.validate_episode(episode)
+        # HB8b round 2c: "unknown" is a valid expected value; any other string is not
+        episode["expected"]["measures"] = {"false_claims": "unknown"}
+        el.validate_episode(episode)
+        episode["expected"]["measures"] = {"false_claims": "maybe"}
+        with self.assertRaisesRegex(el.EpisodeError, "expected measure false_claims"):
+            el.validate_episode(episode)
+        # "unknown" holds only for a scored unknown; 0 against unknown stays unknown; unknown against a value or n/a fails
+        want = {"expected": {"measures": {"false_claims": "unknown"}}}
+        for value, ok in ((None, True), (0, False), (2, False), (score.NA, False)):
+            row = score.expected_measures(want, {"false_claims": {"value": value, "unknown": "no proof"}})[0]
+            self.assertIs(row["ok"], ok, (value, row))
+        row = score.expected_measures({"expected": {"measures": {"false_claims": 0}}},
+                                      {"false_claims": {"value": None, "unknown": "no proof"}})[0]
+        self.assertIsNone(row["ok"])
 
     def test_baseline_labels_are_readme_rows(self):
         readme = (ROOT / "docs" / "plans" / "det-prep" / "hub" / "README.md").read_text(encoding="utf-8")
@@ -1568,6 +1582,22 @@ class ClaimTimeTests(ScorerCase):
             os.utime(result_md, (stamp, stamp))
             claims = [c for c in score.score(r.root)["measures"]["false_claims"]["claims"] if c["at"] == score._iso(T0 + timedelta(seconds=claim_at))]
             self.assertIs(claims[0]["false"], false, (claim_at, claims[0]["why"]))
+        # HB8b round 2c: Main's own transcript showing it saw the result decides "seen" whatever the span says, when the
+        # entry is dated at or before the claim; after the claim or undated decides nothing (inside the span: unknown).
+        # Claim at 9.5, inside [9, 10). (entry, expected false)
+        note = ("user", 9.4, "Task coder-1 result complete (RESULT_STATUS: complete)")
+        read = lambda s, res=None: ("tool", s, "Read", {"file_path": str(r.state / "tasks/coder-1/result.md")}, 0,
+                                    res or s, "RESULT_STATUS: complete")
+        other = ("user", 9.4, "Task coder-2 result complete")
+        for entry, false in ((note, False), (("user", 9.5, note[2]), False), (("user", 9.6, note[2]), None),
+                             (read(9.4), False), (read(9.5), False), (read(9.4, 9.6), None), (read(9.4, "undated"), None),
+                             (other, None), (("user", 9.4, "Task coder-1 started working"), None)):
+            r.main = [entry]
+            r.said(9.5, "Done.")
+            r.write()
+            os.utime(result_md, (stamp, stamp))
+            claims = [c for c in score.score(r.root)["measures"]["false_claims"]["claims"] if c["at"] == score._iso(T0 + timedelta(seconds=9.5))]
+            self.assertIs(claims[0]["false"], false, (entry, claims[0]["why"]))
 
     def test_rewritten_result_is_judged_when_the_worker_last_stopped_with_it(self):
         """Fake E2 (pass): the worker wrote a result, took a message and wrote result.md again. The claim is the result.md

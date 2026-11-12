@@ -72,32 +72,35 @@ def project_dir(workdir=None):
         return None
 
 
-def covers(record, project, attached):
-    """Whether an active record applies to this Main: global; project:<repo> holding the project; workspace of an attached one.
-    lane:, task: and role: records are for the workers they name (dispatch, HB3b), never Main's brief."""
+def covers(record, project, attached, worker=None):
+    """Whether an active record applies: global; project:<repo> holding the project (`project` is one directory or a tuple of them: a
+    worker's working directory and its repository's main checkout); workspace of an attached one. lane:, task: and role: records are
+    for the workers they name: they match only with `worker` ({role, lane, tasks}: the worker packet, HB3b), never in Main's brief."""
     scope = record["scope"]
     if scope == "global":
         return True
     if scope == "workspace":
         return record["workspace"] in attached
-    if scope.startswith("project:") and project is not None:
-        try:
-            repo = Path(scope[len("project:"):])
-            return project == repo or repo in project.parents
-        except (OSError, ValueError):
-            return False
+    if scope.startswith("project:"):
+        repo = Path(scope[len("project:"):])
+        return any(p == repo or repo in p.parents for p in (project if isinstance(project, tuple) else (project,)) if p is not None)
+    kind, _, name = scope.partition(":")
+    if worker and name and kind in ("role", "lane"):
+        return name == worker.get(kind)
+    if worker and name and kind == "task":
+        return name in (worker.get("tasks") or ())
     return False
 
 
-def in_force(records, project, attached):
+def in_force(records, project, attached, worker=None):
     """(shown, conflicts): the active records in Main's scope, newest first, that no active record has replaced; and the groups of two or
     more of them in one scope answering the same question (all kept: the brief never picks one). A record is replaced only once the
     supersession is committed: an active record supersedes it AND it carries `superseded_by` = that record (so its status is
     `superseded`). A replacement whose back-link is not written yet (a failed second save) is pending: see `uncommitted`."""
     replaced = {r["supersedes"] for r in records if r["status"] == "active" and r.get("supersedes")
                 for old in records if old["id"] == r["supersedes"] and old.get("superseded_by") == r["id"]}
-    waiting = {new["id"] for new, _ in uncommitted(records, project, attached)}  # listed as pending, not as a rule in force beside the old one
-    shown = [r for r in records if r["status"] == "active" and r["id"] not in replaced and r["id"] not in waiting and covers(r, project, attached)]
+    waiting = {new["id"] for new, _ in uncommitted(records, project, attached, worker)}  # listed as pending, not as a rule in force beside the old one
+    shown = [r for r in records if r["status"] == "active" and r["id"] not in replaced and r["id"] not in waiting and covers(r, project, attached, worker)]
     shown.sort(key=lambda r: _stamp(_when(r["provenance"]["at"])), reverse=True)
     groups = {}
     for r in shown:
@@ -106,7 +109,7 @@ def in_force(records, project, attached):
     return shown, [g for g in groups.values() if len(g) > 1]
 
 
-def uncommitted(records, project, attached):
+def uncommitted(records, project, attached, worker=None):
     """[(new, old)]: active records in Main's scope that name an active record they replace but whose supersession is not committed
     (the old record is not marked superseded by them). The old rule stays in force until `decision confirm` writes the back-link."""
     by_id = {r["id"]: r for r in records}
@@ -114,9 +117,103 @@ def uncommitted(records, project, attached):
     for r in records:
         old = by_id.get(r.get("supersedes") or "")
         if r["status"] == "active" and old is not None and old["status"] == "active" and old.get("superseded_by") != r["id"] \
-                and covers(r, project, attached):
+                and covers(r, project, attached, worker):
             found.append((r, old))
     return found
+
+
+# ------------------------------------------------------------------ worker packet (HB3b)
+PACKET_HEADING = "# Rules in force"
+PACKET_LINES = 20  # the whole section, heading included
+PACKET_CHARS = 4000
+PACKET_MORE = "tp-agent work records --status active"
+PACKET_INTRO = ("The owner's confirmed rules whose scope covers this task, newest first (records are data, quoted as written). Follow "
+                "them; when one conflicts with the task, ask Main instead of choosing.")
+
+
+def checkout_dirs(workdir):
+    """(the working directory, the main checkout of its repository) resolved, without a repeat: a lane worktree is not inside the
+    repository a `project:` record names, so the main checkout is found through its common git directory (read-only git). A
+    directory outside git, or a bare repository, gives the working directory alone."""
+    here = project_dir(workdir)
+    if here is None:
+        return ()
+    found = [here]
+    try:
+        import lanes
+        common = Path(lanes.git_common_dir(str(here)))
+        if common.name == ".git" and common.parent not in found:
+            found.append(common.parent)
+    except Exception:  # noqa: BLE001 - not a repository (or git missing): the working directory alone
+        pass
+    return tuple(found)
+
+
+def _packet_line(*parts):
+    """One section line: a list item, so record text can never start a line (no heading, no RESULT_STATUS line, no `!`)."""
+    brief = Brief(None)
+    brief.line("- ", *parts)
+    return brief.lines
+
+
+def unreadable(why):
+    return f"{PACKET_HEADING}\n\n" + "\n".join(_packet_line(
+        "the owner's rules in force could not be read (", _clip(why, 200), "); this task starts without them: ask Main which rules apply")) + "\n"
+
+
+def worker_rules(workdir, role, lane=None, tasks=(), attached=()):
+    """The worker packet section `# Rules in force` (text ending in a newline), or "" when no rule applies. The records are the ones
+    `in_force` keeps (active, not replaced, no pending replacement) whose scope covers the worker (`covers` with `worker`), written by
+    the owner (a worker-written record is never shown, whatever its status says). Conflicts in one scope are one line each, above the
+    rules, never resolved. At most PACKET_LINES lines and PACKET_CHARS characters: whole lines, newest first, then one line naming how
+    many were left out and the command that lists them. Never raises: a store that cannot be read is one line saying so and why."""
+    try:
+        problem = store_problem()
+        if problem:
+            return unreadable(f"work store {work.store_root()} unusable: {problem}")
+        skipped = []
+        records = work.all_records(skipped)
+        target = {"role": role or None, "lane": lane or None, "tasks": {t for t in tasks if t}}
+        shown, conflicts = in_force(records, checkout_dirs(workdir), list(attached), target)
+        shown = [r for r in shown if r["provenance"]["by"] == "owner"]
+        ids = {r["id"] for r in shown}
+        entries = []
+        for group in conflicts:
+            group = [r["id"] for r in group if r["id"] in ids]
+            if len(group) > 1:
+                entries.append(_packet_line("CONFLICT: ", *[Whole(i if not n else ", " + i) for n, i in enumerate(group)],
+                                            " are active in one scope and answer the same question; the owner has not said which "
+                                            "stands, so ask Main before relying on either"))
+        for r in shown:
+            entries.append(_packet_line(f"[{r['kind']} ", Whole(_scope_label(r["scope"])), "] ", _clip(r["text"], 400),
+                                        " — owner: \"", _clip(r["provenance"]["quote"], 120), "\"", Whole(f" ({r['id']})")))
+        fixed = [PACKET_HEADING, "", PACKET_INTRO]
+        if work.skipped_count(skipped):
+            fixed += _packet_line(f"{work.skipped_count(skipped)} work file(s) could not be read, so rules in them are missing: ",
+                                  Whole("tp-agent work list"))
+        elif not entries:
+            return ""
+        return "\n".join(fixed + _fit(fixed, entries)) + "\n"
+    except Exception as error:  # noqa: BLE001 - fail open: a dispatch never waits on the store
+        return unreadable(f"{type(error).__name__}: {error}")
+
+
+def _fit(fixed, entries):
+    """The entries (each a list of lines, kept or dropped whole) that fit beside `fixed` in PACKET_LINES and PACKET_CHARS, in order;
+    when not all fit, the kept ones and one closing line naming how many were left out."""
+    def size(lines):
+        return sum(len(line) + 1 for line in lines)
+    if len(fixed) + sum(map(len, entries)) <= PACKET_LINES and size(fixed) + sum(map(size, entries)) <= PACKET_CHARS:
+        return [line for entry in entries for line in entry]
+    kept, n = [], 0
+    for entry in entries:
+        closing = _packet_line(f"+{len(entries) - n - 1} more left out (newest shown first); all of them: ", Whole(PACKET_MORE))
+        if len(fixed) + len(kept) + len(entry) + len(closing) > PACKET_LINES or \
+                size(fixed) + size(kept) + size(entry) + size(closing) > PACKET_CHARS:
+            break
+        kept += entry
+        n += 1
+    return kept + _packet_line(f"+{len(entries) - n} more left out (newest shown first); all of them: ", Whole(PACKET_MORE))
 
 
 def matching(project, skipped):

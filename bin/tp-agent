@@ -706,9 +706,26 @@ def lane_facts_for(item):
     return lane_commands.lane_facts(record, item["lane_step"]), record["base"]["commit"]
 
 
+def rules_for(base, item):
+    """The packet section `# Rules in force` for the task `item` starts (work_brief.worker_rules: "" when no rule applies, one line when
+    the store cannot be read; never raises). The worker is its working directory (and that repository's main checkout), role, lane,
+    its own id and the tasks it continues (the parent it retries, reviews or investigates, and theirs in turn), and the workspaces
+    this session has attached."""
+    tasks, ident = [item["id"]], item["parent"]
+    try:
+        while isinstance(ident, str) and ident not in tasks and len(tasks) < 20 and IDENT.fullmatch(ident):
+            tasks.append(ident)
+            path = base / "tasks" / ident if (base / "tasks" / ident / "meta.json").is_file() else find_archived_task(base, ident)
+            ident = read_json(path / "meta.json").get("parent") if path else None
+        attached = work_index.attached_ids(base)
+    except Exception as error:  # noqa: BLE001 - the rules section never stops a start; it says what it could not read
+        return work_brief.unreadable(f"the task's ancestry or attached workspaces: {type(error).__name__}: {error}")
+    return work_brief.worker_rules(item["workdir"], item["role"], item.get("lane"), tasks, attached)
+
+
 def launch(base, item):
     item = queue_item(item)  # every field below comes from the validator's return value
-    facts_file = None
+    facts_file = rules_file = None
     args = [str(ROOT / "bin/tp-spawn"), "--task-id", item["id"], "--role", item["role"],
             "--worker", item["worker"], "--model", item["model"], "--thinking", item["thinking"],
             "--route-json", json.dumps(item["route_info"]), "--tests", item["tests"]]
@@ -730,6 +747,11 @@ def launch(base, item):
         with tempfile.NamedTemporaryFile("w", suffix=".md", prefix="tp-lane-facts-", delete=False) as facts_file:  # a file, not the shell line
             facts_file.write(facts + "\n")
         args += ["--lane-facts-file", facts_file.name] + (["--worker-env", f"LANE_BASE={lane_base}"] if lane_base else [])
+    rules = rules_for(base, item)
+    if rules:
+        with tempfile.NamedTemporaryFile("w", suffix=".md", prefix="tp-rules-", delete=False) as rules_file:  # a file: records are data
+            rules_file.write(rules)
+        args += ["--rules-file", rules_file.name]
     for spec in item["context"]:
         args += ["--context", spec]
     for note in item["notes"]:
@@ -747,8 +769,9 @@ def launch(base, item):
     try:
         run = subprocess.run(args, text=True, errors="replace", capture_output=True, env=spawn_env)
     finally:
-        if facts_file:
-            Path(facts_file.name).unlink(missing_ok=True)
+        for made in (facts_file, rules_file):
+            if made:
+                Path(made.name).unlink(missing_ok=True)
     if run.returncode:
         raise RuntimeError(run.stderr.strip() or "tp-spawn failed")
     # Record what the packet actually admitted so retry never replays an omitted sensitive input.

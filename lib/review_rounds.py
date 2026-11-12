@@ -360,7 +360,9 @@ def blob_patches(top, pairs):
     Git's attributes are matched against a name (blob_patch's diff matches each side's against its blob id: `* -diff`, a funcname
     driver or `diff=x` with `diff.x.binary` change the output), so a pair goes into the trees only when its old id, its new id
     and k have the same attributes, read both with and without the index (attributes); any other pair, every pair when the
-    attributes cannot be read, and every pair of a list shorter than BATCH_MIN, is diffed alone by blob_patch.
+    attributes cannot be read, and every pair of a list shorter than BATCH_MIN, is diffed alone by blob_patch. So is every pair when
+    the batched text is not of the shape split_sections counts (a diff setting that changes a hunk's lines, such as
+    diff.outputIndicatorContext): the text is then blob_patch's own, never a partial or guessed one.
     The output is split back by structure only: a `diff --git a/k b/k` line counts only outside a hunk body, whose length its
     `@@` header gives (as outside_hunks reads it), and only for a name not yet seen; a file line inside a hunk is never read
     as a boundary. Anything else raises Refused, as does a git call that fails: nothing is guessed or attached in part."""
@@ -385,10 +387,14 @@ def blob_patches(top, pairs):
         if run.returncode:
             raise Refused(f"cannot diff blobs {pairs[batch[0]][0]}..{pairs[batch[0]][1]} and {len(batch) - 1} more pairs "
                           f"(trees {trees[0]}..{trees[1]}): {run.stderr.decode('utf-8', 'replace').strip()}")
-        sections = split_sections(run.stdout.decode("utf-8", "surrogateescape"), [names[k] for k in batch])
+        try:
+            sections = split_sections(run.stdout.decode("utf-8", "surrogateescape"), [names[k] for k in batch])
+            for k in batch:
+                if names[k] not in sections and pairs[k][0] != pairs[k][1]:
+                    raise Refused(f"the diff of blobs {pairs[k][0]}..{pairs[k][1]} is missing from the batched diff")
+        except Refused:  # a diff setting this code does not know shaped the hunks differently: the per-file form is the same text
+            return [blob_patch(top, *pair) for pair in pairs]
         for k in batch:
-            if names[k] not in sections and pairs[k][0] != pairs[k][1]:
-                raise Refused(f"the diff of blobs {pairs[k][0]}..{pairs[k][1]} is missing from the batched diff")
             found[k] = hunks_of(sections.get(names[k], ""))
     return [found[k] for k in range(len(pairs))]
 
@@ -407,7 +413,7 @@ def split_sections(text, names):
     for at, line in enumerate(lines):
         if old or new:
             kind = line[:1]
-            if kind == " ":
+            if kind in (" ", ""):  # an empty line is blank context under diff.suppressBlankEmpty
                 old, new = old - 1, new - 1
             elif kind == "-":
                 old -= 1

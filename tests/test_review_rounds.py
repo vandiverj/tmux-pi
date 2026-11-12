@@ -1054,7 +1054,9 @@ class WholeFileTests(unittest.TestCase):
                  "binary.bin": b"\0" + b"A" * 600,
                  # small edits (their hunks stay) of the other kinds the batched diff (blob_patches) must split back the same way
                  "crlf.txt": cls.lines("crlf", 60).replace("\n", "\r\n"), "latin.txt": "caf\xe9\n".encode("latin-1") + cls.lines("keep", 60).encode(),
-                 "tricky.txt": cls.lines("keep", 60) + cls.TRICKY, "grows.txt": "", "to-link.txt": old}
+                 "tricky.txt": cls.lines("keep", 60) + cls.TRICKY, "grows.txt": "", "to-link.txt": old,
+                 # blank context lines, which git writes as an empty line under diff.suppressBlankEmpty: at the end of a rewrite (a small edit's hunk with one is refused by gate on main too)
+                 "blank-end.txt": old + "\n"}
         for name, content in files.items():
             (cls.work / name).write_bytes(content if isinstance(content, bytes) else content.encode())
         os.symlink("somewhere/else", cls.work / "to-file")
@@ -1086,6 +1088,7 @@ class WholeFileTests(unittest.TestCase):
         (cls.work / "latin.txt").write_bytes("CAF\xc9\n".encode("latin-1") + cls.lines("keep", 60).encode())
         (cls.work / "tricky.txt").write_text(cls.lines("keep", 60) + cls.TRICKY.replace(".env", ".envx") + "diff --git a/3 b/3\n")
         (cls.work / "grows.txt").write_text("one line\n")
+        (cls.work / "blank-end.txt").write_text(cls.lines("new") + "\n")
         (cls.work / "empty-added.txt").write_text("")
         (cls.work / "to-link.txt").unlink()
         os.symlink("target", cls.work / "to-link.txt")
@@ -1199,7 +1202,7 @@ class WholeFileTests(unittest.TestCase):
             moded = self.section(text, "mode-and-rewrite.sh")  # a mode change with a rewrite: not a plain modification
             self.assertTrue(moded.startswith("old mode 100644\nnew mode 100755\n--- a/mode-and-rewrite.sh\n"), moded[:120])
             self.assertIn("-old line 0 ", moded)
-            self.assertEqual(text.count("Whole file shown"), 5)  # rewritten, no-newline, to-empty, forged and secret: nothing else
+            self.assertEqual(text.count("Whole file shown"), 6)  # rewritten, blank-end, no-newline, to-empty, forged and secret: nothing else
 
     def test_the_boundary_a_tie_keeps_the_hunks_and_one_char_shorter_goes_whole(self):
         # entry_patch compares the hunk section with the whole-file section as attached, in characters. Git is stubbed (two blob
@@ -1277,6 +1280,7 @@ class WholeFileTests(unittest.TestCase):
         env = {**os.environ, "GIT_INDEX_FILE": str(index)}
         subprocess.run(["git", "-C", str(self.work), "update-index", "--add", "--cacheinfo", f"100644,{blob},.gitattributes"], env=env, check=True)
         HEAD, REVIEWED = "HEAD", self.reviewed_tree
+        (Path(self.tmp.name) / "order").write_text("small-change.txt\n")
         rows = (  # name, info/attributes, global attributes file, config, extra environment, old side, batched (diff runs twice)
             ("none, round 1", "", None, {}, {}, HEAD, True),
             ("none, round 2 (since the reviewed tree)", "", None, {}, {}, REVIEWED, True),
@@ -1293,6 +1297,19 @@ class WholeFileTests(unittest.TestCase):
             ("[0-9] -diff matches the batch's one-digit names only", "[0-9] -diff\n", None, {}, {}, HEAD, False),
             ("* diff in the index only, over [0-7]* -diff in core.attributesFile: git diff does not read the index",
              "", "[0-7]* -diff\n", {}, {"GIT_INDEX_FILE": str(index)}, HEAD, False),
+            ("diff.suppressBlankEmpty: blank context is an empty line", "", None, {"diff.suppressBlankEmpty": "true"}, {}, HEAD, True),
+            ("diff.suppressBlankEmpty, round 2", "", None, {"diff.suppressBlankEmpty": "true"}, {}, REVIEWED, True),
+            ("diff.context=0 and diff.interHunkContext=5", "", None, {"diff.context": "0", "diff.interHunkContext": "5"}, {}, HEAD, True),
+            ("diff.algorithm patience with diff.indentHeuristic=false", "", None,
+             {"diff.algorithm": "patience", "diff.indentHeuristic": "false"}, {}, REVIEWED, True),
+            ("diff.orderFile, diff.relative, diff.wsErrorHighlight=all, color.diff=always, core.quotePath=false", "", None,
+             {"diff.orderFile": str(Path(self.tmp.name) / "order"), "diff.relative": "true", "diff.wsErrorHighlight": "all", "color.diff": "always", "color.ui": "always",
+              "core.quotePath": "false"}, {}, HEAD, True),
+            ("core.autocrlf=true, core.eol=crlf, core.whitespace, diff.renames=false, core.abbrev=40", "", None,
+             {"core.autocrlf": "true", "core.eol": "crlf", "core.whitespace": "trailing-space,cr-at-eol", "diff.renames": "false",
+              "core.abbrev": "40"}, {}, HEAD, True),
+            ("diff.outputIndicatorContext=_, diff.outputIndicatorNew=> (git 2.x does not read them from config: no change)", "", None,
+             {"diff.outputIndicatorContext": "_", "diff.outputIndicatorNew": ">"}, {}, HEAD, True),
             ("diff.noprefix, diff.mnemonicPrefix, diff.context=1, diff.algorithm=histogram", "", None,
              {"diff.noprefix": "true", "diff.mnemonicPrefix": "true", "diff.context": "1", "diff.algorithm": "histogram"}, {}, REVIEWED, True),
         )
@@ -1316,6 +1333,12 @@ class WholeFileTests(unittest.TestCase):
                 self.assertEqual((calls.count("mktree"), calls.count("check-attr")), (1 if batched else calls.count("mktree"), 2))
                 self.assertLessEqual(calls.count("mktree"), 1)
                 self.assertEqual(calls.count("cat-file"), min(1, main_calls.count("cat-file")))  # the texts a whole-file section may need, together
+        with self.subTest("a batched text of a shape split_sections refuses: every pair is diffed alone, the same text"):
+            main, _ = self.safe_diff_counted(HEAD, per_file=True)
+            with mock.patch.object(review_rounds, "split_sections", side_effect=review_rounds.Refused("unknown shape")):
+                got, calls = self.safe_diff_counted(HEAD)
+            self.assertEqual(got, main)
+            self.assertGreater(calls.count("diff"), 15)
 
 
 class TimerWaitsTests(unittest.TestCase):

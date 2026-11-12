@@ -1157,3 +1157,22 @@ Each lane: checkpoint, Main's evidence, openai-codex review, notes closed, `lane
   point at a machine-local HB3 record. The 24 entries now point to hb7b-decision.md "Owner decision on the 24 lines"; the
   check resolves with no `--store` (97 justified: 53 owner-stated / 44 Main, 0 problems). Gap noted for HB7: a doc pointer
   counts as Main even when it quotes the owner, so portable owner-stated reasons exist only as H48 label rows today.
+
+## 2026-11-12 (late afternoon): PF1c, LP2, GB1, TR1, TR2 merged; HB3b waits on the owner
+- PF1c (lane perf-review, round 2 on Sonnet, coder-9628d382cb): split_sections counts an empty line as blank context
+  (diff.suppressBlankEmpty); blob_patches falls back to per-file blob_patch on any Refused. A survey of 38 diff/core settings
+  found only suppressBlankEmpty differs. review-coder-9628d382cb-124549 APPROVED; merged ab722a0. Round-1 F2 (identical cell
+  wall times) was settled as separate processes: separate CPU, different end times when staggered; cells now log user CPU.
+- Batched full run on main + PF1c + HB3b (9b23173): 5546 tests, 2 failures: an HB3b comment (fixed in HB3b round 3, lane
+  0f07089, review-coder-8c0089d198-134156 APPROVED, still the owner's A/B) and test_local_provider:190, stale since e97296d.
+- LP2 (lane lp-test): the LP1 alias launch test reads pi's system prompt from its file. Main's `--tests none` made the worker
+  skip tests (memory: dispatch-tests-flag); Main ran the cells. review-coder-22c2364fd8-134141 APPROVED_WITH_NOTES; merged 0f82f94.
+- GB1 (lane gate-blank): the review gate's outside_hunks counts blank context under diff.suppressBlankEmpty, never the end piece
+  after the final newline. review-coder-8fc2571f65-135739 APPROVED_WITH_NOTES; merged 6120340.
+- TR1 (lane task-record-utf8, 3 rounds): task_record never raises on non-UTF-8 task files (display reads replace; verbatim fields
+  round-trip with surrogateescape and newline=""). Round 1 F1 CRLF/CR translation, F2 artifact rows; round 2 F1 fallback rows;
+  round 3 retried `--route rule-first` (family verbatim-newline-loss twice) with a kept-field x reader table.
+  review-coder-b9add0ae87-140827 APPROVED_WITH_NOTES; merged 4d21709.
+- TR2 (lane task-reader-utf8, 2 rounds, from TR1 review F3): tp-agent record/retry, model_router review_plan, contract ledger_row
+  read with utf-8/replace. Round 1 F1: retry's fix had no row. review-coder-bd259bdc7e-141312 APPROVED_WITH_NOTES; merged 20af558.
+  Not fixed: lib/bench/runner.py:381,422 read result.md strictly (bench harness).

@@ -240,7 +240,7 @@ class FrictionReport(unittest.TestCase):
         """An unreadable memory directory, doc directory and store: a listed problem each, every other source still reported."""
         with tempfile.TemporaryDirectory() as tmp:
             p = plant(tmp)
-            locked = [Path(p["memory"]), p["root"] / "docs", Path(p["store"])]
+            locked = [Path(p["memory"]), p["root"] / "docs", Path(p["store"]) / "workspaces", p["root"] / "agent" / "roles"]
             try:
                 for d in locked:
                     d.chmod(0)
@@ -252,11 +252,12 @@ class FrictionReport(unittest.TestCase):
         alpha = next(k for k in out["keys"] if k["key"] == "alpha")
         self.assertIn("memory", got)
         self.assertIn("record", got)
+        self.assertIn("contract", got)
         self.assertEqual(
             {u["pointer"] for u in alpha["unresolved"] if u["pointer"].startswith("doc:docs/")},
             {"doc:docs/ideas.md#H1", "doc:docs/ideas.md#H2"})
         self.assertEqual(alpha["occurrences"].get("label"), {"dated": 1, "undated": 1})  # labels and contract files still reported
-        self.assertEqual(len(out["contract_size"]["files"]), 3)
+        self.assertEqual(len(out["contract_size"]["files"]), 2)  # roles dir unreadable: listed, main prompt and worker contract still counted
 
 
 if __name__ == "__main__":

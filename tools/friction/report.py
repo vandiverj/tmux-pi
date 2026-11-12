@@ -104,6 +104,14 @@ def load_records(store, problems):
     if not found:
         problems.append({"source": "record", "where": str(store), "problem": "store directory not found"})
         return {}, info
+    for sub in ("workspaces", "archive/workspaces"):  # Path.glob/is_dir skip an unreadable directory silently on Python 3.13+; listdir raises
+        try:
+            os.listdir(Path(store) / sub)
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            problems.append({"source": "record", "where": sub, "problem": f"store not readable: {type(error).__name__}"})
+            return {}, info
     import work  # noqa: E402  imported here: the store root is read from TP_WORK_DIR at call time
     old = os.environ.get("TP_WORK_DIR")
     os.environ["TP_WORK_DIR"] = str(store)
@@ -464,13 +472,17 @@ def contract_size(root, problems):
     """Lines, non-blank lines, words and evidence-carrying lines of Main's prompt, each role file and the worker contract. `total`
     is every file; `brief_total` is the brief's population (Main's prompt and the role files) for comparison with it."""
     root = Path(root)
-    try:
-        files = [(root / "claude" / "main-prompt.md", True)]
-        files += [(p, True) for p in sorted((root / "agent" / "roles").glob("*.md"))]
-        files += [(p, False) for p in sorted((root / "agent" / "contract").glob("*.md"))]
-    except OSError as error:
-        problems.append({"source": "contract", "where": "agent", "problem": f"directory not readable: {type(error).__name__}"})
-        files = [(root / "claude" / "main-prompt.md", True)]
+    files = [(root / "claude" / "main-prompt.md", True)]
+    for sub, in_brief in (("roles", True), ("contract", False)):
+        folder = root / "agent" / sub
+        try:  # os.listdir raises on every Python; Path.glob skips an unreadable directory silently from 3.13
+            names = sorted(n for n in os.listdir(folder) if n.endswith(".md"))
+        except FileNotFoundError:
+            names = []
+        except OSError as error:
+            problems.append({"source": "contract", "where": f"agent/{sub}", "problem": f"directory not readable: {type(error).__name__}"})
+            continue
+        files += [(folder / n, in_brief) for n in names]
     rows = []
     zero = {"lines": 0, "nonblank": 0, "words": 0, "evidence_lines": 0}
     total, brief_total = dict(zero), dict(zero)

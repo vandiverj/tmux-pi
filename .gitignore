@@ -38,3 +38,6 @@ credentials*
 .pi/
 .claude/settings.local.json
 bench/answers-src/
+
+# Local bench run outputs (kept on disk, never committed)
+bench-results/

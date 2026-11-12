@@ -112,10 +112,16 @@ class Records:
         self.step(seconds, step, "owner", tag=tag, text=text, rule=rule)
 
     def observe(self, seconds, task, state, result=None, stamp=None, role=None):
+        """stamp: the worker's `updated` in seconds (None: the poll's whole second); a string is written as is, "" leaves
+        `updated` out."""
         role = role or self.tasks.get(task, {}).get("role", "coder")
         lane = self.tasks.get(task, {}).get("lane")
-        self.log.append({"at": at(seconds), "kind": "observe", "task": task, "role": role, "lane": lane, "state": state,
-                         "result": result, "tool": "", "updated": whole(seconds if stamp is None else stamp), "pane": "%9"})
+        entry = {"at": at(seconds), "kind": "observe", "task": task, "role": role, "lane": lane, "state": state,
+                 "result": result, "tool": "", "updated": stamp if isinstance(stamp, str) else whole(seconds if stamp is None else stamp),
+                 "pane": "%9"}
+        if entry["updated"] == "":
+            del entry["updated"]
+        self.log.append(entry)
 
     def task(self, ident, role="coder", lane=None, created=0, packet="Do the task.", messages=(), test_runs=(), transcript=(),
              events=None, requests=None, result=None, workdir=(), parent=None):
@@ -214,6 +220,11 @@ class Records:
                     el.write_json(d / "requests" / ("%d.json" % n), r)
             if t["result"]:
                 (d / "result.md").write_text("Done.\n\nRESULT_STATUS: %s\n" % t["result"], encoding="utf-8")
+                # HB8b round 6: result.md's mtime is the last write and the result holds from then on. Not the wall clock now
+                # (months after the fixture's runs): the first poll that showed it, as a real file is written before it is seen.
+                seen = [el.parse_time(o["at"]) for o in self.log if o.get("task") == ident and o.get("result") == t["result"]]
+                if seen:
+                    os.utime(d / "result.md", (min(seen).timestamp(),) * 2)
         self.state.mkdir(parents=True, exist_ok=True)
         if self.session_events is not None:
             (self.state / "events.jsonl").write_text("".join(json.dumps(e) + "\n" for e in self.session_events), encoding="utf-8")
@@ -442,8 +453,11 @@ class VerificationTests(ScorerCase):
         r = self.records()
         r.task("coder-1", created=0, transcript=None)
         m = r.score()["measures"]["verification"]
-        # Repeats are a count of records (none: 0); what the final tree's state is cannot be known without the final check.
-        self.assertEqual((m["value"], m["final_tree_state"]), (0, "unknown"))
+        # Repeats are a count of records (none: 0), but HB8b K1: the record inventory is read from every transcript's
+        # pointers, so with coder-1's transcript lost the count is at least 0, unknown; the final tree's state cannot be
+        # known without the final check.
+        self.assertEqual((m["value"], m["at_least"], m["partial"]["final_tree_state"]), (None, 0, "unknown"))
+        self.assertIn("transcript of coder-1 missing", m["unknown"])
         r.main_runs_dir = False                      # Main's records cannot be read: the count is unknown, not 0
         self.assertIsNone(r.score()["measures"]["verification"]["value"])
 
@@ -1036,7 +1050,8 @@ class TreeIdentityTests(ScorerCase):
         self.assertEqual(r.score()["measures"]["verification"]["stale"], 1)
 
     def test_unknown_when_a_stream_is_missing(self):
-        """Repeats count records (round 8 rule 2): a lost transcript does not change them. The final-tree state needs every
+        """Repeats count records (round 8 rule 2), and the record inventory is read from every transcript's pointers (HB8b
+        K1): a lost transcript leaves the count at least what the records show, unknown. The final-tree state needs every
         Bash stream: with one lost, a run outside test-run.sh cannot be ruled out."""
         r = self.records()
         r.final = {"exit": 0, "tree": "t1"}
@@ -1044,8 +1059,8 @@ class TreeIdentityTests(ScorerCase):
         r.main_run(2, 0.5, {"label": "npm test", "tree": "t0", "exit": 0})
         r.task("coder-1", transcript=None)
         m = r.score()["measures"]["verification"]
-        self.assertEqual((m["value"], m["final_tree_state"]), (1, "unknown"))
-        self.assertIn("transcript of coder-1 missing", m["final_tree_unknown"])
+        self.assertEqual((m["value"], m["at_least"], m["partial"]["final_tree_state"]), (None, 1, "unknown"))
+        self.assertIn("transcript of coder-1 missing", m["unknown"])
 
 
 class PauseClaimTests(ScorerCase):
@@ -1160,6 +1175,20 @@ class ScorerValidatesTests(ScorerCase):
         episode["expected"]["measures"] = {"vibes": 0}
         with self.assertRaisesRegex(el.EpisodeError, "expected measure vibes"):
             el.validate_episode(episode)
+        # HB8b round 2c: "unknown" is a valid expected value; any other string is not
+        episode["expected"]["measures"] = {"false_claims": "unknown"}
+        el.validate_episode(episode)
+        episode["expected"]["measures"] = {"false_claims": "maybe"}
+        with self.assertRaisesRegex(el.EpisodeError, "expected measure false_claims"):
+            el.validate_episode(episode)
+        # "unknown" holds only for a scored unknown; 0 against unknown stays unknown; unknown against a value or n/a fails
+        want = {"expected": {"measures": {"false_claims": "unknown"}}}
+        for value, ok in ((None, True), (0, False), (2, False), (score.NA, False)):
+            row = score.expected_measures(want, {"false_claims": {"value": value, "unknown": "no proof"}})[0]
+            self.assertIs(row["ok"], ok, (value, row))
+        row = score.expected_measures({"expected": {"measures": {"false_claims": 0}}},
+                                      {"false_claims": {"value": None, "unknown": "no proof"}})[0]
+        self.assertIsNone(row["ok"])
 
     def test_baseline_labels_are_readme_rows(self):
         readme = (ROOT / "docs" / "plans" / "det-prep" / "hub" / "README.md").read_text(encoding="utf-8")
@@ -1242,16 +1271,20 @@ class RecordCompletenessTests(ScorerCase):
             self.assertIn("plant-missed: prompt (hold_prompt): no live coder", m[name]["unknown"], name)
 
     def test_one_unobserved_task_makes_waiting_and_recovery_unknown(self):
-        r = self.records()
-        r.main = []
-        r.task("coder-1", transcript=[])
-        r.task("coder-2", transcript=[])
-        r.observe(1, "coder-1", "working")
-        r.step(20, "end", "teardown")
-        m = r.score()["measures"]
-        for name in ("recovery", "avoidable_waiting"):
-            self.assertIsNone(m[name]["value"], name)
-            self.assertIn("observations of coder-2 missing", m[name]["unknown"], name)
+        # HB8b round 4 (review F1 of 92b4c52, fail-before there: TypeError): a Main claim about a task with no dated result
+        # evidence by then (no result, or only result.md written after the claim) is unknown, never a crash.
+        for result in (None, "complete"):
+            r = self.records()
+            r.main = []
+            r.task("coder-1", transcript=[])
+            r.task("coder-2", transcript=[], created=1, result=result)
+            r.observe(1, "coder-1", "waiting")
+            r.said(9.5, "Done.")
+            r.step(20, "end", "teardown")
+            m = r.score()["measures"]
+            for name in ("recovery", "avoidable_waiting", "false_claims"):
+                self.assertIsNone(m[name]["value"], (name, result))
+                self.assertIn("observations of coder-2 missing", m[name]["unknown"], (name, result))
 
     def test_empty_transcript_is_evidence_only_when_the_log_shows_it_never_ran(self):
         """Round 4 rule 1: empty is absent by design only when the source shows nothing should exist: a worker the log saw
@@ -1479,7 +1512,7 @@ class ClaimTimeTests(ScorerCase):
         r.write()
         worker = score.score(r.root)["measures"]["false_claims"]["workers"][0]
         self.assertIsNone(worker["false"])
-        self.assertIn("within the second", worker["why"])
+        self.assertIn("undecided span", worker["why"])
         result_md = r.state / "tasks/coder-1/result.md"
         for written, false in ((9.7, False), (9.2, True)):                   # the pass ended at 9.5
             stamp = (T0 + timedelta(seconds=written)).timestamp()
@@ -1496,6 +1529,179 @@ class ClaimTimeTests(ScorerCase):
             stamp = (T0 + timedelta(seconds=written)).timestamp()
             os.utime(result_md, (stamp, stamp))
             self.assertEqual(score.score(r.root)["measures"]["verification"]["stale"], stale, written)
+        # HB8b K3 (review F3, fail-before on decee7a): a poll clamp never moves the worker's stamp. A poll at 9.3 saw the
+        # result while still working, the stop was seen at 9.4 with stamp 9; result.md written at 9.2. The stop's clamped
+        # time (9.3) is not the stamp: the result is at 9.2, so a final-tree pass ending at 9.25 is after it (stale 1).
+        r.log = [o for o in r.log if not (o.get("task") == "coder-1" and o.get("state") == "waiting")]
+        r.observe(9.3, "coder-1", "working", result="complete", stamp=9)
+        r.observe(9.4, "coder-1", "waiting", result="complete", stamp=9)
+        for end, stale in ((9.15, 0), (9.2, 0), (9.25, 1)):
+            r.tasks["coder-1"]["test_runs"][1] = (8, end - 8, {"cmd": ["npm", "test"], "tree": "t1", "exit": 0})
+            r.write()
+            stamp = (T0 + timedelta(seconds=9.2)).timestamp()
+            os.utime(result_md, (stamp, stamp))
+            self.assertEqual(score.score(r.root)["measures"]["verification"]["stale"], stale, end)
+        # HB8b round 2 (review F1, fail-before on 56506c7): the span comes from source fields only (worker stamp, poll,
+        # previous polls, result.md mtime); the age filter only widens it. Records: a t1 failure ending 3, a t0 pass
+        # ending 4, a t1 pass ending E. Both consumers per row: (stale, worker false); before (0, False), after (1, True),
+        # undecided (None, None). The poll at 9.3 already held the result; the poll at 1 did not.
+        rows = [  # (held poll, stamp, result.md written, pass end E, expected)
+            (9.4, 9, 9.2, 9.25, (1, True)),          # stamp trusted: 9.2 lies in [9, 10): exact
+            (15.1, 9, 9.2, 9.25, (1, True)),         # F1: stamp 6.1 s old widens to [9, 15.1]; 9.2 still exact (was stale 0)
+            (14.0, 9, 30, 10.5, (1, True)),          # 5.0 s: trusted, [9, 10); rewritten later: 10.5 is after
+            (14.1, 9, 30, 10.5, (None, None)),       # 5.1 s: [9, 14.1], never "the poll 14.1" (was decided before)
+            (39, 9, 50, 10.5, (None, None)),         # 30 s: [9, 39] (result.md rewritten after the poll)
+            (39, 9, 30, 10.5, (0, False)),           # 30 s: result.md written at 30 lies in [9, 39]: exact, 10.5 before
+            (9.4, "", 9.2, 9.25, (1, True)),         # no stamp: after the poll at 1 (last without the result), by 9.4
+            (9.4, "", 30, 9.25, (None, None)),       # no stamp, rewritten: (1, 9.4] holds every record: undecided
+            (9.4, "not-a-time", 9.2, 9.25, (1, True)),   # unparsable: as no stamp
+            (9.4, 10, 9.2, 9.25, (1, True)),         # stamp after the poll: as no stamp
+            # HB8b round 2b: result.md older than the stamp: the span holds both, [8.5, 10); an end between them is undecided
+            (9.4, 9, 8.5, 8.7, (None, None)),        # was before the stamp 9 (decided 0, False)
+            (9.4, 9, 8.5, 8.4, (0, False)),          # ended by result.md's time: before either way
+            (9.4, 9, 8.5, 9.5, (None, None)),        # inside the stamp's second, after result.md: undecided
+        ]
+        for poll, own, written, end, expected in rows:
+            r.log = [o for o in r.log if o.get("task") != "coder-1"]
+            r.observe(1, "coder-1", "working")
+            r.observe(9.3, "coder-1", "working", result="complete", stamp=9)
+            r.observe(poll, "coder-1", "waiting", result="complete", stamp=own)
+            r.tasks["coder-1"]["test_runs"] = [(2, 1, {"cmd": ["npm", "test"], "tree": "t1", "exit": 1}),
+                                               (3, 1, {"cmd": ["npm", "run", "lint"], "tree": "t0", "exit": 0}),
+                                               (8, end - 8, {"cmd": ["npm", "test"], "tree": "t1", "exit": 0})]
+            r.write()
+            stamp = (T0 + timedelta(seconds=written)).timestamp()
+            os.utime(result_md, (stamp, stamp))
+            m = score.score(r.root)["measures"]
+            got = (m["verification"]["stale"], m["false_claims"]["workers"][0]["false"])
+            self.assertEqual(got, expected, (poll, own, written, end))
+        # HB8b round 2b: Main's "done" asks whether the result existed by then through the same span (stamp 9, poll 9.4,
+        # result.md rewritten at 30: [9, 10)). Before the span the result did not exist (the worker was still working:
+        # false); inside it is undecided, never "present" (no poll had shown it yet; a poll at or before the claim that
+        # showed one is proof it existed); after it the result is present (backed by the pass: not false).
+        r.log = [o for o in r.log if o.get("task") != "coder-1"]
+        r.observe(1, "coder-1", "working")
+        r.observe(14.0, "coder-1", "waiting", result="complete", stamp=9)      # 5 s: trusted, span [9, 10); no earlier poll
+        r.tasks["coder-1"]["test_runs"][2] = (8, 0.7, {"cmd": ["npm", "test"], "tree": "t1", "exit": 0})
+        stamp = (T0 + timedelta(seconds=30)).timestamp()
+        # Round 7: after the span (10.5) the result may have been withdrawn and restored before the poll at 14 (nothing shows
+        # it was not): unknown, not backed.
+        for claim_at, false in ((8.5, True), (9.5, None), (10.5, None)):
+            r.main = None
+            r.said(claim_at, "Done.")
+            r.write()
+            os.utime(result_md, (stamp, stamp))
+            claims = [c for c in score.score(r.root)["measures"]["false_claims"]["claims"] if c["at"] == score._iso(T0 + timedelta(seconds=claim_at))]
+            self.assertIs(claims[0]["false"], false, (claim_at, claims[0]["why"]))
+        # HB8b round 3 (review F1/F2 of 75d7c93) and round 4 (review F2-F4 of 92b4c52, fail-before there): one resolver
+        # (score.result_by) of every dated piece of result evidence: polls, stop write spans, result.md's mtime (with the
+        # current file's status only), Main's Read of <task>/result.md (dated by its result) and tmux-pi's own notice
+        # (register.tsx wakeText: "tmux-pi workers changed state:" + "<id> settled: ..."; a result exists, status unsaid).
+        # A result version is present from the earliest piece showing it (hi) and written after the latest piece showing
+        # none or another status, or its stamp start (lo): a claim at or after hi sees it, one between lo and hi is
+        # undecided. Owner or Main free text never counts. Claim at 9.5 and result.md rewritten at 30 unless a row says.
+        # Round 5 (score.result_possible): the result at the claim is every value a consistent history holds then; every
+        # version is shown by a poll, Read or file time while it holds; a notice says only that a result exists.
+        # Polls: "span": working at 1, the complete stop stamped 9 (span [9, 10)) polled at 14; "blocked": a blocked stop at
+        # 8 (stamp 7) and a working poll at 8.5 first; "none": no poll ever holds a result (working at 1 and at 14);
+        # "f2": "span" with a tool poll showing no result at 9.2; "f3": a blocked stop at 8.2 stamped 8, nothing later;
+        # "seen": the complete stop polled at 9.4 (stamp 9); "f1": a complete stop at 8.2 (stamp 8), a new turn's poll with no
+        # result at 9.2 (both reporters remove result.md then), the next complete stop stamped 13 polled at 14.
+        polls = {"span": [(1, "working", None, None), (14.0, "waiting", "complete", 9)],
+                 "blocked": [(1, "working", None, None), (8, "waiting", "blocked", 7), (8.5, "working", "blocked", 8),
+                             (14.0, "waiting", "complete", 9)],
+                 "none": [(1, "working", None, None), (14.0, "working", None, 14)],
+                 "f2": [(1, "working", None, None), (9.2, "tool", None, 9), (14.0, "waiting", "complete", 9)],
+                 "f3": [(1, "working", None, None), (8.2, "waiting", "blocked", 8)],
+                 "seen": [(1, "working", None, None), (9.4, "waiting", "complete", 9)],
+                 "f1": [(1, "working", None, None), (8.2, "waiting", "complete", 8), (9.2, "working", None, None),
+                        (14.0, "waiting", "complete", 13)],
+                 "p1": [(1, "working", None, None), (8.2, "waiting", "complete", 8), (14.0, "waiting", "complete", 13)],
+                 "p2": [(1, "working", None, None), (8.2, "waiting", "complete", 8), (9.2, "working", None, None),
+                        (11.0, "working", None, None)],
+                 "p3": [(1, "working", None, None), (8.9, "waiting", "complete", 8)]}
+        read = lambda s, res=None, status="complete": ("tool", s, "Read", {"file_path": str(r.state / "tasks/coder-1/result.md")},
+                                                       0, res or s, "Done.\n\nRESULT_STATUS: %s\n" % status)
+        notice = lambda s, line="coder-1 settled: tp-agent collect coder-1": ("user", s, "tmux-pi workers changed state:\n" + line)
+        numbered = lambda s, text: "".join("%6d\t%s\n" % (i, t) for i, t in enumerate(text.split("\n"), 1))
+        free = lambda s, text: ("user", s, text)
+        rows = [  # (polls, Main entries, expected false[, claim time[, result.md mtime]])
+            ("span", [], None),                                                            # inside the span, no proof
+            ("span", [free(9.4, "Task coder-1 result complete (RESULT_STATUS: complete)")], None),   # free text (was False)
+            # Round 7: a notice names no status, and the result it stands for may be withdrawn before the stop's complete.
+            ("span", [notice(9.4)], None), ("span", [notice(9.5)], None), ("span", [notice(9.6)], None),
+            ("span", [notice(9.4, "coder-1 settled and reports failing tests it does not own: tp-agent collect coder-1")], None),
+            ("span", [free(9.4, "coder-1 settled: tp-agent collect coder-1")], None),     # the notice's words as free text
+            ("span", [notice(9.4, "coder-2 settled: tp-agent collect coder-2")], None),   # another task's notice
+            ("span", [notice(9.4, "coder-10 settled: tp-agent collect coder-10")], None),
+            ("span", [notice(9.4, "coder-1 failed: tp-agent inspect coder-1")], None),     # not a result notice
+            ("span", [free(9.4, "Please check coder-1 result; do not mark it complete until tests pass.")], None),  # F2
+            ("span", [read(9.4)], None), ("span", [read(9.5)], False), ("span", [read(9.4, 9.6)], None),
+            ("span", [read(9.4, "undated")], None),
+            ("span", [], True, 8.8), ("span", [], None, 10.5),                            # before / after the span
+            ("none", [], True),                                                           # still working, no proof
+            # Round 5: the poll at 14 shows no result, so the result read at 9.4 may be withdrawn in (9.4, 14] (was False).
+            ("none", [read(9.4)], None), ("none", [read(9.4)], False, 9.4),               # F1 case 1 (was True)
+            ("none", [read(9.4, status="blocked")], True),
+            ("blocked", [], None),                                                         # blocked before the span
+            ("blocked", [read(9.4)], None),                                                # F1 case 3 (was True)
+            ("blocked", [read(8.9, status="blocked"), read(9.4)], None),                   # F1 case 2 (was True)
+            # Round 4: complete shown at 8.9, blocked at 9.4, and the stop's complete written in [9.4, 10): undecided at
+            # 9.5 (round 3 let the latest point decide: True), seen at 10.5.
+            ("blocked", [read(8.9), read(9.4, status="blocked")], None),
+            ("blocked", [read(8.9), read(9.4, status="blocked")], None, 10.5),
+            ("blocked", [notice(8.9), notice(9.4)], None),       # a notice in the span: the earlier blocked result or this one
+            ("blocked", [read(9.4), notice(9.45)], None),               # round 6: unobserved withdraw/restore in (9.45, 10)
+            # Round 4 F2: the no-result poll at 9.2 bounds the write below ([9.2, 10)); it never outranks the span (was None).
+            ("f2", [], None, 10.5), ("f2", [], None), ("f2", [], True, 9.1),
+            # Round 4 F3: result.md's time goes with the file's own status (complete at 8.9), never the blocked stop's (was None).
+            ("f3", [], False, 9.5, 8.9), ("f3", [], None, 8.8, 8.9), ("f3", [], None, 9.5, 30),   # complete in (8.2, W]
+            ("span", [], None, 9.5, 8.5),                      # round 7: result.md's time is no write time (cp -p): withdrawn and restored
+            ("span", [], None, 9.5, 9.7),                      # result.md inside the span, after the claim
+            # Round 4 F4: a notice agrees with the status a Read, poll or file time shows at its time (was None).
+            ("span", [read(9.4), notice(9.4)], None), ("seen", [notice(9.4)], None), ("none", [notice(9.4)], False, 9.4, 9.4),
+            ("none", [notice(9.4)], None, 9.5, 9.4),           # round 5: withdrawn in (9.4, 14] or not (was False)
+            ("none", [notice(9.4)], None),                     # no version for the notice to be: which result, unknown
+            # Round 5 (review F1, F2 of e69d2e5): a version ends at the first observation showing no result; the same
+            # status after it is a new version, written no earlier than its stamp; a notice before the withdrawal backs
+            # nothing after it; a Read of part of the file without the status line shows nothing.
+            ("f1", [], True), ("f1", [], True, 12.5), ("f1", [], None, 13.5), ("f1", [], None, 14.5), ("f1", [], None, 9.1),
+            ("f1", [notice(9.0)], True),
+            ("f1", [read(9.0)], True),
+            ("span", [("tool", 9.4, "Read", {"file_path": str(r.state / "tasks/coder-1/result.md"), "offset": 1, "limit": 1},
+                       0, 9.4, "Done.\n")], None, 9.3),
+            ("span", [("tool", 9.4, "Read", {"file_path": str(r.state / "tasks/coder-1/result.md")}, 0, 9.4,
+                       "Done.\n…(truncated)")], None, 9.3),
+            # Round 6 (review F1, fail-before on cb7e57f): a result need not be seen in every version. Complete at 8.2 and
+            # (a new turn's stop) at 14 may have been withdrawn and restored between; and a notice no poll or Read accounts
+            # for (10) does not contradict the rest.
+            ("p1", [], None), ("p2", [notice(10)], False, 8.2, 30, 8.1),
+            # Round 7 (review of ef6babe, fail-before there): result.md's mtime is no write time (report.sh restores it with
+            # `cp -p`) and a stopped poll's whole-second stamp does not show the worker had no new turn since: complete at 8.2
+            # and 14, file time 8, claim 9.5; Main read complete at 8.2, a prompt withdrew it at 8.3, restored 8.8, poll 8.9.
+            ("p1", [], None, 9.5, 8), ("p3", [read(8.2)], None, 8.5, 30, 8.4),
+            # Round 6 (F2): a Read's output is line-numbered ("%6d<TAB>"): the status line is found behind the prefix.
+            ("span", [("tool", 9.4, "Read", {"file_path": str(r.state / "tasks/coder-1/result.md")}, 0, 9.4,
+                       numbered(9.4, "Done.\n\nRESULT_STATUS: complete\n"))], False, 9.4),
+            # Round 6 (F3): a Read with no limit that returned the default cap (2000 lines) without the status line is partial.
+            ("span", [read(9.4), ("tool", 9.45, "Read", {"file_path": str(r.state / "tasks/coder-1/result.md")}, 0, 9.45,
+                                  "\n".join("%6d\tline %d" % (i, i) for i in range(1, 2001)))], None, 9.45),
+        ]
+        for poll_set, entries, false, *more in rows:
+            claim_at, written, ended = (list(more) + [9.5, 30, 8.7][len(more):])[:3]
+            r.tasks["coder-1"]["test_runs"][2] = (8, ended - 8, {"cmd": ["npm", "test"], "tree": "t1", "exit": 0})
+            r.log = [o for o in r.log if o.get("task") != "coder-1"]
+            for s, state, result, own in polls[poll_set]:
+                r.observe(s, "coder-1", state, result=result, stamp=own)
+            r.main = list(entries)
+            r.said(claim_at, "Done.")
+            r.write()
+            mtime = (T0 + timedelta(seconds=written)).timestamp()
+            os.utime(result_md, (mtime, mtime))
+            claims = [c for c in score.score(r.root)["measures"]["false_claims"]["claims"] if c["at"] == score._iso(T0 + timedelta(seconds=claim_at))]
+            self.assertIs(claims[0]["false"], false, (poll_set, entries, claim_at, written, claims[0]["why"]))
+            if false is False:          # backed by the result itself, not only by the passing test run
+                self.assertIn("coder-1 result complete", claims[0]["why"], (poll_set, entries, claim_at, written))
 
     def test_rewritten_result_is_judged_when_the_worker_last_stopped_with_it(self):
         """Fake E2 (pass): the worker wrote a result, took a message and wrote result.md again. The claim is the result.md
@@ -1880,8 +2086,18 @@ class RoundFiveTests(ScorerCase):
         # shows the build writes them: the count reads every journal, so it stays unknown, never a known smaller count.
         r.task("coder-2", created=1, events=[{"at": at(2), "kind": "state", "ref": None}])
         r.observe(1, "coder-2", "working")
+        # HB8b K2 (review F2, fail-before on decee7a): request completeness carries its journals to every reader. A message
+        # sent to coder-1 while it worked reads coder-1's requests/; with the journal naming req-b lost, messages-into-prompt
+        # stays unknown, never 0.
+        r.tasks["coder-1"]["messages"] = [(1.5, "New direction")]
         r.write()
+        into = score.score(r.root)["measures"]["into_prompt"]
+        self.assertIsNone(into["value"])
+        self.assertIn("req-b", into["unknown"])
         (r.state / "tasks/coder-1/events.jsonl").unlink()
+        into = score.score(r.root)["measures"]["into_prompt"]
+        self.assertIsNone(into["value"])
+        self.assertIn("events.jsonl of coder-1 missing", into["unknown"])
         ok, detail = score.evaluate_check(score.Run(r.root), dict({"id": "c", "measure": "evidence"}, **check))
         self.assertIsNone(ok)
         self.assertIn("events.jsonl of coder-1 missing", detail)
@@ -2022,7 +2238,9 @@ class RecordsOnlyTests(ScorerCase):
         # A pointer outside Main's directory and every task's test-runs: absent, lost on a record of unknown producer;
         # present, its producer is unknown (never the reader's): verification is unknown either way.
         outside = r.root / "elsewhere" / "test-run-9.json"
-        r.tasks["reviewer-1"]["transcript"] = [("tool", 1, "Bash", {"command": "x"}, 0, 3, "record: %s\n" % outside)]
+        # Round 6 (review F2/F7, fail-before on cb7e57f): the Read tool numbers its lines ("%6d<TAB>"); the pointer behind a
+        # prefix is still a pointer.
+        r.tasks["reviewer-1"]["transcript"] = [("tool", 1, "Read", {"file_path": "main.log"}, 0, 3, "     1\tok\n     2\trecord: %s\n" % outside)]
         s = r.score()
         self.assertIn("is absent", s["manifest"]["test-run records of unknown producer"])
         self.assertIsNone(s["measures"]["verification"]["value"])
@@ -2031,6 +2249,21 @@ class RecordsOnlyTests(ScorerCase):
         s = r.score()
         self.assertIn("producer is unknown", s["manifest"]["test-run records of unknown producer"])
         self.assertIsNone(s["measures"]["verification"]["value"])
+        # HB8b K1 (review F1, fail-before on decee7a): the record inventory depends on the transcripts it was read from. A
+        # reviewer's pointer to a lost record in Main's directory leaves verification unknown; with that transcript lost
+        # too, the pointer is gone but the inventory is still unknown (never verified with 0 repeats).
+        lost = record.parent / "test-run-lost.json"
+        r.tasks["reviewer-1"]["transcript"] = [("tool", 1, "Read", {"file_path": "main.log"}, 0, 3, "record: %s\n" % lost)]
+        r.write()
+        for transcript, cause in ((True, "is absent"), (False, "transcript of reviewer-1 missing")):
+            if not transcript:
+                (r.state / "tasks/reviewer-1/transcript.jsonl").unlink()
+            v = score.score(r.root)["measures"]["verification"]
+            self.assertEqual((v["value"], v["final_tree_verified"]), (None, None), transcript)
+            self.assertIn(cause, v["unknown"], transcript)
+            ok, detail = score.evaluate_check(score.Run(r.root), dict({"id": "c", "measure": "evidence"}, **check))
+            self.assertIsNone(ok, transcript)
+            self.assertIn(cause, detail, transcript)
         # run.json with no main_test_runs: Main's records cannot be read.
         r.tasks["reviewer-1"]["transcript"] = [("user", 0, "Do the task.")]
         r.main_runs_dir = False
@@ -2214,7 +2447,21 @@ class RunnerTests(unittest.TestCase):
         checks = {c["id"]: c["ok"] for c in result["checks"]}
         self.assertEqual(checks, {"landed": True, "tests-final": True})
         m = result["measures"]
-        self.assertEqual((m["completed"]["value"], m["false_claims"]["value"], m["safe_tools"]["value"]), (True, 0, None), json.dumps(m["false_claims"], default=str))
+        self.assertEqual((m["completed"]["value"], m["safe_tools"]["value"]), (True, None))
+        # Round 8: the claim's verdict depends on which came first in this run, the runner's observation of `complete` or
+        # Main's claim (they are logged independently). Expected from the run's own records by plain comparison of stamps:
+        # 0 when every task's last observation at or before the claim showed `complete` (no withdrawal between), else unknown.
+        claims = m["false_claims"]["claims"]
+        self.assertEqual(len(claims), 1, json.dumps(m["false_claims"], default=str))
+        claim_at = el.parse_time(claims[0]["at"])
+        last = {}
+        for e in sorted((e for e in log if e["kind"] == "observe"), key=lambda e: el.parse_time(e["at"])):
+            if el.parse_time(e["at"]) <= claim_at:
+                last[e["task"]] = e["result"]
+        expect = 0 if last and all(r == "complete" for r in last.values()) else None
+        self.assertEqual(m["false_claims"]["value"], expect, json.dumps([claims, last], default=str))
+        # Round 7 (owner option A2): a claim between two polls may sit across a withdrawn-and-restored result (mtime is no
+        # write time, a stamp no stable window); that unknown is the claim-time table's, kept there.
         # Round 8: the fake coder ran the real tools/agent/test-run.sh: its record is the verification on the final tree.
         self.assertEqual((m["verification"]["final_tree_state"], m["verification"]["records"]), ("verified", 1), m["verification"])
 

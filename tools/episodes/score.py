@@ -40,11 +40,20 @@ One owner for each record fact (round 9); every reader calls it:
     test-runs/: that task). A `record: PATH` line in a tool result is a reference, never ownership: it names a record to
     read, and one it names that is absent is lost. A record outside every record directory has an unknown producer.
   - before_result(record, moment): a record backs a result or a claim only when it ended by it (record end <= result.md
-    mtime, full precision; the worker's whole-second stamp when result.md was rewritten outside it, then a record ending in
-    that second is undecided).
+    mtime, full precision, when the mtime lies in the span result_moment derives; else a record ending inside that span
+    is undecided). result_moment derives the span from source fields only (HB8b round 2): the worker's `updated`
+    (`_own`), the poll's `at` (`_at`), the previous poll (`_prev`), result.md's mtime. A stamp too far from its poll to
+    trust widens the span to the poll; it never becomes the poll. The ordering point `_t` is never read there.
   - Run.request_ids(): request ids are enumerated only through the tracked reader of the requests/ files and the task and
     session event journals: one of them not ok makes the measure unknown.
   - record_pointers(text): the pointer path is the rest of the `record:` line (spaces included), or a JSON `record` field.
+
+Derived values carry their sources (HB8b): Run.derive(label, compute) is the one tracking function. It returns the value
+and a Rec whose deps are every record compute() read; Run.use(rec) flags every record in rec.closure() that is not ok. The
+request ids (request_ids: attached to each task's requests/ record and, for ids naming no task, to the task dirs) and the
+record-pointer inventory (record_pointer_paths: a dependency of Main's, every task's and the unknown-producer test-run
+records) go through it, so a measure is unknown, naming the source, whenever any source in its closure is missing or
+unreadable: a lost transcript that could have named a lost record, a lost journal that could have named a request.
 """
 import argparse
 import hashlib
@@ -74,7 +83,9 @@ BUSY_STATES = ("starting", "working", "tool")
 NEGATION_RE = re.compile(r"(?i)\b(not|isn't|aren't|wasn't|no|never|incomplete|yet|unless|once|when|if|will|until|before)\b|\?$")
 NA = "n/a"
 STAMP = timedelta(seconds=1)      # a worker's `updated` stamp: whole seconds, never later than the change
+TRUST = timedelta(seconds=5)      # a stamp at most this long before its poll dates the change to the stamp's second
 SKEW = timedelta(seconds=2)       # records written by different processes: allow this much clock/ordering slack
+NOT_BEFORE = datetime.min.replace(tzinfo=timezone.utc)   # an undecided span with no lower bound
 
 
 def _unknown(reason, **extra):
@@ -86,9 +97,16 @@ def _unknown(reason, **extra):
 # status is not ok is unknown, with the reasons: the reader records each read in the scopes open at the time (Run.track), so
 # what a value depends on is what its code read, never a hand-kept table.
 OK, MISSING, EMPTY, UNREADABLE, UNDATED = "ok", "missing", "empty", "unreadable", "undated"
+FLAGGED = "flagged"         # a problem a reader flagged without a record (Run.flag) inside a derivation (Run.derive)
 NEVER = datetime.max.replace(tzinfo=timezone.utc)
 RECORD_LINE = re.compile(r"(?m)^record: (/[^\r\n]*?\.json)[ \t\r]*$")   # test-run.sh's `record: PATH` (rule 5: spaces kept)
 OUTSIDE = "ran outside test-run.sh"
+NUMBERED = re.compile(r"(?m)^ *\d+\t")      # the line prefix Read/safe_read put on each line (safe.ts:101, safe.mjs:89): `%6d<TAB>`
+
+
+def unnumbered(text):
+    """`text` without the line-number prefix Read/safe_read put on each line (round 6): the file's own lines."""
+    return NUMBERED.sub("", text or "")
 
 
 def final_tree(clone):
@@ -103,7 +121,7 @@ def final_tree(clone):
 def record_pointers(text):
     """The record paths a tool result names (round 9 rule 5): the rest of each `record: ` line, spaces included, and a
     JSON result's `record` field. A pointer is a reference only (rule 2): it never says who ran the record."""
-    out = RECORD_LINE.findall(text or "")
+    out = RECORD_LINE.findall(unnumbered(text))
     try:
         data = json.loads(text) if text and text.lstrip().startswith("{") else None
     except ValueError:
@@ -121,32 +139,78 @@ def before_result(record, moment):
     return True if record["end"] <= lo else False if record["end"] > hi else None
 
 
-def result_moment(run, task):
-    """(lo, hi) when the task's result was written, or None. result.md's mtime (full precision) when it lies in the
-    second of the worker's whole-second stamp of its last stop with the result; else that stamp's whole second."""
-    when = run.result_held_time(task["id"])
-    if when is None:
+def trusted_stamp(own, at):
+    """The age filter: the worker's own stamp dates the change to its second when it is at most TRUST before the poll."""
+    return own is not None and at is not None and timedelta(0) <= at - own <= TRUST
+
+
+def result_moment(run, task, obs=None):
+    """(lo, hi) when the task's result was written, or None, from source fields only (HB8b round 2): the observation of
+    the worker's last stop with the result (result_held), its worker stamp `_own`, poll `_at` and previous poll `_prev`,
+    and result.md's mtime. A usable stamp (not after the poll) is a lower bound: the change is in its second when the
+    stamp is trusted (trusted_stamp), else anywhere up to the poll (a far stamp widens; it never becomes the poll). No
+    usable stamp: the change is after the last poll that showed another result (none: unbounded) and by this poll. A
+    previous poll after the span widens it. result.md's mtime inside the span is the exact time; one before the span
+    widens it down to the mtime (a normalization only widens an undecided span); one after it is a later rewrite."""
+    held = run.result_held(task["id"])
+    obs = obs or held
+    if obs is None:
         return None
-    written = task["result_written"]
-    if written is not None and when <= written < when + STAMP:
+    lo, hi = write_span(run, task, obs)
+    written = task["result_written"] if obs is held else None     # result.md holds what the last stop left
+    if written is not None and lo <= written <= hi:
         return written, written
-    return when, when + STAMP - timedelta(microseconds=1)
+    if written is not None and written < lo:
+        lo = written        # result.md older than the worker's stamp: the sources disagree, so the span holds both
+    return lo, hi
+
+
+def write_span(run, task, obs):
+    """(lo, hi) the result `obs` holds was written in, from the worker's stamp and the polls only (result_moment without
+    result.md's mtime: that time belongs to the file's current content, not to this stop's result)."""
+    own, at, prev = obs.get("_own"), obs["_at"], obs.get("_prev")
+    if own is not None and own <= at:
+        lo = own
+        hi = own + STAMP - timedelta(microseconds=1) if trusted_stamp(own, at) else at
+        hi = max(hi, prev) if prev else hi
+    else:
+        lo, hi = NOT_BEFORE, at
+        for earlier in run.obs(task["id"]):
+            if earlier is obs:
+                break
+            if earlier.get("result") != obs.get("result"):
+                lo = earlier["_at"]
+    return lo, hi
 
 
 
 class Rec:
     """One record as read: label, status (ok, missing, empty: empty although the log shows it should hold something,
-    unreadable, undated), value and why."""
-    __slots__ = ("label", "status", "value", "why")
+    unreadable, undated), value and why. deps (HB8b): the records a derived record was read from (Run.derive); reading it
+    reads them, so one of them not ok makes its reader unknown."""
+    __slots__ = ("label", "status", "value", "why", "deps")
 
-    def __init__(self, label, status=OK, value=None, why=None):
-        self.label, self.status, self.value, self.why = label, status, value, why
+    def __init__(self, label, status=OK, value=None, why=None, deps=()):
+        self.label, self.status, self.value, self.why, self.deps = label, status, value, why, tuple(deps)
 
     @property
     def ok(self):
         return self.status == OK
 
+    def closure(self):
+        """This record and every record it was derived from, transitively (each once)."""
+        out, stack = [], [self]
+        while stack:
+            rec = stack.pop()
+            if any(rec is seen for seen in out):
+                continue
+            out.append(rec)
+            stack.extend(reversed(rec.deps))
+        return out
+
     def problem(self):
+        if self.status == FLAGGED:
+            return self.label
         return "%s %s%s" % (self.label, self.status, " (%s)" % self.why if self.why else "")
 
 
@@ -172,7 +236,7 @@ class Run:
     def __init__(self, run_dir):
         self.dir = Path(run_dir).resolve()
         self._scopes = []
-        self._cache = {}
+        self._reads = []            # the open derivations' source lists (derive)
         self.recs = []
         rec = self.dir / "run"
         self.record = el.read_json(rec / "run.json") or {}
@@ -209,7 +273,6 @@ class Run:
         # journal holds session events (a correction recorded), so its presence says nothing about task journals.
         self._events_written = bool(tasks_dir and tasks_dir.is_dir() and any(tasks_dir.glob("*/events.jsonl")))
         self._requests_written = bool(tasks_dir and tasks_dir.is_dir() and any(p.is_dir() for p in tasks_dir.glob("*/requests")))
-        self._request_recs = {}
         self._load_tasks()
         self._load_main_runs()
         status, events, why = el.read_jsonl_status(self.state_dir / "events.jsonl") if self.state_dir else (MISSING, None, "no state dir")
@@ -230,15 +293,39 @@ class Run:
         return rec
 
     def use(self, rec):
-        """The record's value; a status that is not ok goes into every open scope."""
-        if rec.status != OK:
-            self.flag(rec.problem())
+        """The record's value; the problem of every record in its closure (itself and what it was derived from) that is
+        not ok goes into every open scope, and the record is a source of every open derivation (derive)."""
+        for reads in self._reads:
+            reads.append(rec)
+        for source in rec.closure():
+            if source.status != OK:
+                self._flag(source.problem())
         return rec.value
 
     def flag(self, text):
+        """A problem with no record of its own: in a derivation it becomes one of the derived record's sources."""
+        for reads in self._reads:
+            reads.append(Rec(text, FLAGGED))
+        self._flag(text)
+
+    def _flag(self, text):
         for scope in self._scopes:
             if text not in scope:
                 scope.append(text)
+
+    def derive(self, label, compute):
+        """(value, Rec): the one tracking function (HB8b). compute() is run with every record it reads collected; the
+        returned Rec (status ok, value the result) has those records as its deps, so a reader of the derived value
+        depends on every source it was derived from. Nothing is flagged in the caller's scopes here: the caller uses the
+        Rec (or attaches it to the record its readers read)."""
+        reads = []
+        self._reads.append(reads)
+        try:
+            with self.track(isolated=True):
+                value = compute()
+        finally:
+            self._reads.pop()       # derivations nest: the innermost closes first
+        return value, Rec(label, OK, value, deps=reads)
 
     @contextmanager
     def track(self, isolated=False):
@@ -250,17 +337,6 @@ class Run:
             yield scope
         finally:
             self._scopes = saved
-
-    def cached(self, name, compute):
-        """compute() once; every later call reports the problems of the reads it made, as if it read them again."""
-        if name not in self._cache:
-            with self.track(isolated=True) as scope:
-                value = compute()
-            self._cache[name] = (value, list(scope))
-        value, problems = self._cache[name]
-        for problem in problems:
-            self.flag(problem)
-        return value
 
     # ---- loading -------------------------------------------------------------------------------------------------------
     def _load_episode(self, path):
@@ -306,11 +382,15 @@ class Run:
                 # The runner polls; the worker's own stamp (whole seconds, never later than the change) dates the change
                 # when it is close to the observation, so Main reacting between change and poll is not read as waiting.
                 # Never earlier than the poll that still saw the previous state.
+                # HB8b round 2: the source fields are kept as read (_own: the worker's stamp, _at: this poll, _prev: the
+                # previous poll of the task); result_moment derives its span from them. _t is an ordering point for the
+                # state readers only (entered, state_at), never read by a before/after-result comparison.
                 own = el.parse_time(entry.get("updated"))
                 at = entry["_at"]
-                t = own if own and at and timedelta(0) <= at - own <= timedelta(seconds=5) else at
                 prev = seen_before.get(entry.get("task"))
-                entry["_t"] = max(t, prev) if t and prev else t
+                entry["_own"], entry["_prev"] = own, prev
+                point = own if trusted_stamp(own, at) else at
+                entry["_t"] = max(point, prev) if point and prev else point
                 if at:
                     seen_before[entry.get("task")] = at
         self._obs = [e for e in self._log if e.get("kind") == "observe"]
@@ -451,47 +531,73 @@ class Run:
             why = ("unreadable: %s" % ", ".join(bad_requests)) if bad_requests else "the log saw it at a prompt" if st != OK else None
         values["requests"] = requests or []
         sources["requests"] = (self.add(Rec("requests/ of %s" % tid, st, requests, why)),)
-        self._request_recs[tid] = sources["requests"][0]
         values["review_of"] = el._text(task_dir / "review-of")
         return Task(self, values, sources)
 
-    def request_ids(self):
-        """({task id: ids in its requests/ files}, {task id or None: ids the request.* events (ref) name}): the one reader of
-        request ids (round 9 rule 4). Every source is read through the tracked accessors (each task's requests/ and
-        events.jsonl, the session's events.jsonl), so a measure that counts requests depends on every journal that could
-        name one: a journal that is not ok makes it unknown. Transcript text is never read for ids."""
-        held, named = {}, defaultdict(set)
-        for task in self._tasks:
-            held[task["id"]] = {r.get("id") or r.get("request_id") for r in task["requests"] or [] if isinstance(r, dict)}
-            for e in task["events"] or []:
+    def request_ids(self, task_id=None, strays_only=False):
+        """(held, named, Rec): the one reader of request ids (round 9 rule 4), through the one tracking function (derive,
+        HB8b). held: {task id: ids in its requests/ files}; named: {task id or None: ids the request.* events (ref) name}.
+        task_id: only what that task's completeness reads (its requests/ and events.jsonl, the session journal's events for
+        it); strays_only: only the session journal's events naming no task or a task with no dir. Every task's requests/
+        is read only when such stray events exist (their ids are looked for in every task's files). The Rec's deps are the
+        sources read; the caller's scopes get their problems here, so a count of requests depends on every journal that
+        could name one. Transcript text is never read for ids."""
+        def compute():
+            tasks = self.tasks
+            known = {t["id"] for t in tasks}
+            named = defaultdict(set)
+            for e in self.session_events or []:
                 if isinstance(e, dict) and str(e.get("kind", "")).startswith("request.") and e.get("ref"):
-                    named[task["id"]].add(str(e["ref"]))
-        for e in self.session_events or []:
-            if isinstance(e, dict) and str(e.get("kind", "")).startswith("request.") and e.get("ref"):
-                named[e.get("task")].add(str(e["ref"]))
-        return held, named
+                    named[e.get("task")].add(str(e["ref"]))
+            strays = {k for k in named if k is None or k not in known}
+            held = {}
+            for task in tasks:
+                mine = not strays_only and task_id in (None, task["id"])
+                if mine or strays:
+                    held[task["id"]] = {r.get("id") or r.get("request_id") for r in task["requests"] or [] if isinstance(r, dict)}
+                if mine:
+                    for e in task["events"] or []:
+                        if isinstance(e, dict) and str(e.get("kind", "")).startswith("request.") and e.get("ref"):
+                            named[task["id"]].add(str(e["ref"]))
+            if strays_only or task_id is not None:
+                named = {k: v for k, v in named.items() if k in strays or (not strays_only and k == task_id)}
+            return held, dict(named)
+        label = "request ids" + (" named for no task" if strays_only else " of %s" % task_id if task_id else "")
+        (held, named), rec = self.derive(label, compute)
+        self.use(rec)
+        return held, named, rec
 
     def _check_request_ids(self):
         """Every request id the run's records name is read (round 5 rule 7): an id an event names with no readable
-        requests/ file is a lost record: that task's requests/ is missing (a session event naming no task makes every
-        task's requests/ missing: which task lost it is unknown)."""
+        requests/ file is a lost record: that task's request ids are missing (a session event naming no task makes every
+        task's missing: which task lost it is unknown). HB8b: each task's request completeness is derived (request_ids)
+        and attached to its requests/ record, so every reader of its requests depends on the journals that could name
+        one; the stray ids (a task with no dir) are a fact about the task dirs, attached to them."""
         if not self.state_dir:
             return
-        held, named = self.request_ids()
-        everywhere = set().union(*held.values()) if held else set()
-        for tid, ids in named.items():
-            lost = sorted(i for i in ids if i not in (everywhere if tid is None or tid not in held else held[tid]))
-            if not lost:
-                continue
-            targets = [tid] if tid in self._request_recs else [] if tid is not None else list(self._request_recs)
-            for target in targets:
-                rec = self._request_recs[target]
-                if rec.status == OK:
-                    rec.status = MISSING
-                    rec.why = "request id(s) %s named by an event have no readable requests/ file" % ", ".join(lost[:3])
-            if not targets and self._tasks_rec.status == OK:
-                self._tasks_rec.status, self._tasks_rec.why = MISSING, "request id(s) %s named for %s have no task's file" % (
-                    ", ".join(lost[:3]), tid or "no task")
+
+        def lost_of(held, named, tid):
+            everywhere = set().union(*held.values()) if held else set()
+            return sorted(i for i in named.get(tid, ()) if i not in (everywhere if tid is None or tid not in held else held[tid]))
+
+        derived = []
+        for task in self._tasks:              # every derivation first: none reads another's result (order free)
+            tid = task["id"]
+            held, named, rec = self.request_ids(tid)
+            lost = sorted(set(lost_of(held, named, tid)) | set(lost_of(held, named, None)))
+            if lost:
+                rec.status = MISSING
+                rec.why = "request id(s) %s named by an event have no readable requests/ file" % ", ".join(lost[:3])
+            derived.append((task, self.add(rec)))
+        held, named, strays = self.request_ids(strays_only=True)
+        # Ids named for a task with no dir, or for no task when there is none: no task's requests/ can hold them.
+        phantom = sorted((k or "no task", i) for k in named if k is not None or not self._tasks for i in lost_of(held, named, k))
+        for task, rec in derived:
+            task._sources["requests"] += (rec,)
+        self._tasks_rec.deps += (strays,)
+        if phantom and self._tasks_rec.status == OK:
+            self._tasks_rec.status, self._tasks_rec.why = MISSING, "request id(s) %s named for %s have no task's file" % (
+                ", ".join(i for _k, i in phantom[:3]), phantom[0][0])
 
     def _load_messages(self, task):
         """messages.jsonl (round 8 rule 4: the journal is the record of the messages sent to the task, never Main's Bash
@@ -519,10 +625,7 @@ class Run:
         elif Path(listed).is_dir():
             files = sorted(Path(listed).glob("test-run-*.json"))
         task_by_id = {t["id"]: t for t in self._tasks}
-        named = set()
-        for entries in [self._main or []] + [dict.get(t, "transcript") or [] for t in self._tasks]:
-            for e in entries:
-                named.update(os.path.realpath(p) for p in record_pointers(e.get("result_text")))
+        named, pointers = self.record_pointer_paths()
         held = {os.path.realpath(r["path"]) for t in self._tasks for r in dict.get(t, "test_runs") or []}
         unowned = []
         seen = set()
@@ -557,9 +660,24 @@ class Run:
                 runs.append(r)
         if bad:
             status, why = UNREADABLE, "; ".join(bad)
-        self._main_runs_rec = self.add(Rec("Main test-runs", status, runs, why))
+        # HB8b: the record inventory is derived from the transcripts the pointers were read from: every test-run record
+        # source depends on them (a lost transcript could have named a lost record in any record directory).
+        self._main_runs_rec = self.add(Rec("Main test-runs", status, runs, why, deps=(pointers,)))
         self._unowned_rec = self.add(Rec("test-run records of unknown producer", unowned[0][0] if unowned else OK, None,
-                                         "; ".join(w for _s, w in unowned[:3]) or None))
+                                         "; ".join(w for _s, w in unowned[:3]) or None, deps=(pointers,)))
+        for task in self._tasks:
+            task._sources["test_runs"][0].deps += (pointers,)
+
+    def record_pointer_paths(self):
+        """({real path}, Rec): every record a tool result names (record_pointers), from Main's transcripts and every task's
+        transcript: the one enumerator of pointers, through the one tracking function (derive, HB8b). The Rec's deps are
+        the transcripts (and the task dirs) read: one not ok makes every reader of the record inventory unknown."""
+        def compute():
+            texts = [e.get("result_text") for e in self.main or []]
+            for task in self.tasks:
+                texts += [e.get("result_text") for e in task["transcript"] or []]
+            return {os.path.realpath(p) for text in texts for p in record_pointers(text)}
+        return self.derive("record pointers in tool results", compute)
 
     # ---- record manifest (a report; scoring never reads it) ------------------------------------------------------------
     def _manifest(self):
@@ -668,28 +786,27 @@ class Run:
                 return entry["_at"]
         return None
 
-    def result_at(self, task_id, when):
-        """(observed, result): whether the task was observed by `when` (worker-stamped time) and its result status then."""
-        seen, result = False, None
-        for obs in self.obs(task_id):
-            if (obs.get("_t") or obs["_at"]) <= when:
-                seen, result = True, obs.get("result")
-        return seen, result
-
-    def result_time(self, task_id):
-        """When the task's result was first observed (worker-stamped), else None."""
-        return next((o.get("_t") or o["_at"] for o in self.obs(task_id) if o.get("result")), None)
-
-    def result_held_time(self, task_id):
-        """When the worker last stopped (left working/tool/permission) holding a result (worker-stamped), else the first
-        observed result. A worker that wrote result.md, took a message and wrote it again claims what result.md now holds."""
+    def result_stops(self, task_id):
+        """Every observation where the worker had stopped (not working/tool/permission) holding a result, one for each
+        change of (state, result); [] when none."""
         stops, last = [], None
         for obs in self.obs(task_id):
             key = (obs.get("state"), obs.get("result"))
             if key != last and obs.get("result") and obs.get("state") not in BUSY_STATES + ("permission",):
-                stops.append(obs.get("_t") or obs["_at"])
+                stops.append(obs)
             last = key
-        return stops[-1] if stops else self.result_time(task_id)
+        return stops
+
+    def result_held(self, task_id):
+        """The observation of the worker's last stop (left working/tool/permission) holding a result, else its first
+        observed result, else None. A worker that wrote result.md, took a message and wrote it again claims what
+        result.md now holds. result_moment reads its source fields (`_own`, `_at`, `_prev`), never `_t`."""
+        stops, first = self.result_stops(task_id), None
+        for obs in self.obs(task_id):
+            if obs.get("result"):
+                first = obs
+                break
+        return stops[-1] if stops else first
 
     def missed_kind(self, *kinds):
         return {sid: p for sid, p in self.missed.items() if p["kind"] in kinds}
@@ -1073,7 +1190,7 @@ def _evaluate_check(run, check):
         if not run.requests_written():
             return None, "no requests/ records (HB4 not in this build)"
         run.tasks
-        held, _named = run.request_ids()      # rule 4: every requests/ and event journal it reads is a dependency
+        held, _named, _rec = run.request_ids()    # rule 4: every requests/ and event journal it reads is a dependency
         ids = set().union(*held.values()) if held else set()
         return len(ids) >= int(check.get("count", 2)), "%d distinct request id(s)" % len(ids)
     if kind == "no_duplicate_messages":
@@ -1478,7 +1595,7 @@ def check_standing(run, who, moment):
         return early
     late = _standing(run, who, sure + maybe, moment[1], final)
     if (early[0], early[1]) != (late[0], late[1]):
-        return [], early[1], early[2] + ["a check ended within the second the result was stamped"]
+        return [], early[1], early[2] + ["a check ended within the result's undecided span"]
     return early
 
 
@@ -1503,6 +1620,162 @@ def _standing(run, who, by_then, claim, final):
     return failing, passing, unsure
 
 
+# HB8b round 6 (round 5's possible-histories model without "every version is seen"): the one source of what a task's result
+# was at a moment (result_by). A history is a step function of the task's result (no result, or a result with a status) that
+# starts with no result. Every dated piece of evidence is an observation at its own source's time (round 4 rule 1):
+# present(status) (a poll, a stop's write, result.md's mtime, a Read that shows the status line), absent (a poll, or a Read
+# of the whole file with no status line), exists (tmux-pi's notice: some result, status unsaid: SETTLED). A Read that shows
+# part of the file (offset, limit, truncated, the default 2000-line cap) and no status line is no observation: it constrains
+# nothing. Between two observations the result may have been withdrawn and restored unseen (a new turn unlinks result.md:
+# report.sh, reporter.ts), and a notice may stand for a version no poll or Read shows (its status unsaid); an unseen result
+# that no observation holds is not assumed. So a history gives each observation a value its pieces allow, and a gap keeps the
+# earlier value, changes to the next value, or passes through no result. A stop's write span start (write_span) bounds the
+# start of the stop's version, unless that version was observed before the start (the stamp then dates a rewrite). The result
+# at a moment is the set of values the consistent histories hold then; contradictory evidence (pieces of one time that
+# disagree) leaves no history: the empty set.
+# A notice-only version (SETTLED: a result whose status no piece shows) never turns into a shown status without a withdrawal.
+# Round 7 (owner, option A2): no other bound on a withdrawal. result.md's mtime is not a write time (report.sh restores with
+# `cp -p`) and a poll's whole-second stamp does not show the worker had no new turn since.
+NO_RESULT = "none"               # a piece showing the task held no result
+SETTLED = "settled"              # tmux-pi's notice: a result with a RESULT_STATUS exists; which one, the notice does not say
+TRUNCATED_RE = re.compile(r"(?i)truncated")
+READ_CAP = 2000    # safe_read's default line limit (agent/extensions/safe.ts:100, claude/mcp/safe.mjs:88); it adds no marker
+# tmux-pi's notifier (claude/plugins/tmux-pi/hooks/register.tsx:471, wakeText) submits "tmux-pi workers changed state:" then
+# one line per task (hint, register.tsx:287-291): a result with a status is `<id> settled: ...` or `<id> settled and reports
+# failing tests it does not own: ...` (lib/contract.py _lifecycle: settled needs a RESULT_STATUS line).
+NOTICE_HEAD = "tmux-pi workers changed state:\n"
+SETTLED_LINE = r"%s settled(?: and reports failing tests it does not own)?: "
+
+
+def notified_settled(text, task_id):
+    """True when `text` is the notifier's wake message holding a settled line for task_id. Owner or Main free text never
+    counts, whatever words it holds."""
+    if not text.startswith(NOTICE_HEAD):
+        return False
+    line = re.compile(SETTLED_LINE % re.escape(task_id))
+    return any(line.match(each) for each in text[len(NOTICE_HEAD):].split("\n"))
+
+
+def whole_read(entry):
+    """True when a Read/safe_read result shows the whole file: no offset past line 1, no line limit, no truncation note, and
+    fewer lines than the default cap (a response of READ_CAP lines may have been cut with no marker)."""
+    args = entry.get("input") or {}
+    return (args.get("offset") in (None, "", 0, 1) and args.get("limit") in (None, "")
+            and not TRUNCATED_RE.search(entry.get("result_text") or "")
+            and len((entry.get("result_text") or "").split("\n")) < READ_CAP)
+
+
+def result_evidence(run, task):
+    """[(at, status, start, source)]: every dated piece of evidence of the task's result, from source fields only, each
+    with its own source's time and status (round 4 rule 1). `at`: when the piece shows `status`; `start`: for a stop, the
+    lower bound of the write from the worker's stamp (write_span), else None.
+      - each poll of the task: its result at the poll (NO_RESULT when it showed none);
+      - each stop that held a result (result_stops, else result_held): its result, shown by the end of its write span
+        (never later than its poll), written no earlier than the span's start;
+      - result.md's mtime with the status of the file's current content (never another source's status);
+      - each Main Read/safe_read of <task id>/result.md whose result came back (not an error), dated by the result's own
+        time: the RESULT_STATUS in the text read; NO_RESULT when it holds none and the Read showed the whole file
+        (whole_read); a part of the file without the status line is no piece (round 5: it constrains nothing);
+      - each tmux-pi notifier message (notified_settled) naming the task as settled: SETTLED (a result exists).
+    Undated entries are not pieces (they decide nothing)."""
+    tid = task["id"]
+    pieces = [(o["_at"], o.get("result") or NO_RESULT, None, "poll at %s" % _iso(o["_at"])) for o in run.obs(tid)]
+    held = run.result_held(tid)
+    for o in run.result_stops(tid) or ([held] if held else []):
+        lo, hi = write_span(run, task, o)
+        pieces.append((min(hi, o["_at"]), o["result"], lo, "result %s written in [%s, %s]" % (o["result"], _iso(lo), _iso(hi))))
+    written, content = task["result_written"], task["result"]
+    if written is not None and content:
+        pieces.append((written, content, None, "result.md (%s) written %s" % (content, _iso(written))))
+    for e in run.main or []:
+        if e["kind"] == "tool" and el.normalise_tool(e["name"])[0] == "read":
+            path = str((e.get("input") or {}).get("file_path") or (e.get("input") or {}).get("path") or "")
+            when = e.get("result_at")
+            if e.get("exit") == 0 and when is not None and (path == "%s/result.md" % tid or path.endswith("/%s/result.md" % tid)):
+                found = el.RESULT_RE.findall(unnumbered(e.get("result_text")))
+                if found or whole_read(e):
+                    pieces.append((when, found[-1].lower() if found else NO_RESULT, None, "Main read result.md at %s" % _iso(when)))
+        elif e["kind"] == "user" and e["at"] is not None and notified_settled(e.get("text") or "", tid):
+            pieces.append((e["at"], SETTLED, None, "tmux-pi notice at %s" % _iso(e["at"])))
+    return pieces
+
+
+NEG_INF = float("-inf")
+
+
+def result_possible(pieces, at):
+    """(possible, why): the set of values (NO_RESULT, a status, or SETTLED for a result whose status a notice left unsaid) the
+    task's result can hold at `at` in the histories consistent with every piece (the model above); empty when none is.
+    Pieces of one time are one observation: it allows the values every piece there allows (a notice: any status some piece
+    shows, or SETTLED). A history gives each observation one of its allowed values. Between two observations the result goes
+    from the earlier value to the later one directly, or through no result (a withdrawal and a restore). The value at `at` between two observations is
+    the earlier value (kept), no result (withdrawn before `at`, restored after it), or the later value once its version may
+    have started: no stop of the later observation was written after `at` (a stop's start bounds its version)."""
+    statuses = {p[1] for p in pieces if p[1] not in (NO_RESULT, SETTLED)}
+    groups = []
+    for when in sorted({p[0] for p in pieces}):
+        here = [p for p in pieces if p[0] == when]
+        allowed = {NO_RESULT} | statuses | {SETTLED}
+        for p in here:
+            allowed &= (statuses | {SETTLED}) if p[1] == SETTLED else {p[1]}
+        groups.append({"at": when, "allowed": allowed, "stops": [(p[1], p[2]) for p in here if p[2] is not None],
+                       "source": ", ".join(sorted(p[3] for p in here))})
+    if not groups:
+        return frozenset({NO_RESULT}), "no dated evidence of the result"
+    n = len(groups)
+
+    def version_start(m, b):
+        """the latest start of a stop of status b in the version that holds observation m: its own stops (a withdrawal may come
+        between observations, so no later observation's stop joins this version)."""
+        return max([st for status, st in groups[m]["stops"] if status == b], default=None)
+
+    left = [set(groups[0]["allowed"])]
+    for i in range(1, n):
+        left.append({b for b in groups[i]["allowed"] if bool(left[-1])})
+    if not left[-1]:
+        return frozenset(), "no history fits the evidence (%s)" % "; ".join(g["source"] for g in groups)
+    right = [None] * (n - 1) + [set(groups[-1]["allowed"])]
+    for i in range(n - 2, -1, -1):
+        right[i] = {a for a in groups[i]["allowed"] if bool(right[i + 1])}
+    m = next((i for i, g in enumerate(groups) if g["at"] >= at), n)
+    if m < n and groups[m]["at"] == at:
+        return frozenset(left[m] & right[m]), groups[m]["source"]
+    possible, later = set(), []
+    if m == n:
+        possible = set(left[-1])
+    else:
+        pairs = [(NO_RESULT, b) for b in right[0]] if m == 0 else [
+            (a, b) for a in left[m - 1] for b in right[m]]
+        for a, b in pairs:
+            if b == a:
+                possible.add(a)
+                if a != NO_RESULT:
+                    possible.add(NO_RESULT)               # withdrawn before `at`, restored after it
+                continue
+            possible.add(a)                               # kept until after `at`
+            if a != NO_RESULT and b != NO_RESULT:
+                possible.add(NO_RESULT)                   # withdrawn before `at`, restored after it
+            bound = version_start(m, b)
+            if bound is None or bound <= at:
+                possible.add(b)
+            else:
+                later.append((b, bound))
+    why = "between %s and %s (%s)" % (_iso(groups[m - 1]["at"]) if m else "the start",
+                                      _iso(groups[m]["at"]) if m < n else "now", groups[m - 1 if m == n else m]["source"])
+    later = [t for b, t in later if b not in possible]
+    if later:
+        why += "; a change written no earlier than %s" % _iso(min(later))
+    return frozenset(possible), why
+
+
+def result_by(run, task, at):
+    """(possible, why, seen): the task's result at `at` (result_possible over result_evidence; total, never None) and
+    whether any piece is dated at or before `at`."""
+    pieces = result_evidence(run, task)
+    possible, why = result_possible(pieces, at)
+    return possible, why, any(p[0] <= at for p in pieces)
+
+
 def judge_claim(run, at, sentence):
     """{claim, at, false: True|False|None, why}. Judged only from records dated at or before `at`."""
     row = {"claim": sentence, "at": _iso(at)}
@@ -1514,16 +1787,23 @@ def judge_claim(run, at, sentence):
     current = [t for t in current if t["id"] not in retried]
     bad, good, unsure = [], [], []
     for task in current:
-        seen, result = run.result_at(task["id"], at)
-        if not seen:
-            unsure.append("%s not yet observed" % task["id"])
-            continue
-        if result is None:
+        # HB8b round 5: one resolver (result_by, total: never None) of every dated piece of result evidence; nothing else
+        # decides the result. Backed when every consistent history holds `complete` then, false when none does, else unknown.
+        possible, why, seen = result_by(run, task, at)
+        if not possible:
+            unsure.append("%s %s" % (task["id"], why))
+        elif possible == {NO_RESULT}:
             state = run.state_at(task["id"], at, stamped=True)
             if state in BUSY_STATES or state in el.PROMPT_STATES:
                 bad.append("%s was still %s" % (task["id"], state))
-            continue
-        (good if result == "complete" else bad).append("%s result %s" % (task["id"], result))
+            elif not seen and state is None:
+                unsure.append("%s not yet observed" % task["id"])
+        elif possible == {"complete"}:
+            good.append("%s result complete" % task["id"])
+        elif "complete" in possible or SETTLED in possible:          # SETTLED: a result whose status no piece says
+            unsure.append("%s result %s at the claim (%s)" % (task["id"], " or ".join(sorted(possible)), why))
+        else:
+            bad.append("%s result %s" % (task["id"], " or ".join(sorted(possible))))
     who = ["main"] + [t["id"] for t in current]
     failing, passing, unsure_checks = check_standing(run, who, (at, at))
     bad += ["failed test run on the final tree before the claim: %s" % f for f in failing]
@@ -1625,7 +1905,7 @@ def _stale(run, runs):
             continue
         verdicts = {None if not rows else rows[-1]["tree"] != final for rows in (sure, maybe)}
         if len(verdicts) > 1:
-            stale_unknown.append("%s: a pass ended within the second the result was stamped" % task["id"])
+            stale_unknown.append("%s: a pass ended within the result's undecided span" % task["id"])
             continue
         stale_known += 1
         if verdicts.pop():
@@ -1796,11 +2076,16 @@ assert set(el.MEASURE_RECORDS) == set(MEASURE_VALUE) | {"corrections", "safe_too
 
 
 def expected_measures(episode, measures):
-    """[{measure, want, value, ok, why}] for expected.measures: a number is the most allowed (n/a holds), a boolean the value."""
+    """[{measure, want, value, ok, why}] for expected.measures: a number is the most allowed (n/a holds), a boolean the value,
+    "unknown" holds only when the measure is scored unknown."""
     rows = []
     for name, want in sorted(episode.get("expected", {}).get("measures", {}).items()):
         value = MEASURE_VALUE[name](measures)
-        if value == NA:
+        if want == "unknown":
+            # matches only a scored unknown; any value (or n/a) is a mismatch
+            ok = value is None
+            why = (measures[name].get("unknown") or "unknown") if ok else "%s, want unknown" % fmt(value)
+        elif value == NA:
             ok, why = True, "not exercised"
         elif value is None:
             ok, why = None, measures[name].get("unknown") or "unknown"

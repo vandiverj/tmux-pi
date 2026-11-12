@@ -278,8 +278,9 @@ def validate_episode(episode, where="episode"):
     for name, want in measures.items():
         if name not in EXPECTABLE_MEASURES:
             raise EpisodeError("%s: expected measure %s: must be one of %s" % (where, name, "|".join(EXPECTABLE_MEASURES)))
-        if not isinstance(want, (bool, int, float)):
-            raise EpisodeError("%s: expected measure %s: must be a number (the most allowed) or true/false" % (where, name))
+        if want != "unknown" and not isinstance(want, (bool, int, float)):
+            raise EpisodeError("%s: expected measure %s: must be a number (the most allowed), true/false or \"unknown\" "
+                               "(matches only a scored unknown)" % (where, name))
     checks = episode["expected"].get("checks", [])
     records = episode["expected"].get("records")
     if not isinstance(records, list) or any(r not in RECORD_KINDS for r in records):

@@ -110,11 +110,15 @@ class AgentCase(unittest.TestCase):
         self.env = {**outside_session(), "TP_STATE_DIR": str(self.state)}
         self.env.pop("TMUX", None)
 
-    def run_agent(self, *argv, submitted=True, worker=False):
+    def run_agent(self, *argv, submitted=True, worker=False, during=None):
+        """during: run inside the faked send, as another writer acting while the text is typed (the worker's own state
+        change closing a request the message answers)."""
         sent = []
 
         def send(pane, text, task_dir=None, token=None):
             sent.append((pane, text, token))
+            if during:
+                during()
             return {"submitted": submitted, "attempts": 1 if submitted else 3}
         out, err = io.StringIO(), io.StringIO()
         env = {**self.env, **({"TP_TASK_DIR": str(self.task)} if worker else {})}
@@ -177,12 +181,84 @@ class TpAgentRequestTests(AgentCase):
         self.assertEqual(self.legacy()["status"], "answered")
         value, _, _, _ = self.run_agent("message", "w1", "--resolves", req, "--text", "again")  # already resolved: unchanged
         self.assertEqual(value["resolves"]["resolved"], False)
+        # HB6b1 rule 2: the owner decided, Main relays: by owner, with the owner's words on the resolved event
+        self.run_agent("request", "--kind", "context", "--what", "api", "--reason", "fetch", worker=True)
+        second = self.legacy()["id"]
+        value, _, error, _ = self.run_agent("message", "w1", "--resolves", second, "--by", "owner", "--quote", " yes, use it ",
+                                            "--text", "the owner says yes")
+        self.assertIsNone(error)
+        self.assertEqual(self.requests()[second]["resolution"], {"by": "owner", "how": "message", "ref": value["delivery"]})
+        resolved = [e for e in hub_records.read_events(self.task) if e["kind"] == "request.resolved" and e["ref"] == second]
+        self.assertEqual([(e["detail"]["by"], e["detail"]["quote"], e["actor"]) for e in resolved], [("owner", "yes, use it", "main")])
+        # HB6b1 round 2 (F1): who answered survives another writer closing the request first. Each row: how the request
+        # opens, the writer acting while the message is typed, confirmed?, then the record and request_log it leaves.
+        hook = lambda **f: hub_records.claude_hook(self.task, f, f.pop("prev"), f.pop("new"), calls=f.pop("calls", None))  # noqa: E731
+        opens = {"input": lambda: hub_records.pi_state(self.task, "waiting", "which file?")["opened"]["id"],
+                 "permission": lambda: hook(hook_event_name="Notification", message="Claude needs your permission to use Bash",
+                                            prev="working", new="permission", calls=[{"id": "tu1", "name": "Bash"}])["opened"]["id"],
+                 "capability": lambda: (self.run_agent("request", "--kind", "tool", "--what", "x", "--reason", "y", worker=True),
+                                        self.legacy()["id"])[1]}
+        pi_working = lambda: hub_records.pi_state(self.task, "working")  # noqa: E731  reporter.ts:217-227 agent_start
+        ran = lambda: hook(hook_event_name="PostToolUse", tool_use_id="tu1", prev="permission", new="working")  # noqa: E731
+        superseded = lambda: hub_records.open_request(self.task, "permission", "other prompt", "other prompt", "hook", "hook",  # noqa: E731
+                                                       supersede=True)
+        withdrawn = lambda: hub_records.resolve(self.task, current[0], "main", "withdrawn", None, "main", "file",  # noqa: E731
+                                                status="withdrawn")
+        races = [
+            # (name, kind, during, confirmed, (status, by, how) the other writer left, answer by or None, resolved?, closes in
+            # request_log). Round 3: the answer is recorded whatever closed the request (resolved, superseded, withdrawn).
+            ("pi input closed by agent_start while typed", "input", pi_working, True, ("resolved", "worker", "left-state"), "owner", True, 1),
+            ("claude permission closed by PostToolUse while typed", "permission", ran, True, ("resolved", "hook", "approved"), "owner", True, 1),
+            ("claude permission superseded by a newer prompt while typed", "permission", superseded, True,
+             ("superseded", "hook", "superseded"), "owner", True, 1),
+            ("input withdrawn by Main while typed", "input", withdrawn, True, ("withdrawn", "main", "withdrawn"), "owner", True, 1),
+            ("unconfirmed delivery invents no answer", "input", pi_working, False, ("resolved", "worker", "left-state"), None, False, 1),
+            ("capability answered by Main meanwhile: an answer never replaces an answer", "capability",
+             lambda: hub_records.resolve(self.task, current[0], "main", "message", "[tp:other]", "main", "file"), True,
+             ("resolved", "main", "message"), None, False, 1),
+            ("no race: the owner's answer closes it; a state change after never overwrites it", "input", None, True,
+             ("resolved", "owner", "message"), None, True, 1),
+        ]
+        for name, kind, during, confirmed, closed, answered, resolved, closes in races:
+            with self.subTest(name):
+                for r in hub_records.open_requests(self.task):
+                    hub_records.resolve(self.task, r["id"], "main", "withdrawn", None, "main", "file", status="withdrawn")
+                current = [opens[kind]()]
+                value, _, error, _ = self.run_agent("message", "w1", "--resolves", current[0], "--by", "owner", "--quote", "go",
+                                                    "--text", "the owner says go", submitted=confirmed, during=during)
+                if during is None:
+                    pi_working()
+                record = self.requests()[current[0]]
+                resolution = record["resolution"]
+                self.assertEqual((record["status"], resolution["by"], resolution["how"]), closed)
+                given = resolution.get("answer")
+                self.assertEqual(given and (given["by"], given["how"], given["ref"], given["quote"]),
+                                 answered and (answered, "message", value["delivery"], "go"))
+                self.assertEqual(value["resolves"]["resolved"], resolved)
+                log = [e for e in hub_records.request_log(self.task) if e["id"] == current[0] and e["change"] == "closed"]
+                self.assertEqual(len(log), closes)
+                if answered:
+                    self.assertIn("the answer is recorded on it", value["resolves"]["why"])
+                if kind == "capability":
+                    self.assertEqual(self.legacy()["status"], "answered")
 
     def test_an_unknown_request_id_is_refused_before_anything_is_typed(self):
         _, sent, error, _ = self.run_agent("message", "w1", "--resolves", "req-01JABCDEFGHJKMNPQRSTVWXYZ0", "--text", "yes")
         self.assertIn("has no request", error)
         self.assertEqual(sent, [])
         self.assertFalse((self.task / "messages.jsonl").exists())
+        # HB6b1 rule 2: who answered is never inferred; an owner answer without the owner's words is refused, untyped
+        self.run_agent("request", "--kind", "tool", "--what", "browser", "--reason", "render", worker=True)
+        req = self.legacy()["id"]
+        for argv, refusal in ((("--resolves", req, "--by", "owner"), "needs --quote"),
+                              (("--resolves", req, "--by", "owner", "--quote", "  "), "needs --quote"),
+                              (("--by", "owner", "--quote", "yes"), "needs --resolves"),
+                              (("--resolves", req, "--quote", "yes"), "needs --by owner")):
+            _, sent, error, _ = self.run_agent("message", "w1", *argv, "--text", "yes")
+            self.assertIn(refusal, error or "", argv)
+            self.assertEqual(sent, [], argv)
+        self.assertFalse((self.task / "messages.jsonl").exists())
+        self.assertEqual(self.requests()[req]["status"], "open")
 
     def test_the_capability_file_stays_pending_while_another_capability_request_is_open(self):
         self.run_agent("request", "--kind", "tool", "--what", "browser", "--reason", "render", worker=True)

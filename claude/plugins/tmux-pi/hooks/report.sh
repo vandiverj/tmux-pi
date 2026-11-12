@@ -250,6 +250,15 @@ jq -n --argjson prev "$prev" --argjson in "$input" --argjson usage "$usage" \
   def reply: ($prev.replyTurn | if type == "number" and . == floor and . > settled and . <= turn then . else settled + 1 end);
   def hint: ((.tool_input.file_path // .tool_input.path // .tool_input.command // .tool_input.pattern // "") | tostring);
   def clip: gsub("\\s+"; " ") | if length > 80 then .[0:79] + "…" else . end;
+  # The calls in flight (HB6b1 round 2), what a permission prompt is matched to: the Claude Notification names only the tool;
+  # PreToolUse, PostToolUse, PostToolUseFailure and PermissionDenied carry the tool_use_id of the call. PreToolUse adds
+  # {id, name} (id null when its input has none: that call can then never be told apart), the other three remove their id,
+  # Stop clears the list; at most the last 16 are kept.
+  def calls: ($prev.calls | if type == "array" then . else [] end);
+  # calls_dropped (round 3): the cap evicted an entry, so no match is proof of identity until the list is empty again.
+  def dropped: ($prev.calls_dropped == true);
+  def done_call: (if ($in.tool_use_id | type) == "string" then [calls[] | select(.id != $in.tool_use_id)] else calls end)
+    | { calls: ., calls_dropped: (if length == 0 then false else dropped end) };
   # Transcripts carry no cost. cost stays numeric 0 because lib/goal.py treats a
   # non-numeric cost as unmetered and fails closed; costKnown:false marks it unknown.
   { id: $id, harness: "claude", state: "starting", tool: "", model: "", turns: 0, tools: 0, toolErrors: 0,
@@ -262,15 +271,18 @@ jq -n --argjson prev "$prev" --argjson in "$input" --argjson usage "$usage" \
           promptSubmits: (($prev.promptSubmits // 0) + 1),
           promptLog: ((($prev.promptLog // []) + [{ n: (($prev.promptSubmits // 0) + 1), at: $now, tokens: $record.tokens, marks: $record.marks }]) | .[-8:]) }
       elif $in.hook_event_name == "PreToolUse" and active then
-        { state: "tool", tool: ("\($in.tool_name) \($in | hint)" | clip), tools: (($prev.tools // 0) + 1) }
-      elif $in.hook_event_name == "PostToolUse" and active then { state: "working", tool: "", toolErrors: 0 }
+        { state: "tool", tool: ("\($in.tool_name) \($in | hint)" | clip), tools: (($prev.tools // 0) + 1),
+          calls: ((calls + [{ id: (if ($in.tool_use_id | type) == "string" then $in.tool_use_id else null end),
+                              name: (if ($in.tool_name | type) == "string" then $in.tool_name else null end) }]) | .[-16:]),
+          calls_dropped: (dropped or ((calls | length) >= 16)) }
+      elif $in.hook_event_name == "PostToolUse" and active then { state: "working", tool: "", toolErrors: 0 } + done_call
       elif $in.hook_event_name == "PostToolUseFailure" and active then
-        { state: "working", tool: "", toolErrors: (($prev.toolErrors // 0) + 1) }
+        { state: "working", tool: "", toolErrors: (($prev.toolErrors // 0) + 1) } + done_call
       elif $in.hook_event_name == "Notification" and active then
         (if ($in.message // "" | test("permission"; "i")) then { state: "permission", tool: ($in.message | clip) } else {} end)
-      elif $in.hook_event_name == "PermissionDenied" and active then { state: "working", tool: "" }
+      elif $in.hook_event_name == "PermissionDenied" and active then { state: "working", tool: "" } + done_call
       elif $in.hook_event_name == "Stop" and active then
-        { state: "waiting", tool: "", promptTurn: turn, settledTurn: turn,
+        { state: "waiting", tool: "", promptTurn: turn, settledTurn: turn, calls: [], calls_dropped: false,
           completedTurn: (if $done == "yes" then ([completed, reply] | max) else completed end) }
       else {} end )
   + ( if ($in.hook_event_name == "UserPromptSubmit" or ($in.hook_event_name == "Stop" and active)) and $usage != null
@@ -282,7 +294,11 @@ rm -f "$state_tmp"
 
 # Request identity (HB4a, docs/plans/det-prep/hub/interfaces.md section 4): entering `permission` opens (or finds, for the
 # same prompt seen again) a request record under requests/ with an id; leaving `permission` (a tool event, a new prompt, a
-# PermissionDenied, a Stop) resolves it with how `left-state`. lib/hub_records.py is the one writer; it runs only on those
+# PermissionDenied, a Stop) resolves it at this hook with how approved (the asked call's PostToolUse/PostToolUseFailure: it
+# ran, so the close is the call's end, not the approval, which no hook sees), denied (the asked call's PermissionDenied) or
+# left (anything else; HB6b1, hub_records.permission_how). The asked call is told by tool_use_id, never by tool name:
+# --calls passes the calls in flight before this hook (state.json calls) and a closing hook's tool_use_id is in its input.
+# lib/hub_records.py is the one writer; it runs only on those
 # transitions, so ordinary tool events start no extra process. A failure there never fails the hook.
 prev_state="$(jq -r '.state // empty' <<<"$prev" 2>/dev/null)"
 new_state="$(jq -r '.state // empty' "$state" 2>/dev/null)"
@@ -290,6 +306,8 @@ if [[ "$prev_state" == permission || "$new_state" == permission || "$event" == P
   hub_py="$(dirname "$0")/../../../../lib/hub_records.py"
   py=/usr/bin/python3; [[ -x "$py" ]] || py=python3
   [[ -f "$hub_py" ]] && "$py" "$hub_py" claude-hook --task-dir "$TP_TASK_DIR" --prev-state "$prev_state" \
-    --new-state "$new_state" --prev-tool "$(jq -r '.tool // empty' <<<"$prev" 2>/dev/null)" <<<"$input" >/dev/null 2>&1
+    --new-state "$new_state" --prev-tool "$(jq -r '.tool // empty' <<<"$prev" 2>/dev/null)" \
+    --calls-dropped "$(jq -r '.calls_dropped == true' <<<"$prev" 2>/dev/null || echo false)" \
+    --calls "$(jq -c '.calls | if type == "array" then . else [] end' <<<"$prev" 2>/dev/null || echo '[]')" <<<"$input" >/dev/null 2>&1
 fi
 exit 0

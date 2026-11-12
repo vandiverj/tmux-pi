@@ -113,13 +113,18 @@ def _task(task_dir):
     return Path(task_dir).name
 
 
-def event(task_dir, kind, actor, source, confidence, ref=None, state=None, detail=None):
-    """Append one tp-event:v1 line to TASK_DIR/events.jsonl and return it. A tool name in detail["tool"] is normalised."""
+def event(task_dir, kind, actor, source, confidence, ref=None, state=None, detail=None, at=None, root=None):
+    """Append one tp-event:v1 line to TASK_DIR/events.jsonl and return it. A tool name in detail["tool"] is normalised.
+    `at`: when the event happened, if that was recorded earlier than this write (a queue reason kept in the queue file while
+    the task had no directory yet, HB6b1); default now. `root`: the state directory, for a directory that is not under
+    tasks/ or archive/ (a cancelled queue entry's record, HB6b1 round 2); default the task's own."""
     if kind not in EVENT_KINDS:
         raise ValueError("unknown event kind {!r}".format(kind))
     if actor not in ACTORS or source not in SOURCES or confidence not in CONFIDENCE:
         raise ValueError("bad actor, source or confidence: {!r} {!r} {!r}".format(actor, source, confidence))
-    line = {"v": EVENT_VERSION, "id": new_id("ev"), "at": utc_now(), "task": _task(task_dir), "actor": actor, "kind": kind}
+    if at is not None and (not isinstance(at, str) or not at):
+        raise ValueError("bad event time {!r}".format(at))
+    line = {"v": EVENT_VERSION, "id": new_id("ev"), "at": at or utc_now(), "task": _task(task_dir), "actor": actor, "kind": kind}
     if ref is not None:
         line["ref"] = ref
     if state is not None:
@@ -131,7 +136,8 @@ def event(task_dir, kind, actor, source, confidence, ref=None, state=None, detai
             detail.update(named)
         line["detail"] = detail
     line.update(source=source, confidence=confidence)
-    safe_write.append_text(Path(task_dir) / "events.jsonl", json.dumps(line, sort_keys=False) + "\n", root=_root(task_dir))
+    safe_write.append_text(Path(task_dir) / "events.jsonl", json.dumps(line, sort_keys=False) + "\n",
+                           root=root if root is not None else _root(task_dir))
     return line
 
 
@@ -249,6 +255,34 @@ def resolve(task_dir, req_id, by, how, ref, actor, source, confidence="exact", s
         return _close(task_dir, record, status, by, how, ref, actor, source, confidence, detail), True
 
 
+def answer(task_dir, req_id, by, ref, actor, source, quote=None):
+    """(record, changed): an explicit answer (tp-agent message --resolves, by main or owner, how message, ref the confirmed
+    delivery) to a request that was OPEN when the answer was sent. Open now: it is closed by the answer (as resolve). Closed
+    since by ANY other writer (a state change: pi's agent_start, a Claude hook leaving `permission`; a newer prompt that
+    superseded it; withdrawn; whatever the status): that close, its status and writer stay as written and the answer is
+    recorded beside them, as resolution.answer {by, how, ref, at, quote?} and one request.resolved event naming it
+    (detail.answer: true; request_log does not count it as a second close). Only a request an answer already closed (or
+    was recorded on) is unchanged: an answer never replaces another answer. The rule never looks at the close status.
+    HB6b1 round 3."""
+    detail = {"quote": quote} if quote else None
+    with _locked(task_dir):
+        record = find_request(task_dir, req_id)
+        if record is None:
+            return None, False
+        if record.get("status") == "open":
+            return _close(task_dir, record, "resolved", by, "message", ref, actor, source, detail=detail), True
+        resolution = record.get("resolution") if isinstance(record.get("resolution"), dict) else {}
+        if "answer" in resolution or resolution.get("how") == "message":  # an answer never replaces an answer
+            return record, False
+        given = dict({"by": by, "how": "message", "ref": ref, "at": utc_now()}, **(detail or {}))
+        record = dict(record, resolution=dict(resolution, answer=given))
+        _save(task_dir, record)
+        event(task_dir, "request.resolved", actor, source, "exact", ref=record["id"], state=str(record.get("status")),
+              detail=dict({"kind": record["kind"], "by": by, "how": "message", "resolution_ref": ref, "answer": True},
+                          **(detail or {})))
+        return record, True
+
+
 def resolve_open(task_dir, kind, by, how, ref, actor, source, confidence="exact", detail=None):
     """Close every open request of `kind` (the worker left the state that asked); the closed records."""
     if not requests_dir(task_dir).is_dir():
@@ -273,13 +307,16 @@ def request_log(task_dir):
     (never from row_requests, which is a display window). Each is {seq, id, change: "opened"|"closed", kind, summary, state,
     how?}: seq counts request transitions only, from 1, so a reader keeps "the transitions I have taken" as one number per
     task. A request.opened or request.resolved event is written for every opening and every closing (resolved, superseded,
-    withdrawn) under the requests/ lock, so the log has each transition once, in the order it happened."""
+    withdrawn) under the requests/ lock, so the log has each transition once, in the order it happened. An answer recorded
+    on a request a state change had already closed (answer(), detail.answer) is not a transition: the request closed once."""
     out, summaries = [], {}
     for line in read_events(task_dir):
         kind, ref = line.get("kind"), line.get("ref")
         if kind not in ("request.opened", "request.resolved") or not REQUEST_ID.fullmatch(str(ref or "")):
             continue
         detail = line.get("detail") if isinstance(line.get("detail"), dict) else {}
+        if kind == "request.resolved" and detail.get("answer") is True:
+            continue
         if kind == "request.opened":
             summaries[ref] = str(detail.get("summary") or "")
         entry = {"seq": len(out) + 1, "id": ref, "change": "opened" if kind == "request.opened" else "closed",
@@ -316,10 +353,56 @@ PERMISSION = re.compile(r"permission", re.I)
 TOOL_IN_MESSAGE = re.compile(r"permission to use (\S+)", re.I)
 
 
-def claude_hook(task_dir, hook, prev_state, new_state, prev_tool=""):
+def permission_how(hook, asked_call, calls_dropped=False):
+    """HB6b1 rule 3 (round 2: by call identity, never by tool name): how the hook that ends a permission prompt answered it.
+    `asked_call` is the tool_use_id of the call that asked (claude_hook records it when the prompt opens; None when it could
+    not be told). Claude Code fires PostToolUse or PostToolUseFailure for a call only after it ran, PermissionDenied when a
+    call is denied, each with that call's tool_use_id; a declined dialog fires nothing (tests/test_g3_e2e.py). So: the ASKED
+    call's PostToolUse/PostToolUseFailure is `approved` (it ran; the approval instant itself is not seen by any hook: the
+    request closes when the approved call ENDS), the asked call's PermissionDenied is `denied`. Everything else that ends
+    `permission` (another call's hook, even one with the same tool name; an unknown asked call; a new prompt; Stop) is
+    `left`: whether the prompt was approved is not known from that hook. `calls_dropped` (round 3): the calls-in-flight
+    list evicted an entry (report.sh caps it at 16) and has not emptied since, so no identity is proof: `left`."""
+    if calls_dropped or not isinstance(hook, dict) or not isinstance(asked_call, str) or not asked_call or hook.get("tool_use_id") != asked_call:
+        return "left"
+    name = hook.get("hook_event_name")
+    if name == "PermissionDenied":
+        return "denied"
+    if name in ("PostToolUse", "PostToolUseFailure"):
+        return "approved"
+    return "left"
+
+
+def asking_call(calls, tool):
+    """The tool_use_id of the call a permission prompt asks for, or None. `calls` is the calls in flight when the prompt's
+    Notification came (report.sh keeps them in state.json `calls`: each PreToolUse adds {id, name}, its PostToolUse,
+    PostToolUseFailure or PermissionDenied removes it); the Notification itself names only the tool. Exactly one call in
+    flight with that name (any name when the prompt names none) and a readable id: that call. None, two or more, or an
+    entry without an id: unknown (the close is then `left`, never guessed)."""
+    if not isinstance(calls, list):
+        return None
+    named = [c for c in calls if isinstance(c, dict) and (not tool or c.get("name") == tool)]
+    if len(named) != 1 or not isinstance(named[0].get("id"), str) or not named[0]["id"]:
+        return None
+    return named[0]["id"]
+
+
+def _asked_calls(task_dir):
+    """{request id: the tool_use_id its request.opened event named} (claude_hook writes it as detail.tool_use_id)."""
+    out = {}
+    for line in read_events(task_dir):
+        detail = line.get("detail") if isinstance(line.get("detail"), dict) else {}
+        if line.get("kind") == "request.opened" and isinstance(detail.get("tool_use_id"), str):
+            out[line.get("ref")] = detail["tool_use_id"]
+    return out
+
+
+def claude_hook(task_dir, hook, prev_state, new_state, prev_tool="", calls=None, calls_dropped=False):
     """report.sh's request bookkeeping, after state.json was written. A permission Notification that put the worker in
-    `permission` opens (or finds) the permission request for its message; leaving `permission` for any other state, or a
-    PermissionDenied, resolves the open permission request(s) with how `left-state`."""
+    `permission` opens (or finds) the permission request for its message, with the asking call's tool_use_id when it can be
+    told (asking_call over `calls`, the calls in flight before this hook); leaving `permission` for any other state, or a
+    PermissionDenied, resolves the open permission request(s) at that hook, with how approved, denied or left
+    (permission_how, by call identity) and the hook's name in detail.hook."""
     name = hook.get("hook_event_name") if isinstance(hook, dict) else None
     done = {"opened": None, "resolved": []}
     if new_state == "permission" and name == "Notification":
@@ -327,12 +410,22 @@ def claude_hook(task_dir, hook, prev_state, new_state, prev_tool=""):
         if PERMISSION.search(message):
             found = TOOL_IN_MESSAGE.search(message)
             tool = found.group(1).rstrip(".,;:") if found else (prev_tool.split(" ", 1)[0] if prev_tool else "")
+            asked = None if calls_dropped else asking_call(calls, tool)
+            detail = dict({"tool": tool} if tool else {}, **({"tool_use_id": asked} if asked else {}))
             record, created = open_request(task_dir, "permission", message, message, "hook", "hook", supersede=True,
-                                           detail={"tool": tool} if tool else None)
+                                           detail=detail or None)
             done["opened"] = {"id": record["id"], "created": created}
     elif (prev_state == "permission" and new_state != "permission") or name == "PermissionDenied":
-        done["resolved"] = [r["id"] for r in resolve_open(task_dir, "permission", "hook", "left-state", None, "hook", "hook",
-                                                          detail={"hook": name, "state": new_state})]
+        if not requests_dir(task_dir).is_dir():
+            return done
+        asked = _asked_calls(task_dir)
+        with _locked(task_dir):
+            for record in requests(task_dir):
+                if record.get("status") == "open" and record.get("kind") == "permission":
+                    how = permission_how(hook, asked.get(record["id"]), calls_dropped)
+                    _close(task_dir, record, "resolved", "hook", how, None, "hook", "hook",
+                           detail={"hook": name, "state": new_state})
+                    done["resolved"].append(record["id"])
     return done
 
 
@@ -359,6 +452,8 @@ def main(argv=None):
     c.add_argument("--prev-state", default="")
     c.add_argument("--new-state", default="")
     c.add_argument("--prev-tool", default="")
+    c.add_argument("--calls-dropped", default="false", help="true: state.json calls_dropped (an entry was evicted)")
+    c.add_argument("--calls", default="[]", help="JSON: the calls in flight before this hook (state.json calls)")
     p = sub.add_parser("pi-state")
     p.add_argument("--task-dir", required=True)
     p.add_argument("--state", required=True)
@@ -372,7 +467,12 @@ def main(argv=None):
                 hook = json.loads(sys.stdin.read() or "{}")
             except ValueError:
                 hook = {}
-            out = claude_hook(args.task_dir, hook, args.prev_state, args.new_state, args.prev_tool)
+            try:
+                calls = json.loads(args.calls)
+            except ValueError:
+                calls = None
+            out = claude_hook(args.task_dir, hook, args.prev_state, args.new_state, args.prev_tool, calls,
+                                args.calls_dropped == "true")
         else:
             text = ""
             if args.text_file:

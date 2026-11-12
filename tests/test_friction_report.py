@@ -293,10 +293,12 @@ def ledger_fixture(tmp):
             entry["removal_reasons"] = [r.replace(H, head) for r in removal]
         entries.append(entry)
     drift = [
-        {**GOOD, "sha": sha("- old wording here")},                                # one word changed: stale
+        # one word changed: stale; its pointers are still checked (unresolved key, unchecked label, bad removal pointer), uncounted
+        {**GOOD, "sha": sha("- old wording here"), "reasons": ["key:nokey", "label:labels-X.json#0"], "status": "remove-candidate",
+         "removal_reasons": ["bogus"]},
         {**GOOD, "file": "agent/roles/coder.md", "sha": sha("- moved rule")},      # moved to worker.md: stale + no entry
-        {**GOOD, "file": "agent/roles/gone.md", "sha": sha("- x")},                # file removed
-        {**GOOD, "sha": sha("- dup target"), "reasons": ["key:alpha"]},            # duplicate (file, sha): neither counts
+        {**GOOD, "file": "agent/roles/gone.md", "sha": sha("- x"), "reasons": ["key:nokey"]},  # file removed; pointer still checked
+        {**GOOD, "sha": sha("- dup target"), "reasons": ["key:alpha", "key:nokey"]},  # duplicate (file, sha): neither counts
         {**GOOD, "sha": sha("- dup target"), "reasons": ["key:alpha"]},
     ]
     faults = []
@@ -305,6 +307,8 @@ def ledger_fixture(tmp):
         entry.update({k: v for k, v in change.items() if k != "drop"})
         entry.pop(change.get("drop"), None)
         faults.append(entry)
+    # a valid companion with the faulty rows' identity: every identity seen twice is a duplicate, whatever else is wrong with it
+    faults.append({**GOOD, "sha": sha("- faulty target"), "reasons": ["key:alpha"]})
     ledger = Path(tmp) / "ledger.json"
     ledger.write_text(json.dumps({"schema": report.LEDGER_SCHEMA, "entries": entries + drift + faults + ["not an object"]}))
     return {**p, "ledger": str(ledger), "head": head, "first_fault": len(entries) + len(drift)}
@@ -395,6 +399,16 @@ class FrictionReport(unittest.TestCase):
             return any((w == f"ledger.json entry {n}" or w.startswith(f"ledger.json entry {n} (")) and pr == want + "; entry skipped"
                        for w, pr in ledger_problems)
         skel_by = {(e["file"], e["sha"]): e for e in skel["entries"]}
+        listed = [x for x in out["problems"] if x["source"] in ("ledger", "commit")]
+        nogit_listed = [x for x in nogit["problems"] if x["source"] in ("ledger", "commit")]
+        # entries whose problems name no readable file: a dropped file, file 3, docs/ideas.md, a subfolder file, gone.md, a non-object
+        unattributed = 6
+        # the faulty rows that keep their (file, sha) identity: with the valid companion each is a duplicate
+        kept_identity = sum(not ({"file", "sha"} & ({k for k in c if k != "drop"} | {c.get("drop")})) for c, _ in FAULTS)
+
+        def pointers(rows, sha_):
+            return {(u["role"], u["pointer"]) for u in rows if u["sha"] == sha_}
+        shown = report.render(out)
         cells = [
             # pointer side: unresolved reasons are listed with why
             ("why record", "record not in the store", why.get((sha("- rec missing"), "record:fr/R99"))),
@@ -406,7 +420,8 @@ class FrictionReport(unittest.TestCase):
             ("why malformed", ["malformed pointer", "malformed pointer (commit:<7-40 lowercase hex>)",
                                "malformed pointer (label:<file>#<i>)", "malformed pointer (key:<friction key>)"],
              [why.get((sha("- malformed"), x)) for x in ("bogus", "commit:XYZ", "label:nohash", "key:Bad Key")]),
-            ("unchecked label file", {sha("- label other"): "labels file not given (or not readable)"},
+            ("unchecked label file", {sha("- label other"): "labels file not given (or not readable)",
+                                       sha("- old wording here"): "labels file not given (or not readable)"},
              {u["sha"]: u["why"] for u in led["unchecked"]}),
             ("removal pointer listed", "key not in the mapping", next(u["why"] for u in led["unresolved"]
                                                                      if u["sha"] == sha("- rm unresolved") and u["role"] == "removal")),
@@ -427,6 +442,21 @@ class FrictionReport(unittest.TestCase):
              mp["claude/main-prompt.md"]["needing"]),
             ("duplicate lines covered", 2, next(m["lines"] for m in led["matched"] if m["sha"] == sha("- dup line"))),
             ("one word changed: stale", True, any(s["sha"] == sha("- old wording here") for s in led["stale"])),
+            # a stale entry's pointers are still resolved and listed; nothing of it counts
+            ("stale pointers listed", ({("reason", "key:nokey"), ("removal", "bogus")}, {("reason", "label:labels-X.json#0")}, False),
+             (pointers(led["unresolved"], sha("- old wording here")), pointers(led["unchecked"], sha("- old wording here")),
+              ("claude/main-prompt.md", sha("- old wording here")) in cat)),
+            ("stale removal not counted", False, any(r["sha"] == sha("- old wording here") for r in led["removal"])),
+            ("stale text", True, any(w.startswith("ledger.json entry") and pr == "stale: no current line that needs a reason has this sha"
+                                     for w, pr in ledger_problems)),
+            ("stale heading", True, "no current line that needs a reason has this sha" in shown),
+            # duplicate and missing-file entries: pointers listed, uncounted
+            ("duplicate pointers listed", {("reason", "key:nokey")}, pointers(led["unresolved"], sha("- dup target"))),
+            ("duplicate entries uncounted", False, ("claude/main-prompt.md", sha("- dup target")) in cat),
+            ("missing file pointers listed", {("reason", "key:nokey")},
+             {(u["role"], u["pointer"]) for u in led["unresolved"] if u["file"] == "agent/roles/gone.md"}),
+            # the valid companion of the faulty rows is a duplicate: no justification, no evidence credit
+            ("faulty identity companion uncounted", False, ("claude/main-prompt.md", sha("- faulty target")) in cat),
             # coder.md also has "- coder rule" without an entry
             ("moved to another file", ((1, 1), (0, 1)), ((mp["agent/roles/coder.md"]["stale_entries"], mp["agent/roles/coder.md"]["no_entry"]),
                                                          (mp["agent/contract/worker.md"]["stale_entries"], mp["agent/contract/worker.md"]["no_entry"]))),
@@ -435,12 +465,21 @@ class FrictionReport(unittest.TestCase):
             ("no entry main-prompt", 7, mp["claude/main-prompt.md"]["no_entry"]),
             ("file removed", True, any(w.startswith("ledger.json entry") and "agent/roles/gone.md" in w and pr == "file not found"
                                        for w, pr in ledger_problems)),
-            ("duplicate (file, sha)", 2, sum(pr == "duplicate (file, sha): neither entry counts" for _, pr in ledger_problems)),
+            # the valid pair, then the faulty rows with the valid companion: every entry with the identity is listed
+            ("duplicate (file, sha)", 2 + kept_identity + 1,
+             sum(pr == "duplicate (file, sha): no entry with it counts" for _, pr in ledger_problems)),
+            # one accounting: the totals equal the problems listed, per file where a readable file is named
+            ("problems total", (len(listed), len(nogit_listed)), (led["total"]["problems"], nogit["contract_ledger"]["total"]["problems"])),
+            ("problems per file", (len(listed) - unattributed - 1, 1, 0),  # coder.md: its one stale entry
+             (mp["claude/main-prompt.md"]["problems"], mp["agent/roles/coder.md"]["problems"], mp["agent/contract/worker.md"]["problems"])),
+            ("problems text", True, any(l.startswith("  total:") and "need a reason" in l and l.endswith(f"problems {len(listed)}")
+                                       for l in shown.split("\n"))),
             *[(f"fault {i} {want}", True, fault_listed(p["first_fault"] + i, want)) for i, (_, want) in enumerate(FAULTS)],
             ("entry not an object", True, any(pr == "entry is not an object; skipped" for _, pr in ledger_problems)),
             # ledger level: listed, the rest of the report runs
-            *[(f"ledger {name}", (want, 0, True), (next(x["problem"] for x in o["problems"] if x["source"] == "ledger"),
-                                                   o["contract_ledger"]["entries"], bool(o["contract_size"]["files"])))
+            *[(f"ledger {name}", (want, 0, True, 1), (next(x["problem"] for x in o["problems"] if x["source"] == "ledger"),
+                                                      o["contract_ledger"]["entries"], bool(o["contract_size"]["files"]),
+                                                      o["contract_ledger"]["total"]["problems"]))
               for name, want, o in (("missing", "ledger not readable: FileNotFoundError", levels["missing"]),
                                     ("not json", "ledger not JSON: JSONDecodeError", levels["not json"]),
                                     ("wrong schema", "schema is not tp-contract-ledger:v1; ledger not read", levels["wrong schema"]),
@@ -552,6 +591,7 @@ class FrictionReport(unittest.TestCase):
         self.assertEqual(alpha["occurrences"].get("label"), {"dated": 1, "undated": 1})  # labels and contract files still reported
         self.assertEqual(len(out["contract_size"]["files"]), 2)  # roles dir unreadable: listed, main prompt and worker contract still counted
         self.assertEqual(ledger_problems(out), ["directory not readable; entry not checked"])
+        self.assertEqual(out["contract_ledger"]["total"]["problems"], 1)  # no readable file named: the total only
 
         # a store root that can be traversed but not listed (0o111): the root itself is the listed problem; the other sources report
         with tempfile.TemporaryDirectory() as tmp:
@@ -569,6 +609,7 @@ class FrictionReport(unittest.TestCase):
                 role.chmod(0o644)
                 Path(ledger).chmod(0o644)
         self.assertEqual(ledger_problems(out), ["file not readable; entry not checked"])
+        self.assertEqual((out["contract_ledger"]["total"]["problems"], no_ledger["contract_ledger"]["total"]["problems"]), (1, 1))
         self.assertEqual((ledger_problems(no_ledger), len(no_ledger["contract_size"]["files"])),
                          (["ledger not readable: PermissionError"], 2))
         self.assertEqual([(x["where"], x["problem"]) for x in out["problems"] if x["source"] == "record"],

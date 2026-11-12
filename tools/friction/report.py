@@ -27,6 +27,7 @@ import os
 import re
 import subprocess
 import sys
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -587,14 +588,22 @@ def prefix(text):
     return " ".join(text.split()[:8])
 
 
-def load_ledger(path, problems):
-    """(valid entries, every (file, sha) any entry names). A ledger that cannot be read, parsed or is of another schema is one
-    problem and yields no entries; each faulty entry is one problem per fault and is skipped."""
+def load_ledger(path, problems, tally=None):
+    """(valid entries, {(file, sha): how many entries name it}). The multiplicity counts every entry with a string `file` and `sha`,
+    faulty or not, so an identity seen twice is a duplicate whatever else is wrong with either entry. A ledger that cannot be read,
+    parsed or is of another schema is one problem and yields no entries; each faulty entry is one problem per fault and is skipped;
+    each entry with a duplicated identity is one more problem (valid ones are returned, flagged `duplicate`, so their pointers can
+    still be checked). `tally` gets, per problem listed, the file it names (None: no file)."""
     name = Path(path).name
 
+    def add(where, text, file=None):
+        problems.append({"source": "ledger", "where": where, "problem": text})
+        if tally is not None:
+            tally.append(file if isinstance(file, str) else None)
+
     def fail(problem):
-        problems.append({"source": "ledger", "where": name, "problem": problem})
-        return [], set()
+        add(name, problem)
+        return [], Counter()
     try:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
     except OSError as error:
@@ -605,14 +614,16 @@ def load_ledger(path, problems):
         return fail(f"schema is not {LEDGER_SCHEMA}; ledger not read")
     if not isinstance(data.get("entries"), list):
         return fail("ledger has no `entries` list; ledger not read")
-    valid, named = [], set()
+    named = Counter((e["file"], e["sha"]) for e in data["entries"]
+                    if isinstance(e, dict) and isinstance(e.get("file"), str) and isinstance(e.get("sha"), str))
+    valid = []
     for position, entry in enumerate(data["entries"]):
         where = f"{name} entry {position}"
         if not isinstance(entry, dict):
-            problems.append({"source": "ledger", "where": where, "problem": "entry is not an object; skipped"})
+            add(where, "entry is not an object; skipped")
             continue
-        if isinstance(entry.get("file"), str) and isinstance(entry.get("sha"), str):
-            named.add((entry["file"], entry["sha"]))
+        usable = isinstance(entry.get("file"), str) and isinstance(entry.get("sha"), str)
+        if usable:
             where = f"{where} ({entry['file']} {entry['sha'][:12]})"
         faults = []
         need = ["file", "sha", "prefix", "reasons", "by", "status"]
@@ -637,9 +648,12 @@ def load_ledger(path, problems):
         if isinstance(entry.get("file"), str) and not POPULATION_RE.match(entry["file"]):
             faults.append("file outside the contract population")
         for fault in faults:
-            problems.append({"source": "ledger", "where": where, "problem": fault + "; entry skipped"})
+            add(where, fault + "; entry skipped", entry.get("file"))
+        duplicate = usable and named[(entry["file"], entry["sha"])] > 1
+        if duplicate:
+            add(where, "duplicate (file, sha): no entry with it counts", entry["file"])
         if not faults:
-            valid.append({**entry, "where": where, "removal_reasons": entry.get("removal_reasons") or []})
+            valid.append({**entry, "where": where, "removal_reasons": entry.get("removal_reasons") or [], "duplicate": duplicate})
     return valid, named
 
 
@@ -729,14 +743,18 @@ def classify(entry, reasons):
 
 
 def ledger_report(path, files, unreadable_dirs, ctx, problems):
-    """The ledger check (HB7b rules 2-9). Returns (section, {file: justified line indexes})."""
-    entries, _ = load_ledger(path, problems)
+    """The ledger check (HB7b rules 2-9). Returns (section, {file: justified line indexes}). Every ledger problem listed goes into
+    `tally` (the file it names, or None) and the counts are taken from it, so the totals equal the problems listed."""
+    tally = []
+    entries, _ = load_ledger(path, problems, tally)
     hexes = set()
-    for entry in entries:
+    for entry in entries:  # every structurally valid entry's commit pointers, matched or not
         for pointer in entry["reasons"] + entry["removal_reasons"]:
             if pointer.startswith("commit:") and COMMIT_RE.match(pointer[7:]):
                 hexes.add(pointer[7:])
+    before = len(problems)
     ctx = {**ctx, "commits": check_commits(hexes, ctx["root"], problems)}
+    tally += [None] * (len(problems) - before)
     by_file = {f["file"]: f for f in files}
     counts = {f["file"]: dict.fromkeys(LEDGER_COUNTS, 0) for f in files if f["lines"] is not None}
     lines_of = {}
@@ -745,21 +763,26 @@ def ledger_report(path, files, unreadable_dirs, ctx, problems):
         row["needing"] = len(need)
         for n in need:
             lines_of.setdefault((name, line_sha(by_file[name]["lines"][n])), []).append(n)
-    keys = {}
-    for entry in entries:
-        keys.setdefault((entry["file"], entry["sha"]), []).append(entry)
     section = {"given": True, "ledger": Path(path).name, "entries": len(entries), "matched": [], "stale": [], "worker": [], "removal": [],
                "unresolved": [], "unchecked": []}
     justified, matched = {}, set()
 
     def problem(entry, text):
         problems.append({"source": "ledger", "where": entry["where"], "problem": text})
-        if entry["file"] in counts:
-            counts[entry["file"]]["problems"] += 1
+        tally.append(entry["file"])
     for entry in entries:
         ident = (entry["file"], entry["sha"])
-        if len(keys[ident]) > 1:
-            problem(entry, "duplicate (file, sha): neither entry counts")
+        view_ = {"file": entry["file"], "sha": entry["sha"], "prefix": entry.get("prefix")}
+        good = {}
+        for role, pointers in (("reason", entry["reasons"]), ("removal", entry["removal_reasons"])):  # diagnostics for every entry
+            good[role] = []
+            for pointer in pointers:
+                state, prov, why = resolve_reason(pointer, ctx)
+                if state == "resolved":
+                    good[role].append((pointer, prov))
+                else:
+                    section[state].append({**view_, "role": role, "pointer": pointer[:120], "why": why})
+        if entry["duplicate"]:  # listed by the loader; counts for nothing
             continue
         folder = entry["file"].rpartition("/")[0]
         if entry["file"] not in counts:
@@ -767,30 +790,19 @@ def ledger_report(path, files, unreadable_dirs, ctx, problems):
             problem(entry, "directory not readable; entry not checked" if folder in unreadable_dirs else
                     "file not readable; entry not checked" if state == "not readable" else "file not found")
             continue
-        view_ = {"file": entry["file"], "sha": entry["sha"], "prefix": entry.get("prefix")}
         covered = lines_of.get(ident)
         if not covered:
             counts[entry["file"]]["stale_entries"] += 1
             section["stale"].append(view_)
+            problem(entry, "stale: no current line that needs a reason has this sha")
             continue
         matched.add(ident)
-        resolved = []
-        for role, pointers in (("reason", entry["reasons"]), ("removal", entry["removal_reasons"])):
-            good = []
-            for pointer in pointers:
-                state, prov, why = resolve_reason(pointer, ctx)
-                if state == "resolved":
-                    good.append((pointer, prov))
-                else:
-                    section[state].append({**view_, "role": role, "pointer": pointer[:120], "why": why})
-            if role == "reason":
-                resolved = good
-            elif entry["status"] == "remove-candidate":
-                with_reason = any(prov not in ("commit", "worker") for _, prov in good)
-                counts[entry["file"]]["removal_with_reason" if with_reason else "removal_without_reason"] += 1
-                section["removal"].append({**view_, "lines": len(covered),
-                                           "removal": "removal with a reason" if with_reason else "removal without a reason"})
-        category = classify(entry, resolved)
+        if entry["status"] == "remove-candidate":
+            with_reason = any(prov not in ("commit", "worker") for _, prov in good["removal"])
+            counts[entry["file"]]["removal_with_reason" if with_reason else "removal_without_reason"] += 1
+            section["removal"].append({**view_, "lines": len(covered),
+                                       "removal": "removal with a reason" if with_reason else "removal without a reason"})
+        category = classify(entry, good["reason"])
         counts[entry["file"]][category] += len(covered)
         section["matched"].append({**view_, "lines": len(covered), "category": category})
         if category.startswith("justified"):
@@ -800,9 +812,12 @@ def ledger_report(path, files, unreadable_dirs, ctx, problems):
     for (name, _), covered in lines_of.items():
         if (name, _) not in matched:
             counts[name]["no_entry"] += len(covered)
+    for name, row in counts.items():
+        row["problems"] = tally.count(name)
     rows = [{"file": name, **row} for name, row in counts.items()]
     section["files"] = rows
     section["total"] = {k: sum(r[k] for r in rows) for k in ("needing",) + LEDGER_COUNTS}
+    section["total"]["problems"] = len(tally)  # includes problems that name no readable file
     return section, justified
 
 
@@ -922,7 +937,7 @@ def render_ledger(led):
     out += [f"  {r['file']}: {counts(r)}" for r in led["files"]]
     out.append(f"  total: {counts(led['total'])}")
     for title, rows, fmt in (
-            ("stale (no current line has this sha)", led["stale"], lambda r: ""),
+            ("stale (no current line that needs a reason has this sha)", led["stale"], lambda r: ""),
             ("worker text, evidence only", led["worker"], lambda r: f"  ({r['lines']} line(s))"),
             ("removal candidates (listed, never applied)", led["removal"], lambda r: f"  {r['removal']} ({r['lines']} line(s))"),
             ("unresolved pointers (count for nothing)", led["unresolved"], lambda r: f"  {r['role']} {r['pointer']}: {r['why']}"),

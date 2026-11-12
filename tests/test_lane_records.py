@@ -232,6 +232,20 @@ class FileTests(RepoFixture):
         self.assertEqual(lanes.git_common_dir(self.wt), self.common)
         self.assertEqual(lanes.read_lane(lanes.git_common_dir(self.wt), "alpha")["name"], "alpha")
         self.assertEqual(lanes.main_worktree(self.common), str(self.repo))
+        # within common_dir_once git is asked once per path (a nested block shares it); after the block it is asked again
+        asked = []
+        real_git = lanes._git
+        lanes._git = lambda args, cwd, **kw: (asked.append(str(cwd)), real_git(args, cwd, **kw))[1]
+        self.addCleanup(setattr, lanes, "_git", real_git)
+        with lanes.common_dir_once():
+            with lanes.common_dir_once():
+                self.assertEqual([lanes.git_common_dir(self.wt) for _ in range(3)], [self.common] * 3)
+            self.assertEqual(lanes.git_common_dir(self.wt), self.common)
+            self.assertEqual(lanes.git_common_dir(self.repo), self.common)
+        self.assertEqual(asked, [str(self.wt), str(self.repo)])
+        lanes.git_common_dir(self.wt)
+        lanes.git_common_dir(self.wt)
+        self.assertEqual(len(asked), 4)   # outside the block nothing is kept
 
     def test_no_lanes_directory_means_no_lanes(self):
         self.assertEqual(lanes.lane_names(self.common), [])

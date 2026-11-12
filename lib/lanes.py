@@ -96,13 +96,39 @@ def _git(args, cwd, ok=(0,), timeout=None):
     return run.returncode, run.stdout
 
 
+_COMMON_ONCE = None  # None outside `common_dir_once`; inside, {str(path): answer} for the one command that entered it
+
+
+@contextlib.contextmanager
+def common_dir_once():
+    """Within the block, `git_common_dir` asks git once per distinct path (a successful answer only; a refusal is asked again).
+    For one command invocation: the memo is dropped on leaving the block, so nothing outlives the command. A nested use shares
+    the outer block's memo."""
+    global _COMMON_ONCE
+    if _COMMON_ONCE is not None:
+        yield
+        return
+    _COMMON_ONCE = {}
+    try:
+        yield
+    finally:
+        _COMMON_ONCE = None
+
+
 def git_common_dir(path):
     """The realpath of the repository's common git directory, from any directory of any of its worktrees."""
+    memo = _COMMON_ONCE
+    key = str(path)
+    if memo is not None and key in memo:
+        return memo[key]
     _, out = _git(["rev-parse", "--path-format=absolute", "--git-common-dir"], path)
     value = out.strip()
     if not value.startswith("/"):
         raise ValueError(f"cannot find a git repository from {path}")
-    return os.path.realpath(value)
+    value = os.path.realpath(value)
+    if memo is not None:
+        memo[key] = value
+    return value
 
 
 def main_worktree(common_dir):

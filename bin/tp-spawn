@@ -195,7 +195,7 @@ elif [[ ! -t 0 ]]; then
 else
   task=""
 fi
-[[ -n "${task//[[:space:]]/}" ]] || usage 1
+[[ "$task" =~ [!-~] || -n "${task//[[:space:]]/}" ]] || usage 1   # printable ASCII => nonblank fast (the substitution is quadratic in bash 3.2); else the original test, which classifies every other byte string
 
 session="$(tp_session)"
 state_dir="$(tp_opt "$session" @tp_state_dir)"

@@ -147,6 +147,32 @@ esac
         self.assertIn("--append-system-prompt", (task / "run.sh").read_text())
         self.assertNotIn("General rule.", (task / "packet.md").read_text())
 
+    def test_spawn_refuses_an_empty_or_whitespace_only_task_and_takes_a_long_one(self):
+        for task in ("", " ", "\t", "\n", "\r", " \t\r\n ", "\n\n  \t"):
+            with self.subTest(task=task):
+                spawned = subprocess.run([str(ROOT / "bin/tp-spawn"), "--worker", "pi", "--model", MODEL, "--workdir", str(self.project)],
+                                         env=self.env, input=task, text=True, capture_output=True)
+                self.assertEqual(spawned.returncode, 1, spawned.stderr)
+                self.assertIn("Usage: tp-spawn", spawned.stdout + spawned.stderr)
+        # bytes that are not valid UTF-8 are text, not blank for the emptiness test (the old ${task//[[:space:]]/} test said nonblank):
+        # CP1251 "Ispravi oshibku", a lone continuation byte, and whitespace around 0xff
+        for task in (b"\xc8\xf1\xef\xf0\xe0\xe2\xfc", b"\x80", b" \xe2\x80 ", b"\n\xff\n"):
+            for loc in ("en_US.UTF-8", "C"):
+                with self.subTest(task=task, locale=loc):
+                    spawned = subprocess.run([str(ROOT / "bin/tp-spawn"), "--worker", "pi", "--model", MODEL, "--workdir", str(self.project)],
+                                             env={**self.env, "LC_ALL": loc}, input=task, capture_output=True)
+                    self.assertNotIn(b"Usage: tp-spawn", spawned.stdout + spawned.stderr)   # (later steps may still reject non-UTF-8 text)
+        # a lone Latin-1 NBSP (0xa0): the original substitution calls it blank in a UTF-8 locale and text in C
+        for loc, usage in (("en_US.UTF-8", True), ("C", False)):
+            with self.subTest(task=b"\xa0", locale=loc):
+                spawned = subprocess.run([str(ROOT / "bin/tp-spawn"), "--worker", "pi", "--model", MODEL, "--workdir", str(self.project)],
+                                         env={**self.env, "LC_ALL": loc}, input=b"\xa0", capture_output=True)
+                self.assertEqual(b"Usage: tp-spawn" in spawned.stdout + spawned.stderr, usage)
+        long_task = "word " * 20000   # 100 000 characters: the emptiness test must not be quadratic in the length
+        spawned = subprocess.run([str(ROOT / "bin/tp-spawn"), "--worker", "pi", "--model", MODEL, "--workdir", str(self.project), "--", long_task],
+                                 env=self.env, text=True, capture_output=True, timeout=60)
+        self.assertEqual(spawned.returncode, 0, spawned.stderr)
+
     def test_system_prompt_prefix_is_stable_across_tasks_and_roles(self):
         general = "General rule one.\n\nGeneral rule two."
         self.write_preamble(general + "\n\n## Role: coder\nCoder-only rule.\n\n## Role: tester\nTester-only rule.\n")

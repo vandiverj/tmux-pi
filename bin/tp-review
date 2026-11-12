@@ -143,7 +143,7 @@ fi
 if [[ "$have_dispositions" == 1 ]]; then check_supplied --dispositions "$dispositions"; fi
 if [[ "$have_sweep" == 1 ]]; then check_supplied --sweep "$sweep"; fi
 if [[ "$same_provider" == 1 ]]; then
-  [[ -n "${approval//[[:space:]]/}" ]] || die "--same-provider needs --approved-by-user with the user's approval quoted; refused"
+  [[ "$approval" =~ [!-~] || -n "${approval//[[:space:]]/}" ]] || die "--same-provider needs --approved-by-user with the user's approval quoted; refused"
   plan_opts+=(--same-provider --approved-by-user "$approval")
 elif [[ -n "$approval" ]]; then
   die "--approved-by-user applies only with --same-provider"

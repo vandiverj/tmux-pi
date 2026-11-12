@@ -263,7 +263,7 @@ TASK = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")  # tp-agent's task id
 TP = {"tp-agent inspect": "reads", "tp-agent list": "reads", "tp-agent end-author": "ends", "tp-agent stop": "ends",
       "tp-agent review": "ends", "tp-spawn": "ends", "tp-trial run": "runner"}
 SPAWN_FLAGS = frozenset(("--task-id", "--worker", "--model", "--thinking", "--workdir", "--preamble-from", "--worker-env", "--role",
-                         "--tests", "--deliverable", "--other-lane-paths", "--context", "--note", "--file"))  # each takes a value
+                         "--tests", "--deliverable", "--other-lane-paths", "--context", "--note", "--file", "--rules-file"))  # each takes a value
 
 
 def tp_command(argv):

@@ -1178,3 +1178,24 @@ Each lane: checkpoint, Main's evidence, openai-codex review, notes closed, `lane
   Not fixed: lib/bench/runner.py:381,422 read result.md strictly (bench harness).
 - Full run on main 20af558 (tree 0e10c42, python 3.9.6, outside tmux): 5545 tests OK (skipped 78), 2789 s. The two failures from
   the 9b23173 run are gone on main: the stale test_local_provider row (LP2); the HB3b comment is still on its unmerged lane.
+
+## 2026-11-12 (evening): safe-search abandoned, HB3b adopted, HB3c merged; HB5b and SN1 started
+- safe-search abandoned on the owner's word ("Abandon lane safe-search"): `tp-agent lane remove --abandon safe-search` after
+  collecting its worker. Tip 8cc889c (restore: `git branch lane/safe-search 8cc889c`).
+- HB3b adopted on the owner's word ("adopt HB3b"): `tp-agent lane close hub-packet HB3b` passed; merged b21a31c; decision note
+  c8deb43. Pre-push full run on c8deb43 started (the owner: "push changes").
+- HB3c (lane hub-rules-review, HB3b follow-ups 1, 3, 4; Sonnet, coder-c0fef53014): reviewers get the owner's active in-scope
+  rules (`work_brief.rules_for_task`, `bin/tp-review --rules-file`); the stale launch_record.py comment; tests/session_env.py
+  points TP_WORK_DIR at an empty temp store by default. Cells 230 x 4 OK (preview bde7a47). review-coder-c0fef53014-160954
+  APPROVED_WITH_NOTES (F1 isolation regression coverage, F2 +20 s in test_lane_writer, F3 canary proof, F4 Main's cells not
+  re-verified). F3 checked by Main: the one flagged file in test_orchestration (base and lane alike) was the canary's own
+  sitecustomize .pyc; control row True. Lane close passed; merged 4866ff1. Needs a full run (session_env reaches every module).
+- HB6 measure on a live lane with HB6b1's records (timeline.py, coder-c0fef53014): 21m48s, 0% unknown. tool 11m02s (one 10m03s
+  shell call: the canary script running 24 module runs), test 4m12s, waiting:main 3m34s, model 2m58s.
+- PF1a proposal 6 (fewer tp-agent starts): measured 0.06 s per `tp-agent --help`, of which python start 0.01 s and imports
+  ~0.025 s (autonomy/contract 7 ms, work_commands 4 ms, argparse 3 ms). Lazy imports save at most ~0.03 s per call (~2% of a
+  parallel full run, estimated); medium risk across every tp-agent command. Parked: not worth a lane now.
+- HB5b (lane hub-main-runs, brief hub/hb5/hb5b-brief.md, Sonnet coder-56c0c62fe6): Main's runs recorded through test-run.sh
+  with the interpreter, read by repeats.py as role main.
+- SN1 (lane small-notes, brief fixes/sn1-brief.md, Sonnet coder-21c3cc49a8): lib/bench/runner.py result readers tolerate
+  non-UTF-8 (TR2 note); HB8b stale comments in tests/test_episode_harness.py.

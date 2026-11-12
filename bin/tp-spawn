@@ -806,7 +806,9 @@ run_sh="$(
   # SIGKILLed) with one short line saying it is the task.
   printf '%q ' "${cmd[@]}"
   if [[ "$worker" == pi ]]; then
-    printf -- '-- %q %q\n' "@$task_dir/packet.md" "The attached packet.md is your task. Do it as it says."
+    # The task dir is not the working directory: say which one relative paths resolve against.
+    printf -- '-- %q %q\n' "@$task_dir/packet.md" \
+      "The attached packet.md is your task. Do it as it says. Your working directory is $workdir; resolve relative paths against it, not against the packet's directory."
   else printf -- '-- "$(cat %q)"\n' "$task_dir/packet.md"; fi
   echo 'status=$?'
   printf 'echo "$status" | python3 %q write %q --root %q\n' "$ROOT/lib/safe_write.py" "$task_dir/exit" "$state_dir"

@@ -17,6 +17,10 @@ ROOT = Path(__file__).resolve().parent.parent
 TOOLS = ROOT / "tools" / "agent"
 sys.path.insert(0, str(ROOT / "lib"))
 import gate_record  # noqa: E402
+import importlib.util  # noqa: E402
+_ispec = importlib.util.spec_from_file_location("tp_interpreter", TOOLS / "interpreter.py")
+interpreter = importlib.util.module_from_spec(_ispec)
+_ispec.loader.exec_module(interpreter)
 LAST = re.compile(r"^exit=(\d+) log=(\S+)$")
 
 
@@ -1403,6 +1407,8 @@ class TestRunTests(ScriptCase):
         self.assertEqual((record["schema"], record["label"], record["cwd"], record["exit"], record["timed_out"], record["log"]),
                          ("tp-test-run:v1", "pwd", str(repo), 3, False, log))
         self.assertEqual(record["cmd"], ["sh", "-c", "pwd; echo err >&2; exit 3"])
+        self.assertIsNone(record["interpreter"])  # HB5b: a shell head starts no python that is read
+        self.assertNotIn("role", record)  # and without --main there is no role
         self.assertEqual((record["head"], record["tree"]), gate_record.fingerprint(repo))
         self.assertEqual(gate_record.status(record, repo), "fresh")
         # n counts up; without a label the label is empty
@@ -1498,6 +1504,99 @@ class TestRunTests(ScriptCase):
             with self.subTest(runner=name):
                 body = self.last_line(self.run_in(repo, "--", "printf", output))[2]
                 self.assertEqual(self.record_of(body)["summary"], summary)
+
+    def test_the_record_names_the_python_the_command_starts(self):
+        """HB5b rule 2: interpreter.resolve reads the head of cmd the way repeats.py does (env, perl alarm) and finds the
+        python on the PATH the command sees; one row per head form."""
+        real = os.path.realpath(sys.executable)
+        version = "%d.%d.%d" % sys.version_info[:3]
+        pybin = self.tmp / "pybin"
+        pybin.mkdir()
+        for name in ("python3", "python3.14"):
+            os.symlink(sys.executable, pybin / name)
+        wt = self.tmp / "wt"
+        (wt / "venv" / "bin").mkdir(parents=True)
+        os.symlink(sys.executable, wt / "venv" / "bin" / "python3")
+        self.stub("python3", exit_code=1, where=self.tmp / "broken")  # starts, cannot report a version
+        sys_python = os.path.realpath("/usr/bin/python3")
+        alarm = ["perl", "-e", "alarm 60; exec @ARGV"]
+        path_env = {"PATH": f"{pybin}:/usr/bin:/bin"}
+        rows = [  # name, cmd, PATH the command sees, expected (path, version) or None
+            ("/usr/bin/python3", ["/usr/bin/python3", "-m", "unittest"], path_env, (sys_python, None)),
+            ("absolute path of the running python", [sys.executable, "-m", "unittest"], path_env, (real, version)),
+            ("python3 from PATH", ["python3", "-m", "unittest"], path_env, (real, version)),
+            ("python3.14 from PATH", ["python3.14", "-m", "unittest"], path_env, (real, version)),
+            ("through env -u", ["env", "-u", "FOO", "python3", "-m", "unittest"], path_env, (real, version)),
+            ("env PATH=... decides which python3", ["env", f"PATH={pybin}:/bin", "python3"], {"PATH": "/usr/bin"}, (real, version)),
+            ("through the perl alarm wrapper", alarm + ["python3", "-m", "unittest"], path_env, (real, version)),
+            ("perl alarm then env -u", alarm + ["env", "-u", "FOO", "python3.14"], path_env, (real, version)),
+            ("a shell prefix assignment", ["X=1", "python3"], path_env, (real, version)),
+            ("relative path in the worktree", ["venv/bin/python3", "-m", "unittest"], path_env, (real, version)),
+            ("a non-python cmd", ["bash", "x.sh"], path_env, None),
+            ("bash -c is not read", ["bash", "-c", "python3 -m unittest"], path_env, None),
+            ("missing interpreter", ["python3.99", "-m", "unittest"], path_env, None),
+            ("an env flag that is not read", ["env", "-S", "python3"], path_env, None),
+            ("one that cannot report a version", ["python3"], {"PATH": f"{self.tmp / 'broken'}:/usr/bin"}, None),
+        ]
+        for name, cmd, env, want in rows:
+            with self.subTest(name):
+                got = interpreter.resolve(str(wt), cmd, env)
+                if want is None:
+                    self.assertIsNone(got)
+                else:
+                    self.assertEqual(got["path"], want[0])
+                    self.assertRegex(got["version"], r"^\d+\.\d+\.\d+$")
+                    if want[1]:
+                        self.assertEqual(got["version"], want[1])
+
+    def test_main_runs_write_their_record_under_the_session_and_every_other_form_is_refused(self):
+        """HB5b rule 1: --main [--lane L --step S] writes SESSION/main-runs/<n>.json (role main, the interpreter); a worker
+        (TP_TASK_DIR), no session, a directory that is no session and --lane without --main refuse before CMD runs."""
+        repo = self.repo()
+        session = self.tmp / "session"
+        (session / "tasks").mkdir(parents=True)
+        marker = self.tmp / "ran"
+        pybin = self.tmp / "pybin"
+        pybin.mkdir()
+        os.symlink(sys.executable, pybin / "python3")
+        touch = ["--", "sh", "-c", f"touch {marker}"]
+        tmux_tmp = Path(tempfile.mkdtemp(prefix="tpm", dir="/tmp"))
+        self.addCleanup(shutil.rmtree, tmux_tmp, True)
+        nosession = {"TP_SESSION": "no-such-session", "TMUX_TMPDIR": str(tmux_tmp)}
+        # (name, args, env, exit code, text the output says, whether CMD ran)
+        refused = [
+            ("a worker", ["--main"] + touch, {"TP_STATE_DIR": str(session), "TP_TASK_DIR": str(self.tmp / "task")}, 2, "TP_TASK_DIR is set", False),
+            ("no session", ["--main"] + touch, nosession, 2, "needs the session directory", False),
+            ("a directory that is no session", ["--main"] + touch, {"TP_STATE_DIR": str(self.tmp / "unrelated")}, 2, "needs the session directory", False),
+            ("--lane without --main", ["--lane", "L"] + touch, {"TP_STATE_DIR": str(session)}, 2, "go with --main", False),
+        ]
+        for name, args, env, code, text, ran in refused:
+            with self.subTest(name):
+                marker.unlink(missing_ok=True)
+                got, log, body = self.last_line(self.run_in(repo, *args, env=env))
+                self.assertEqual(got, code)
+                self.assertTrue(any(text in line for line in body), body)
+                self.assertEqual(marker.exists(), ran)
+                self.assertEqual(sorted(p.name for p in session.iterdir()), ["tasks"])  # nothing written
+                self.assertFalse((self.tmp / "task").exists())
+                self.assertFalse(any(p.suffix == ".json" for p in Path(log).parent.glob("*")) if log != "-" else False)
+        env = {"TP_STATE_DIR": str(session), "PATH": f"{pybin}:/usr/bin:/bin"}
+        body = self.last_line(self.run_in(repo, "--main", "--lane", "ln", "--step", "S1", "--", "python3", "-c", "pass", env=env))[2]
+        record = self.record_of(body)
+        self.assertEqual(Path([line for line in body if line.startswith("record: ")][-1][len("record: "):]), session / "main-runs" / "1.json")
+        self.assertEqual(gate_record.validate(record), [])
+        self.assertEqual((record["role"], record["lane"], record["step"], record["exit"]), ("main", "ln", "S1", 0))
+        self.assertEqual(record["interpreter"], {"path": os.path.realpath(sys.executable), "version": "%d.%d.%d" % sys.version_info[:3]})
+        self.assertEqual(list((session / "tasks").iterdir()), [])
+        # without lane/step they are absent; two Mains at the same moment take distinct numbers and lose nothing
+        procs = [subprocess.Popen([str(TOOLS / "test-run.sh"), str(repo), "--main", "--", "true"], env=dict(self.env, **env),
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for _ in range(4)]
+        outs = [p.communicate(timeout=60) for p in procs]
+        self.assertEqual([p.returncode for p in procs], [0] * 4, outs)
+        runs = session / "main-runs"
+        self.assertEqual(sorted(p.name for p in runs.iterdir()), [f"{n}.json" for n in range(1, 6)])  # no lock left
+        later = [json.loads((runs / f"{n}.json").read_text()) for n in range(2, 6)]
+        self.assertTrue(all("lane" not in r and "step" not in r and r["role"] == "main" and r["interpreter"] is None for r in later))
 
     def test_every_byte_of_an_argument_survives_into_the_record(self):
         """Round trip: one argument per byte 0x01-0xFF (each between 'a' and 'b'), plus quote, backslash, newline, a mix, and

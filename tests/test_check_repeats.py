@@ -8,6 +8,7 @@ The task directories are producer-shaped, copied field for field from:
                        checks[{name,status,exit,seconds}], exit, started, finished, log); the previous gate.json is renamed
                        gate-YYYYMMDD-HHMMSS-PID.json (:686-688)
   tests.jsonl          tests/run_bounded.py:189-190 (cmd, files, seconds, rc, timed_out, load1, per_file, leftovers)
+  main-runs/<n>.json   tools/agent/test-run.sh --main (the same record plus role, lane, step; HB5b) in SESSION/main-runs, beside tasks/
   meta.json            bin/tp-spawn (id, role, lane, lane_step, workdir, created); review-of from bin/tp-review
 """
 import session_env  # noqa: F401  first: removes the caller's session, however the suite is started
@@ -28,6 +29,7 @@ _spec.loader.exec_module(repeats)
 T, T2 = "a" * 40, "b" * 40
 WT = "/work/tmux-pi-wt-x"
 PY = ["python3", "-m", "unittest"]
+P39, P314 = "/usr/bin/python3", "/opt/homebrew/Cellar/python@3.14/3.14.0/bin/python3.14"
 
 
 class Tasks:
@@ -49,12 +51,18 @@ class Tasks:
             (d / "review-of").write_text(review_of + "\n")
         return d
 
-    def run(self, ident, cmd, tree=T, exit=0, seconds=1.0, at=0, label="", cwd=WT):
+    def run(self, ident, cmd, tree=T, exit=0, seconds=1.0, at=0, label="", cwd=WT, interp="absent", extra=None, dirname="test-runs"):
+        """`interp`: absent (a record from before HB5b), None (null) or (path, version). `extra`: more fields (a Main record's
+        role, lane, step). `dirname`: where the record goes under `ident` (a Main record: ident "." and dirname "main-runs")."""
         n = self.n[ident] = self.n.get(ident, 0) + 1
-        path = self.root / ident / "test-runs" / ("%d.json" % n)
-        path.write_text(json.dumps({"schema": "tp-test-run:v1", "label": label, "cmd": cmd, "cwd": cwd, "head": "c" * 40,
-                                    "tree": tree, "exit": exit, "timed_out": exit == 124, "seconds": seconds,
-                                    "log": "/tmp/tp-tools/x.log", "summary": ""}))
+        path = self.root / ident / dirname / ("%d.json" % n)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        record = {"schema": "tp-test-run:v1", "label": label, "cmd": cmd, "cwd": cwd, "head": "c" * 40,
+                  "tree": tree, "exit": exit, "timed_out": exit == 124, "seconds": seconds,
+                  "log": "/tmp/tp-tools/x.log", "summary": ""}
+        if interp != "absent":
+            record["interpreter"] = None if interp is None else {"path": interp[0], "version": interp[1]}
+        path.write_text(json.dumps(dict(record, **(extra or {}))))
         os.utime(path, (1_800_000_000 + at, 1_800_000_000 + at))
         return str(path)
 
@@ -78,7 +86,7 @@ class RepeatsTest(unittest.TestCase):
         ut = PY + ["tests.test_x"]
         live_ut = PY + ["tests.test_qual_summarize_structured.LiveLmStudioTests"]
         rows = [
-            # name, a(cmd, tree, exit, seconds), b(...), expected b class, b repeated seconds, extra checks
+            # name, a(cmd, tree, exit, seconds[, {interp}]), b(..., cwd, label[, {interp}]), expected b class, b repeated seconds, extra checks
             ("D1 same cmd+tree", (ut, T, 0, 3), (ut, T, 0, 3), "duplicate", 3, {}),
             ("D1 same cmd other tree", (ut, T, 0, 3), (ut, T2, 0, 3), "first", 0, {}),
             ("N1 other cwd (same relative argv, other worktree path)",
@@ -98,6 +106,24 @@ class RepeatsTest(unittest.TestCase):
              "first", 0, {}),
             ("N4 module order", (PY + ["tests.test_x", "tests.test_y"], T, 0, 3), (PY + ["tests.test_y", "tests.test_x"], T, 0, 3),
              "duplicate", 3, {}),
+            # HB5b: the interpreter the record names. The same spelling (python3) on two pythons is not the same check; naive
+            # (HEAD's key, which never reads the field): duplicate.
+            ("HB5b python3 on py3.9 then py3.14 (naive: duplicate)", (ut, T, 0, 3, {"interp": (P39, "3.9.6")}),
+             (ut, T, 0, 3, WT, "", {"interp": (P314, "3.14.0")}), "first", 0, {}),
+            ("HB5b same path, other version (an upgrade in place)", (ut, T, 0, 3, {"interp": (P314, "3.14.0")}),
+             (ut, T, 0, 3, WT, "", {"interp": (P314, "3.14.1")}), "first", 0, {}),
+            ("HB5b same interpreter = duplicate", (ut, T, 0, 3, {"interp": (P314, "3.14.0")}),
+             (ut, T, 0, 3, WT, "", {"interp": (P314, "3.14.0")}), "duplicate", 3, {}),
+            ("HB5b a record without the field keeps today's rule", (ut, T, 0, 3, {"interp": (P39, "3.9.6")}), (ut, T, 0, 3), "duplicate", 3, {}),
+            ("HB5b the field is null (no python, or unresolved) keeps today's rule", (ut, T, 0, 3, {"interp": None}),
+             (ut, T, 0, 3, WT, "", {"interp": (P314, "3.14.0")}), "duplicate", 3, {}),
+            ("HB5b the field is null on both", (ut, T, 0, 3, {"interp": None}), (ut, T, 0, 3, WT, "", {"interp": None}), "duplicate", 3, {}),
+            ("HB5b covered by a run on another interpreter is not covered", (PY + ["tests.test_x", "tests.test_y"], T, 0, 8, {"interp": (P39, "3.9.6")}),
+             (ut, T, 0, 3, WT, "", {"interp": (P314, "3.14.0")}), "first", 0, {}),
+            ("HB5b covered by a run on the same interpreter", (PY + ["tests.test_x", "tests.test_y"], T, 0, 8, {"interp": (P314, "3.14.0")}),
+             (ut, T, 0, 3, WT, "", {"interp": (P314, "3.14.0")}), "first", 3, {"how": "measured"}),
+            ("HB5b a retry on the other interpreter is a first run", (ut, T, 1, 3, {"interp": (P39, "3.9.6")}),
+             (ut, T, 0, 3, WT, "", {"interp": (P314, "3.14.0")}), "first", 0, {}),
             ("alarm bound stays in the key", (["perl", "-e", "alarm 60; exec @ARGV"] + ut, T, 0, 3),
              (["perl", "-e", "alarm 900; exec @ARGV"] + ut, T, 0, 3), "first", 0, {}),
             ("D2 fail then pass = retry (naive: duplicate)", (ut, T, 1, 3), (ut, T, 0, 3), "retry", 0, {"retries": 1}),
@@ -316,9 +342,11 @@ class RepeatsTest(unittest.TestCase):
                 s = Tasks(tmp)
                 s.task("coder-1")
                 s.task("review-coder-1-1", review_of="coder-1")
-                s.run("coder-1", a[0], a[1], a[2], a[3], at=0)
+                ia = a[4]["interp"] if len(a) > 4 else "absent"
+                ib = b[6]["interp"] if len(b) > 6 else "absent"
+                s.run("coder-1", a[0], a[1], a[2], a[3], at=0, interp=ia)
                 pb = s.run("review-coder-1-1", b[0], b[1], b[2], b[3], at=10, cwd=b[4] if len(b) > 4 else WT,
-                           label=b[5] if len(b) > 5 else "")
+                           label=b[5] if len(b) > 5 else "", interp=ib)
                 rep = repeats.build(tmp)
                 rb = by_path(rep)[pb]
                 self.assertEqual(rb["class"], want_class)
@@ -421,6 +449,56 @@ class RepeatsTest(unittest.TestCase):
                 problems = " | ".join(p["problem"] for p in rep["problems"])
                 for want in ("malformed test-run record", "invalid test-run record", "symlink skipped", "malformed tests.jsonl"):
                     self.assertIn(want, problems)
+
+    def test_main_runs_join_the_groups_and_their_rerun_seconds_are_reported(self):
+        """HB5b rule 3: SESSION/main-runs records (role main, lane, step from the record) join the same groups; per lane and step
+        the seconds Main spent on checks a worker or reviewer had run on the same tree. One row per relation."""
+        with tempfile.TemporaryDirectory() as tmp:
+            session = Path(tmp) / "session"
+            tasks = session / "tasks"
+            s, m = Tasks(tasks), Tasks(session)
+            s.task("coder-1", lane="ln", step="S1")
+            s.task("review-coder-1-1", lane="ln", step="S1", review_of="coder-1")
+            xy, x, z = PY + ["tests.test_x", "tests.test_y"], PY + ["tests.test_x"], PY + ["tests.test_z"]
+            main = lambda cmd, tree=T, seconds=1.0, at=0, interp="absent", lane="ln", step="S1": m.run(
+                ".", cmd, tree, 0, seconds, at=at, interp=interp, dirname="main-runs",
+                extra={"role": "main", **({"lane": lane} if lane else {}), **({"step": step} if step else {})})
+            s.run("coder-1", xy, T, 0, 10, at=1, interp=(P314, "3.14.0"))
+            s.run("review-coder-1-1", z, T, 0, 2, at=2, interp=(P314, "3.14.0"))
+            main(xy, T, 9, 3, (P314, "3.14.0"))   # 1: same cmd as the worker, same tree and interpreter
+            main(x, T, 4, 4, (P314, "3.14.0"))    # 2: a subset of the worker's run
+            main(z, T, 2, 5)                      # 3: the reviewer's check, no interpreter field
+            main(xy, T2, 8, 6, (P314, "3.14.0"))  # 4: same cmd on another tree
+            main(xy, T, 7, 7, (P39, "3.9.6"))     # 5: same cmd, other interpreter
+            main(PY + ["tests.test_q"], T, 5, 8)  # 6, and 7: Main's own repeat of its own run
+            main(PY + ["tests.test_q"], T, 6, 9)
+            main(xy, T, 20, 10, (P314, "3.14.0"), lane="other", step=None)  # 8: another lane, no step
+            rep = repeats.build(str(tasks))
+            got = {(r["lane"], r["step"], r["path"].rsplit("/", 1)[-1], r["role"]): r["class"] for r in rep["runs"] if r["role"] == "main"}
+            self.assertEqual(got[("ln", "S1", "1.json", "main")], "duplicate")                 # worker's run, same everything
+            self.assertEqual(got[("ln", "S1", "2.json", "main")], "first")                     # covered by the worker's run
+            self.assertEqual(got[("ln", "S1", "3.json", "main")], "duplicate")                 # reviewer's run; no field keeps today's rule
+            self.assertEqual(got[("ln", "S1", "4.json", "main")], "first")                     # other tree
+            self.assertEqual(got[("ln", "S1", "5.json", "main")], "first")                     # other interpreter: never the same check
+            self.assertEqual(got[("ln", "S1", "7.json", "main")], "duplicate")                 # Main's own repeat of Main's run
+            self.assertEqual(got[("other", "(none)", "8.json", "main")], "duplicate")          # lane and step as the record says
+            per = {(r["lane"], r["step"]): r for r in rep["per_lane_step"]}
+            # duplicate xy 9 s + covered x 4 s + duplicate z 2 s; the repeat of Main's own run (6 s) and the other lane's (20 s,
+            # its lane has no worker run: a duplicate of the worker's run on the same tree) are apart
+            self.assertAlmostEqual(per[("ln", "S1")]["main_rerun"], 9 + 4 + 2)
+            self.assertAlmostEqual(per[("other", "(none)")]["main_rerun"], 20.0)
+            self.assertEqual(rep["totals"]["main_visible"], 8)
+            self.assertIn("Main's reruns", repeats.render(rep))
+            # --lane keeps the lane of the record; the tasks dir named otherwise does not look for main-runs
+            self.assertEqual({r["lane"] for r in repeats.build(str(tasks), "other")["runs"]}, {"other"})
+            self.assertEqual(repeats.build(str(tasks), main_dir=None)["totals"]["main_visible"], 0)
+            self.assertNotIn("Main's reruns", repeats.render(repeats.build(str(tasks), main_dir=None)))
+            # a bad interpreter field and a link are listed and skipped, never raised
+            m.run(".", xy, T, 0, 1, dirname="main-runs", extra={"role": "main", "interpreter": "python3"})
+            (session / "main-runs" / "11.json").symlink_to(session / "tasks")
+            problems = " | ".join(p["problem"] for p in repeats.build(str(tasks))["problems"])
+            self.assertIn("interpreter is not null or {path, version}", problems)
+            self.assertIn("symlink skipped", problems)
 
     def test_case1_planted_schedule(self):
         """Case 1: the brief's planted schedule, scored over every pair of runs, then the CLI over the same directory."""

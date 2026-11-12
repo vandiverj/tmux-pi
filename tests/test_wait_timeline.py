@@ -16,6 +16,7 @@ import importlib.util
 import json
 import os
 import shutil
+import sys
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -666,6 +667,176 @@ class WaitTimelineTest(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit):
                 timeline.main([str(tasks), "--now", "yesterday"])
+
+
+class StatusTest(unittest.TestCase):
+    """tools/waits/status.py (HB6c): one real git repository with one lane per case and a session dir of task records; one
+    table-driven method over the lanes, one CLI check."""
+    NOW = T0 + 5000
+    COVERAGE = "\n## Coverage\n- I read the whole diff and checked every changed line\n"
+
+    @classmethod
+    def setUpClass(cls):
+        import subprocess
+        sys.path.insert(0, str(ROOT / "lib"))
+        sys.path.insert(0, str(ROOT / "tools" / "waits"))
+        import lanes
+        import status
+        cls.lanes, cls.status = lanes, status
+        cls.tmp = tempfile.mkdtemp(prefix="hb6c.")
+        cls.base = Path(os.path.realpath(cls.tmp))
+        cls.git = staticmethod(lambda cwd, *a: subprocess.run(
+            ["git", "-C", str(cwd), "-c", "user.name=t", "-c", "user.email=t@t"] + list(a), check=True, capture_output=True,
+            text=True).stdout.strip())
+        cls.repo = cls.make_repo(cls.base / "repo")
+        cls.common = lanes.git_common_dir(cls.repo)
+        cls.state = cls.base / "session"
+        cls.tasks = cls.state / "tasks"
+        cls.tasks.mkdir(parents=True)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    @classmethod
+    def make_repo(cls, path):
+        path.mkdir()
+        cls.git(path, "init", "-q", "-b", "main")
+        (path / "f").write_text("1")
+        cls.git(path, "add", "f")
+        cls.git(path, "commit", "-qm", "one")
+        return path
+
+    @classmethod
+    def lane(cls, repo, name, closed=None, commit=False, raw=None):
+        """A lane of `repo`: its worktree and branch, and its record (`raw`: this text instead). commit: one commit on its branch."""
+        common = cls.lanes.git_common_dir(repo)
+        wt = cls.base / (repo.name + "-wt-" + name)
+        cls.git(repo, "worktree", "add", "-q", "-b", "lane/" + name, str(wt), "HEAD")
+        if commit:
+            (wt / "g").write_text(name)
+            cls.git(wt, "add", "g")
+            cls.git(wt, "commit", "-qm", name)
+        head = cls.git(wt, "rev-parse", "HEAD")
+        record = {"schema": "tp-lane:v1", "name": name, "kind": "work", "state": "open", "repo": str(repo), "git_common_dir": common,
+                  "branch": "lane/" + name, "worktree": str(wt), "base": {"ref": "main", "commit": cls.git(repo, "rev-parse", "HEAD")},
+                  "created": iso_off(-86400 * 2), "domain": "objective of " + name, "touches": ["lib"],
+                  "closed": [], "integrated": None, "defaulted": [], "deps": "own"}
+        if closed:
+            record["closed"] = [{"step": closed, "commit": head, "tree": cls.git(wt, "rev-parse", "HEAD^{tree}"), "review": "rev-1",
+                                 "verdict": "APPROVED", "closed_at": iso_off(-100)}]
+        if raw is not None:
+            path = Path(common) / "tmux-pi" / "lanes" / name
+            path.mkdir(parents=True, exist_ok=True)
+            (path / "lane.json").write_text(raw)
+            return
+        with cls.lanes.lane_lock(common):
+            cls.lanes.write_lane(common, record)
+
+    def task(self, ident, lane, created, life="working", review_of=None, step="S1", requests=(), raw_requests=(), reply=None):
+        d = self.tasks / ident
+        d.mkdir()
+        meta = {"id": ident, "worker": "claude", "role": "code-reviewer" if review_of else "coder", "created": iso_s(created),
+                "workdir": "/nonexistent", "lane": lane, "lane_step": step}
+        (d / "meta.json").write_text(json.dumps(meta))
+        if review_of:
+            (d / "review-of").write_text(review_of + "\n")
+        state = {"id": ident, "harness": "claude", "state": "working" if life == "working" else "waiting", "updated": iso_s(created + 1)}
+        (d / "state.json").write_text(json.dumps(state))
+        if life == "failed":
+            (d / "exit").write_text("1")
+        elif life == "settled":
+            (d / "result.md").write_text((reply + "\nRESULT_STATUS: complete\n") if reply else "RESULT_STATUS: complete\ndone\n")
+        for n, kind in enumerate(requests):
+            (d / "requests").mkdir(exist_ok=True)
+            rid = "req-" + "0" * 25 + "ABCDEFGH"[n]
+            (d / "requests" / (rid + ".json")).write_text(json.dumps({"id": rid, "task": ident, "kind": kind, "status": "open",
+                                                                      "opened": iso_s(created + 2), "summary": "s"}))
+        for text in raw_requests:
+            (d / "requests").mkdir(exist_ok=True)
+            (d / "requests" / ("req-" + "0" * 25 + "Z.json")).write_text(text)
+
+    def test_next_action_table(self):
+        lane = type(self).lane
+        for name in ("perm", "cap", "none", "run", "revrun", "final", "rc", "appr", "unusable", "incomplete", "dead", "queued",
+                     "twotasks", "chain", "olderrev", "badreq", "closedun"):
+            lane(self.repo, name, commit=name == "closedun", closed="S1" if name == "closedun" else None)
+        lane(self.repo, "closedmerged", closed="S1")
+        lane(self.repo, "badlane", raw="{not json")
+        foreign = self.make_repo(self.base / "other")
+        lane(foreign, "foreign")
+        t = self.task
+        t("t-perm", "perm", 10, requests=["permission"])
+        t("t-cap", "cap", 10, requests=["capability"])
+        t("t-run", "run", 10)
+        t("t-revrun", "revrun", 10, life="settled")
+        t("r-revrun", "revrun", 20, life="working", review_of="t-revrun")
+        t("t-final", "final", 10, life="settled")
+        t("t-rc", "rc", 10, life="settled")
+        t("r-rc", "rc", 20, review_of="t-rc", life="settled", reply="REQUEST_CHANGES\n1. broken. Closes by: code\n" + self.COVERAGE)
+        t("t-appr", "appr", 10, life="settled")
+        t("r-appr", "appr", 20, review_of="t-appr", life="settled", reply="APPROVED\n" + self.COVERAGE)
+        t("t-unusable", "unusable", 10, life="settled")
+        t("r-unusable", "unusable", 20, review_of="t-unusable", life="settled",
+          reply="REQUEST_CHANGES\n1. note. Closes by: decision\n" + self.COVERAGE)
+        t("t-incomplete", "incomplete", 10, life="settled")
+        t("r-incomplete", "incomplete", 20, review_of="t-incomplete", life="settled", reply="APPROVED\n")
+        t("t-dead", "dead", 10, life="failed")
+        (self.state / "queue").mkdir(exist_ok=True)
+        (self.state / "queue" / "q-1.json").write_text(json.dumps({"lane": "queued", "lane_step": "S1", "role": "coder", "created": iso_s(10)}))
+        t("t-two-a", "twotasks", 10, life="settled")    # the older one is final with no review; the newer one is running
+        t("t-two-b", "twotasks", 30)
+        t("t-chain-1", "chain", 10, life="settled")      # retry chain: the first attempt was rejected, the retry is running
+        t("r-chain-1", "chain", 20, review_of="t-chain-1", life="settled", reply="REQUEST_CHANGES\nx Closes by: code\n" + self.COVERAGE)
+        t("t-chain-2", "chain", 30)
+        t("t-old-1", "olderrev", 10, life="settled")     # the review is of the older task; the newest has none
+        t("r-old-1", "olderrev", 20, review_of="t-old-1", life="settled", reply="APPROVED\n" + self.COVERAGE)
+        t("t-old-2", "olderrev", 30, life="settled")
+        t("t-badreq", "badreq", 10, raw_requests=["{broken"])
+        t("t-foreign", "foreign", 10)                    # a task of a lane of another repository
+        (self.tasks / "no-meta").mkdir()
+        status = self.status
+        report = status.build(self.tasks, self.repo, now=self.NOW)
+        got = {r["lane"]: r for r in report["lanes"]}
+        want = {  # lane: (rule, who)
+            "perm": (1, "owner"), "cap": (2, "main"), "none": (3, "main"), "run": (4, "worker"), "revrun": (5, "reviewer"),
+            "final": (6, "main"), "rc": (7, "main"), "appr": (8, "main"), "closedun": (9, "main"),
+            "unusable": (10, "unknown"), "incomplete": (10, "unknown"), "dead": (10, "unknown"), "queued": (10, "unknown"),
+            "twotasks": (4, "worker"), "chain": (4, "worker"), "olderrev": (6, "main"), "badreq": (10, "unknown"),
+            "closedmerged": (10, "unknown"), "badlane": (10, "unknown")}
+        self.assertEqual(sorted(got), sorted(want))     # the foreign lane is left out, every other open lane has a row
+        for name, (rule, who) in want.items():
+            with self.subTest(lane=name):
+                self.assertEqual((got[name]["rule"], got[name]["who"]), (rule, who), got[name])
+        self.assertEqual(got["chain"]["task"], "t-chain-2")
+        self.assertEqual(got["twotasks"]["task"], "t-two-b")
+        self.assertEqual(got["olderrev"]["review"], None)
+        self.assertEqual(got["appr"]["review"], {"id": "r-appr", "verdict": "APPROVED"})
+        self.assertEqual(got["perm"]["requests"][0]["kind"], "permission")
+        self.assertEqual(got["run"]["state"]["state"], "stalled")  # timeline's word: no first prompt in 4990 s
+        self.assertEqual((got["run"]["objective"], got["run"]["step"], got["run"]["age"]), ("objective of run", "S1", "2d"))
+        wheres = " ".join(p["where"] + " " + p["problem"] for p in report["problems"])
+        for word in ("no-meta", "req-", "badlane"):
+            self.assertIn(word, wheres)
+        order = [r["who"] for r in report["lanes"]]
+        self.assertEqual(order, sorted(order, key=lambda w: status.WHO_ORDER[w]))  # owner, then main, then worker/reviewer, unknown last
+        text = status.render(report)
+        self.assertEqual(len([line for line in text.splitlines() if "  -> " in line]), len(want))
+        for secret in ("done", "broken"):
+            self.assertNotIn(secret, text)
+
+    def test_cli(self):
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(self.status.main([str(self.tasks), "--repo", str(self.repo), "--json", "--now", iso_s(5000)]), 0)
+        self.assertIn("lanes", json.loads(buf.getvalue()))
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                self.status.main([str(self.tasks), "--now", "yesterday"])
+            with self.assertRaises(SystemExit):
+                self.status.main([str(self.base / "nope")])
 
 
 if __name__ == "__main__":

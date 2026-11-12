@@ -19,6 +19,7 @@ import json
 import os
 from pathlib import Path
 import re
+import sys
 
 import launch_record
 import work
@@ -216,6 +217,40 @@ def worker_rules(workdir, role, lane=None, tasks=(), attached=()):
         return "\n".join(fixed + _fit(fixed, entries)) + "\n"
     except Exception as error:  # noqa: BLE001 - fail open: a dispatch never waits on the store
         return unreadable(f"{type(error).__name__}: {error}")
+
+
+def rules_for_task(base, task_id, parent, workdir, role, lane=None):
+    """`worker_rules` for the task `task_id` (state directory `base`) that continues `parent`: the worker is its working directory, role,
+    lane, its own id and the tasks it continues (the parent it retries, reviews or investigates, and theirs in turn, in tasks/ or
+    archive/), and the workspaces this session has attached. The one builder every start shares: bin/tp-agent launch (rules_for) and
+    bin/tp-review (`python3 lib/work_brief.py reviewer-rules`). Never raises: what cannot be read is one line saying so."""
+    from task_archive import find_archived_task
+    tasks, ident = [task_id], parent
+    try:
+        while isinstance(ident, str) and ident not in tasks and len(tasks) < 20 and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", ident):
+            tasks.append(ident)
+            path = Path(base) / "tasks" / ident if (Path(base) / "tasks" / ident / "meta.json").is_file() else find_archived_task(base, ident)
+            try:
+                meta = json.loads((path / "meta.json").read_text()) if path else {}
+            except (OSError, ValueError):
+                meta = {}
+            ident = meta.get("parent") if isinstance(meta, dict) else None
+        attached = work_index.attached_ids(Path(base))
+    except Exception as error:  # noqa: BLE001 - the rules section never stops a start; it says what it could not read
+        return unreadable(f"the task's ancestry or attached workspaces: {type(error).__name__}: {error}")
+    return worker_rules(workdir, role, lane, tasks, attached)
+
+
+def _main(argv):
+    """`work_brief.py reviewer-rules STATE_DIR AUTHOR_TASK_ID AUTHOR_WORKDIR [AUTHOR_LANE]`: the section for the reviewer of that task
+    (role code-reviewer; it continues the reviewed task, so its ancestry is the author's and the author's), on stdout. The reviewer has
+    no id yet, so its own id is not among the tasks; the reviewed task stands in as its parent."""
+    if len(argv) not in (4, 5) or argv[0] != "reviewer-rules":
+        print("usage: work_brief.py reviewer-rules STATE_DIR AUTHOR_TASK_ID AUTHOR_WORKDIR [AUTHOR_LANE]", file=sys.stderr)
+        return 2
+    _, base, author, workdir = argv[:4]
+    sys.stdout.write(rules_for_task(base, "", author, workdir, "code-reviewer", argv[4] if len(argv) == 5 else None))
+    return 0
 
 
 def _fit(fixed, entries):
@@ -717,3 +752,7 @@ def run(args, state_dir_fn, build_index, render_index, guard=None):
     if args.hook_json:
         return json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": text}})
     return text
+
+
+if __name__ == "__main__":
+    sys.exit(_main(sys.argv[1:]))

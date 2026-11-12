@@ -711,16 +711,7 @@ def rules_for(base, item):
     the store cannot be read; never raises). The worker is its working directory (and that repository's main checkout), role, lane,
     its own id and the tasks it continues (the parent it retries, reviews or investigates, and theirs in turn), and the workspaces
     this session has attached."""
-    tasks, ident = [item["id"]], item["parent"]
-    try:
-        while isinstance(ident, str) and ident not in tasks and len(tasks) < 20 and IDENT.fullmatch(ident):
-            tasks.append(ident)
-            path = base / "tasks" / ident if (base / "tasks" / ident / "meta.json").is_file() else find_archived_task(base, ident)
-            ident = read_json(path / "meta.json").get("parent") if path else None
-        attached = work_index.attached_ids(base)
-    except Exception as error:  # noqa: BLE001 - the rules section never stops a start; it says what it could not read
-        return work_brief.unreadable(f"the task's ancestry or attached workspaces: {type(error).__name__}: {error}")
-    return work_brief.worker_rules(item["workdir"], item["role"], item.get("lane"), tasks, attached)
+    return work_brief.rules_for_task(base, item["id"], item["parent"], item["workdir"], item["role"], item.get("lane"))  # the one builder, lib/work_brief.py
 
 
 def launch(base, item):

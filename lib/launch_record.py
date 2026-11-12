@@ -268,7 +268,7 @@ def worker(facts, env=None):
         reasons["effort"] = "no effort was passed: the harness's own default"
     if not role_text:
         reasons["role"] = "started with no role (no --role or --preamble-role)"
-    reasons["preferences"] = "HB3 decision records are not applied at launch: no preference ids reach tp-spawn"
+    reasons["preferences"] = "the owner's rules reach the worker as the packet section `# Rules in force` (HB3b), not as preference ids, so there are none to record here"
     base = worker_env.get("LANE_BASE") or None
     if base is None:
         reasons["context.base_commit"] = "only a lane task is given its base (LANE_BASE)"

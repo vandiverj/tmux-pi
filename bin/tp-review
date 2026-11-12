@@ -491,14 +491,25 @@ if [[ "$force_alive" != 1 ]]; then
 fi
 ctx_args=()
 for f in "${ctx_list[@]}"; do ctx_args+=(--context "$f"); done
-if ! review_id="$("$ROOT/bin/tp-spawn" --worker "$reviewer" --model "$model" --thinking "$thinking" --name "review-$id" --workdir "$author_workdir" --preamble-role code-reviewer --review-of "$id" ${lane_args[@]+"${lane_args[@]}"} \
+# The owner's rules (HB3c): the same section every worker gets (lib/work_brief.py rules_for_task), scoped to the reviewer: the author's
+# working directory and lane, role code-reviewer, and the reviewed task and its ancestry. Passed as a file, never on the shell line
+# (records are data), and removed afterwards. Fails open: a broken store is one line in the section or none, never a refused review.
+rules_args=(); rules_file="$(mktemp "${TMPDIR:-/tmp}/tp-rules-XXXXXX")" || rules_file=""
+if [[ -n "$rules_file" ]]; then
+  if python3 "$ROOT/lib/work_brief.py" reviewer-rules "$state_dir" "$id" "$author_workdir" ${author_lane:+"$author_lane"} > "$rules_file" 2>/dev/null && [[ -s "$rules_file" ]]; then
+    rules_args=(--rules-file "$rules_file")
+  fi
+fi
+if ! review_id="$("$ROOT/bin/tp-spawn" --worker "$reviewer" --model "$model" --thinking "$thinking" --name "review-$id" --workdir "$author_workdir" --preamble-role code-reviewer --review-of "$id" ${lane_args[@]+"${lane_args[@]}"} ${rules_args[@]+"${rules_args[@]}"} \
   ${ctx_args[@]+"${ctx_args[@]}"} --context "$dir/task.md" \
   --note "Author task id: $id" ${extra[@]+"${extra[@]}"} \
   --note "Review policy: $policy ($independence)" ${same_provider_note[@]+"${same_provider_note[@]}"} \
   --note "The author used worker: $worker. You must independently review; do not accept assertions without checking." \
   -- "$review_task")"; then
+  rm -f -- "$rules_file"
   die "reviewer '$reviewer' ($model) could not start; ask the human (no silent skip or substitute)"
 fi
+rm -f -- "$rules_file"
 
 jq --arg review "$review_id" --arg reviewer "$reviewer" --arg model "$model" --arg thinking "$thinking" \
   --arg policy "$policy" --arg independence "$independence" --arg approved "$approved_quote" \

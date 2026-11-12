@@ -504,6 +504,50 @@ class RetryAndReviewTests(LaneCase):
         self.assertEqual(os.path.realpath(reviewers[0]["workdir"]), os.path.realpath(self.worktree))
 
 
+    def review_packet(self, records, store_is_a_file=False):
+        """Start a reviewer of a settled lane-alpha task (bin/tp-review: HB3c passes it the owner's rules as --rules-file) with the owner's
+        `records` ({scope: (rule text, written by)}) in the fixture's work store; the reviewer's packet before its context. `store_is_a_file` makes the store unreadable."""
+        store = Path(self.env["TP_WORK_DIR"])
+        if store_is_a_file:
+            store.write_text("not a directory\n")
+        else:
+            (store / "workspaces").mkdir(parents=True)
+            lines = [f"- 2026-11-01 {text} <!-- record: " + json.dumps({"id": f"hub/R{n}", "kind": "preference", "scope": scope, "status": "active",
+                     "provenance": {"by": by, "quote": "my words", "at": f"2026-11-01T00:00:{n:02d}Z"}}) + " -->"
+                     for n, (scope, (text, by)) in enumerate(records.items(), 1)]
+            (store / "workspaces" / "hub.md").write_text("---\nid: hub\ntitle: Hub\nstatus: active\n---\n\n## Decisions\n" + "\n".join(lines) + "\n")
+        item, task = self.lane_ok()
+        self.settle(task)
+        run = subprocess.run([str(ROOT / "bin/tp-review"), item["id"]], env=self.env, text=True, capture_output=True, timeout=90)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        packet = (self.state / "tasks" / run.stdout.strip() / "packet.md").read_text()
+        return packet.split("\n# Context\n")[0]  # the reviewer's own text; the context holds the author's packet, with the author's rules
+
+    def test_a_reviewer_of_a_lane_task_gets_the_owners_lane_rule(self):
+        packet = self.review_packet({"lane:alpha": ("rule for lane alpha", "owner"), "lane:beta": ("rule for lane beta", "owner")})
+        self.assertIn("# Rules in force\n", packet)
+        self.assertIn("rule for lane alpha", packet)
+        self.assertNotIn("rule for lane beta", packet)
+
+    def test_a_reviewer_gets_a_global_rule_and_a_code_reviewer_role_rule(self):
+        packet = self.review_packet({"global": ("rule for everyone", "owner"), "role:code-reviewer": ("rule for reviewers", "owner"),
+                                     "role:coder": ("rule for coders", "owner")})
+        self.assertIn("rule for everyone", packet)
+        self.assertIn("rule for reviewers", packet)
+        self.assertNotIn("rule for coders", packet)
+
+    def test_a_worker_written_record_is_never_shown_to_a_reviewer(self):
+        packet = self.review_packet({"global": ("worker says so", "worker"), "lane:alpha": ("owner says so", "owner")})
+        self.assertIn("owner says so", packet)
+        self.assertNotIn("worker says so", packet)
+
+    def test_an_unreadable_store_gives_the_reviewer_one_line_and_the_review_still_starts(self):
+        packet = self.review_packet({}, store_is_a_file=True)
+        section = packet.split("# Rules in force\n", 1)[1].split("\n\n# ", 1)[0]
+        self.assertIn("could not be read", section)
+        self.assertEqual(len([l for l in section.splitlines() if l.startswith("- ")]), 1, section)
+
+
 class TickTests(LaneCase):
     snapshot_lane = True  # every test starts from the default dispatch; setUpClass makes it once
 

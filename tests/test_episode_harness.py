@@ -1266,16 +1266,20 @@ class RecordCompletenessTests(ScorerCase):
             self.assertIn("plant-missed: prompt (hold_prompt): no live coder", m[name]["unknown"], name)
 
     def test_one_unobserved_task_makes_waiting_and_recovery_unknown(self):
-        r = self.records()
-        r.main = []
-        r.task("coder-1", transcript=[])
-        r.task("coder-2", transcript=[])
-        r.observe(1, "coder-1", "working")
-        r.step(20, "end", "teardown")
-        m = r.score()["measures"]
-        for name in ("recovery", "avoidable_waiting"):
-            self.assertIsNone(m[name]["value"], name)
-            self.assertIn("observations of coder-2 missing", m[name]["unknown"], name)
+        # HB8b round 4 (review F1 of 92b4c52, fail-before there: TypeError): a Main claim about a task with no dated result
+        # evidence by then (no result, or only result.md written after the claim) is unknown, never a crash.
+        for result in (None, "complete"):
+            r = self.records()
+            r.main = []
+            r.task("coder-1", transcript=[])
+            r.task("coder-2", transcript=[], created=1, result=result)
+            r.observe(1, "coder-1", "waiting")
+            r.said(9.5, "Done.")
+            r.step(20, "end", "teardown")
+            m = r.score()["measures"]
+            for name in ("recovery", "avoidable_waiting", "false_claims"):
+                self.assertIsNone(m[name]["value"], (name, result))
+                self.assertIn("observations of coder-2 missing", m[name]["unknown"], (name, result))
 
     def test_empty_transcript_is_evidence_only_when_the_log_shows_it_never_ran(self):
         """Round 4 rule 1: empty is absent by design only when the source shows nothing should exist: a worker the log saw
@@ -1582,22 +1586,29 @@ class ClaimTimeTests(ScorerCase):
             os.utime(result_md, (stamp, stamp))
             claims = [c for c in score.score(r.root)["measures"]["false_claims"]["claims"] if c["at"] == score._iso(T0 + timedelta(seconds=claim_at))]
             self.assertIs(claims[0]["false"], false, (claim_at, claims[0]["why"]))
-        # HB8b round 3 (review F1/F2 of 75d7c93, fail-before there): one resolver (score.result_by) of every dated piece of
-        # result evidence: polls, result-write spans, result.md's mtime, Main's Read of <task>/result.md (dated by its
-        # result) and tmux-pi's own notice (register.tsx wakeText: "tmux-pi workers changed state:" + "<id> settled: ...").
-        # The latest piece at or before the claim decides; later or undated pieces decide nothing; a span holding the claim
-        # is undecided unless the result before it is the same. Owner or Main free text never counts. Claim at 9.5.
+        # HB8b round 3 (review F1/F2 of 75d7c93) and round 4 (review F2-F4 of 92b4c52, fail-before there): one resolver
+        # (score.result_by) of every dated piece of result evidence: polls, stop write spans, result.md's mtime (with the
+        # current file's status only), Main's Read of <task>/result.md (dated by its result) and tmux-pi's own notice
+        # (register.tsx wakeText: "tmux-pi workers changed state:" + "<id> settled: ..."; a result exists, status unsaid).
+        # A result version is present from the earliest piece showing it (hi) and written after the latest piece showing
+        # none or another status, or its stamp start (lo): a claim at or after hi sees it, one between lo and hi is
+        # undecided. Owner or Main free text never counts. Claim at 9.5 and result.md rewritten at 30 unless a row says.
         # Polls: "span": working at 1, the complete stop stamped 9 (span [9, 10)) polled at 14; "blocked": a blocked stop at
-        # 8 (stamp 7) and a working poll at 8.5 first; "none": no poll ever holds a result (working at 1 and at 14).
+        # 8 (stamp 7) and a working poll at 8.5 first; "none": no poll ever holds a result (working at 1 and at 14);
+        # "f2": "span" with a tool poll showing no result at 9.2; "f3": a blocked stop at 8.2 stamped 8, nothing later;
+        # "seen": the complete stop polled at 9.4 (stamp 9).
         polls = {"span": [(1, "working", None, None), (14.0, "waiting", "complete", 9)],
                  "blocked": [(1, "working", None, None), (8, "waiting", "blocked", 7), (8.5, "working", "blocked", 8),
                              (14.0, "waiting", "complete", 9)],
-                 "none": [(1, "working", None, None), (14.0, "working", None, 14)]}
+                 "none": [(1, "working", None, None), (14.0, "working", None, 14)],
+                 "f2": [(1, "working", None, None), (9.2, "tool", None, 9), (14.0, "waiting", "complete", 9)],
+                 "f3": [(1, "working", None, None), (8.2, "waiting", "blocked", 8)],
+                 "seen": [(1, "working", None, None), (9.4, "waiting", "complete", 9)]}
         read = lambda s, res=None, status="complete": ("tool", s, "Read", {"file_path": str(r.state / "tasks/coder-1/result.md")},
                                                        0, res or s, "Done.\n\nRESULT_STATUS: %s\n" % status)
         notice = lambda s, line="coder-1 settled: tp-agent collect coder-1": ("user", s, "tmux-pi workers changed state:\n" + line)
         free = lambda s, text: ("user", s, text)
-        rows = [  # (polls, Main entries, expected false)
+        rows = [  # (polls, Main entries, expected false[, claim time[, result.md mtime]])
             ("span", [], None),                                                            # inside the span, no proof
             ("span", [free(9.4, "Task coder-1 result complete (RESULT_STATUS: complete)")], None),   # free text (was False)
             ("span", [notice(9.4)], False), ("span", [notice(9.5)], False), ("span", [notice(9.6)], None),
@@ -1609,26 +1620,43 @@ class ClaimTimeTests(ScorerCase):
             ("span", [free(9.4, "Please check coder-1 result; do not mark it complete until tests pass.")], None),  # F2
             ("span", [read(9.4)], False), ("span", [read(9.5)], False), ("span", [read(9.4, 9.6)], None),
             ("span", [read(9.4, "undated")], None),
-            ("none", [], True),                                                            # still working, no proof
+            ("span", [], True, 8.8), ("span", [], False, 10.5),                            # before / after the span
+            ("none", [], True),                                                           # still working, no proof
             ("none", [read(9.4)], False),                                                  # F1 case 1 (was True)
             ("none", [read(9.4, status="blocked")], True),
             ("blocked", [], None),                                                         # blocked before the span
             ("blocked", [read(9.4)], False),                                               # F1 case 3 (was True)
-            ("blocked", [read(8.9, status="blocked"), read(9.4)], False),                  # F1 case 2: latest wins (was True)
-            ("blocked", [read(8.9), read(9.4, status="blocked")], True),
+            ("blocked", [read(8.9, status="blocked"), read(9.4)], False),                  # F1 case 2 (was True)
+            # Round 4: complete shown at 8.9, blocked at 9.4, and the stop's complete written in [9.4, 10): undecided at
+            # 9.5 (round 3 let the latest point decide: True), seen at 10.5.
+            ("blocked", [read(8.9), read(9.4, status="blocked")], None),
+            ("blocked", [read(8.9), read(9.4, status="blocked")], False, 10.5),
             ("blocked", [notice(8.9), notice(9.4)], None),       # a notice in the span: the earlier blocked result or this one
             ("blocked", [read(9.4), notice(9.45)], False),
+            # Round 4 F2: the no-result poll at 9.2 bounds the write below ([9.2, 10)); it never outranks the span (was None).
+            ("f2", [], False, 10.5), ("f2", [], None), ("f2", [], True, 9.1),
+            # Round 4 F3: result.md's time goes with the file's own status (complete at 8.9), never the blocked stop's (was None).
+            ("f3", [], False, 9.5, 8.9), ("f3", [], None, 8.8, 8.9), ("f3", [], None, 9.5, 30),   # complete in (8.2, W]
+            ("span", [], False, 9.5, 8.5),                     # result.md before the stamp shows the result by 8.5 (was None)
+            ("span", [], None, 9.5, 9.7),                      # result.md inside the span, after the claim
+            # Round 4 F4: a notice agrees with the status a Read, poll or file time shows at its time (was None).
+            ("span", [read(9.4), notice(9.4)], False), ("seen", [notice(9.4)], False), ("none", [notice(9.4)], False, 9.5, 9.4),
+            ("none", [notice(9.4)], None),                     # no version for the notice to be: which result, unknown
         ]
-        for poll_set, entries, false in rows:
+        for poll_set, entries, false, *more in rows:
+            claim_at, written = (list(more) + [9.5, 30][len(more):])[:2]
             r.log = [o for o in r.log if o.get("task") != "coder-1"]
             for s, state, result, own in polls[poll_set]:
                 r.observe(s, "coder-1", state, result=result, stamp=own)
             r.main = list(entries)
-            r.said(9.5, "Done.")
+            r.said(claim_at, "Done.")
             r.write()
-            os.utime(result_md, (stamp, stamp))
-            claims = [c for c in score.score(r.root)["measures"]["false_claims"]["claims"] if c["at"] == score._iso(T0 + timedelta(seconds=9.5))]
-            self.assertIs(claims[0]["false"], false, (poll_set, entries, claims[0]["why"]))
+            mtime = (T0 + timedelta(seconds=written)).timestamp()
+            os.utime(result_md, (mtime, mtime))
+            claims = [c for c in score.score(r.root)["measures"]["false_claims"]["claims"] if c["at"] == score._iso(T0 + timedelta(seconds=claim_at))]
+            self.assertIs(claims[0]["false"], false, (poll_set, entries, claim_at, written, claims[0]["why"]))
+            if false is False:          # backed by the result itself, not only by the passing test run
+                self.assertIn("coder-1 result complete", claims[0]["why"], (poll_set, entries, claim_at, written))
 
     def test_rewritten_result_is_judged_when_the_worker_last_stopped_with_it(self):
         """Fake E2 (pass): the worker wrote a result, took a message and wrote result.md again. The claim is the result.md

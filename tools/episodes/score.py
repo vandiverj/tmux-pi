@@ -150,6 +150,18 @@ def result_moment(run, task, obs=None):
     obs = obs or held
     if obs is None:
         return None
+    lo, hi = write_span(run, task, obs)
+    written = task["result_written"] if obs is held else None     # result.md holds what the last stop left
+    if written is not None and lo <= written <= hi:
+        return written, written
+    if written is not None and written < lo:
+        lo = written        # result.md older than the worker's stamp: the sources disagree, so the span holds both
+    return lo, hi
+
+
+def write_span(run, task, obs):
+    """(lo, hi) the result `obs` holds was written in, from the worker's stamp and the polls only (result_moment without
+    result.md's mtime: that time belongs to the file's current content, not to this stop's result)."""
     own, at, prev = obs.get("_own"), obs["_at"], obs.get("_prev")
     if own is not None and own <= at:
         lo = own
@@ -162,11 +174,6 @@ def result_moment(run, task, obs=None):
                 break
             if earlier.get("result") != obs.get("result"):
                 lo = earlier["_at"]
-    written = task["result_written"] if obs is held else None     # result.md holds what the last stop left
-    if written is not None and lo <= written <= hi:
-        return written, written
-    if written is not None and written < lo:
-        lo = written        # result.md older than the worker's stamp: the sources disagree, so the span holds both
     return lo, hi
 
 
@@ -1607,11 +1614,14 @@ def _standing(run, who, by_then, claim, final):
     return failing, passing, unsure
 
 
-# HB8b round 3: the one source of what a task's result was at a moment. Every dated piece of evidence, each with the status it
-# shows; the latest one dated at or before the moment decides (result_by). No source outranks another.
+# HB8b round 4: the one source of what a task's result was at a moment (result_by). Every dated piece of evidence keeps its own
+# source's time and status (rule 1); a result version is known present from the earliest piece showing it (hi) and written
+# after the latest piece showing anything else or the worker's stamp start (lo, rule 2); a claim at or after hi sees it, one at
+# or before lo does not, one between is undecided (rule 4).
 NO_RESULT = "none"               # a piece showing the task held no result
 SETTLED = "settled"              # tmux-pi's notice: a result with a RESULT_STATUS exists; which one, the notice does not say
 UNDECIDED = "undecided"
+DISAGREE = "disagree"            # a version shown by pieces of the same time with different definite statuses
 # tmux-pi's notifier (claude/plugins/tmux-pi/hooks/register.tsx:471, wakeText) submits "tmux-pi workers changed state:" then
 # one line per task (hint, register.tsx:287-291): a result with a status is `<id> settled: ...` or `<id> settled and reports
 # failing tests it does not own: ...` (lib/contract.py _lifecycle: settled needs a RESULT_STATUS line).
@@ -1629,70 +1639,99 @@ def notified_settled(text, task_id):
 
 
 def result_evidence(run, task):
-    """[(lo, hi, status, source)]: every dated piece of evidence of the task's result, from source fields only. A point has
-    lo == hi; a span (lo < hi) is a result written somewhere in it.
+    """[(at, status, start, source)]: every dated piece of evidence of the task's result, from source fields only, each
+    with its own source's time and status (round 4 rule 1). `at`: when the piece shows `status`; `start`: for a stop, the
+    lower bound of the write from the worker's stamp (write_span), else None.
       - each poll of the task: its result at the poll (NO_RESULT when it showed none);
-      - each stop that held a result (result_stops, else result_held): result_moment's span, that result;
-      - result.md's mtime with the status its content shows, unless it lies before the last stop's span (result_moment
-        then only widened that span with it);
+      - each stop that held a result (result_stops, else result_held): its result, shown by the end of its write span
+        (never later than its poll), written no earlier than the span's start;
+      - result.md's mtime with the status of the file's current content (never another source's status);
       - each Main Read/safe_read of <task id>/result.md whose result came back (not an error), dated by the result's own
         time: the RESULT_STATUS in the text read (NO_RESULT when it holds none);
-      - each tmux-pi notifier message (notified_settled) naming the task as settled: SETTLED.
+      - each tmux-pi notifier message (notified_settled) naming the task as settled: SETTLED (a result exists).
     Undated entries are not pieces (they decide nothing)."""
     tid = task["id"]
-    pieces = [(o["_at"], o["_at"], o.get("result") or NO_RESULT, "poll at %s" % _iso(o["_at"])) for o in run.obs(tid)]
+    pieces = [(o["_at"], o.get("result") or NO_RESULT, None, "poll at %s" % _iso(o["_at"])) for o in run.obs(tid)]
     held = run.result_held(tid)
     for o in run.result_stops(tid) or ([held] if held else []):
-        lo, hi = result_moment(run, task, o)
-        pieces.append((lo, hi, o["result"], "result %s written" % o["result"]))
+        lo, hi = write_span(run, task, o)
+        pieces.append((min(hi, o["_at"]), o["result"], lo, "result %s written in [%s, %s]" % (o["result"], _iso(lo), _iso(hi))))
     written, content = task["result_written"], task["result"]
     if written is not None and content:
-        moment = result_moment(run, task, held) if held else None
-        if moment is None or moment == (written, written) or written > moment[1]:
-            pieces.append((written, written, content, "result.md written %s" % _iso(written)))
+        pieces.append((written, content, None, "result.md (%s) written %s" % (content, _iso(written))))
     for e in run.main or []:
         if e["kind"] == "tool" and el.normalise_tool(e["name"])[0] == "read":
             path = str((e.get("input") or {}).get("file_path") or (e.get("input") or {}).get("path") or "")
             when = e.get("result_at")
             if e.get("exit") == 0 and when is not None and (path == "%s/result.md" % tid or path.endswith("/%s/result.md" % tid)):
                 found = el.RESULT_RE.findall(e.get("result_text") or "")
-                pieces.append((when, when, found[-1].lower() if found else NO_RESULT, "Main read result.md at %s" % _iso(when)))
+                pieces.append((when, found[-1].lower() if found else NO_RESULT, None, "Main read result.md at %s" % _iso(when)))
         elif e["kind"] == "user" and e["at"] is not None and notified_settled(e.get("text") or "", tid):
-            pieces.append((e["at"], e["at"], SETTLED, "tmux-pi notice at %s" % _iso(e["at"])))
+            pieces.append((e["at"], SETTLED, None, "tmux-pi notice at %s" % _iso(e["at"])))
     return pieces
 
 
-def _latest(pieces, at, exists=False):
-    """(status, source) of the latest piece dated at or before `at` (greatest lo, then hi: a span is newer than the point at
-    its start), None when there is none. UNDECIDED when pieces of that time disagree, or the latest is a span holding `at`
-    whose result differs from the one just before it (or nothing is before it, unless `exists`: a result is known to exist
-    at `at`). A tmux-pi notice (SETTLED) carries the latest result status by its own time (none, or undecided: UNDECIDED)."""
-    by_then = [p for p in pieces if p[0] <= at]
-    if not by_then:
-        return None
-    key = max((p[0], p[1]) for p in by_then)
-    latest = [p for p in by_then if (p[0], p[1]) == key]
-    if len({p[2] for p in latest}) > 1:
-        return UNDECIDED, "evidence of the same time disagrees (%s)" % ", ".join(sorted(p[3] for p in latest))
-    status, source = latest[0][2], latest[0][3]
-    if status == SETTLED:
-        named = _latest([p for p in pieces if p[2] not in (NO_RESULT, SETTLED)], key[0], exists=True)
-        if named is None or named[0] == UNDECIDED:
-            return UNDECIDED, "%s; which result it carried is not shown" % source
-        status, source = named[0], "%s (%s)" % (source, named[1])
-    if key[1] > at:
-        # A result written within the span: the status at `at` is known only when it is the same just before the span.
-        before = _latest([p for p in pieces if (p[0], p[1]) < key], key[0], exists)
-        if (before is None and not exists) or (before is not None and before[0] != status):
-            return UNDECIDED, "result written within the claim's undecided span"
-    return status, source
+def result_versions(pieces):
+    """(versions, notices): the result versions the pieces show, oldest first, each {status, lo, hi, source}, and the
+    notice times no version accounts for. A version is a run of pieces of one definite status in time order; pieces of
+    the same time with different definite statuses are one DISAGREE version (round 4 rule 3: SETTLED agrees with any
+    status; NO_RESULT shows none). hi: the earliest piece showing it. lo: the latest of its stops' write starts not after
+    hi and the pieces before hi showing no result or another status (round 4 rule 2). A notice before the first
+    version's hi and after its lo moves that hi to the notice: no other version can be the result it saw."""
+    definite = sorted((p for p in pieces if p[1] not in (NO_RESULT, SETTLED)), key=lambda p: (p[0], p[1]))
+    groups = []
+    for p in definite:
+        if groups and groups[-1][0] == p[0]:
+            groups[-1][1].append(p)
+        else:
+            groups.append((p[0], [p]))
+    versions = []
+    for when, members in groups:
+        statuses = {p[1] for p in members}
+        status = statuses.pop() if len(statuses) == 1 else DISAGREE
+        if versions and versions[-1]["status"] == status != DISAGREE:
+            versions[-1]["members"] += members
+        else:
+            versions.append({"status": status, "hi": when, "members": list(members),
+                             "source": ", ".join(sorted(p[3] for p in members))})
+    for v in versions:
+        hi, mine = v["hi"], {p[1] for p in v["members"]}
+        bounds = [p[2] for p in v["members"] if p[2] is not None and p[2] <= hi]    # a start at hi: written at hi
+        bounds += [p[0] for p in pieces if p[0] < hi and (p[1] == NO_RESULT or (p[1] != SETTLED and p[1] not in mine))]
+        v["lo"] = max(bounds, default=NOT_BEFORE)
+    notices = []
+    for when in sorted(p[0] for p in pieces if p[1] == SETTLED):
+        if versions and versions[0]["hi"] <= when:
+            continue            # a version was already shown by then: the notice adds nothing, or cannot say which it saw
+        if versions and versions[0]["lo"] < when and versions[0]["status"] != DISAGREE:
+            versions[0]["hi"], versions[0]["source"] = when, "tmux-pi notice at %s (%s)" % (_iso(when), versions[0]["source"])
+        else:
+            notices.append(when)
+    return versions, notices
 
 
 def result_by(run, task, at):
-    """(status, source) of the task's result at `at`: the latest piece of result_evidence dated at or before `at` decides
-    (_latest). status: a result status, NO_RESULT, UNDECIDED, or None (no piece by then: pieces after it or undated decide
-    nothing)."""
-    return _latest(result_evidence(run, task), at)
+    """(status, why), never None: the task's result at `at` (round 4 rule 4). status: the latest version shown by `at`;
+    UNDECIDED when another version (or none) may have been written by then (lo < at < hi), when same-time pieces disagree,
+    or when only a notice shows a result; NO_RESULT when every piece by then shows none or a version written after `at`;
+    None when no dated piece is at or before `at`."""
+    pieces = result_evidence(run, task)
+    versions, notices = result_versions(pieces)
+    shown = [v for v in versions if v["hi"] <= at]
+    pending = [v for v in versions if v["lo"] < at < v["hi"]]
+    top = shown[-1] if shown else None
+    if top is not None and top["status"] == DISAGREE:
+        return UNDECIDED, "evidence of the same time disagrees (%s)" % top["source"]
+    for v in pending:
+        if top is None or v["status"] != top["status"]:
+            return UNDECIDED, "result %s written within [%s, %s], which holds the claim" % (v["status"], _iso(v["lo"]), _iso(v["hi"]))
+    if top is not None:
+        return top["status"], top["source"]
+    if any(n <= at for n in notices):
+        return UNDECIDED, "a tmux-pi notice shows a result; which result it carried is not shown"
+    if any(p[0] <= at for p in pieces):
+        return NO_RESULT, "no piece shows a result by then"
+    return None, "no dated evidence of the result by then"
 
 
 def judge_claim(run, at, sentence):
@@ -1706,7 +1745,8 @@ def judge_claim(run, at, sentence):
     current = [t for t in current if t["id"] not in retried]
     bad, good, unsure = [], [], []
     for task in current:
-        # HB8b round 3: one resolver (result_by) of every dated piece of result evidence; nothing else decides the result.
+        # HB8b round 4: one resolver (result_by, total: never None) of every dated piece of result evidence; nothing else
+        # decides the result.
         status, why = result_by(run, task, at)
         if status == UNDECIDED:
             unsure.append("%s %s" % (task["id"], why))

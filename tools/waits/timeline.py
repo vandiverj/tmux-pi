@@ -111,6 +111,21 @@ def iso(t):
     return None if t is None else datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
+def record_time(value):
+    """Rule C (HB6d): a time read from a shared record (main-turns.jsonl, a lane's events.jsonl, lease.json, lane.json),
+    converted inside one guard through its last use that can raise: parse_time, then iso(). A time is returned only when
+    both succeed (so it is finite and formattable, and every later use of it is plain arithmetic or iso()); None for any
+    other value, including one parse_time raises on (10**400)."""
+    try:
+        t = parse_time(value)
+        if t is None or t != t or t in (float("inf"), float("-inf")):
+            return None
+        iso(t)
+        return t
+    except Exception:
+        return None
+
+
 class Reader:
     """File access for one report: every read is listed when it fails, nothing is written."""
 
@@ -329,6 +344,7 @@ def regular_file(reader, path, label):
 
 IDLE_WHY = "between Main turns"
 RESTART_WHY = "Main turn with no Stop before Main restarted (its end is not recorded)"
+OPEN_DOUBT_WHY = "; another Claude session started since, so this one may have ended unrecorded"
 
 
 def main_lines(reader, path):
@@ -341,15 +357,15 @@ def main_lines(reader, path):
     out, prev, backwards, bad = [], None, False, 0
     for line in lines:
         try:
-            t, event = parse_time(line.get("at")), line.get("event")
+            t, event = record_time(line.get("at")), line.get("event")
             if t is None or not isinstance(event, str) or event not in MAIN_EVENTS:
                 bad += 1
                 continue
-        except Exception:  # F1: one bad record is skipped, never the report
+            session = line.get("session") if isinstance(line.get("session"), str) else None
+            source = line.get("source") if isinstance(line.get("source"), str) else None
+        except Exception:  # F1, Rule C: one bad record is skipped, never the report
             bad += 1
             continue
-        session = line.get("session") if isinstance(line.get("session"), str) else None
-        source = line.get("source") if isinstance(line.get("source"), str) else None
         if prev is not None and t < prev:
             backwards, t = True, prev
         prev = t
@@ -363,32 +379,32 @@ def main_lines(reader, path):
 
 def main_turns(reader, session_dir, now):
     """M1: [(start, end, state, reason, confidence)], contiguous from the first line that sets Main's state to now, or
-    None when there is no usable main-turns.jsonl. Each Claude session id has its own turn state (F2):
-    - UserPromptSubmit: that session is busy from it. A further prompt before its Stop keeps the turn busy, and the turn is
-      inferred (a queued prompt, or an interrupt Claude reports with no Stop); a turn of one prompt ended by its Stop is exact.
-    - Stop: ends that session's turn; idle from it. A Stop while idle (a duplicate) changes nothing.
-    - SessionStart compact: no change. Any other SessionStart (a restart, /clear, resume) ends that session's open turn as
-      unrecorded (when it ended is not known), idle from it; and, as the file shows it never spoke again, the open turn of
-      every other session with no later line of its own (Claude restarted under a new id). A session with later lines keeps
-      its turn until its own Stop.
-    - Session null (no usable id): a null Stop ends every open turn, a null non-compact SessionStart ends every open turn as
-      unrecorded (one Main, as before ids were kept apart).
-    Main is busy while any session has a turn open; else unrecorded where any session's state is; else idle. The last state
-    of each session runs to now."""
+    None when there is no usable main-turns.jsonl. Rule M (HB6d round 3): each Claude session id has its own turn; the
+    records with session null are the legacy stream (one Main, as before ids were kept).
+    - UserPromptSubmit opens that stream's turn, busy from it. A further prompt before its Stop keeps the turn busy, and the
+      turn is inferred (a queued prompt, or an interrupt Claude reports with no Stop); one prompt ended by its Stop is exact.
+    - Stop closes the turn of its own session and the legacy turn: busy to the Stop, idle from it. A null Stop closes every
+      turn. One identified session's Stop never closes another's. A Stop while idle (a duplicate) changes nothing.
+    - SessionStart compact changes nothing. Any other SessionStart (a restart, /clear, resume) closes the open turn of its
+      own session and the legacy turn as unrecorded (when it ended is not known), idle from it; a null one closes every open
+      turn so. It never closes another identified session's turn.
+    - A turn still open at the end is busy to now, open (no Stop yet). From the first later non-compact SessionStart of
+      another session it is inferred: that may be this session restarted under a new id, so the turn may have ended
+      unrecorded. A Stop that comes later only ends seconds shown busy: no earlier second turns from idle to busy.
+    Main is busy while any turn is open; else unrecorded where any stream's state is; else idle."""
     path = Path(session_dir) / MAIN_FILE
     if not regular_file(reader, path, MAIN_FILE):
         return None
     lines = main_lines(reader, path)
     if lines is None:
         return None
-    last = {}
-    for n, line in enumerate(lines):
-        last[line[2]] = n
-    state, segs = {}, {}  # session -> [busy | idle, since, prompts]; session -> its contiguous segments
+    # session -> [busy | idle, since, prompts, doubt: when another session started during the open turn, or None]
+    state, segs = {}, {}
 
     def close(s, end, kind, why, conf):
         if end > state[s][1]:
             segs.setdefault(s, []).append((state[s][1], end, kind, why, conf))
+            state[s][1] = end
 
     def turn_why(prompts, running):
         if prompts == 1:
@@ -396,7 +412,9 @@ def main_turns(reader, session_dir, now):
         return "Main turn of {} prompts with one Stop (queued prompts or an interrupt with no Stop){}".format(
             prompts, ", running" if running else ""), "inferred"
 
-    for n, (t, event, session, source) in enumerate(lines):
+    for t, event, session, source in lines:
+        # Rule M: a Stop or SessionStart closes its own stream and the legacy one; a legacy one closes every stream
+        closes = [s for s in state if s == session or s is None or session is None]
         if event == "UserPromptSubmit":
             cur = state.get(session)
             if cur and cur[0] == "busy":
@@ -404,31 +422,34 @@ def main_turns(reader, session_dir, now):
                 continue
             if cur:
                 close(session, t, "idle", IDLE_WHY, "exact")
-            state[session] = ["busy", t, 1]
+            state[session] = ["busy", t, 1, None]
         elif event == "Stop":
-            for s in [s for s in state if s == session or session is None]:
+            for s in closes:
                 if state[s][0] == "busy":
                     close(s, t, "busy", *turn_why(state[s][2], False))
-                    state[s] = ["idle", t, 0]
-            state.setdefault(session, ["idle", t, 0])
+                    state[s] = ["idle", t, 0, None]
+            state.setdefault(session, ["idle", t, 0, None])
         elif source != "compact":
-            for s in list(state):
-                ends = s == session or session is None or last[s] < n
-                if state[s][0] == "busy" and ends:
+            for s in closes:
+                if state[s][0] == "busy":
                     close(s, t, "unrecorded", RESTART_WHY, "inferred")
-                    if s != session and session is not None:
-                        del state[s]  # never spoke again: gone, no state after this
-                        continue
-                    state[s] = ["idle", t, 0]
-                elif s == session or session is None:
+                else:
                     close(s, t, "idle", IDLE_WHY, "exact")
-                    state[s] = ["idle", t, 0]
-            state.setdefault(session, ["idle", t, 0])
-    for s, (kind, since, prompts) in state.items():
-        if kind == "busy":
-            close(s, max(now, since), "busy", *turn_why(prompts, True))
-        else:
-            close(s, max(now, since), "idle", IDLE_WHY, "exact")
+                state[s] = ["idle", t, 0, None]
+            state.setdefault(session, ["idle", t, 0, None])
+            for cur in state.values():  # a turn still open here is another identified session's: from now on, in doubt
+                if cur[0] == "busy" and cur[3] is None:
+                    cur[3] = t
+    for s, (kind, since, prompts, doubt) in list(state.items()):
+        end = max(now, since)
+        if kind == "idle":
+            close(s, end, "idle", IDLE_WHY, "exact")
+            continue
+        why, conf = turn_why(prompts, True)
+        if doubt is not None:
+            close(s, min(doubt, end), "busy", why, conf)
+            why, conf = why + OPEN_DOUBT_WHY, "inferred"
+        close(s, end, "busy", why, conf)
     return combine_sessions(list(segs.values()))
 
 
@@ -525,16 +546,16 @@ def lane_events(reader, base, lane, cache):
         out, bad = [], 0
         for ev in raw:
             try:
-                t, kind, task = parse_time(ev.get("at")), ev.get("kind"), ev.get("task")
+                t, kind, task = record_time(ev.get("at")), ev.get("kind"), ev.get("task")
                 usable = t is not None and isinstance(kind, str) and kind in LEASE_KINDS and isinstance(task, str)
+                if usable:  # Rule C: every field converted inside the record's guard
+                    access, how = ev.get("access"), ev.get("how")
+                    out.append({"at": t, "kind": kind, "task": task, "access": access if access in ("read", "write") else None,
+                                "how": how if isinstance(how, str) else None})
             except Exception:
                 usable = False
             if not usable:
                 bad += 1
-                continue
-            out.append({"at": t, "kind": kind, "task": task,
-                        "access": ev.get("access") if ev.get("access") in ("read", "write") else None,
-                        "how": ev.get("how") if isinstance(ev.get("how"), str) else None})
         if bad:
             reader.problem(path, "{} lane events.jsonl line(s) without a readable at, lease kind or task; skipped".format(bad))
         cache[key] = out
@@ -550,14 +571,23 @@ def lane_base(reader, lane, workdir, cache, override):
 
 
 def lease_holders(reader, base, lane):
-    """M2: lease.json's holders that name a task (a str id); a holder without one is listed and not counted (F1)."""
+    """M2: lease.json's holders as [{task, taken}]: a holder counts when it names a task (a str id) and its taken is a
+    readable time (Rule C: record_time, inside the holder's guard); any other holder is listed and not counted (F1)."""
     path = base / lane / "lease.json"
     lease = reader.json(path, "lease.json")
     holders = lease.get("holders") if lease else None
-    holders = [h for h in holders if isinstance(h, dict)] if isinstance(holders, list) else []
-    named = [h for h in holders if isinstance(h.get("task"), str)]
+    holders = holders if isinstance(holders, list) else []
+    named = []
+    for h in holders:
+        try:
+            if isinstance(h, dict) and isinstance(h.get("task"), str):
+                taken = record_time(h.get("taken"))
+                if taken is not None:
+                    named.append({"task": h["task"], "taken": taken})
+        except Exception:
+            pass
     if len(named) < len(holders):
-        reader.problem(path, "lease.json holder(s) without a task id; not counted")
+        reader.problem(path, "lease.json holder(s) without a task id or a readable taken; not counted")
     return named
 
 
@@ -1027,18 +1057,23 @@ def build_task(reader, task, tasks_by_review, now, lanes_cache, lanes_override, 
         record = reader.json(base / lane / "lane.json", "lane.json")
         closed = record.get("closed") if record else None
         for item in closed if isinstance(closed, list) else []:
-            if isinstance(item, dict) and item.get("step") == meta.get("lane_step") and parse_time(item.get("closed_at")):
-                instants.append({"at": iso(parse_time(item["closed_at"])), "what": "lane step {} closed".format(item["step"]),
+            if not isinstance(item, dict) or item.get("step") != meta.get("lane_step"):
+                continue
+            closed_at = record_time(item.get("closed_at"))  # Rule C
+            if closed_at is None and item.get("closed_at") is not None:
+                reader.problem(base / lane / "lane.json", "lane.json closed_at unreadable; not shown")
+            elif closed_at is not None:
+                instants.append({"at": iso(closed_at), "what": "lane step {} closed".format(item["step"]),
                                  "source": "lane.json closed_at", "confidence": "exact"})
         holders = lease_holders(reader, base, lane)
         events = lane_events(reader, base, lane, lanes_cache)
         own = [ev for ev in events if ev["task"] == task["id"]]
-        for ev in own:
+        for ev in own:  # Rule C: ev["at"] passed record_time in lane_events, so iso() cannot raise here
             instants.append({"at": iso(ev["at"]), "what": "lane {} ({})".format(ev["kind"].replace(".", " "), ev["how"]),
                              "source": "lane events.jsonl", "confidence": "exact"})
         for h in holders if not own else []:
-            if h["task"] == task["id"] and parse_time(h.get("taken")):
-                instants.append({"at": iso(parse_time(h["taken"])), "what": "lane lease taken", "source": "lease.json taken",
+            if h["task"] == task["id"]:  # Rule C: taken passed record_time in lease_holders
+                instants.append({"at": iso(h["taken"]), "what": "lane lease taken", "source": "lease.json taken",
                                  "confidence": "exact"})
         paint_lease(canvas, span_start, start, task["id"], meta.get("role"), events, {h["task"] for h in holders},
                     tasks or {}, now)

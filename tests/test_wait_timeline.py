@@ -93,15 +93,16 @@ class Session:
 
     def lane_events(self, lane, items, holders=None):
         """lib/lane_lease.py _record lines in <lanes>/<lane>/events.jsonl: items (t, kind, task, access, how); holders: the
-        task ids lease.json holds (as of now)."""
+        task ids lease.json holds (as of now); a dict holder replaces fields of the produced one (a malformed record)."""
         def content(now):
             return "".join(json.dumps({"at": iso_ms(t), "kind": kind, "task": task, "role": "coder" if access == "write" else
                                        "code-reviewer", "access": access, "holder": "reservation", "how": how}) + "\n"
                            for t, kind, task, access, how in items if t <= now)
         self.put(0, "lanes/{}/events.jsonl".format(lane), content)
         if holders is not None:
+            made = lambda h: {"kind": "reservation", "access": "write", "task": h, "role": "coder", "taken": iso_s(1)}  # noqa: E731
             self.put(0, "lanes/{}/lease.json".format(lane), json.dumps({"schema": "tp-lane-lease:v1", "holders": [
-                {"kind": "reservation", "access": "write", "task": h, "role": "coder", "taken": iso_s(1)} for h in holders]}))
+                dict(made(None), **h) if isinstance(h, dict) else made(h) for h in holders]}))
 
     # --- producer shapes
     def task(self, ident, created, worker, role="coder", review_of=None, lane=None, queued_at=None):
@@ -458,17 +459,21 @@ class WaitTimelineTest(unittest.TestCase):
             return next(((i["state"], i["wait_reason"], i["source"], i["confidence"]) for i in row(report, task)["intervals"]
                          if i["start"] <= T0 + t < i["end"]), None)
 
-        def deep_tail(s, rel):
-            """The file `rel` of `s` with a line too deep for json.loads appended (F1)."""
+        def deep_tail(s, rel, extra=()):
+            """The file `rel` of `s` with a line too deep for json.loads appended (F1), then the JSON lines `extra`."""
             k = next(n for n, f in enumerate(s.files) if f[2] == rel)
             t, removed, _, content = s.files[k]
-            s.files[k] = (t, removed, rel, lambda now: content(now) + DEEP + "\n")
+            s.files[k] = (t, removed, rel, lambda now: content(now) + DEEP + "\n" + "".join(json.dumps(e) + "\n" for e in extra))
 
         def with_bad_lines(s, items):
             s.main_turns(items)
             good = s.files.pop()[3]
             s.put(0, "main-turns.jsonl", lambda now: good(now) + "nope\n" + DEEP + "\n" + json.dumps({"at": "x", "event": "Stop"})
-                  + "\n" + json.dumps({"at": 10 ** 400, "event": "Stop", "session": "s1"}) + "\n")
+                  + "\n" + "".join(json.dumps({"at": v, "event": "Stop", "session": "s1"}) + "\n" for v in EXTREMES))
+
+        def renders(report):
+            """Rule C: the report formats as text and as JSON (no time from a shared record raises on the way out)."""
+            return bool(timeline.render(report)) and bool(json.dumps(timeline._jsonable(report)))
 
         turns_basic = [(10, "UserPromptSubmit", "s1"), (30, "Stop", "s1"), (50, "UserPromptSubmit", "s1"), (60, "Stop", "s1")]
         basic = lambda r: one(r, lines=talk, finish=wait, extra=lambda s: s.main_turns(turns_basic))  # noqa: E731
@@ -727,10 +732,11 @@ class WaitTimelineTest(unittest.TestCase):
                  (40, "UserPromptSubmit", "s1"), (35, "Stop", "s1")])), 100,
              [(mains, [(20, 40, "unrecorded", "inferred"), (40, 80, "idle", "exact")]),
               (lambda x: "main-turns.jsonl times go backwards" in problems(x), True)]),
-            ("M1 compaction changes nothing; a restart with the turn still open makes that turn unrecorded, idle after",
+            ("M1 compaction changes nothing; a restart of the session with its turn still open makes that turn unrecorded,"
+             " idle after",
              lambda r: one(r, lines=talk, finish=wait, extra=lambda s: s.main_turns([
-                 (25, "UserPromptSubmit", "s1"), (35, "SessionStart", "s1", "compact"), (45, "SessionStart", "s2", "startup"),
-                 (60, "UserPromptSubmit", "s2"), (70, "Stop", "s2")])), 100,
+                 (25, "UserPromptSubmit", "s1"), (35, "SessionStart", "s1", "compact"), (45, "SessionStart", "s1", "resume"),
+                 (60, "UserPromptSubmit", "s1"), (70, "Stop", "s1")])), 100,
              [(mains, [(20, 25, "unrecorded", "inferred"), (25, 45, "unrecorded", "inferred"), (45, 60, "idle", "exact"),
                        (60, 70, "busy", "exact"), (70, 80, "idle", "exact")]),
               (lambda x: next(i["main"]["reason"] for i in row(x, "w")["intervals"] if i.get("main", {}).get("state") == "unrecorded"
@@ -747,28 +753,49 @@ class WaitTimelineTest(unittest.TestCase):
               (lambda x: {k: round(v) for k, v in x["totals"]["accumulated_main"].items()}, {"unrecorded": 10, "busy": 15, "idle": 35}),
               (lambda x: "Claude sessions' events in one Main turn" in problems(x), False),
               (lambda x: ("2 malformed line(s) in main-turns.jsonl" in problems(x),
-                          "2 main-turns.jsonl line(s) without a readable at or a known event; skipped" in problems(x)), (True, True))]),
+                          "8 main-turns.jsonl line(s) without a readable at or a known event; skipped" in problems(x)), (True, True)),
+              (renders, True)]),
             ("M1 (F2) two Main sessions interleave, s1 stops first: busy until s2's Stop",
              lambda r: one(r, lines=talk, finish=wait, extra=lambda s: s.main_turns([
                  (30, "UserPromptSubmit", "s1"), (35, "UserPromptSubmit", "s2"), (40, "Stop", "s1"), (50, "Stop", "s2")])), 100,
              [(mains, [(20, 30, "unrecorded", "inferred"), (30, 35, "busy", "exact"), (35, 40, "busy", "exact"),
                        (40, 50, "busy", "exact"), (50, 80, "idle", "exact")])]),
-            ("M1 (F2) s2 restarts (resume) while s1 is busy: only s2's open turn ends; s1 stays busy to its own Stop. A session"
-             " that never speaks again (s4) is ended by the next session's start (s5), as unrecorded",
+            ("M1 (Rule M) s2 restarts (resume) while s1 is busy: only s2's open turn ends; s1 stays busy to its own Stop. A"
+             " session that never speaks again (s4) is not ended by another session's start (s5): open, busy to now, inferred"
+             " from s5's start",
              lambda r: one(r, lines=talk, finish=wait, extra=lambda s: s.main_turns([
                  (30, "UserPromptSubmit", "s1"), (35, "UserPromptSubmit", "s2"), (40, "SessionStart", "s2", "resume"),
                  (45, "UserPromptSubmit", "s2"), (55, "Stop", "s2"), (60, "Stop", "s1"), (62, "UserPromptSubmit", "s4"),
                  (70, "SessionStart", "s5", "startup")])), 100,
              [(mains, [(20, 30, "unrecorded", "inferred"), (30, 45, "busy", "exact"), (45, 55, "busy", "exact"),
-                       (55, 60, "busy", "exact"), (60, 62, "idle", "exact"), (62, 70, "unrecorded", "inferred"),
-                       (70, 80, "idle", "exact")])]),
-            ("M1 (F2) records with session null act on Main as a whole: a null Stop ends s1's turn, a null restart ends the open"
-             " turn as unrecorded",
+                       (55, 60, "busy", "exact"), (60, 62, "idle", "exact"), (62, 70, "busy", "exact"),
+                       (70, 80, "busy", "inferred")])]),
+            ("M1 (Rule M, review F1) s2 restarts while s1's turn is open and s1 has no Stop yet: s1 stays busy to now, open;"
+             " exact until s2's restart, inferred from it (s2's compaction before it changes nothing)",
+             lambda r: one(r, lines=talk, finish={"result": 20}, extra=lambda s: s.main_turns([
+                 (30, "UserPromptSubmit", "s1"), (35, "UserPromptSubmit", "s2"), (38, "SessionStart", "s2", "compact"),
+                 (40, "SessionStart", "s2", "resume")])), 100,
+             [(mains, [(20, 30, "unrecorded", "inferred"), (30, 40, "busy", "exact"), (40, 100, "busy", "inferred")]),
+              (lambda x: [(i["main"]["reason"], i.get("open")) for i in row(x, "w")["intervals"] if "main" in i][-1],
+               ("Main turn running (no Stop yet); another Claude session started since, so this one may have ended unrecorded",
+                True)),
+              (lambda x: {k: round(v) for k, v in x["totals"]["accumulated_main"].items()}, {"unrecorded": 10, "busy": 70})]),
+            ("M1 (Rule M, review F1) the same history once s1's Stop comes at 90: the seconds shown busy stay busy up to it,"
+             " exact; idle after",
+             lambda r: one(r, lines=talk, finish={"result": 20}, extra=lambda s: s.main_turns([
+                 (30, "UserPromptSubmit", "s1"), (35, "UserPromptSubmit", "s2"), (38, "SessionStart", "s2", "compact"),
+                 (40, "SessionStart", "s2", "resume"), (90, "Stop", "s1")])), 100,
+             [(mains, [(20, 30, "unrecorded", "inferred"), (30, 90, "busy", "exact"), (90, 100, "idle", "exact")])]),
+            ("M1 (Rule M) session null is the legacy stream: a null Stop ends s1's turn, a null restart ends the open turn as"
+             " unrecorded; (review F2) an identified Stop ends the legacy turn, idle from it, and an identified restart ends it"
+             " as unrecorded",
              lambda r: one(r, lines=talk, finish=wait, extra=lambda s: s.main_turns([
                  (30, "UserPromptSubmit", "s1"), (40, "Stop", None), (50, "UserPromptSubmit", None),
-                 (60, "SessionStart", None, "startup")])), 100,
+                 (60, "SessionStart", None, "startup"), (62, "UserPromptSubmit", None), (66, "Stop", "s1"),
+                 (70, "UserPromptSubmit", None), (74, "SessionStart", "s2", "resume")])), 100,
              [(mains, [(20, 30, "unrecorded", "inferred"), (30, 40, "busy", "exact"), (40, 50, "idle", "exact"),
-                       (50, 60, "unrecorded", "inferred"), (60, 80, "idle", "exact")])]),
+                       (50, 60, "unrecorded", "inferred"), (60, 62, "idle", "exact"), (62, 66, "busy", "exact"),
+                       (66, 70, "idle", "exact"), (70, 74, "unrecorded", "inferred"), (74, 80, "idle", "exact")])]),
             ("M1 no main-turns.jsonl (an old session) reads exactly as without the rule: no `main`, no Main totals",
              lambda r: one(r, lines=talk, finish=wait), 100,
              [(no_main, (False, False, False))]),
@@ -811,16 +838,25 @@ class WaitTimelineTest(unittest.TestCase):
               (lambda x: [lease_at(x, 40, k)[:2] for k in "qc"], [("waiting:lane-lease", "queued: lane writer")] * 2)]),
             ("M2 taken with no release: to now while lease.json still holds it; gone from lease.json: no span (end unknown);"
              " a reader is not kept out by a reader; (F1) a lease.json holder whose task is [] and a lane event line too deep"
-             " to decode are listed and skipped",
+             " to decode are listed and skipped; (Rule C) so is every record whose time is an extreme (t's own lease event,"
+             " t's lease.json taken, lane.json closed_at): the healthy ones still render",
              lambda r: one(r, lines=talk, finish=done, extra=lambda s: (lane_case(
-                 s, reasons=[], holders=["h", []],
+                 s, reasons=[], holders=["h", [], "t"] + [{"task": "t", "taken": v} for v in EXTREMES],
                  items=[(0, "lease.taken", "h", "write", "reserve"), (5, "lease.taken", "gone", "write", "reserve"),
                         (5, "lease.taken", "rd", "read", "reserve")]),
-                 deep_tail(s, "lanes/L/events.jsonl"),
+                 deep_tail(s, "lanes/L/events.jsonl", [{"at": v, "kind": "lease.taken", "task": "t", "access": "write",
+                                                        "how": "reserve"} for v in EXTREMES]),
+                 s.put(0, "lanes/L/lane.json", json.dumps({"closed": [{"step": "S1", "closed_at": v} for v in EXTREMES]
+                                                          + [{"step": "S1", "closed_at": iso_s(65)}]})),
                  s.task("t2", 50, "claude", role="code-reviewer", lane="L", queued_at=10), s.claude_state("t2", [51]),
                  s.queue_events("t2", [], 50))), 100,
-             [(lambda x: ("lease.json holder(s) without a task id; not counted" in problems(x),
-                          "1 malformed line(s) in lane events.jsonl" in problems(x)), (True, True)),
+             [(lambda x: ("lease.json holder(s) without a task id or a readable taken; not counted" in problems(x),
+                          "1 malformed line(s) in lane events.jsonl" in problems(x),
+                          "7 lane events.jsonl line(s) without a readable at, lease kind or task; skipped" in problems(x),
+                          "lane.json closed_at unreadable; not shown" in problems(x)), (True, True, True, True)),
+              (lambda x: [(i["what"], i["source"]) for i in row(x, "t")["instants"] if "lane" in i["what"]],
+               [("lane lease taken", "lease.json taken"), ("lane step S1 closed", "lane.json closed_at")]),
+              (renders, True),
               (lambda x: lease_at(x, 30), ("waiting:lane-lease", "lane held by h (still held)", "lane events.jsonl lease.*", "exact")),
               (lambda x: "held by gone" in json.dumps([i["wait_reason"] for i in row(x, "t")["intervals"]]), False),
               (lambda x: lease_at(x, 30, "t2"), ("waiting:lane-lease", "lane held by h (still held)", "lane events.jsonl lease.*", "exact")),
@@ -907,6 +943,9 @@ class WaitTimelineTest(unittest.TestCase):
 
 
 DEEP = "[" * 1100 + "0" + "]" * 1100  # valid JSON that json.loads cannot decode (RecursionError)
+# Rule C (HB6d round 3): the numeric extremes every time field of a shared record is tried with (inf and nan are written
+# as Infinity / NaN, which json.loads takes)
+EXTREMES = (10 ** 400, 1e30, float("inf"), float("nan"), -1, True, "10")
 
 
 class StatusTest(unittest.TestCase):
@@ -1279,22 +1318,26 @@ class StatusTest(unittest.TestCase):
         self.assertIn("[waiting:main (Main idle) since " + iso_ms(20) + "]", self.status.render(report))
         (state / "main-turns.jsonl").write_text(json.dumps({"at": iso_ms(100), "event": "UserPromptSubmit", "session": "s1"}) + "\n")
         self.assertEqual(self.status.build(state / "tasks", repo, now=self.NOW, rows=rows)["lanes"][0]["state"]["main"], "busy")
-        # status's task-by-task path (timeline.build raised on another task's record) cuts its rows the same way
+        # status's task-by-task path (timeline.build raised on another task's record) cuts its rows the same way. The record
+        # that makes timeline.build raise is a created too large for a float (parse_time raises on it; a too-deep state.json
+        # no longer does, as Reader.json lists it). The fallback is proven by the problem only _explain writes.
         bad = state / "tasks" / "t-other"
         bad.mkdir()
-        (bad / "meta.json").write_text(json.dumps({"id": "t-other", "worker": "claude", "created": iso_s(5), "workdir": "/nonexistent"}))
-        (bad / "state.json").write_text(DEEP)
-        self.assertEqual(self.status.build(state / "tasks", repo, now=self.NOW, rows=rows)["lanes"][0]["state"],
-                         {"state": "waiting:main", "since": iso_ms(20), "main": "busy"})
+        (bad / "meta.json").write_text(json.dumps({"id": "t-other", "worker": "claude", "created": 10 ** 400, "workdir": "/nonexistent"}))
+        fallback = (str(bad / "meta.json"), "the timeline cannot use this record (hiding it lets the task load)")
+        report = self.status.build(state / "tasks", repo, now=self.NOW, rows=rows)
+        self.assertEqual(report["lanes"][0]["state"], {"state": "waiting:main", "since": iso_ms(20), "main": "busy"})
+        self.assertIn(fallback, [(p["where"], p["problem"]) for p in report["problems"]])
         # F1: a main-turns.jsonl line too deep to decode and one whose time overflows a float are skipped and listed; the
         # healthy line still gives Main's state, on the task-by-task path (t-other's record) and on the ordinary one
         with open(state / "main-turns.jsonl", "a") as handle:
             handle.write(DEEP + "\n" + json.dumps({"at": 10 ** 400, "event": "Stop", "session": "s1"}) + "\n")
         for path in ("task by task", "ordinary"):
             report = self.status.build(state / "tasks", repo, now=self.NOW, rows=rows)
+            listed = [(p["where"], p["problem"]) for p in report["problems"]]
             self.assertEqual(report["lanes"][0]["state"], {"state": "waiting:main", "since": iso_ms(20), "main": "busy"}, path)
-            self.assertIn((str(state / "main-turns.jsonl"), "1 malformed line(s) in main-turns.jsonl"),   # (one per path)
-                          [(p["where"], p["problem"]) for p in report["problems"]], path)
+            self.assertIn((str(state / "main-turns.jsonl"), "1 malformed line(s) in main-turns.jsonl"), listed, path)   # (one per path)
+            self.assertEqual(fallback in listed, path == "task by task", path)
             shutil.rmtree(bad, ignore_errors=True)
 
     def test_cli(self):

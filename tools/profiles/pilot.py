@@ -2,9 +2,8 @@
 """HB7c (M1) profile pilot: the derived catalogs that pin an arm's model, and a dry run that prints the packet each arm would send.
 
   pilot.py catalog --model MODEL --out PATH
-      Write config/model-catalog.json with MODEL as level small's model of its provider: MODEL and small's entry of that provider
-      swap levels (a model is listed once, and the router's own model must stay). For a model already in small it is unchanged.
-      tp-bench dispatches code tasks with --level small, so `--env TP_MODEL_CATALOG=PATH` pins the arm's model.
+      Write config/model-catalog.json with level small listing MODEL alone (the models small gave up move to MODEL's old level, or
+      to mid, because the router's chain and every model must stay listed). tp-bench dispatches code tasks with --level small, so `--env TP_MODEL_CATALOG=PATH` pins the arm's model.
   pilot.py dry-run --out DIR [--base DIR] [--arm DIR] [--tasks ID,ID]
       For every arm (model x profile, plus a no-profile arm per model), dispatch each pilot task exactly as lib/bench/runner.py
       does (`tp-agent dispatch --role coder --task BRIEF --workdir W --tests affected --level small`), against a fake tmux,
@@ -16,6 +15,7 @@ The derived catalogs and every dry-run file are written where --out says; nothin
 import argparse
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -35,10 +35,10 @@ FAKE = {  # the fake tools put first on PATH; every call is logged, and a call t
 
 
 def pinned_catalog(source, model):
-    """The catalog at `source` with `model` as level small's entry of its provider. A model may be listed once, and the router's own
-    model must stay, so the two entries swap: `model` moves to small and small's entry of the same provider takes its old place.
-    A model already in small leaves the catalog as it is. Raises ValueError when no level lists the model or small has no entry
-    of its provider."""
+    """The catalog at `source` with level small listing `model` alone, so no other model of level small (an OpenAI or other
+    alternative) can be chosen for an arm, and a health fallback has nothing to swap in. The router's own chain and every
+    other model must stay listed, so the models small gave up move to the level that held `model` (or, when small held it,
+    to level mid). Raises ValueError when no level lists the model or the catalog has no small (or, for that move, mid) level."""
     catalog = json.loads(Path(source).read_text())
     levels = {level["key"]: level for level in catalog["levels"]}
     if "small" not in levels:
@@ -47,20 +47,25 @@ def pinned_catalog(source, model):
     if home is None:
         raise ValueError(f"no level of {source} lists {model}")
     small = levels["small"]
-    if home is not small:
-        i = next(i for i, m in enumerate(home["models"]) if m.get("model") == model)
-        j = next((j for j, m in enumerate(small["models"]) if m.get("provider") == home["models"][i].get("provider")), None)
-        if j is None:
-            raise ValueError(f"level small of {source} has no {home['models'][i].get('provider')} model to swap with {model}")
-        home["models"][i], small["models"][j] = small["models"][j], home["models"][i]
+    entry = next(m for m in home["models"] if m.get("model") == model)
+    if entry.get("provider") == "local":
+        raise ValueError(f"{model} is a local model: the pilot arms are frontier only (the local arm is slice 2)")
+    displaced = [m for m in small["models"] if m.get("model") != model]
+    dest = home if home is not small else levels.get("mid")
+    if dest is None:
+        raise ValueError(f"{source} has no level to hold the models level small gives up")
+    dest["models"] = [m for m in dest["models"] if m.get("model") != model] + displaced
+    small["models"] = [entry]
     catalog["description"] = f"{catalog.get('description', '')} [M1 pilot: level small pinned to {model}]".strip()
     return catalog
 
 
 def write_catalog(model, out, root=ROOT):
-    Path(out).parent.mkdir(parents=True, exist_ok=True)
-    Path(out).write_text(json.dumps(pinned_catalog(root / "config/model-catalog.json", model), indent=2) + "\n")
-    return Path(out)
+    """Write the pinned catalog and return its ABSOLUTE path (the dispatch that reads it runs in another directory)."""
+    out = Path(out).resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(pinned_catalog(Path(root) / "config/model-catalog.json", model), indent=2) + "\n")
+    return out
 
 
 def outside_env():
@@ -110,17 +115,16 @@ class Sandbox:
 
 
 def bench_commands(arm, catalogs, tasks):
-    lines = []
-    for short, model in MODELS.items():
-        for profile in PROFILES:
-            lines.append(f"bin/tp-bench run --arm {arm} --label m1-{short}-{profile} --tasks {','.join(tasks)} --repeat {REPEAT} "
-                         f"--max-worker-runs {len(tasks) * REPEAT} --order fixed --env TP_PROFILE={profile} "
-                         f"--env TP_MODEL_CATALOG={catalogs[short]}")
-    return lines
+    """One shell-safe line per pilot cell (paths may hold spaces): shlex.split of a line gives back its argv."""
+    return [shlex.join(["bin/tp-bench", "run", "--arm", str(arm), "--label", f"m1-{short}-{profile}", "--tasks", ",".join(tasks),
+                        "--repeat", str(REPEAT), "--max-worker-runs", str(len(tasks) * REPEAT), "--order", "fixed",
+                        "--env", f"TP_PROFILE={profile}", "--env", f"TP_MODEL_CATALOG={catalogs[short]}"])
+            for short in MODELS for profile in PROFILES]
 
 
 def dry_run(out, arm, base, tasks):
-    out = Path(out)
+    out, arm = Path(out).resolve(), str(Path(arm).resolve())   # absolute before any cwd change (dispatch runs in the sandbox)
+    base = str(Path(base).resolve()) if base else None
     out.mkdir(parents=True, exist_ok=True)
     catalogs = {short: write_catalog(model, out / "catalogs" / f"small-{short}.json", Path(arm)) for short, model in MODELS.items()}
     specs = {t: json.loads((Path(arm) / "bench/tasks" / f"{t}.json").read_text()) for t in tasks}
@@ -174,8 +178,7 @@ def main(argv=None):
     if args.command == "catalog":
         print(write_catalog(args.model, args.out))
         return 0
-    return dry_run(args.out, str(Path(args.arm).resolve()), str(Path(args.base).resolve()) if args.base else None,
-                   [t for t in args.tasks.split(",") if t])
+    return dry_run(args.out, args.arm, args.base, [t for t in args.tasks.split(",") if t])
 
 
 if __name__ == "__main__":

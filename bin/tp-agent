@@ -45,6 +45,8 @@ from worker_process import (FINISHED, READ_ONLY_ROLES, alive_on_workdir, clear_c
                             state_words, task_state)
 
 ROLES = ROOT / "agent" / "roles"
+PROFILES = ROOT / "agent" / "profiles"
+PROFILE_NAME = re.compile(r"^[a-z][a-z0-9-]*$")  # the same form tp-spawn accepts
 TESTS_SCOPES = ("affected", "full", "none")
 TESTS_DEFAULT = "affected"
 IDENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -755,6 +757,7 @@ def launch(base, item):
     started_at = failing_tests.head_commit(item["workdir"])  # the commit this task starts from (--investigate-failure diffs against it)
     # The worker carries the main that dispatched it, whichever process runs the start (a queued task is started by a later tick).
     spawn_env = {key: value for key, value in os.environ.items() if key != "TP_MAIN_ID"}
+    spawn_env["TP_PROFILE"] = item["profile"] or ""  # the choice made at dispatch, not the environment of the process that starts it
     if item.get("main"):
         spawn_env["TP_MAIN_ID"] = item["main"]
     try:
@@ -846,6 +849,12 @@ def queue_item(value, name=None):
         raise ValueError("the record's after list holds an invalid task id")
     clean = {key: value[key] for key in QUEUE_TEXT + ("workdir", "route_info", "created", "deliverable", "parent")}
     clean.update({key: list(value[key]) for key in ("after", "context", "notes")}, tests=tests)
+    if "profile" not in value:  # required like every field: the dispatch-time TP_PROFILE (None = explicitly no profile)
+        raise ValueError("the record has no profile (None for none, or a profile name)")
+    profile = value["profile"]
+    if profile is not None and not (isinstance(profile, str) and PROFILE_NAME.fullmatch(profile) and (PROFILES / f"{profile}.md").is_file()):
+        raise ValueError(f"the record has an unknown profile {profile!r}")
+    clean["profile"] = profile
     if ("lane" in value) != ("lane_step" in value):
         raise ValueError("the record has a lane without a lane_step, or a lane_step without a lane")
     if "lane" in value:  # a lane task: the lane, its step and where its repository's preamble is read from (all required together)
@@ -1122,6 +1131,9 @@ def dispatch(args, base):
 def _dispatch(args, base):
     if not (ROLES / f"{args.role}.md").is_file():
         raise ValueError(f"unknown role: {args.role}")
+    profile = os.environ.get("TP_PROFILE") or None  # captured now: a queued start happens in a later process with another environment
+    if profile and not (PROFILE_NAME.fullmatch(profile) and (PROFILES / f"{profile}.md").is_file()):
+        raise ValueError(f"unknown TP_PROFILE: {profile} (a file in agent/profiles/, or unset for none)")
     # Autonomy's recovery gate comes before anything is written: a refused dispatch creates no lane, branch, worktree or queue entry.
     # (A dispatch is never a review, so the lane and the deliverable change nothing: while recovery is pending all of them wait.)
     retry = getattr(args, "lane_meta", None)
@@ -1163,7 +1175,7 @@ def _dispatch(args, base):
             "task": args.task, "workdir": workdir, "worker": worker, "model": model,
             "thinking": thinking, "route_info": info, "deliverable": args.deliverable or "",
             "parent": args.parent or "", "after": args.after or [], "context": args.context or [],
-            "notes": args.note or [], "tests": tests, **({"main": main_id()} if main_id() else {}),
+            "notes": args.note or [], "tests": tests, "profile": profile, **({"main": main_id()} if main_id() else {}),
             **({"gate": args.gate} if getattr(args, "gate", None) else {}),
             **({"gate_review": args.gate_review} if getattr(args, "gate", None) and getattr(args, "gate_review", None) else {})})
     if plan:

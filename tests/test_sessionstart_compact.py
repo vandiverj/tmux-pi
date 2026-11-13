@@ -332,12 +332,23 @@ class MainTurns(Base):
         self.assertIsNone(self.record())
 
     def test_concurrent_events_stay_whole_lines(self):
-        body = json.dumps({"hook_event_name": "Stop", "session_id": "s" * 128})
+        """F5: a hook appends only after its input ends, so every child gets its whole input and is still running (none
+        can have written) before any input is closed; then all inputs are closed back to back and only then is any child
+        waited on: the 16 appends race."""
+        body = json.dumps({"hook_event_name": "Stop", "session_id": "s" * 128}).encode()
         procs = [subprocess.Popen([str(MAIN_TURNS)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=self.env)
                  for _ in range(16)]
         for proc in procs:
-            out, err = proc.communicate(body.encode(), timeout=60)
-            self.assertEqual((proc.returncode, out, err), (0, b"", b""))
+            proc.stdin.write(body)
+            proc.stdin.flush()
+        self.assertEqual([proc.poll() for proc in procs], [None] * 16)   # all held at the barrier: no record yet
+        self.assertIsNone(self.record())
+        for proc in procs:
+            proc.stdin.close()
+        for proc in procs:
+            self.assertEqual((proc.wait(timeout=60), proc.stdout.read(), proc.stderr.read()), (0, b"", b""))
+            proc.stdout.close()
+            proc.stderr.close()
         lines = self.record().splitlines()
         self.assertEqual(len(lines), 16)
         self.assertEqual({json.loads(line)["session"] for line in lines}, {"s" * 128})

@@ -23,12 +23,13 @@ HB6d adds two more, each preferred when present and without effect when absent:
 M1 <session>/main-turns.jsonl (claude/plugins/tmux-pi/hooks/main-turns.sh: one line per UserPromptSubmit, Stop and
    SessionStart of Claude Main) cuts every waiting:main interval at Main's turn boundaries. Each piece keeps its state,
    reason, source and confidence and gains `main`: {state busy | idle | unrecorded, reason, source, confidence, wait_start
-   (the start of the interval before the cut)}. main_turns() is the rule. Totals gain accumulated_main and the critical
-   path by_main (seconds of waiting:main by Main's state). No file (an old session) or an unusable one: no `main` anywhere.
+   (the start of the interval before the cut)}. main_turns() is the rule (one turn state per Claude session; Main is busy
+   while any session has a turn open). Totals gain accumulated_main and the critical path by_main (seconds of
+   waiting:main by Main's state). No file (an old session) or an unusable one: no `main` anywhere.
 M2 <lanes>/<lane>/events.jsonl (lib/lane_lease.py lease.taken / activated / released) gives each other holder of the
-   task's lane a holding interval; in the task's queued wait, the seconds a blocking holder held the lane that are painted
-   unknown or waiting:lane-lease become waiting:lane-lease from those events (lease_holdings()). The task's own lease
-   events are instants and replace lease.json's taken instant.
+   task's lane a holding interval; in every queued wait (a started task's, a still-queued item's, a cancelled item's),
+   the seconds a blocking holder held the lane that are painted unknown or waiting:lane-lease become waiting:lane-lease
+   from those events (paint_lease()). The task's own lease events are instants and replace lease.json's taken instant.
 
 Read-only: it opens files for reading only and writes nothing anywhere. It prints no transcript text and no file content:
 from a transcript it takes only line times, roles, tool names and ids. A missing or malformed record makes its piece absent
@@ -125,7 +126,7 @@ class Reader:
             if not path.exists():
                 return None
             value = json.loads(path.read_text(encoding="utf-8", errors="strict"))
-        except (OSError, ValueError, UnicodeDecodeError):
+        except (OSError, ValueError, UnicodeDecodeError, RecursionError):  # HB6d F1: a lease.json nested too deep
             self.problem(path, "malformed " + label)
             return None
         if need_dict and not isinstance(value, dict):
@@ -156,7 +157,7 @@ class Reader:
                         continue
                     try:
                         value = json.loads(line)
-                    except ValueError:
+                    except (ValueError, RecursionError):  # HB6d F1: a line nested too deep is a bad line, not a crash
                         bad += 1
                         continue
                     if isinstance(value, dict):
@@ -326,72 +327,136 @@ def regular_file(reader, path, label):
     return True
 
 
-def main_turns(reader, session_dir, now):
-    """M1: [(start, end, state, reason, confidence)], contiguous from the first line that sets Main's state to now, or
-    None when there is no usable main-turns.jsonl. Lines in file order (the order the hooks ran); a time before the line
-    before is taken as that line's time and listed.
-    - UserPromptSubmit: busy from it. A further prompt before a Stop keeps the turn busy, and the turn is inferred (a queued
-      prompt, or an interrupt Claude reports with no Stop); a turn of one prompt ended by its Stop is exact.
-    - Stop: ends the turn; idle from it. A Stop while idle (a duplicate) changes nothing.
-    - SessionStart compact: no change. Any other SessionStart (a restart, /clear): an open turn ends there as unrecorded
-      (when it ended is not known), idle from it.
-    - The last state runs to now. A turn whose events carry two Claude session ids is listed once."""
-    path = Path(session_dir) / MAIN_FILE
-    if not regular_file(reader, path, MAIN_FILE):
-        return None
+IDLE_WHY = "between Main turns"
+RESTART_WHY = "Main turn with no Stop before Main restarted (its end is not recorded)"
+
+
+def main_lines(reader, path):
+    """M1: the usable lines of main-turns.jsonl as (t, event, session id or None, source or None), in file order, or None
+    when the file cannot be read. A line whose at or event cannot be used (any failure, e.g. a time too large for a float)
+    is skipped; the skipped lines are listed once. A time before the line before is taken as that line's time (listed)."""
     lines = reader.jsonl(path, MAIN_FILE)
     if lines is None:
         return None
-    out = []
-    state, since, prompts, turn_session, prev, mixed, backwards = None, None, 0, None, None, False, False
+    out, prev, backwards, bad = [], None, False, 0
+    for line in lines:
+        try:
+            t, event = parse_time(line.get("at")), line.get("event")
+            if t is None or not isinstance(event, str) or event not in MAIN_EVENTS:
+                bad += 1
+                continue
+        except Exception:  # F1: one bad record is skipped, never the report
+            bad += 1
+            continue
+        session = line.get("session") if isinstance(line.get("session"), str) else None
+        source = line.get("source") if isinstance(line.get("source"), str) else None
+        if prev is not None and t < prev:
+            backwards, t = True, prev
+        prev = t
+        out.append((t, event, session, source))
+    if bad:
+        reader.problem(path, "{} main-turns.jsonl line(s) without a readable at or a known event; skipped".format(bad))
+    if backwards:
+        reader.problem(path, "main-turns.jsonl times go backwards; file order used")
+    return out
 
-    def close(end, kind, why, conf):
-        if end > since:
-            out.append((since, end, kind, why, conf))
 
-    def turn_why(running):
+def main_turns(reader, session_dir, now):
+    """M1: [(start, end, state, reason, confidence)], contiguous from the first line that sets Main's state to now, or
+    None when there is no usable main-turns.jsonl. Each Claude session id has its own turn state (F2):
+    - UserPromptSubmit: that session is busy from it. A further prompt before its Stop keeps the turn busy, and the turn is
+      inferred (a queued prompt, or an interrupt Claude reports with no Stop); a turn of one prompt ended by its Stop is exact.
+    - Stop: ends that session's turn; idle from it. A Stop while idle (a duplicate) changes nothing.
+    - SessionStart compact: no change. Any other SessionStart (a restart, /clear, resume) ends that session's open turn as
+      unrecorded (when it ended is not known), idle from it; and, as the file shows it never spoke again, the open turn of
+      every other session with no later line of its own (Claude restarted under a new id). A session with later lines keeps
+      its turn until its own Stop.
+    - Session null (no usable id): a null Stop ends every open turn, a null non-compact SessionStart ends every open turn as
+      unrecorded (one Main, as before ids were kept apart).
+    Main is busy while any session has a turn open; else unrecorded where any session's state is; else idle. The last state
+    of each session runs to now."""
+    path = Path(session_dir) / MAIN_FILE
+    if not regular_file(reader, path, MAIN_FILE):
+        return None
+    lines = main_lines(reader, path)
+    if lines is None:
+        return None
+    last = {}
+    for n, line in enumerate(lines):
+        last[line[2]] = n
+    state, segs = {}, {}  # session -> [busy | idle, since, prompts]; session -> its contiguous segments
+
+    def close(s, end, kind, why, conf):
+        if end > state[s][1]:
+            segs.setdefault(s, []).append((state[s][1], end, kind, why, conf))
+
+    def turn_why(prompts, running):
         if prompts == 1:
             return ("Main turn running (no Stop yet)" if running else "Main turn"), "exact"
         return "Main turn of {} prompts with one Stop (queued prompts or an interrupt with no Stop){}".format(
             prompts, ", running" if running else ""), "inferred"
 
-    for line in lines:
-        t, event = parse_time(line.get("at")), line.get("event")
-        if t is None or event not in MAIN_EVENTS:
-            reader.problem(path, "a main-turns.jsonl line without a readable at or a known event; skipped")
-            continue
-        if prev is not None and t < prev:
-            backwards, t = True, prev
-        prev = t
-        session = line.get("session") if isinstance(line.get("session"), str) else None
+    for n, (t, event, session, source) in enumerate(lines):
         if event == "UserPromptSubmit":
-            if state == "busy":
-                prompts += 1
-                mixed = mixed or session != turn_session
+            cur = state.get(session)
+            if cur and cur[0] == "busy":
+                cur[2] += 1
                 continue
-            if state == "idle":
-                close(t, "idle", "between Main turns", "exact")
-            state, since, prompts, turn_session = "busy", t, 1, session
+            if cur:
+                close(session, t, "idle", IDLE_WHY, "exact")
+            state[session] = ["busy", t, 1]
         elif event == "Stop":
-            if state == "busy":
-                mixed = mixed or session != turn_session
-                close(t, "busy", *turn_why(False))
-            if state != "idle":
-                state, since = "idle", t
-        elif line.get("source") != "compact":
-            if state == "busy":
-                close(t, "unrecorded", "Main turn with no Stop before Main restarted (its end is not recorded)", "inferred")
-            elif state == "idle":
-                close(t, "idle", "between Main turns", "exact")
-            state, since, turn_session = "idle", t, None
-    if state == "busy":
-        close(max(now, since), "busy", *turn_why(True))
-    elif state == "idle":
-        close(max(now, since), "idle", "between Main turns", "exact")
-    if backwards:
-        reader.problem(path, "main-turns.jsonl times go backwards; file order used")
-    if mixed:
-        reader.problem(path, "main-turns.jsonl: two Claude sessions' events in one Main turn; Main busy/idle may be wrong")
+            for s in [s for s in state if s == session or session is None]:
+                if state[s][0] == "busy":
+                    close(s, t, "busy", *turn_why(state[s][2], False))
+                    state[s] = ["idle", t, 0]
+            state.setdefault(session, ["idle", t, 0])
+        elif source != "compact":
+            for s in list(state):
+                ends = s == session or session is None or last[s] < n
+                if state[s][0] == "busy" and ends:
+                    close(s, t, "unrecorded", RESTART_WHY, "inferred")
+                    if s != session and session is not None:
+                        del state[s]  # never spoke again: gone, no state after this
+                        continue
+                    state[s] = ["idle", t, 0]
+                elif s == session or session is None:
+                    close(s, t, "idle", IDLE_WHY, "exact")
+                    state[s] = ["idle", t, 0]
+            state.setdefault(session, ["idle", t, 0])
+    for s, (kind, since, prompts) in state.items():
+        if kind == "busy":
+            close(s, max(now, since), "busy", *turn_why(prompts, True))
+        else:
+            close(s, max(now, since), "idle", IDLE_WHY, "exact")
+    return combine_sessions(list(segs.values()))
+
+
+def combine_sessions(per_session):
+    """M1: Main's state from each session's contiguous segments: busy when any session is busy (one: its reason and
+    confidence; several: exact when any is), else unrecorded when any is, else idle. Equal neighbours are merged."""
+    points = sorted({p for segs in per_session for a, b, *_ in segs for p in (a, b)})
+    index = [0] * len(per_session)
+    out = []
+    for a, b in zip(points, points[1:]):
+        here = []
+        for k, segs in enumerate(per_session):
+            while index[k] < len(segs) and segs[index[k]][1] <= a:
+                index[k] += 1
+            if index[k] < len(segs) and segs[index[k]][0] <= a:
+                here.append(segs[index[k]][2:])
+        busy = [h for h in here if h[0] == "busy"]
+        if len(busy) > 1:
+            piece = ("busy", "Main turns running in {} Claude sessions".format(len(busy)),
+                     "exact" if any(h[2] == "exact" for h in busy) else "inferred")
+        else:
+            piece = next((h for kind in ("busy", "unrecorded", "idle") for h in here if h[0] == kind), None)
+        if piece is None:
+            continue
+        if out and out[-1][2:] == piece and out[-1][1] == a:
+            out[-1] = (out[-1][0], b) + piece
+        else:
+            out.append((a, b) + piece)
     return out
 
 
@@ -426,7 +491,12 @@ def split_main(rows, turns):
 
 def apply_main(reader, tasks_dir, rows, now):
     """M1 over built rows: True when a usable main-turns.jsonl (next to tasks_dir) split them, False otherwise (untouched)."""
-    turns = main_turns(reader, Path(tasks_dir).parent, now)
+    try:
+        turns = main_turns(reader, Path(tasks_dir).parent, now)
+    except Exception as error:  # F1: a record no rule foresaw costs the Main split, never the report
+        reader.problem(Path(tasks_dir).parent / MAIN_FILE, "main-turns.jsonl cannot be used ({}); not read".format(
+            error.__class__.__name__))
+        return False
     if turns is None:
         return False
     split_main(rows, turns)
@@ -441,38 +511,94 @@ def by_main(intervals):
     return out
 
 
+LEASE_KINDS = ("lease.taken", "lease.activated", "lease.released")
+
+
 def lane_events(reader, base, lane, cache):
-    """M2: the lease events of lane `lane` (<lanes>/<lane>/events.jsonl), [] when there is none. Read once per report."""
+    """M2: the lease events of lane `lane` (<lanes>/<lane>/events.jsonl) as {at (epoch), kind, task, access, how}, in file
+    order; [] when there is none. Read once per report. A line without a readable at, a lease kind or a task id (any
+    failure) is skipped; the skipped lines are listed once (F1)."""
     key = ("lane events", str(base), lane)
     if key not in cache:
         path = Path(base) / lane / lane_lease.EVENTS
-        cache[key] = (reader.jsonl(path, "lane events.jsonl") or []) if regular_file(reader, path, "lane events.jsonl") else []
+        raw = (reader.jsonl(path, "lane events.jsonl") or []) if regular_file(reader, path, "lane events.jsonl") else []
+        out, bad = [], 0
+        for ev in raw:
+            try:
+                t, kind, task = parse_time(ev.get("at")), ev.get("kind"), ev.get("task")
+                usable = t is not None and isinstance(kind, str) and kind in LEASE_KINDS and isinstance(task, str)
+            except Exception:
+                usable = False
+            if not usable:
+                bad += 1
+                continue
+            out.append({"at": t, "kind": kind, "task": task,
+                        "access": ev.get("access") if ev.get("access") in ("read", "write") else None,
+                        "how": ev.get("how") if isinstance(ev.get("how"), str) else None})
+        if bad:
+            reader.problem(path, "{} lane events.jsonl line(s) without a readable at, lease kind or task; skipped".format(bad))
+        cache[key] = out
     return cache[key]
 
 
+def lane_base(reader, lane, workdir, cache, override):
+    """The lanes directory holding lane `lane` (override, else the worktree's), or None when there is none."""
+    if not (isinstance(lane, str) and lane and re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", lane)):
+        return None
+    base = Path(override) if override else lanes_dir_for(reader, workdir, cache)
+    return base if base is not None and (base / lane).is_dir() else None
+
+
+def lease_holders(reader, base, lane):
+    """M2: lease.json's holders that name a task (a str id); a holder without one is listed and not counted (F1)."""
+    path = base / lane / "lease.json"
+    lease = reader.json(path, "lease.json")
+    holders = lease.get("holders") if lease else None
+    holders = [h for h in holders if isinstance(h, dict)] if isinstance(holders, list) else []
+    named = [h for h in holders if isinstance(h.get("task"), str)]
+    if len(named) < len(holders):
+        reader.problem(path, "lease.json holder(s) without a task id; not counted")
+    return named
+
+
+def paint_lease(canvas, lo, hi, ident, role, events, held_now, tasks, now):
+    """M2: in a queued wait [lo, hi] of task `ident` (role `role`), the seconds a blocking holder held the lane (either is a
+    writer) and that are painted unknown or waiting:lane-lease become waiting:lane-lease from the lease events. Every
+    queued-wait row uses it: a started task's [queued_at, created], a queued item's [created, now], a cancelled item's
+    [created, cancelled] (F3). Other queue reasons are kept."""
+    if not events or hi <= lo:
+        return
+    mine = lane_lease.access_for(role if isinstance(role, str) else "", ident)
+    waits = [(a, b) for a, b, p in canvas.items if b > lo and a < hi and p[0] in ("unknown", "waiting:lane-lease")]
+    for other, a, b, access, how, conf in lease_holdings(events, held_now, tasks, now):
+        if other == ident or not (mine == "write" or access == "write"):
+            continue
+        for x, y in waits:
+            canvas.paint(max(a, x, lo), min(b, y, hi), payload(
+                "waiting:lane-lease", "lane held by {} ({})".format(other, how), "lane events.jsonl lease.*", conf))
+
+
 def lease_holdings(events, held_now, tasks, now):
-    """M2: [(task, start, end, access, how the end is known, confidence)] from lease events in file order: lease.taken
-    starts a holding, lease.released ends it. A release found stale (the holder was dead when a later lease change looked:
-    an upper bound) ends at the holder's own process end when this session has it (derived), else at the drop (inferred).
-    No release: to now when lease.json still holds the task (exact), else the end is not known and the holding is left
-    out."""
+    """M2: [(task, start, end, access, how the end is known, confidence)] from lease events (lane_events()) in file order:
+    lease.taken starts a holding, lease.released ends it. A release found stale (the holder was dead when a later lease
+    change looked: an upper bound) ends at the holder's own process end when this session has it (derived), else at the
+    drop (inferred). No release: to now when lease.json still holds the task (exact), else the end is not known and the
+    holding is left out."""
     out, open_ = [], {}
     for ev in events:
-        t, kind, task = parse_time(ev.get("at")), ev.get("kind"), ev.get("task")
-        if t is None or not isinstance(task, str):
-            continue
+        t, kind, task = ev["at"], ev["kind"], ev["task"]
         if kind == "lease.taken":
-            open_.setdefault(task, (t, ev.get("access")))
+            open_.setdefault(task, (t, ev["access"]))
         elif kind == "lease.released" and task in open_:
             start, access = open_.pop(task)
-            if ev.get("how") == "stale":
+            if ev["how"] == "stale":
                 proc = span_end(tasks[task], now)[3] if task in tasks else None
                 if proc is not None and start <= proc <= t:
                     out.append((task, start, proc, access, "its process end; found stale later", "derived"))
                 else:
                     out.append((task, start, t, access, "found stale then (an upper bound)", "inferred"))
             else:
-                out.append((task, start, t, access, "released ({})".format(ev.get("how")), "exact"))
+                out.append((task, start, t, access, "released ({})".format(ev["how"]), "exact"))
     for task, (start, access) in open_.items():
         if task in held_now:
             out.append((task, start, now, access, "still held", "exact"))
@@ -896,39 +1022,26 @@ def build_task(reader, task, tasks_by_review, now, lanes_cache, lanes_override, 
     # lanes: instants; M2 (HB6d) the lease holdings that kept the queued task out
     meta = task["meta"]
     lane = meta.get("lane")
-    if isinstance(lane, str) and lane and re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", lane):
-        base = Path(lanes_override) if lanes_override else lanes_dir_for(reader, meta.get("workdir"), lanes_cache)
-        if base is not None and (base / lane).is_dir():
-            record = reader.json(base / lane / "lane.json", "lane.json")
-            closed = record.get("closed") if record else None
-            for item in closed if isinstance(closed, list) else []:
-                if isinstance(item, dict) and item.get("step") == meta.get("lane_step") and parse_time(item.get("closed_at")):
-                    instants.append({"at": iso(parse_time(item["closed_at"])), "what": "lane step {} closed".format(item["step"]),
-                                     "source": "lane.json closed_at", "confidence": "exact"})
-            lease = reader.json(base / lane / "lease.json", "lease.json")
-            holders = lease.get("holders") if lease else None
-            holders = [h for h in holders if isinstance(h, dict)] if isinstance(holders, list) else []
-            events = lane_events(reader, base, lane, lanes_cache)
-            own = [ev for ev in events if ev.get("task") == task["id"] and parse_time(ev.get("at")) is not None
-                   and str(ev.get("kind", "")).startswith("lease.")]
-            for ev in own:
-                instants.append({"at": iso(parse_time(ev["at"])), "what": "lane {} ({})".format(
-                    ev["kind"].replace(".", " "), ev.get("how")), "source": "lane events.jsonl", "confidence": "exact"})
-            for h in holders if not own else []:
-                if h.get("task") == task["id"] and parse_time(h.get("taken")):
-                    instants.append({"at": iso(parse_time(h["taken"])), "what": "lane lease taken", "source": "lease.json taken",
-                                     "confidence": "exact"})
-            if span_start < start and events:
-                mine = lane_lease.access_for(meta.get("role") if isinstance(meta.get("role"), str) else "", task["id"])
-                held_now = {h.get("task") for h in holders}
-                waits = [(a, b) for a, b, p in canvas.items if b > span_start and a < start
-                         and p[0] in ("unknown", "waiting:lane-lease")]
-                for other, a, b, access, how, conf in lease_holdings(events, held_now, tasks or {}, now):
-                    if other == task["id"] or not (mine == "write" or access == "write"):
-                        continue
-                    for lo, hi in waits:
-                        canvas.paint(max(a, lo, span_start), min(b, hi, start), payload(
-                            "waiting:lane-lease", "lane held by {} ({})".format(other, how), "lane events.jsonl lease.*", conf))
+    base = lane_base(reader, lane, meta.get("workdir"), lanes_cache, lanes_override)
+    if base is not None:
+        record = reader.json(base / lane / "lane.json", "lane.json")
+        closed = record.get("closed") if record else None
+        for item in closed if isinstance(closed, list) else []:
+            if isinstance(item, dict) and item.get("step") == meta.get("lane_step") and parse_time(item.get("closed_at")):
+                instants.append({"at": iso(parse_time(item["closed_at"])), "what": "lane step {} closed".format(item["step"]),
+                                 "source": "lane.json closed_at", "confidence": "exact"})
+        holders = lease_holders(reader, base, lane)
+        events = lane_events(reader, base, lane, lanes_cache)
+        own = [ev for ev in events if ev["task"] == task["id"]]
+        for ev in own:
+            instants.append({"at": iso(ev["at"]), "what": "lane {} ({})".format(ev["kind"].replace(".", " "), ev["how"]),
+                             "source": "lane events.jsonl", "confidence": "exact"})
+        for h in holders if not own else []:
+            if h["task"] == task["id"] and parse_time(h.get("taken")):
+                instants.append({"at": iso(parse_time(h["taken"])), "what": "lane lease taken", "source": "lease.json taken",
+                                 "confidence": "exact"})
+        paint_lease(canvas, span_start, start, task["id"], meta.get("role"), events, {h["task"] for h in holders},
+                    tasks or {}, now)
     state = task["state"]
     if state.get("updated") is not None:
         instants.append({"at": iso(parse_time(state.get("updated"))), "what": "last state {}".format(state.get("state")),
@@ -949,7 +1062,24 @@ def _actor(task):
     return "reviewer" if task["review_of"] else "worker"
 
 
-def queued_items(reader, tasks_dir, now, known):
+def queue_wait_intervals(reader, item, ident, segments, lo, hi, now, tasks, lanes_cache, lanes_override):
+    """The intervals of a not-started queue row from its segments [(a, b, state, why, source, confidence)] over [lo, hi].
+    M2 (F3): when the item names a lane with lease events, they paint its wait as a started task's queued wait is painted
+    (paint_lease); without them the segments stand as they are."""
+    base = lane_base(reader, item.get("lane"), item.get("workdir"), lanes_cache, lanes_override)
+    events = lane_events(reader, base, item["lane"], lanes_cache) if base is not None else []
+    if events:
+        canvas = Canvas(lo, hi)
+        for a, b, st, why, src, conf in segments:
+            canvas.paint(a, b, payload(st, why, src, conf))
+        paint_lease(canvas, lo, hi, ident, item.get("role"), events,
+                    {h["task"] for h in lease_holders(reader, base, item["lane"])}, tasks, now)
+        segments = [(a, b) + (p[0], p[2], p[3], p[4]) for a, b, p in canvas.merged()]
+    return [{"task": ident, "actor": ACTOR.get(st, ""), "state": st, "start": a, "end": b, "wait_reason": why,
+             "source": src, "confidence": conf} for a, b, st, why, src, conf in segments]
+
+
+def queued_items(reader, tasks_dir, now, known, tasks=None, lanes_cache=None, lanes_override=None):
     """D-R22: a task still in the session queue (no task directory yet)."""
     out = []
     folder = Path(tasks_dir).parent / "queue"
@@ -980,8 +1110,8 @@ def queued_items(reader, tasks_dir, now, known):
             if state == "unknown":
                 why = "queued; no reason recorded yet"
             segments = [(created, now, state, why, "queue/" + path.name + " created, queue_reason", "derived")]
-        intervals = [{"task": ident, "actor": ACTOR.get(st, ""), "state": st, "start": a, "end": b, "wait_reason": why,
-                      "source": src, "confidence": conf} for a, b, st, why, src, conf in segments]
+        intervals = queue_wait_intervals(reader, item, ident, segments, created, now, now, tasks or {},
+                                         {} if lanes_cache is None else lanes_cache, lanes_override)
         if intervals:
             intervals[-1]["open"] = True
         out.append({"task": ident, "harness": item.get("worker") or "", "role": "queued", "start": created, "end": now,
@@ -990,7 +1120,7 @@ def queued_items(reader, tasks_dir, now, known):
     return out
 
 
-def cancelled_items(reader, tasks_dir, now, known):
+def cancelled_items(reader, tasks_dir, now, known, tasks=None, lanes_cache=None, lanes_override=None):
     """B1 round 2: a queued task that `tp-agent stop` removed before it started. It has no task directory; tp-agent keeps
     its queue entry and its queue.reason events (queued..., then cancelled) in <state>/queue-cancelled/<id>/ (bin/tp-agent
     record_queue_cancel). Its row is [created, the cancelled event], painted from the reasons as a started task's wait is."""
@@ -1029,9 +1159,10 @@ def cancelled_items(reader, tasks_dir, now, known):
             continue
         end = min(cancelled, now)
         source = "queue-cancelled/" + ident + "/events.jsonl queue.reason"
-        intervals = [{"task": ident, "actor": ACTOR.get(st, ""), "state": st, "start": a, "end": b, "wait_reason": why,
-                      "source": source, "confidence": "exact" if st != "unknown" else "inferred"}
-                     for a, b, st, why in queue_log_segments([(t, r) for t, r in log if t <= end + TOL], created, end)]
+        segments = [(a, b, st, why, source, "exact" if st != "unknown" else "inferred")
+                    for a, b, st, why in queue_log_segments([(t, r) for t, r in log if t <= end + TOL], created, end)]
+        intervals = queue_wait_intervals(reader, item, ident, segments, created, end, now, tasks or {},
+                                         {} if lanes_cache is None else lanes_cache, lanes_override)
         out.append({"task": ident, "harness": item.get("worker") or "", "role": "cancelled", "start": created, "end": end,
                     "end_source": "queue.reason cancelled", "running": False, "instants": [], "transcript": "none",
                     "intervals": intervals})
@@ -1124,8 +1255,8 @@ def build(tasks_dir, task_ids=None, now=None, lanes_dir=None):
     for ident in wanted:
         rows.append(build_task(reader, tasks[ident], by_review, now, lanes_cache, lanes_dir, tasks))
     if not task_ids:
-        rows += queued_items(reader, tasks_dir, now, set(tasks))
-        rows += cancelled_items(reader, tasks_dir, now, set(tasks))
+        rows += queued_items(reader, tasks_dir, now, set(tasks), tasks, lanes_cache, lanes_dir)
+        rows += cancelled_items(reader, tasks_dir, now, set(tasks), tasks, lanes_cache, lanes_dir)
     rows.sort(key=lambda r: (r["start"], r["task"]))
     split = apply_main(reader, tasks_dir, rows, now)  # M1: before any total, so every total sees the pieces
     for row in rows:

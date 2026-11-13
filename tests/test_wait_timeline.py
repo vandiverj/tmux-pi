@@ -208,11 +208,13 @@ class Session:
                            for n, item in enumerate(items) if item[0] <= now) or None
         self.put(min(i[0] for i in items), "{}/{}/events.jsonl".format(folder, ident), content)
 
-    def cancelled(self, ident, created, log, at):
+    def cancelled(self, ident, created, log, at, lane=None):
         """bin/tp-agent record_queue_cancel (`tp-agent stop` of a queued task, HB6b1 round 2): the entry and its queue.reason
         events (queued per log entry, backdated, then cancelled) in queue-cancelled/<id>/, from the stop on."""
         entry = {"id": ident, "role": "coder", "worker": "pi", "model": "m", "created": iso_s(created), "after": ["w"],
                  "queue_reason": log[-1][1] if log else "", "queue_log": [{"at": iso_s(t), "reason": r} for t, r in log], "workdir": "/w"}
+        if lane:
+            entry.update(lane=lane, lane_step="S1")
         self.put(at, "queue-cancelled/{}/entry.json".format(ident), json.dumps(entry))
         self.events(ident, [(t, "queue.reason", None, {"reason": r}, "queued") for t, r in log]
                     + [(at, "queue.reason", None, {"reason": entry["queue_reason"]}, "cancelled")], folder="queue-cancelled")
@@ -238,10 +240,12 @@ class Session:
         if exit_at is not None:
             self.put(exit_at, "tasks/{}/exit".format(ident), "0\n")
 
-    def queued(self, ident, created, removed, reason, log=None):
+    def queued(self, ident, created, removed, reason, log=None, lane=None):
         """log: [(t, reason)] as bin/tp-agent with_queue_reason keeps it in queue_log (HB6b1); None: arm A's entry."""
         entry = {"id": ident, "role": "coder", "worker": "claude", "model": "m", "created": iso_s(created), "after": ["coder-b"],
                  "queue_reason": reason, "workdir": "/w"}
+        if lane:
+            entry.update(lane=lane, lane_step="S1")
         if log is not None:
             entry["queue_log"] = [{"at": iso_s(t), "reason": r} for t, r in log]
         self.put(created, "queue/{}.json".format(ident), json.dumps(entry), removed=removed)
@@ -434,7 +438,12 @@ class WaitTimelineTest(unittest.TestCase):
             return check
 
         # HB6d M2: task t queued at 10, started at 50 in lane L (a writer); h held the lane before it
-        def lane_case(s, holder_finish=None, reasons=None, items=(), holders=None, t_role="coder"):
+        def lane_case(s, holder_finish=None, reasons=None, items=(), holders=None, t_role="coder", lifecycle=False):
+            """lifecycle (F3): the same wait as two rows that never start: q still queued (created 10) and c cancelled at
+            50 (created 10), both in lane L with t's queue reasons."""
+            if lifecycle:
+                s.queued("q", 10, None, reasons[-1][1] if reasons else "", log=list(reasons) if reasons else None, lane="L")
+                s.cancelled("c", 10, list(reasons or []), 50, lane="L")
             s.task("h", 0, "claude", lane="L")
             s.claude_state("h", [1])
             s.finish("h", **(holder_finish or {"result": 30, "collected": 60, "exit_at": 60}))
@@ -449,10 +458,17 @@ class WaitTimelineTest(unittest.TestCase):
             return next(((i["state"], i["wait_reason"], i["source"], i["confidence"]) for i in row(report, task)["intervals"]
                          if i["start"] <= T0 + t < i["end"]), None)
 
+        def deep_tail(s, rel):
+            """The file `rel` of `s` with a line too deep for json.loads appended (F1)."""
+            k = next(n for n, f in enumerate(s.files) if f[2] == rel)
+            t, removed, _, content = s.files[k]
+            s.files[k] = (t, removed, rel, lambda now: content(now) + DEEP + "\n")
+
         def with_bad_lines(s, items):
             s.main_turns(items)
             good = s.files.pop()[3]
-            s.put(0, "main-turns.jsonl", lambda now: good(now) + "nope\n" + json.dumps({"at": "x", "event": "Stop"}) + "\n")
+            s.put(0, "main-turns.jsonl", lambda now: good(now) + "nope\n" + DEEP + "\n" + json.dumps({"at": "x", "event": "Stop"})
+                  + "\n" + json.dumps({"at": 10 ** 400, "event": "Stop", "session": "s1"}) + "\n")
 
         turns_basic = [(10, "UserPromptSubmit", "s1"), (30, "Stop", "s1"), (50, "UserPromptSubmit", "s1"), (60, "Stop", "s1")]
         basic = lambda r: one(r, lines=talk, finish=wait, extra=lambda s: s.main_turns(turns_basic))  # noqa: E731
@@ -719,13 +735,40 @@ class WaitTimelineTest(unittest.TestCase):
                        (60, 70, "busy", "exact"), (70, 80, "idle", "exact")]),
               (lambda x: next(i["main"]["reason"] for i in row(x, "w")["intervals"] if i.get("main", {}).get("state") == "unrecorded"
                               and i["start"] == T0 + 25), "Main turn with no Stop before Main restarted (its end is not recorded)")]),
-            ("M1 two Main sessions in one tmux-pi session interleave in one turn: listed once; bad lines are listed and skipped",
+            ("M1 (F2) two Main sessions interleave, s2's turn inside s1's: Main is busy until s1's own Stop, each session's"
+             " Stop ends only its turn; totals follow; bad lines (one too deep to decode) are listed and skipped",
              lambda r: one(r, lines=talk, finish=wait, extra=lambda s: with_bad_lines(s, [
                  (30, "UserPromptSubmit", "s1"), (35, "UserPromptSubmit", "s2"), (40, "Stop", "s2"), (45, "Stop", "s1")])),
              100,
-             [(mains, [(20, 30, "unrecorded", "inferred"), (30, 40, "busy", "inferred"), (40, 80, "idle", "exact")]),
-              (lambda x: problems(x).count("two Claude sessions' events in one Main turn"), 1),
-              (lambda x: ("1 malformed line(s) in main-turns.jsonl" in problems(x), "without a readable at" in problems(x)), (True, True))]),
+             [(mains, [(20, 30, "unrecorded", "inferred"), (30, 35, "busy", "exact"), (35, 40, "busy", "exact"),
+                       (40, 45, "busy", "exact"), (45, 80, "idle", "exact")]),
+              (lambda x: [i["main"]["reason"] for i in row(x, "w")["intervals"] if i.get("main", {}).get("state") == "busy"],
+               ["Main turn", "Main turns running in 2 Claude sessions", "Main turn"]),
+              (lambda x: {k: round(v) for k, v in x["totals"]["accumulated_main"].items()}, {"unrecorded": 10, "busy": 15, "idle": 35}),
+              (lambda x: "Claude sessions' events in one Main turn" in problems(x), False),
+              (lambda x: ("2 malformed line(s) in main-turns.jsonl" in problems(x),
+                          "2 main-turns.jsonl line(s) without a readable at or a known event; skipped" in problems(x)), (True, True))]),
+            ("M1 (F2) two Main sessions interleave, s1 stops first: busy until s2's Stop",
+             lambda r: one(r, lines=talk, finish=wait, extra=lambda s: s.main_turns([
+                 (30, "UserPromptSubmit", "s1"), (35, "UserPromptSubmit", "s2"), (40, "Stop", "s1"), (50, "Stop", "s2")])), 100,
+             [(mains, [(20, 30, "unrecorded", "inferred"), (30, 35, "busy", "exact"), (35, 40, "busy", "exact"),
+                       (40, 50, "busy", "exact"), (50, 80, "idle", "exact")])]),
+            ("M1 (F2) s2 restarts (resume) while s1 is busy: only s2's open turn ends; s1 stays busy to its own Stop. A session"
+             " that never speaks again (s4) is ended by the next session's start (s5), as unrecorded",
+             lambda r: one(r, lines=talk, finish=wait, extra=lambda s: s.main_turns([
+                 (30, "UserPromptSubmit", "s1"), (35, "UserPromptSubmit", "s2"), (40, "SessionStart", "s2", "resume"),
+                 (45, "UserPromptSubmit", "s2"), (55, "Stop", "s2"), (60, "Stop", "s1"), (62, "UserPromptSubmit", "s4"),
+                 (70, "SessionStart", "s5", "startup")])), 100,
+             [(mains, [(20, 30, "unrecorded", "inferred"), (30, 45, "busy", "exact"), (45, 55, "busy", "exact"),
+                       (55, 60, "busy", "exact"), (60, 62, "idle", "exact"), (62, 70, "unrecorded", "inferred"),
+                       (70, 80, "idle", "exact")])]),
+            ("M1 (F2) records with session null act on Main as a whole: a null Stop ends s1's turn, a null restart ends the open"
+             " turn as unrecorded",
+             lambda r: one(r, lines=talk, finish=wait, extra=lambda s: s.main_turns([
+                 (30, "UserPromptSubmit", "s1"), (40, "Stop", None), (50, "UserPromptSubmit", None),
+                 (60, "SessionStart", None, "startup")])), 100,
+             [(mains, [(20, 30, "unrecorded", "inferred"), (30, 40, "busy", "exact"), (40, 50, "idle", "exact"),
+                       (50, 60, "unrecorded", "inferred"), (60, 80, "idle", "exact")])]),
             ("M1 no main-turns.jsonl (an old session) reads exactly as without the rule: no `main`, no Main totals",
              lambda r: one(r, lines=talk, finish=wait), 100,
              [(no_main, (False, False, False))]),
@@ -747,28 +790,38 @@ class WaitTimelineTest(unittest.TestCase):
               (lambda x: lease_at(x, 40)[0], "unknown"),
               (lambda x: [(i["what"], i["source"]) for i in row(x, "t")["instants"] if "lease" in i["what"]],
                [("lane lease taken (reserve)", "lane events.jsonl")])]),
-            ("M2 a stale holder with no process end in the session ends at the drop, inferred (an upper bound)",
+            ("M2 a stale holder with no process end in the session ends at the drop, inferred (an upper bound); the same"
+             " for a still-queued and a cancelled row with no queue reason (F3)",
              lambda r: one(r, lines=talk, finish=done, extra=lambda s: lane_case(
-                 s, holder_finish={"result": 30}, reasons=[],
+                 s, holder_finish={"result": 30}, reasons=[], lifecycle=True,
                  items=[(0, "lease.taken", "x", "write", "reserve"), (45, "lease.released", "x", "write", "stale")])), 100,
-             [(lambda x: lease_at(x, 44), ("waiting:lane-lease", "lane held by x (found stale then (an upper bound))",
-                                           "lane events.jsonl lease.*", "inferred")), (lambda x: lease_at(x, 46)[0], "unknown")]),
-            ("M2 an explicit release is exact; a queue reason other than the lane is kept; free lease seconds keep the queue's",
+             [(lambda x: [lease_at(x, 44, k) for k in "tqc"], [("waiting:lane-lease", "lane held by x (found stale then (an upper bound))",
+                                                                "lane events.jsonl lease.*", "inferred")] * 3),
+              (lambda x: [lease_at(x, 46, k)[0] for k in "tqc"], ["unknown"] * 3),
+              (lambda x: (lease_at(x, 60, "q")[0], row(x, "q")["intervals"][-1].get("open"), row(x, "c")["end"] - T0), ("unknown", True, 50))]),
+            ("M2 an explicit release is exact; a queue reason other than the lane is kept; free lease seconds keep the queue's;"
+             " a still-queued and a cancelled row the same (F3)",
              lambda r: one(r, lines=talk, finish=done, extra=lambda s: lane_case(
-                 s, reasons=[(10, "global worker slots full"), (20, "waiting for lane L")],
+                 s, reasons=[(10, "global worker slots full"), (20, "waiting for lane L")], lifecycle=True,
                  items=[(0, "lease.taken", "h", "write", "reserve"), (30, "lease.released", "h", "write", "release")])), 100,
-             [(lambda x: lease_at(x, 15)[0], "waiting:worker-slot"),
-              (lambda x: lease_at(x, 25), ("waiting:lane-lease", "lane held by h (released (release))", "lane events.jsonl lease.*", "exact")),
-              (lambda x: lease_at(x, 40), ("waiting:lane-lease", "queued: lane writer", "events.jsonl queue.reason", "exact"))]),
+             [(lambda x: [lease_at(x, 15, k)[0] for k in "tqc"], ["waiting:worker-slot"] * 3),
+              (lambda x: [lease_at(x, 25, k) for k in "tqc"],
+               [("waiting:lane-lease", "lane held by h (released (release))", "lane events.jsonl lease.*", "exact")] * 3),
+              (lambda x: lease_at(x, 40), ("waiting:lane-lease", "queued: lane writer", "events.jsonl queue.reason", "exact")),
+              (lambda x: [lease_at(x, 40, k)[:2] for k in "qc"], [("waiting:lane-lease", "queued: lane writer")] * 2)]),
             ("M2 taken with no release: to now while lease.json still holds it; gone from lease.json: no span (end unknown);"
-             " a reader is not kept out by a reader",
+             " a reader is not kept out by a reader; (F1) a lease.json holder whose task is [] and a lane event line too deep"
+             " to decode are listed and skipped",
              lambda r: one(r, lines=talk, finish=done, extra=lambda s: (lane_case(
-                 s, reasons=[], holders=["h"],
+                 s, reasons=[], holders=["h", []],
                  items=[(0, "lease.taken", "h", "write", "reserve"), (5, "lease.taken", "gone", "write", "reserve"),
                         (5, "lease.taken", "rd", "read", "reserve")]),
+                 deep_tail(s, "lanes/L/events.jsonl"),
                  s.task("t2", 50, "claude", role="code-reviewer", lane="L", queued_at=10), s.claude_state("t2", [51]),
                  s.queue_events("t2", [], 50))), 100,
-             [(lambda x: lease_at(x, 30), ("waiting:lane-lease", "lane held by h (still held)", "lane events.jsonl lease.*", "exact")),
+             [(lambda x: ("lease.json holder(s) without a task id; not counted" in problems(x),
+                          "1 malformed line(s) in lane events.jsonl" in problems(x)), (True, True)),
+              (lambda x: lease_at(x, 30), ("waiting:lane-lease", "lane held by h (still held)", "lane events.jsonl lease.*", "exact")),
               (lambda x: "held by gone" in json.dumps([i["wait_reason"] for i in row(x, "t")["intervals"]]), False),
               (lambda x: lease_at(x, 30, "t2"), ("waiting:lane-lease", "lane held by h (still held)", "lane events.jsonl lease.*", "exact")),
               (lambda x: "held by rd" in json.dumps([i["wait_reason"] for i in row(x, "t2")["intervals"]]), False)]),
@@ -1233,6 +1286,16 @@ class StatusTest(unittest.TestCase):
         (bad / "state.json").write_text(DEEP)
         self.assertEqual(self.status.build(state / "tasks", repo, now=self.NOW, rows=rows)["lanes"][0]["state"],
                          {"state": "waiting:main", "since": iso_ms(20), "main": "busy"})
+        # F1: a main-turns.jsonl line too deep to decode and one whose time overflows a float are skipped and listed; the
+        # healthy line still gives Main's state, on the task-by-task path (t-other's record) and on the ordinary one
+        with open(state / "main-turns.jsonl", "a") as handle:
+            handle.write(DEEP + "\n" + json.dumps({"at": 10 ** 400, "event": "Stop", "session": "s1"}) + "\n")
+        for path in ("task by task", "ordinary"):
+            report = self.status.build(state / "tasks", repo, now=self.NOW, rows=rows)
+            self.assertEqual(report["lanes"][0]["state"], {"state": "waiting:main", "since": iso_ms(20), "main": "busy"}, path)
+            self.assertIn((str(state / "main-turns.jsonl"), "1 malformed line(s) in main-turns.jsonl"),   # (one per path)
+                          [(p["where"], p["problem"]) for p in report["problems"]], path)
+            shutil.rmtree(bad, ignore_errors=True)
 
     def test_cli(self):
         import contextlib

@@ -815,7 +815,7 @@ QUEUE_TEXT = ("id", "role", "worker", "model", "thinking", "task")
 def queue_item(value, name=None):
     """The one check of a queue item (what dispatch writes to queue/<id>.json). It covers every field any reader uses
     and returns a new dict of just those fields, normalised; launch, capacity, tick, the index and the queue views take
-    their data only from this return value. Every field but queue_reason is required, tests included: the default
+    their data only from this return value. Every field but queue_reason and profile (missing = none) is required, tests included: the default
     scope is applied only where dispatch builds the record from the command line, never to a stored one. `name` is
     the file stem the id must match. ValueError says which field is wrong."""
     if not isinstance(value, dict):
@@ -849,9 +849,7 @@ def queue_item(value, name=None):
         raise ValueError("the record's after list holds an invalid task id")
     clean = {key: value[key] for key in QUEUE_TEXT + ("workdir", "route_info", "created", "deliverable", "parent")}
     clean.update({key: list(value[key]) for key in ("after", "context", "notes")}, tests=tests)
-    if "profile" not in value:  # required like every field: the dispatch-time TP_PROFILE (None = explicitly no profile)
-        raise ValueError("the record has no profile (None for none, or a profile name)")
-    profile = value["profile"]
+    profile = value.get("profile")  # optional: the dispatch-time TP_PROFILE; missing = null = no profile (a record from before profiles, or another module's fixture)
     if profile is not None and not (isinstance(profile, str) and PROFILE_NAME.fullmatch(profile) and (PROFILES / f"{profile}.md").is_file()):
         raise ValueError(f"the record has an unknown profile {profile!r}")
     clean["profile"] = profile

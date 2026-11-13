@@ -35,8 +35,8 @@ FAKE = {  # the fake tools put first on PATH; every call is logged, and a call t
 
 
 def pinned_catalog(source, model):
-    """The catalog at `source` with level small listing `model` alone, so no other model of level small (an OpenAI or other
-    alternative) can be chosen for an arm, and a health fallback has nothing to swap in. The router's own chain and every
+    """The catalog at `source` with level small listing `model` alone and nothing reachable from it, so no other model (an OpenAI or
+    other alternative, at small or any level) can be chosen for an arm: a health fallback finds nothing to swap in. The router's own chain and every
     other model must stay listed, so the models small gave up move to the level that held `model` (or, when small held it,
     to level mid). Raises ValueError when no level lists the model or the catalog has no small (or, for that move, mid) level."""
     catalog = json.loads(Path(source).read_text())
@@ -56,6 +56,15 @@ def pinned_catalog(source, model):
         raise ValueError(f"{source} has no level to hold the models level small gives up")
     dest["models"] = [m for m in dest["models"] if m.get("model") != model] + displaced
     small["models"] = [entry]
+    # The resolver's availability fallback tries the requested level, then the levels above (never a restricted one), then below
+    # (never under the route's floor, which an explicit --level small lowers to small). So every level above small is made restricted and
+    # the default level is small: an unhealthy pinned model then ends in a refusal, never in another model.
+    above = False
+    for level in catalog["levels"]:
+        if above:
+            level["restricted"] = True
+        above = above or level is small
+    catalog["default_level"] = "small"
     catalog["description"] = f"{catalog.get('description', '')} [M1 pilot: level small pinned to {model}]".strip()
     return catalog
 

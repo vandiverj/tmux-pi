@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT / "lib"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pilot  # noqa: E402
+import route_resolve  # noqa: E402
 import router_catalog  # noqa: E402
 
 SOURCE = ROOT / "config/model-catalog.json"
@@ -40,6 +41,17 @@ class PinnedCatalogTests(unittest.TestCase):
                 small = next(level for level in loaded["levels"] if level["key"] == "small")
                 self.assertEqual([m["model"] for m in small["models"]], [model])   # one model: no OpenAI or other alternative
                 self.assertEqual(models(loaded), models(shipped))   # no model added or lost (the router's chain stays valid)
+                # the real resolver, as bench dispatches (explicit --level small, role coder): healthy -> the pin; the pinned model or its
+                # whole provider exhausted -> a refusal, never another model at any level (the resolver's fallback goes up, then down)
+                decision = {"level_key": "small", "effort": "medium", "review": "optional", "shape": None, "source": "explicit_level"}
+                provider = next(m["provider"] for level in loaded["levels"] for m in level["models"] if m["model"] == model)
+                for label, health, expect in (("healthy", {}, model), ("model exhausted", {f"{provider}:{model}": {"status": "exhausted"}}, None),
+                                              ("provider exhausted", {provider: {"status": "exhausted"}}, None)):
+                    with self.subTest(model=model, health=label):
+                        rec = route_resolve.resolve(dict(decision), loaded, health, {"role": "coder", "skip_caps": True})
+                        self.assertEqual(rec.get("model"), expect)
+                        if expect is None:
+                            self.assertEqual(rec["source"], "stop_and_ask")
         for model in ("not/a-model", "lmstudio/qwen/qwen3.6-35b-a3b"):
             with self.subTest(refused=model):
                 with self.assertRaises(ValueError):

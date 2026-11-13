@@ -364,7 +364,7 @@ esac
                    ("tests is a list", {"tests": []}), ("unknown role", {"role": "wizard"}),
                    ("unknown worker", {"worker": "other"}), ("thinking missing", {"thinking": None}),
                    ("id does not match the file", {"id": "coder-0000000000"}),
-                   ("profile unknown", {"profile": "novice"}), ("profile is a number", {"profile": 3}))
+                   ("profile unknown", {"profile": "novice"}), ("profile is a number", {"profile": 3}), ("profile is a list", {"profile": ["expert"]}))
         for label, change in changes:
             with self.subTest(label):
                 path.write_text(json.dumps({**good, **change}))
@@ -375,8 +375,10 @@ esac
                 self.assertFalse((self.state / "tasks" / queued["id"]).exists())
                 rows = {row["id"]: row for row in self.cli("index")["active"]}  # the index is still written
                 self.assertEqual(rows[queued["id"]]["status"], "queued")
-        path.write_text(json.dumps(good))  # the same record, restored, starts
-        self.assertEqual(self.cli("tick")["started"], [queued["id"]])
+        # profile is optional: a record without it (queued before profiles existed, or written by another module) means no profile
+        path.write_text(json.dumps({k: v for k, v in good.items() if k != "profile"}))
+        self.assertEqual(json.loads(self.raw("tick", env={**self.env, "TP_PROFILE": "expert"}).stdout)["started"], [queued["id"]])  # the tick's own TP_PROFILE is not used
+        self.assertNotIn("# Worker Profile", self.packet(queued))
 
     def test_one_bad_queue_entry_never_stops_the_others_or_the_index(self):
         first = self.dispatch()
@@ -422,7 +424,7 @@ esac
         def add(label, content):
             entries[f"shape{len(entries):02d}"] = (label, content)
         for key in good:
-            if key not in ("queue_reason", "queue_log"):  # the optional fields may be absent
+            if key not in ("queue_reason", "queue_log", "profile"):  # the optional fields may be absent (profile: missing = no profile)
                 add(f"{key} missing", {k: v for k, v in good.items() if k != key})
             add(f"{key} wrong type", {**good, key: wrong[key]})
         add("queue_reason a list", {**good, "queue_reason": ["x"]})

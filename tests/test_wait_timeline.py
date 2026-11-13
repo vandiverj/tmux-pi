@@ -920,11 +920,14 @@ class StatusTest(unittest.TestCase):
             # Round 5 F1: a record a shared reader cannot decode keeps its lane as a row, unknown, with the record listed.
             ("run", "t-run/review-of", b"\xff\n", 10, "t-run/review-of"),          # undecodable review-of, writer
             ("appr", "r-appr/review-of", b"\xff\n", 10, "r-appr/review-of"),       # and review
-            ("run", "t-run/meta.json", DEEP, 10, "t-run"),                          # too deep to decode: unreadable, placed by dispatch.json
+            ("run", "t-run/meta.json", DEEP, 10, "t-run/meta.json"),                # too deep to decode: unreadable, placed by dispatch.json
             ("run", "t-run/state.json", DEEP, 10, "t-run/state.json"),
             ("cap", "t-cap/requests/req-" + "0" * 25 + "A.json", DEEP, 10, "t-cap/requests/req-" + "0" * 25 + "A.json"),
-            ("rc", "r-rc/acceptance-items.json", DEEP, 10, "r-rc"),
-            ("rc", "r-rc/acceptance-items.json", '{"it', 10, "r-rc"),           # truncated: the unparseable verdict is listed
+            ("rc", "r-rc/acceptance-items.json", DEEP, 10, "r-rc/acceptance-items.json"),
+            ("rc", "r-rc/acceptance-items.json", '{"it', 10, "r-rc/acceptance-items.json"),   # truncated: listed by the file
+            # Round 7 F2: a failed record is listed by its file, not only its directory.
+            ("rc", "r-rc/sweep-rows.json", "{bad", 10, "r-rc/sweep-rows.json"),   # (r-appr is shadowed by a newer review; r-rc is the one read)
+            ("run", "t-run/meta.json", "{broken", 10, "t-run/meta.json"),       # the only writer; its dispatch tag is valid
             ("run", "t-foreign/state.json", DEEP, 4, "t-foreign/state.json"),   # a decoder error on 3.9, a wrong shape on 3.14: listed either way, lane run keeps its rule
             ("run", "t-foreign/state.json", b"\xff\xfe", 4, "t-foreign/state.json"),   # undecodable on every version
             ("final", "t-run-new/meta.json", {"created": 10 ** 400}, 10, "t-run-new/meta.json"),   # timeline overflows on it
@@ -973,6 +976,22 @@ class StatusTest(unittest.TestCase):
                     self.assertTrue(row["next"].startswith("unknown") or rule in (1, 4), row)   # (rule 4: a foreign task's record)
                 else:
                     self.assertFalse([w for w in listed if Path(w).parent.name in rel], listed)
+        # Round 7 F1: a foreign task's undecodable record and another's malformed one cost the healthy lane nothing, and both are listed.
+        t("t-foreign-b", "foreign", 12)
+        saved = {n: (self.tasks / n / "state.json").read_bytes() for n in ("t-foreign", "t-foreign-b")}
+        (self.tasks / "t-foreign" / "state.json").write_text(DEEP)    # a decoder error on 3.9, a wrong shape on 3.14
+        (self.tasks / "t-foreign-b" / "state.json").write_text("{bad")
+        try:
+            one = status.build(self.tasks, self.repo, now=self.NOW, rows=[{"name": n, "state": "open"} for n in ("run", "perm")])
+        finally:
+            for n, body in saved.items():
+                (self.tasks / n / "state.json").write_bytes(body)
+        row = {r["lane"]: r for r in one["lanes"]}["run"]
+        self.assertEqual((row["rule"], row["state"]["state"], sorted(row["state"])), (4, "stalled", ["since", "state"]), row)
+        listed = [p["where"] for p in one["problems"]]
+        for n in ("t-foreign", "t-foreign-b"):
+            self.assertIn(str(self.tasks / n / "state.json"), listed)
+        self.assertFalse([p for p in one["problems"] if p["where"] == str(self.tasks / "t-run") and "no timeline" in p["problem"]])
         if os.geteuid() != 0:   # round 5: no session can be read, yet every open lane is still a row (unknown), not lanes: []
             os.chmod(self.tasks, 0)
             try:

@@ -288,6 +288,21 @@ def _why(bad):
     return "; ".join(why for _, why in bad)[:160]
 
 
+def _review_files_bad(path, error):
+    """[(file, why)]: the file(s) of a review the strict reader refused, each by its own path. A sidecar is probed alone; result.md
+    is listed when read_review names it (message starts "the review result") or no sidecar explains the refusal."""
+    result = path / "result.md"
+    out = []
+    for name, probe in ((review_verdict.ITEMS_FILE, review_verdict.recorded_items), (review_verdict.SWEEP_FILE, review_verdict.recorded_sweep_open)):
+        try:
+            probe(result)
+        except Exception as inner:
+            out.append((path / name, f"{name} cannot be read ({inner.__class__.__name__})"))
+    if not out or str(error).startswith("the review result") or isinstance(error, review_verdict.ReviewMissing):
+        out.append((result, f"the review's result.md cannot be used ({error.__class__.__name__})"))
+    return out
+
+
 def _read_review(task):
     """{id, life, life_problem, verdict, incomplete, unusable} of a review task; verdict only when it has finished."""
     life, bad = _life(task)
@@ -300,7 +315,7 @@ def _read_review(task):
         out["unusable"] = review_verdict.request_changes_problem(text)
     except Exception as error:  # result.md or a verdict sidecar (acceptance-items.json, sweep-rows.json) the strict reader refuses
         out["verdict"] = "unparseable"
-        out["bad"] = [(task["path"], f"the review's verdict records cannot be read ({error.__class__.__name__})")]
+        out["bad"] = _review_files_bad(task["path"], error)
     return out
 
 
@@ -399,13 +414,13 @@ def _problem_dirs(state_dir):
                 if not d.is_dir() or d.is_symlink() or d.name.startswith("."):
                     continue
                 if not (d / "meta.json").exists():
-                    out.append((d, "task directory has no meta.json"))
+                    out.append((d / "meta.json", "task directory has no meta.json"))
                     continue
                 ok = isinstance(json.loads((d / "meta.json").read_text()), dict)
             except Exception:  # unreadable, undecodable, too deep
                 ok = False
             if not ok:
-                out.append((d, "meta.json is malformed"))
+                out.append((d / "meta.json", "meta.json is malformed"))
     return out
 
 
@@ -498,36 +513,49 @@ def _timeline(tasks_dir, ids, now):
     """(timeline rows by task id, problems, {task directory name: why} of the tasks timeline could not read, error or None).
 
     timeline.build reads every task directory, so one record it cannot take (a state.json too deep to decode) raises out of it
-    for every lane. When it raises, each directory is loaded alone to find which one it was; when none fails alone, each wanted
-    task is built alone. A failure no task can be named for is returned as `error` (every lane is then unknown)."""
+    for every lane. When it raises, each directory is loaded alone to find the culprits (a task whose records cannot be
+    decoded), and the timeline is rebuilt over every other task, so a healthy lane keeps its row. A culprit's lanes are unknown.
+    Every problem found is returned, decodable or not. A failure no task can be named for is returned as `error` (every lane
+    is then unknown)."""
     try:
         report = timeline.build(tasks_dir, ids, now)
         return {r["task"]: r for r in report["tasks"]}, report["problems"], {}, None
     except Exception as error:
         failure = error
-    culprits = {}
+    culprits, problems = {}, []
     try:
         dirs = sorted(p for p in Path(tasks_dir).iterdir() if p.is_dir() and not p.is_symlink())
     except Exception:
         dirs = []
-    rows, problems = {}, []
+    tasks, by_review = {}, {}
     for d in dirs:
         reader = _TotalReader()
+        task = None
         try:
-            timeline.load_task(reader, d)
+            task = timeline.load_task(reader, d)
         except Exception as error:
             culprits[d.name] = f"the timeline cannot read the task's records ({error.__class__.__name__})"
         if reader.undecodable:  # the record is listed under its own path, as timeline lists a wrong shape
             culprits.setdefault(d.name, "the timeline cannot decode the task's records")
-            problems += [p for p in reader.problems if p not in problems]
-    if not culprits:
-        for ident in ids:
-            try:
-                report = timeline.build(tasks_dir, [ident], now)
-                rows.update({r["task"]: r for r in report["tasks"]})
-                problems += report["problems"]
-            except Exception as error:
-                culprits[ident] = f"the timeline cannot read the task's records ({error.__class__.__name__})"
+        problems += reader.problems
+        if task is not None and d.name not in culprits:
+            tasks[task["id"]] = task
+            if task["review_of"]:
+                by_review.setdefault(task["review_of"], []).append(task)
+    rows, cache = {}, {}
+    for ident in ids:
+        if ident not in tasks:
+            continue
+        reader = _TotalReader()  # one per task: a record it cannot decode makes that task a culprit, never another
+        try:
+            row = timeline.build_task(reader, tasks[ident], by_review, now, cache, None)
+            if reader.undecodable:
+                culprits[ident] = "the timeline cannot decode the task's records"
+            else:
+                rows[row["task"]] = row
+        except Exception as error:
+            culprits[ident] = f"the timeline cannot read the task's records ({error.__class__.__name__})"
+        problems += reader.problems
     return rows, problems, culprits, (failure if not culprits else None)
 
 
@@ -578,7 +606,7 @@ def build(tasks_dir, repo, now=None, rows=None):
         broken += f" ({error.__class__.__name__})"
         problems.append({"where": str(state_dir), "problem": f"session unreadable ({error.__class__.__name__})"})
     for d, why in _problem_dirs(state_dir):
-        problems.append({"where": str(d), "problem": why})
+        problem(d, why)
     chosen = []  # (name, record or None, task or None, step, why the lane is unknown before its row is built or "")
     for lane in rows:
         if lane.get("state") not in ("open", "error"):
@@ -606,7 +634,8 @@ def build(tasks_dir, repo, now=None, rows=None):
     by_task, culprits = {}, {}
     if ids:
         by_task, found, culprits, failure = _timeline(state_dir / "tasks", ids, now)
-        problems += found
+        for entry in found:
+            problem(entry["where"], entry["problem"])
         for name, why in culprits.items():
             problem(state_dir / "tasks" / name, why)
         if failure is not None:

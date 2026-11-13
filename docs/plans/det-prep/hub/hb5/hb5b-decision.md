@@ -27,3 +27,7 @@ is a line in claude/main-prompt.md, which needs the owner's OK.
   how much of Main's cell time repeats the worker's runs. That is the evidence for or against reuse (the next HB5 step).
 - **B.** Only Main's verify scripts pass it; no prompt change. Records exist only while this Main session's scripts are in use.
 - **C.** Neither; the flag stays unused.
+
+**Decided 2026-11-12: A** (owner: "A"). claude/main-prompt.md, Lanes section, now tells Main to run its own checks through
+`tools/agent/test-run.sh WORKTREE --main --lane L --step S -- CMD`. Main's cell script records each module run in
+SESSION/main-runs with lane, step and interpreter. Next: once a few lanes have records, read the repeat report and decide on reuse.

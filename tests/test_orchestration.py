@@ -115,6 +115,52 @@ esac
         self.assertEqual(index["recent"][-1]["id"], item["id"])
         self.assertEqual(index["recent"][-1]["status"], "completed")
 
+    def test_profile_layer_follows_the_role_and_no_profile_is_the_default_packet(self):
+        """HB7c: TP_PROFILE=expert|guided adds agent/profiles/<name>.md right after the role text and changes nothing else;
+        unset or empty is today's packet byte for byte; a name with no profile file refuses before anything is made. The bench
+        sets it with --env, which reaches tp-spawn through tp-agent dispatch."""
+        def spawn(ident, profile=None, role=("--role", "coder")):
+            env = {k: v for k, v in self.env.items() if k != "TP_PROFILE"}   # unset means unset, whatever the caller's shell holds
+            if profile is not None:
+                env["TP_PROFILE"] = profile
+            return subprocess.run([str(ROOT / "bin/tp-spawn"), "--task-id", ident, "--worker", "pi", "--model", MODEL, "--workdir",
+                                   str(self.project), *role, "--deliverable", "Report paths and checks", "--", "Make a focused change"],
+                                  env=env, text=True, capture_output=True)
+
+        def packet(ident):
+            return (self.state / "tasks" / ident / "packet.md").read_text().replace(ident, "ID")
+
+        self.assertEqual(spawn("p-unset").returncode, 0)
+        default = packet("p-unset")
+        role = "# Worker Role\n\n" + (ROOT / "agent/roles/coder.md").read_text().rstrip("\n") + "\n"
+        self.assertEqual(default.count(role), 1)
+        self.assertNotIn("# Worker Profile", default)
+        for name in ("", "expert", "guided"):
+            with self.subTest(profile=name):
+                run = spawn(f"p-{name or 'empty'}", name)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                layer = (ROOT / "agent/profiles" / f"{name}.md").read_text().rstrip("\n") if name else None
+                expected = default if layer is None else default.replace(role, role + "\n\n" + layer + "\n", 1)
+                self.assertEqual(packet(f"p-{name or 'empty'}"), expected)
+                # a profile adds no directive the contract already gives (the report path stays stated once, as a fact)
+                self.assertEqual(expected.count("report.md"), 1)
+                self.assertNotIn("RESULT_STATUS", expected)
+        for name in ("novice", "../roles/coder", "Expert"):
+            with self.subTest(refused=name):
+                run = spawn("p-refused", name)
+                self.assertNotEqual(run.returncode, 0)
+                self.assertIn("unknown TP_PROFILE", run.stderr)
+                self.assertFalse((self.state / "tasks" / "p-refused").exists())
+        with self.subTest(row="no role, no layer"):
+            run = spawn("p-norole", "guided", role=())
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertNotIn("# Worker Profile", packet("p-norole"))
+        with self.subTest(row="through tp-agent dispatch"):
+            run = self.raw("dispatch", "--role", "coder", "--task", "Make a focused change", "--worker", "pi", "--model", MODEL,
+                           "--workdir", str(self.project), env={**self.env, "TP_PROFILE": "guided"})
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertEqual(self.packet(json.loads(run.stdout)).count("# Worker Profile: guided\n"), 1)
+
     def write_preamble(self, text):
         (self.state / "worker-preamble.md").write_text(text)
 

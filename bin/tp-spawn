@@ -160,6 +160,12 @@ fi
 if [[ -n "$preamble_role" ]]; then
   [[ "$preamble_role" =~ ^[a-z][a-z0-9-]*$ && -f "$ROOT/agent/roles/$preamble_role.md" ]] || die "unknown --preamble-role: $preamble_role"
 fi
+# M1 worker profile (docs/plans/det-prep/m1-model-profiles.md): TP_PROFILE=<name> adds agent/profiles/<name>.md right after the
+# role text (a layer over the role; agent/roles/ is never changed). Unset or empty is no profile: the packet is what it was before
+# profiles existed. A name with no profile file refuses here, before anything is made. tp-bench arms set it with --env.
+profile="${TP_PROFILE:-}"
+[[ -z "$profile" || ( "$profile" =~ ^[a-z][a-z0-9-]*$ && -f "$ROOT/agent/profiles/$profile.md" ) ]] ||
+  die "unknown TP_PROFILE: $profile (a file in agent/profiles/, or unset for none)"
 [[ -z "$lane" || "$lane" =~ ^[a-z0-9][a-z0-9-]{0,23}$ ]] || die "bad --lane: $lane"
 [[ -z "$gate" || "$gate" == rule-first || "$gate" == design ]] || die "bad --gate: $gate (rule-first or design)"
 [[ -z "$gate_review" || -n "$gate" ]] || die "--gate-review needs --gate"
@@ -571,6 +577,9 @@ if [[ -n "$role_text" && -f "$ROOT/agent/roles/$role_text.md" ]]; then
   packet+=$'\n\n# Worker Role\n\n'
   packet+="$(cat "$ROOT/agent/roles/$role_text.md")"
   packet+=$'\n'
+  if [[ -n "$profile" ]]; then
+    packet+=$'\n\n'"$(cat "$ROOT/agent/profiles/$profile.md")"$'\n'
+  fi
 fi
 if [[ -n "$deliverable" ]]; then
   packet+=$'\n\n# Expected Deliverable\n\n'

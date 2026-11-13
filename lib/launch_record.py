@@ -570,15 +570,31 @@ def read(path):
     return record
 
 
-def contract_version(record):
-    return next((i.get("version") for i in record.get("instructions", []) if i.get("name") == "contract"), None)
-
-
 def summary(record):
     """One short line for a reader: contract version, role, route, unsupported capabilities, and a failure when there is one."""
-    parts = [f"contract {contract_version(record) or 'none'}", f"role {record.get('role') or 'none'}", f"route {record.get('route')}"]
-    unsupported = (record.get("capabilities") or {}).get("unsupported") or []
-    parts.append("unsupported " + ("+".join(unsupported) if unsupported else "none"))
+    # each field is a value (the record holds it), "none" (it holds the field, empty) or "unknown" (it does not hold the field)
+    def held(container, key):
+        if not isinstance(container, dict) or key not in container:
+            return "unknown"
+        return "none" if container[key] in ("", None) else str(container[key])  # only "" and null are empty; 0 and false are values
+    def scalar(key):
+        return held(record, key)
+    instructions = record.get("instructions")
+    if not isinstance(instructions, list):
+        contract = "unknown"
+    else:
+        entry = next((i for i in instructions if isinstance(i, dict) and i.get("name") == "contract"), None)
+        if entry is None:
+            contract = "none"
+        else:
+            contract = held(entry, "version")
+    capabilities = record.get("capabilities")
+    unsupported = capabilities.get("unsupported") if isinstance(capabilities, dict) else None
+    if not isinstance(unsupported, list):
+        unsupported = "unknown"
+    else:
+        unsupported = "+".join(str(u) for u in unsupported) or "none"
+    parts = [f"contract {contract}", f"role {scalar('role')}", f"route {scalar('route')}", f"unsupported {unsupported}"]
     if record.get("status") == "failed":
         parts.insert(0, "FAILED (" + str(record.get("failure", "")) + ")")
     if record.get("status") == "error":

@@ -492,10 +492,36 @@ class Realistic(Base):
         main = [l for l in lines if l.startswith("launch record (HB2")]
         self.assertEqual(main, ["launch record (HB2; tasks: [launch: ...] in active work; Main) [2026-01-01T00:00:00Z]: claude resume, "
                                 "model opus, contract none, role main, route main, unsupported interrupt.rpc+cost.known"])
+        # HB2c: a field the record does not hold is "unknown"; one it holds and is empty is "none"
+        error = {"schema": "tp-launch:v1", "status": "error", "error": "RecordError: boom", "task": "t", "role": "coder",
+                 "harness": "claude", "recorded": "2026-01-01T00:00:00Z"}  # launch_record._main's shape
+        empty = record("", None, instructions=[], capabilities={"unsupported": []})
+        odd = record("coder", "spawn", instructions="x", capabilities={"unsupported": "x"})  # containers of the wrong type
+        bare = record("coder", "spawn", instructions=[{"name": "contract"}], capabilities={})  # a contract entry with no version
+        blank = record("coder", "spawn", instructions=[{"name": "contract", "version": ""}], capabilities={})  # version held, empty
+        nullv = record("coder", "spawn", instructions=[{"name": "contract", "version": None}], capabilities={})
+        zero = record("coder", "spawn", instructions=[{"name": "contract", "version": 0}], capabilities={})  # 0 and false are held values
+        false = record("coder", "spawn", instructions=[{"name": "contract", "version": False}], capabilities={})
+        zrole = record(0, "spawn", capabilities={})
+        for ident, rec in (("coder-err", error), ("coder-empty", empty), ("coder-odd", odd), ("coder-bare", bare),
+                           ("coder-blank", blank), ("coder-nullv", nullv), ("coder-zero", zero), ("coder-false", false),
+                           ("coder-zrole", zrole)):
+            (self.task(ident, "coder", "working") / "launch.json").write_text(json.dumps(rec))
+        row = {l.split()[1]: l for l in self.brief().splitlines() if l.startswith("- coder-")}
+        self.assertEqual(row["coder-err"], "- coder-err coder working [launch: ERROR (RecordError: boom), contract unknown, role coder, "
+                                           "route unknown, unsupported unknown]")
+        self.assertIn("[launch: contract none, role none, route none, unsupported none]", row["coder-empty"])
+        self.assertIn("[launch: contract unknown, role coder, route spawn, unsupported unknown]", row["coder-odd"])
+        self.assertIn("[launch: contract unknown, role coder, route spawn, unsupported unknown]", row["coder-bare"])
+        for ident in ("coder-blank", "coder-nullv"):
+            self.assertIn("[launch: contract none, role coder, route spawn, unsupported unknown]", row[ident])
+        self.assertIn("[launch: contract 0, role coder, route spawn, unsupported unknown]", row["coder-zero"])
+        self.assertIn("[launch: contract False, role coder, route spawn, unsupported unknown]", row["coder-false"])
+        self.assertIn("[launch: contract v1, role 0, route spawn, unsupported unknown]", row["coder-zrole"])
         for l in lines:
             self.assertLessEqual(len(l), work_brief.LINE_CHARS)
 
-    REVIEW = "{verdict}\nRESULT_STATUS: complete\n\nCoverage\n- lib/work_brief.py: reviewed the whole file and its callers\n"
+    REVIEW ="{verdict}\nRESULT_STATUS: complete\n\nCoverage\n- lib/work_brief.py: reviewed the whole file and its callers\n"
 
     def test_last_evidence_is_the_newest_approved_review_and_the_evidence_it_was_given(self):
         def packet(*names):

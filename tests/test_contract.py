@@ -1030,7 +1030,8 @@ class EnforceKeepsTheRecordTests(unittest.TestCase):
                 self.assertTrue(self.held())
                 cases += [(e, state, e["action"] == "pause-requested") for e in self.events()]
             # (f) HB4b K2: overlapping prompts. Turn 2's prompt arrives while turn 1's reply runs, the pause names turn 2,
-            # then turn 1's own statused Stop: it completes turn 1, never turn 2, so turn 2's pause stays.
+            # then turn 1's own statused Stop: it completes turn 1, never turn 2, so turn 2's pause stays. HB4c case (a):
+            # then turn 2's own Stop completes turn 2 (two distinct statused Stops; real order, coder-6da07903aa).
             with self.subTest(sequence="f", harness=harness):
                 w = self.worker(harness)
                 w.prompt(); w.tool(); w.prompt()
@@ -1045,6 +1046,20 @@ class EnforceKeepsTheRecordTests(unittest.TestCase):
                 self.assertEqual(self.life(), "paused")
                 self.assertTrue(self.held())
                 cases += [(e, state, False) for e in self.events()]
+                # HB4c (a): turn 2 ran as its own turn after turn 1's Stop. A duplicate of turn 1's Stop (Claude: the same
+                # reply; pi: a settle with no new message) completes nothing; turn 2's own statused Stop completes turn 2,
+                # so its pause is void and the dependent is released.
+                w.stop(first if harness == "claude" else "")
+                state = self.state_now()
+                self.assertEqual([state.get("promptTurn"), state.get("completedTurn"), state.get("owedTurn")], [2, 1, 2])
+                self.assertTrue(self.held())
+                cases += [(e, state, False) for e in self.events()]
+                w.stop("Second turn finished.\nRESULT_STATUS: complete")
+                state = self.state_now()
+                self.assertEqual([state.get("promptTurn"), state.get("completedTurn"), state.get("owedTurn")], [2, 2, 0])
+                self.assertEqual((self.task / "result.md").read_text(), "Second turn finished.\nRESULT_STATUS: complete\n")
+                self.assertFalse(self.held())
+                cases += [(e, state, True) for e in self.events()]
 
         # (d) F4: the paused turn completes at each boundary of pause_worker. A completion is two writes, result.md (R) and
         # state.json (S, with completedTurn), in that order for both writers (report.sh; pi's agent_settled writes result.md

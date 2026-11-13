@@ -45,6 +45,21 @@ groups (Claude Code injects the later prompt into the running turn) and two Stop
   names the turn it answers (reply identity), not a hook rule. Main's decision, 2026-11-12.
 - **HB4c-L2 (review F2, low, pre-existing): follow-up.** After a new prompt, a duplicate of an older statused Stop is taken
   as the open prompt's Stop and can complete the new turn (report.sh:127-149; traced, not run). Direction: check
-  `already_kept` for an active Stop too. Named follow-up HB4d; not started.
+  `already_kept` for an active Stop too. **Fixed by HB4d** (merged 2026-11-12, review-coder-e1560fb1e0-215351
+  APPROVED_WITH_NOTES): rule 2', below.
+
+## HB4d: a byte-equal Stop on the open prompt (rule 2')
+
+Step 1 over 421 Claude workers / 560 Stops: 0 duplicate Stops (after a new prompt or otherwise); 1 legitimate reply to turn
+N+1 that is byte-equal to an earlier kept reply (coder-61108a8b31, a re-sent statused report). The Stop input carries no
+message or turn id, so the hook cannot tell the two apart. Rule 2': such a Stop ends the working state (state waiting, never
+stuck), completes nothing, and leaves its turn owed (owedTurn = replyTurn); a later new Stop completes it (rule 3) or the
+next prompt closes it (rule 1). pi (reporter.ts) is unchanged: it tells a new reply by message, not bytes.
+- **HB4d-L1 (realistic, 1 of 560): accepted.** A legitimate byte-equal reply leaves turn N+1 without its own completion; a
+  pause on it stays live until a later turn completes (fails safe, same cost as HB4c's one-Stop case). result.md holds the
+  reply.
+- **HB4d-L2 (contrived, 0 of 560): accepted.** After a real duplicate, the worker reads `waiting` until turn 2's own Stop;
+  in that window tool events are not counted and an unconfirmed Escape hold clears. A confirmed pause and its dependency hold
+  stay. Direction if ever seen: carry the reply's message id in the Stop input, not a hook rule.
 - The trust-store guard again refused an edit whose text only named the trust store (the F5 tooling follow-up above); this
   worker asked first and used Edit on Main's grant.

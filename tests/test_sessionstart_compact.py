@@ -240,6 +240,109 @@ class FailsOpen(Base):
         self.assertEqual(run.stderr, "")
 
 
+MAIN_TURNS = PLUGIN / "hooks" / "main-turns.sh"
+
+
+class MainTurns(Base):
+    """HB6d: main-turns.sh, the SessionStart/UserPromptSubmit/Stop hook beside this one, under the same orchestrator gate. One line
+    per event in SESSION/main-turns.jsonl; never the prompt, the reply or any other input; never output; always exit 0."""
+    SECRET = "OWNER-WORDS-7f3a"
+
+    def turn(self, event, **env):
+        body = {"hook_event_name": event, "session_id": "sess-1", "prompt": self.SECRET, "last_assistant_message": self.SECRET,
+                "transcript_path": "/x/" + self.SECRET + ".jsonl", "cwd": "/" + self.SECRET, "tool_input": {"file_path": self.SECRET},
+                "nested": {"session_id": "not-this", "hook_event_name": "Stop"}}
+        if event == "SessionStart":
+            body["source"] = "compact"
+        run = self.run_hook(json.dumps(body), hook=MAIN_TURNS, **env)
+        self.assertEqual((run.returncode, run.stdout, run.stderr), (0, "", ""))
+        return run
+
+    def record(self):
+        path = self.state / "main-turns.jsonl"
+        return path.read_text() if path.exists() else None
+
+    def test_each_event_is_one_line_with_time_event_and_session_only(self):
+        for event in ("SessionStart", "UserPromptSubmit", "Stop"):
+            self.turn(event)
+        text = self.record()
+        self.assertNotIn(self.SECRET, text)
+        self.assertNotIn("not-this", text)
+        lines = [json.loads(line) for line in text.splitlines()]
+        self.assertEqual([(r["event"], r["session"], r.get("source")) for r in lines],
+                         [("SessionStart", "sess-1", "compact"), ("UserPromptSubmit", "sess-1", None), ("Stop", "sess-1", None)])
+        for r in lines:
+            self.assertLessEqual(set(r), {"at", "event", "session", "source"})
+            self.assertRegex(r["at"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$")
+        self.assertEqual(stat.S_IMODE((self.state / "main-turns.jsonl").stat().st_mode), 0o600)
+        # No session id, an id outside the pattern, an unknown event or source, or no input: null session, nothing, no source.
+        for stdin, want in (('{"hook_event_name":"Stop"}', {"event": "Stop", "session": None}),
+                            ('{"hook_event_name":"Stop","session_id":"a\\"b"}', {"event": "Stop", "session": None}),
+                            ('{"hook_event_name":"SessionStart","source":"other"}', {"event": "SessionStart", "session": None}),
+                            ('{"hook_event_name":"PreToolUse"}', None), ("", None), ("not json", None)):
+            with self.subTest(stdin=stdin):
+                before = self.record()
+                run = self.run_hook(stdin, hook=MAIN_TURNS)
+                self.assertEqual((run.returncode, run.stdout, run.stderr), (0, "", ""))
+                added = self.record()[len(before):]
+                if want is None:
+                    self.assertEqual(added, "")
+                else:
+                    got = json.loads(added)
+                    del got["at"]
+                    self.assertEqual(got, want)
+
+    def test_only_an_orchestrator_main_of_a_tmux_pi_session_records(self):
+        rows = [{"TP_TASK_DIR": str(self.tmp)}, {"TP_TASK_DIR": ""}, {"TP_TASK_ID": "coder-1"}, {"TP_TASK_ID": ""},
+                {"TP_MODE": "legacy"}, {"TP_MODE": None},
+                # Outside tmux-pi: a directory with no tasks/, or none at all (no TP_STATE_DIR, no tmux, and a tmux socket
+                # directory of its own so no tmux server, the default one included, is ever reached).
+                {"TP_STATE_DIR": str(self.tmp)}, {"TP_STATE_DIR": str(self.tmp / "gone")},
+                {"TP_STATE_DIR": None, "TMUX": None, "TMUX_PANE": None, "TP_SESSION": "nope", "TMUX_TMPDIR": str(self.tmp)}]
+        for env in rows:
+            with self.subTest(env=env):
+                self.turn("UserPromptSubmit", **env)
+                self.assertIsNone(self.record())
+        self.assertFalse((self.tmp / "main-turns.jsonl").exists())
+        self.turn("UserPromptSubmit")
+        self.assertEqual(len(self.record().splitlines()), 1)
+
+    def test_a_symlink_or_fifo_is_never_written_or_waited_on(self):
+        victim = self.tmp / "victim.txt"
+        victim.write_text("keep")
+        path = self.state / "main-turns.jsonl"
+        path.symlink_to(victim)
+        self.turn("Stop")
+        self.assertEqual(victim.read_text(), "keep")
+        self.assertTrue(path.is_symlink())
+        path.unlink()
+        path.symlink_to(self.tmp / "absent")
+        self.turn("Stop")
+        self.assertFalse((self.tmp / "absent").exists())
+        path.unlink()
+        os.mkfifo(path)
+        self.turn("Stop")  # run_hook's timeout would fail a hook that waited for a reader
+        self.assertTrue(stat.S_ISFIFO(path.lstat().st_mode))
+
+    def test_an_unwritable_session_directory_is_a_quiet_exit(self):
+        os.chmod(self.state, 0o500)
+        self.addCleanup(os.chmod, self.state, 0o700)
+        self.turn("Stop")
+        os.chmod(self.state, 0o700)
+        self.assertIsNone(self.record())
+
+    def test_concurrent_events_stay_whole_lines(self):
+        body = json.dumps({"hook_event_name": "Stop", "session_id": "s" * 128})
+        procs = [subprocess.Popen([str(MAIN_TURNS)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=self.env)
+                 for _ in range(16)]
+        for proc in procs:
+            out, err = proc.communicate(body.encode(), timeout=60)
+            self.assertEqual((proc.returncode, out, err), (0, b"", b""))
+        lines = self.record().splitlines()
+        self.assertEqual(len(lines), 16)
+        self.assertEqual({json.loads(line)["session"] for line in lines}, {"s" * 128})
+
+
 class Registered(unittest.TestCase):
     def test_hooks_json_runs_it_at_startup_resume_and_compaction_with_a_short_timeout(self):
         hooks = json.loads((PLUGIN / "hooks" / "hooks.json").read_text())["hooks"]["SessionStart"]

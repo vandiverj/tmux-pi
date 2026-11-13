@@ -50,9 +50,13 @@ class Session:
         self.root = Path(root)
         self.tasks = self.root / "tasks"
         self.files = []  # (t_written, t_removed or None, relpath, content: str | callable(now) -> str | None)
+        self.links = []  # (relpath, target relpath): symlinks made after the files
 
     def put(self, t, rel, content, removed=None):
         self.files.append((t, removed, rel, content))
+
+    def link(self, rel, target):
+        self.links.append((rel, target))
 
     def materialize(self, now):
         shutil.rmtree(self.root, ignore_errors=True)
@@ -67,7 +71,37 @@ class Session:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(text, encoding="utf-8")
             os.utime(path, (T0 + t, T0 + t))
+        for rel, target in self.links:
+            (self.root / rel).parent.mkdir(parents=True, exist_ok=True)
+            os.symlink(self.root / target, self.root / rel)
         return self.tasks
+
+    def main_turns(self, items):
+        """claude/plugins/tmux-pi/hooks/main-turns.sh lines (HB6d): items (t, event, session id[, source]), appended as the
+        hooks ran (file order is item order; a t may go backwards)."""
+        def content(now):
+            out = []
+            for item in items:
+                if item[0] > now:
+                    continue
+                line = {"at": iso_ms(item[0]), "event": item[1], "session": item[2]}
+                if len(item) > 3 and item[3]:
+                    line["source"] = item[3]
+                out.append(json.dumps(line) + "\n")
+            return "".join(out)
+        self.put(0, "main-turns.jsonl", content)
+
+    def lane_events(self, lane, items, holders=None):
+        """lib/lane_lease.py _record lines in <lanes>/<lane>/events.jsonl: items (t, kind, task, access, how); holders: the
+        task ids lease.json holds (as of now)."""
+        def content(now):
+            return "".join(json.dumps({"at": iso_ms(t), "kind": kind, "task": task, "role": "coder" if access == "write" else
+                                       "code-reviewer", "access": access, "holder": "reservation", "how": how}) + "\n"
+                           for t, kind, task, access, how in items if t <= now)
+        self.put(0, "lanes/{}/events.jsonl".format(lane), content)
+        if holders is not None:
+            self.put(0, "lanes/{}/lease.json".format(lane), json.dumps({"schema": "tp-lane-lease:v1", "holders": [
+                {"kind": "reservation", "access": "write", "task": h, "role": "coder", "taken": iso_s(1)} for h in holders]}))
 
     # --- producer shapes
     def task(self, ident, created, worker, role="coder", review_of=None, lane=None, queued_at=None):
@@ -351,7 +385,9 @@ class WaitTimelineTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, True)
 
     def report(self, session, now):
-        return timeline.build(session.materialize(now), now=T0 + now)
+        tasks = session.materialize(now)
+        lanes = session.root / "lanes"  # HB6d: a session builder that writes lane records reads them as the lanes dir
+        return timeline.build(tasks, now=T0 + now, lanes_dir=str(lanes) if lanes.is_dir() else None)
 
     def test_rules(self):
         done = {"result": 20, "collected": 30, "exit_at": 30}
@@ -369,6 +405,60 @@ class WaitTimelineTest(unittest.TestCase):
 
         def problems(report):
             return " | ".join(p["problem"] for p in report["problems"])
+
+        # HB6d M1: the reply waits for Main over [20, 80]
+        wait = {"result": 20, "collected": 80, "exit_at": 80}
+
+        def mains(report, task="w"):
+            return [(round(i["start"] - T0), round(i["end"] - T0), i["main"]["state"], i["main"]["confidence"])
+                    for i in row(report, task)["intervals"] if i["state"] == "waiting:main"]
+
+        def no_main(report):
+            return (any("main" in i for r in report["tasks"] for i in r["intervals"]), "accumulated_main" in report["totals"],
+                    "by_main" in report["critical_path"])
+
+        def without(build, drop):
+            """The same session without the files whose relpath starts with `drop` (the report of an old session)."""
+            def make(r):
+                s = build(r)
+                s.files = [f for f in s.files if not f[2].startswith(drop)]
+                s.links = []
+                return s
+            return make
+
+        def same_as_old(build, now, drop):
+            def check(report):
+                old = self.report(without(build, drop)(Path(self.tmp) / ("old" + str(abs(hash(drop))))), now)
+                strip = lambda x: json.dumps(timeline._jsonable(dict(x, problems=[])), sort_keys=True)  # noqa: E731
+                return strip(report) == strip(old)
+            return check
+
+        # HB6d M2: task t queued at 10, started at 50 in lane L (a writer); h held the lane before it
+        def lane_case(s, holder_finish=None, reasons=None, items=(), holders=None, t_role="coder"):
+            s.task("h", 0, "claude", lane="L")
+            s.claude_state("h", [1])
+            s.finish("h", **(holder_finish or {"result": 30, "collected": 60, "exit_at": 60}))
+            s.task("t", 50, "claude", role=t_role, lane="L", queued_at=10)
+            s.claude_state("t", [51])
+            s.finish("t", result=60, collected=70, exit_at=70)
+            if reasons is not None:
+                s.queue_events("t", reasons, 50)
+            s.lane_events("L", list(items), holders)
+
+        def lease_at(report, t, task="t"):
+            return next(((i["state"], i["wait_reason"], i["source"], i["confidence"]) for i in row(report, task)["intervals"]
+                         if i["start"] <= T0 + t < i["end"]), None)
+
+        def with_bad_lines(s, items):
+            s.main_turns(items)
+            good = s.files.pop()[3]
+            s.put(0, "main-turns.jsonl", lambda now: good(now) + "nope\n" + json.dumps({"at": "x", "event": "Stop"}) + "\n")
+
+        turns_basic = [(10, "UserPromptSubmit", "s1"), (30, "Stop", "s1"), (50, "UserPromptSubmit", "s1"), (60, "Stop", "s1")]
+        basic = lambda r: one(r, lines=talk, finish=wait, extra=lambda s: s.main_turns(turns_basic))  # noqa: E731
+        symlinked = lambda r: one(r, lines=talk, finish=wait, extra=lambda s: (  # noqa: E731
+            s.put(0, "elsewhere.jsonl", "".join(json.dumps({"at": iso_ms(t), "event": e, "session": "s1"}) + "\n"
+                                                for t, e, _ in turns_basic)), s.link("main-turns.jsonl", "elsewhere.jsonl")))
 
         rows = [
             # (name, session builder, now, checks: [(fn(report) -> value, expected)])
@@ -593,6 +683,100 @@ class WaitTimelineTest(unittest.TestCase):
              lambda r: one(r, lines=talk, finish=done, extra=lambda s: s.queued("q9", 5, None, "waiting for w", log=[(80, "waiting for w")])),
              50,
              [(lambda x: [(i["start"] - T0, i["end"] - T0, i["state"]) for i in row(x, "q9")["intervals"]], [(5, 50, "unknown")])]),
+            ("M1 a waiting:main span crossing Main's turn boundaries is cut: busy, idle, busy, idle, each exact from"
+             " main-turns.jsonl; the state, its seconds and the totals by state are unchanged; totals and path by Main's state",
+             basic, 100,
+             [(mains, [(20, 30, "busy", "exact"), (30, 50, "idle", "exact"), (50, 60, "busy", "exact"), (60, 80, "idle", "exact")]),
+              (lambda x: {(i["wait_reason"], i["source"], i["confidence"], timeline.iso(i["main"]["wait_start"]), i["main"]["source"])
+                          for i in row(x, "w")["intervals"] if "main" in i},
+               {("reply waits for Main (collected.json)", "result.md (mtime)", "derived", iso_ms(20), "main-turns.jsonl")}),
+              (lambda x: round(x["totals"]["accumulated_by_state"]["waiting:main"]), 60),
+              (lambda x: {k: round(v) for k, v in x["totals"]["accumulated_main"].items()}, {"busy": 20, "idle": 40}),
+              (lambda x: {k: round(v) for k, v in x["critical_path"]["by_main"].items()}, {"busy": 20, "idle": 40}),
+              (lambda x: "Main idle: between Main turns [main-turns.jsonl; exact]" in timeline.render(x), True),
+              (lambda x: (timeline._jsonable(x)["tasks"][0]["intervals"][-1]["main"]["wait_start"]), iso_ms(20))]),
+            ("M1 before the first line: unrecorded; a turn with no Stop yet is busy to now and only the last piece is open",
+             lambda r: one(r, lines=talk, finish={"result": 20}, extra=lambda s: s.main_turns([(40, "UserPromptSubmit", "s1")])), 100,
+             [(mains, [(20, 40, "unrecorded", "inferred"), (40, 100, "busy", "exact")]),
+              (lambda x: [i.get("open") for i in row(x, "w")["intervals"] if i["state"] == "waiting:main"], [None, True]),
+              (lambda x: [i["main"]["source"] for i in row(x, "w")["intervals"] if "main" in i], ["-", "main-turns.jsonl"])]),
+            ("M1 a second prompt before a Stop keeps the turn busy, inferred; a duplicate Stop changes nothing",
+             lambda r: one(r, lines=talk, finish=wait, extra=lambda s: s.main_turns([
+                 (30, "UserPromptSubmit", "s1"), (40, "UserPromptSubmit", "s1"), (50, "Stop", "s1"), (55, "Stop", "s1"),
+                 (70, "UserPromptSubmit", "s1")])), 100,
+             [(mains, [(20, 30, "unrecorded", "inferred"), (30, 50, "busy", "inferred"), (50, 70, "idle", "exact"),
+                       (70, 80, "busy", "exact")])]),
+            ("M1 a time before the line before is taken as that line's time and listed (file order wins)",
+             lambda r: one(r, lines=talk, finish=wait, extra=lambda s: s.main_turns([
+                 (40, "UserPromptSubmit", "s1"), (35, "Stop", "s1")])), 100,
+             [(mains, [(20, 40, "unrecorded", "inferred"), (40, 80, "idle", "exact")]),
+              (lambda x: "main-turns.jsonl times go backwards" in problems(x), True)]),
+            ("M1 compaction changes nothing; a restart with the turn still open makes that turn unrecorded, idle after",
+             lambda r: one(r, lines=talk, finish=wait, extra=lambda s: s.main_turns([
+                 (25, "UserPromptSubmit", "s1"), (35, "SessionStart", "s1", "compact"), (45, "SessionStart", "s2", "startup"),
+                 (60, "UserPromptSubmit", "s2"), (70, "Stop", "s2")])), 100,
+             [(mains, [(20, 25, "unrecorded", "inferred"), (25, 45, "unrecorded", "inferred"), (45, 60, "idle", "exact"),
+                       (60, 70, "busy", "exact"), (70, 80, "idle", "exact")]),
+              (lambda x: next(i["main"]["reason"] for i in row(x, "w")["intervals"] if i.get("main", {}).get("state") == "unrecorded"
+                              and i["start"] == T0 + 25), "Main turn with no Stop before Main restarted (its end is not recorded)")]),
+            ("M1 two Main sessions in one tmux-pi session interleave in one turn: listed once; bad lines are listed and skipped",
+             lambda r: one(r, lines=talk, finish=wait, extra=lambda s: with_bad_lines(s, [
+                 (30, "UserPromptSubmit", "s1"), (35, "UserPromptSubmit", "s2"), (40, "Stop", "s2"), (45, "Stop", "s1")])),
+             100,
+             [(mains, [(20, 30, "unrecorded", "inferred"), (30, 40, "busy", "inferred"), (40, 80, "idle", "exact")]),
+              (lambda x: problems(x).count("two Claude sessions' events in one Main turn"), 1),
+              (lambda x: ("1 malformed line(s) in main-turns.jsonl" in problems(x), "without a readable at" in problems(x)), (True, True))]),
+            ("M1 no main-turns.jsonl (an old session) reads exactly as without the rule: no `main`, no Main totals",
+             lambda r: one(r, lines=talk, finish=wait), 100,
+             [(no_main, (False, False, False))]),
+            ("M1 a symlinked main-turns.jsonl is not read: listed, and the report is the old session's",
+             symlinked, 100,
+             [(no_main, (False, False, False)), (lambda x: "main-turns.jsonl is not a regular file; not read" in problems(x), True),
+              (same_as_old(symlinked, 100, "elsewhere"), True)]),
+            ("M1 an empty main-turns.jsonl: every waiting:main second is unrecorded",
+             lambda r: one(r, lines=talk, finish=wait, extra=lambda s: s.put(0, "main-turns.jsonl", "")), 100,
+             [(mains, [(20, 80, "unrecorded", "inferred")])]),
+            ("M2 a holder found stale later ends at its own process end (reaped.json), derived; after it the queue wait is"
+             " what the queue recorded; the task's own lease events are instants and replace lease.json's taken",
+             lambda r: one(r, lines=talk, finish=done, extra=lambda s: lane_case(
+                 s, holder_finish={"result": 30, "reaped": 35}, reasons=[],
+                 items=[(0, "lease.taken", "h", "write", "reserve"), (50, "lease.released", "h", "write", "stale"),
+                        (50, "lease.taken", "t", "write", "reserve")], holders=["t"])), 100,
+             [(lambda x: lease_at(x, 20), ("waiting:lane-lease", "lane held by h (its process end; found stale later)",
+                                           "lane events.jsonl lease.*", "derived")),
+              (lambda x: lease_at(x, 40)[0], "unknown"),
+              (lambda x: [(i["what"], i["source"]) for i in row(x, "t")["instants"] if "lease" in i["what"]],
+               [("lane lease taken (reserve)", "lane events.jsonl")])]),
+            ("M2 a stale holder with no process end in the session ends at the drop, inferred (an upper bound)",
+             lambda r: one(r, lines=talk, finish=done, extra=lambda s: lane_case(
+                 s, holder_finish={"result": 30}, reasons=[],
+                 items=[(0, "lease.taken", "x", "write", "reserve"), (45, "lease.released", "x", "write", "stale")])), 100,
+             [(lambda x: lease_at(x, 44), ("waiting:lane-lease", "lane held by x (found stale then (an upper bound))",
+                                           "lane events.jsonl lease.*", "inferred")), (lambda x: lease_at(x, 46)[0], "unknown")]),
+            ("M2 an explicit release is exact; a queue reason other than the lane is kept; free lease seconds keep the queue's",
+             lambda r: one(r, lines=talk, finish=done, extra=lambda s: lane_case(
+                 s, reasons=[(10, "global worker slots full"), (20, "waiting for lane L")],
+                 items=[(0, "lease.taken", "h", "write", "reserve"), (30, "lease.released", "h", "write", "release")])), 100,
+             [(lambda x: lease_at(x, 15)[0], "waiting:worker-slot"),
+              (lambda x: lease_at(x, 25), ("waiting:lane-lease", "lane held by h (released (release))", "lane events.jsonl lease.*", "exact")),
+              (lambda x: lease_at(x, 40), ("waiting:lane-lease", "queued: lane writer", "events.jsonl queue.reason", "exact"))]),
+            ("M2 taken with no release: to now while lease.json still holds it; gone from lease.json: no span (end unknown);"
+             " a reader is not kept out by a reader",
+             lambda r: one(r, lines=talk, finish=done, extra=lambda s: (lane_case(
+                 s, reasons=[], holders=["h"],
+                 items=[(0, "lease.taken", "h", "write", "reserve"), (5, "lease.taken", "gone", "write", "reserve"),
+                        (5, "lease.taken", "rd", "read", "reserve")]),
+                 s.task("t2", 50, "claude", role="code-reviewer", lane="L", queued_at=10), s.claude_state("t2", [51]),
+                 s.queue_events("t2", [], 50))), 100,
+             [(lambda x: lease_at(x, 30), ("waiting:lane-lease", "lane held by h (still held)", "lane events.jsonl lease.*", "exact")),
+              (lambda x: "held by gone" in json.dumps([i["wait_reason"] for i in row(x, "t")["intervals"]]), False),
+              (lambda x: lease_at(x, 30, "t2"), ("waiting:lane-lease", "lane held by h (still held)", "lane events.jsonl lease.*", "exact")),
+              (lambda x: "held by rd" in json.dumps([i["wait_reason"] for i in row(x, "t2")["intervals"]]), False)]),
+            ("M2 no lane events.jsonl: lease.json's taken instant, the queue wait as the queue recorded it",
+             lambda r: one(r, lines=talk, finish=done, extra=lambda s: (lane_case(s, reasons=[], holders=["t"]), s.files.pop(-2))), 100,
+             [(lambda x: lease_at(x, 20)[0], "unknown"),
+              (lambda x: [(i["what"], i["source"]) for i in row(x, "t")["instants"] if "lease" in i["what"]],
+               [("lane lease taken", "lease.json taken")])]),
             ("D10 malformed and missing records are listed, never raise",
              lambda r: one(r, lines=talk, finish=done, extra=lambda s: (
                  s.put(1, "tasks/w/state.json", "{not json"), s.put(1, "tasks/w/test-runs/1.json", "[1]"),
@@ -1015,6 +1199,40 @@ class StatusTest(unittest.TestCase):
                 os.chmod(self.tasks, 0o755)
             self.assertEqual([(r["lane"], r["rule"]) for r in one["lanes"]], [("run", 10)])
             self.assertIn(str(self.state), [p["where"] for p in one["problems"]])
+
+    def test_main_turns_in_the_lane_state(self):
+        """HB6d R4: a lane waiting on Main says since when it waits (the waiting:main interval's start, not the start of the
+        piece Main's turns cut) and, only when main-turns.jsonl is there, Main's state now; without it the row is today's."""
+        repo = self.make_repo(self.base / "mainrepo")
+        type(self).lane(repo, "ms")
+        state = self.base / "mainsession"
+        d = state / "tasks" / "t-ms"
+        d.mkdir(parents=True)
+        (d / "meta.json").write_text(json.dumps({"id": "t-ms", "worker": "claude", "role": "coder", "created": iso_s(10),
+                                                 "workdir": "/nonexistent", "lane": "ms", "lane_step": "S1"}))
+        (d / "dispatch.json").write_text(json.dumps({"lane": "ms", "lane_step": "S1"}))
+        (d / "state.json").write_text(json.dumps({"id": "t-ms", "harness": "claude", "state": "waiting", "updated": iso_s(11)}))
+        (d / "result.md").write_text("RESULT_STATUS: complete\ndone\n")
+        os.utime(d / "result.md", (T0 + 20, T0 + 20))
+        rows = [{"name": "ms", "state": "open"}]
+        old = self.status.build(state / "tasks", repo, now=self.NOW, rows=rows)["lanes"][0]
+        self.assertEqual(old["state"], {"state": "waiting:main", "since": iso_ms(20)}, old)
+        (state / "main-turns.jsonl").write_text("".join(json.dumps({"at": iso_ms(t), "event": e, "session": "s1"}) + "\n"
+                                                        for t, e in ((100, "UserPromptSubmit"), (200, "Stop"))))
+        report = self.status.build(state / "tasks", repo, now=self.NOW, rows=rows)
+        new = report["lanes"][0]
+        self.assertEqual(new["state"], {"state": "waiting:main", "since": iso_ms(20), "main": "idle"}, new)
+        self.assertEqual({k: v for k, v in new.items() if k != "state"}, {k: v for k, v in old.items() if k != "state"})
+        self.assertIn("[waiting:main (Main idle) since " + iso_ms(20) + "]", self.status.render(report))
+        (state / "main-turns.jsonl").write_text(json.dumps({"at": iso_ms(100), "event": "UserPromptSubmit", "session": "s1"}) + "\n")
+        self.assertEqual(self.status.build(state / "tasks", repo, now=self.NOW, rows=rows)["lanes"][0]["state"]["main"], "busy")
+        # status's task-by-task path (timeline.build raised on another task's record) cuts its rows the same way
+        bad = state / "tasks" / "t-other"
+        bad.mkdir()
+        (bad / "meta.json").write_text(json.dumps({"id": "t-other", "worker": "claude", "created": iso_s(5), "workdir": "/nonexistent"}))
+        (bad / "state.json").write_text(DEEP)
+        self.assertEqual(self.status.build(state / "tasks", repo, now=self.NOW, rows=rows)["lanes"][0]["state"],
+                         {"state": "waiting:main", "since": iso_ms(20), "main": "busy"})
 
     def test_cli(self):
         import contextlib

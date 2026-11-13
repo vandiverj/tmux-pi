@@ -591,7 +591,7 @@ def _timeline(tasks_dir, ids, now):
             continue
         reader = _TotalReader()  # one per task: a record it cannot decode makes that task a culprit, never another
         try:
-            row = timeline.build_task(reader, tasks[ident], by_review, now, cache, None)
+            row = timeline.build_task(reader, tasks[ident], by_review, now, cache, None, tasks)
             if reader.undecodable:
                 culprits[ident] = "the timeline cannot decode the task's records"
             else:
@@ -601,6 +601,9 @@ def _timeline(tasks_dir, ids, now):
             unnamed.add(ident)
             opened[ident] = opened.get(ident, []) + [p for p in reader.opened if p not in opened.get(ident, [])]
         problems += reader.problems
+    reader = timeline.Reader()  # HB6d M1: the rows built one by one are cut by Main's turns as timeline.build cuts its rows
+    timeline.apply_main(reader, tasks_dir, list(rows.values()), now)
+    problems += reader.problems
     for name in sorted(unnamed & set(culprits)):
         directory = Path(tasks_dir) / name
 
@@ -751,7 +754,11 @@ def _lane_row(record, task, step, session, by_task, culprits, main_repo, now, pr
     row = by_task.get(task["path"].name) if task else None
     if row and row["intervals"]:
         last = row["intervals"][-1]
-        state = {"state": last["state"], "since": timeline.iso(last["start"])}
+        # HB6d: a waiting:main interval cut by Main's turns still waits since its start (main.wait_start); Main's state
+        # now is added, only when main-turns.jsonl was read
+        state = {"state": last["state"], "since": timeline.iso(last["main"]["wait_start"] if "main" in last else last["start"])}
+        if "main" in last:
+            state["main"] = last["main"]["state"]
     elif task:
         problem(task["path"], "no timeline for the task (archived or unreadable)")
     step_closed = step is None and bool(record["closed"])
@@ -773,7 +780,8 @@ def _lane_row(record, task, step, session, by_task, culprits, main_repo, now, pr
 def render(report):
     lines = []
     for r in report["lanes"]:
-        state = r["state"] if isinstance(r["state"], str) else "{} since {}".format(r["state"]["state"], r["state"]["since"])
+        state = r["state"] if isinstance(r["state"], str) else "{}{} since {}".format(
+            r["state"]["state"], " (Main {})".format(r["state"]["main"]) if "main" in r["state"] else "", r["state"]["since"])
         review = "none" if not r["review"] else "{} {}".format(r["review"]["id"], r["review"]["verdict"])
         reqs = ",".join("{}:{}".format(q["id"], q["kind"]) for q in r["requests"]) or "-"
         lines.append("{:<7} {:<16} {:<6} age {:<5} task {} [{}] review {} requests {} objective {}  -> {}".format(

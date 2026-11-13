@@ -66,6 +66,26 @@ class ClaudePluginModuleTests(unittest.TestCase):
         self.assertLess(text.index("work compacted"), text.index("work checkpoint"))
         self.assertTrue(text.rstrip().endswith("exit 0"))
 
+    def test_main_turns_runs_once_at_every_prompt_stop_and_session_start_after_report(self):
+        # HB6d: main-turns.sh records Main's turns. Once per event, after report.sh (which it must not delay), with no matcher (every
+        # SessionStart source: a restart closes an open turn) and a short timeout; an executable that always exits 0.
+        hooks = json.loads((PLUGIN / "hooks" / "hooks.json").read_text())["hooks"]
+        entry = {"type": "command", "command": '"${CLAUDE_PLUGIN_ROOT}/hooks/main-turns.sh"', "timeout": 5}
+        for event, groups in hooks.items():
+            found = [(g, h) for g in groups for h in g["hooks"] if "main-turns.sh" in h["command"]]
+            if event not in ("UserPromptSubmit", "Stop", "SessionStart"):
+                self.assertEqual(found, [], event)
+                continue
+            self.assertEqual(len(found), 1, event)
+            group, hook = found[0]
+            self.assertEqual(hook, entry)
+            self.assertNotIn("matcher", group)
+            names = [Path(h["command"].strip('"')).name for h in group["hooks"]]
+            self.assertLess(names.index("report.sh"), names.index("main-turns.sh"), event)
+        script = PLUGIN / "hooks" / "main-turns.sh"
+        self.assertTrue(os.access(script, os.X_OK))
+        self.assertTrue(script.read_text().rstrip().endswith("exit 0"))
+
     def test_manifest_names_the_state_contract(self):
         manifest = json.loads((PLUGIN / ".claude-plugin" / "plugin.json").read_text())
         self.assertEqual(manifest["types"], "./types/index.d.ts")

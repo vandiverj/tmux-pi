@@ -1004,6 +1004,20 @@ class EnforceKeepsTheRecordTests(unittest.TestCase):
                 self.assertEqual(self.life(), "paused")
                 self.assertTrue(self.held())
                 cases += [(e, state, False) for e in self.events()]
+                # HB4d (HB4c-L2): then a duplicate of turn 1's statused Stop (Claude: the same reply after prompt 2; pi's
+                # equivalent, a settle with no new message, is the abort settle above). It completes nothing: turn 2's
+                # pause stays and the dependent stays held. Turn 2's own new Stop completes turn 2 and voids its pause.
+                if harness == "claude":
+                    w.stop("Turn one.\nRESULT_STATUS: complete")
+                    state = self.state_now()
+                    self.assertEqual([state.get(k) for k in ("promptTurn", "completedTurn", "owedTurn")], [2, 1, 2])
+                    self.assertTrue(self.held())
+                    cases += [(e, state, False) for e in self.events()]
+                    w.stop("Turn two.\nRESULT_STATUS: complete")
+                    state = self.state_now()
+                    self.assertEqual([state.get(k) for k in ("promptTurn", "completedTurn", "owedTurn")], [2, 2, 0])
+                    self.assertFalse(self.held())
+                    cases += [(e, state, True) for e in self.events()]
             # (e) HB4b K1: the attempt reads turn 1 at a tool; between that read and the Escape turn 1 completes and turn 2
             # starts, so the Escape interrupts turn 2, and a partial Stop then puts turn 1's report back. The outcome names
             # turn 2 (read after the Escape, with turnBefore 1) and the task stays paused. Claude's confirmation compares with

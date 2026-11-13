@@ -108,6 +108,7 @@ already_kept() { # already_kept FILE: FILE's bytes equal a reply already kept an
   return 1
 }
 turn_done=""  # "yes" when this Stop ends an open turn with a statused reply: completedTurn becomes that turn
+stale=""  # "yes" when this Stop ends the open prompt with a reply that is not new (HB4d rule 2'): it completes nothing
 owe=0  # the owed turn this Stop answers (HB4c rule 3), 0 when it answers an open prompt or none
 later_count() { local n; n="$(jq -r '.laterReplies // 0 | if type == "number" then floor else 0 end' <<<"$prev" 2>/dev/null)"; echo "${n:-0}"; }
 ext='{}'
@@ -142,7 +143,11 @@ elif [[ "$event" == Stop ]]; then
     fi
     rm -f "$reply_tmp"
   else
-    if has_status "$reply_tmp"; then turn_done=yes; fi  # the turn's own reply, wherever it is kept below
+    # HB4d rule 2': a reply byte-equal to one already kept is a duplicate of an older Stop or this turn's reply repeating
+    # an earlier one word for word; the hook cannot tell which. It ends the working state (never stuck) but completes
+    # nothing, and the turn stays owed so its own later new Stop completes it (rule 3).
+    if [[ "$owe" == 0 && -s "$reply_tmp" ]] && already_kept "$reply_tmp"; then stale=yes
+    elif has_status "$reply_tmp"; then turn_done=yes; fi  # the turn's own reply, wherever it is kept below
     held_file=""
     held_rel="$(field heldReport)"
     if [[ -n "$held_rel" && -f "$TP_TASK_DIR/$held_rel" ]]; then held_file="$TP_TASK_DIR/$held_rel"; fi
@@ -252,7 +257,7 @@ fi
 state_tmp="$(mktemp "$TP_TASK_DIR/.state.XXXXXXXX")" || exit 0
 jq -n --argjson prev "$prev" --argjson in "$input" --argjson usage "$usage" \
   --arg id "${TP_TASK_ID:-}" --arg now "$now" --argjson record "$record" --argjson ext "$ext" --arg done "$turn_done" \
-  --argjson owe "$owe" '
+  --argjson owe "$owe" --arg stale "$stale" '
   def turn: ($prev.promptTurn // (if $prev.state == "working" or $prev.state == "tool" or $prev.state == "permission" then 1 else 0 end));
   def settled: ($prev.settledTurn // (if $prev.state == "waiting" then turn else 0 end));
   def active: turn > settled;
@@ -299,7 +304,7 @@ jq -n --argjson prev "$prev" --argjson in "$input" --argjson usage "$usage" \
       elif ending then
         { state: "waiting", tool: "", promptTurn: turn, settledTurn: turn, calls: [], calls_dropped: false,
           completedTurn: (if $done == "yes" then ([completed, answers] | max) else completed end),
-          owedTurn: (if answers < turn then answers + 1 else 0 end) }
+          owedTurn: (if $stale == "yes" then answers elif answers < turn then answers + 1 else 0 end) }
       else {} end )
   + ( if ($in.hook_event_name == "UserPromptSubmit" or ending) and $usage != null
       then $usage | if .model == "" then del(.model) else . end else {} end )

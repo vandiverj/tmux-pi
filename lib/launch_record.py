@@ -573,8 +573,12 @@ def read(path):
 def summary(record):
     """One short line for a reader: contract version, role, route, unsupported capabilities, and a failure when there is one."""
     # each field is a value (the record holds it), "none" (it holds the field, empty) or "unknown" (it does not hold the field)
+    def held(container, key):
+        if not isinstance(container, dict) or key not in container:
+            return "unknown"
+        return "none" if container[key] in ("", None) else str(container[key])  # only "" and null are empty; 0 and false are values
     def scalar(key):
-        return "unknown" if key not in record else (str(record[key]) if record[key] else "none")
+        return held(record, key)
     instructions = record.get("instructions")
     if not isinstance(instructions, list):
         contract = "unknown"
@@ -583,7 +587,7 @@ def summary(record):
         if entry is None:
             contract = "none"
         else:
-            contract = "unknown" if "version" not in entry else (str(entry["version"]) if entry["version"] else "none")
+            contract = held(entry, "version")
     capabilities = record.get("capabilities")
     unsupported = capabilities.get("unsupported") if isinstance(capabilities, dict) else None
     if not isinstance(unsupported, list):

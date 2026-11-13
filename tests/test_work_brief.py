@@ -500,8 +500,12 @@ class Realistic(Base):
         bare = record("coder", "spawn", instructions=[{"name": "contract"}], capabilities={})  # a contract entry with no version
         blank = record("coder", "spawn", instructions=[{"name": "contract", "version": ""}], capabilities={})  # version held, empty
         nullv = record("coder", "spawn", instructions=[{"name": "contract", "version": None}], capabilities={})
+        zero = record("coder", "spawn", instructions=[{"name": "contract", "version": 0}], capabilities={})  # 0 and false are held values
+        false = record("coder", "spawn", instructions=[{"name": "contract", "version": False}], capabilities={})
+        zrole = record(0, "spawn", capabilities={})
         for ident, rec in (("coder-err", error), ("coder-empty", empty), ("coder-odd", odd), ("coder-bare", bare),
-                           ("coder-blank", blank), ("coder-nullv", nullv)):
+                           ("coder-blank", blank), ("coder-nullv", nullv), ("coder-zero", zero), ("coder-false", false),
+                           ("coder-zrole", zrole)):
             (self.task(ident, "coder", "working") / "launch.json").write_text(json.dumps(rec))
         row = {l.split()[1]: l for l in self.brief().splitlines() if l.startswith("- coder-")}
         self.assertEqual(row["coder-err"], "- coder-err coder working [launch: ERROR (RecordError: boom), contract unknown, role coder, "
@@ -511,6 +515,9 @@ class Realistic(Base):
         self.assertIn("[launch: contract unknown, role coder, route spawn, unsupported unknown]", row["coder-bare"])
         for ident in ("coder-blank", "coder-nullv"):
             self.assertIn("[launch: contract none, role coder, route spawn, unsupported unknown]", row[ident])
+        self.assertIn("[launch: contract 0, role coder, route spawn, unsupported unknown]", row["coder-zero"])
+        self.assertIn("[launch: contract False, role coder, route spawn, unsupported unknown]", row["coder-false"])
+        self.assertIn("[launch: contract v1, role 0, route spawn, unsupported unknown]", row["coder-zrole"])
         for l in lines:
             self.assertLessEqual(len(l), work_brief.LINE_CHARS)
 

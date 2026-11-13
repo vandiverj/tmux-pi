@@ -1234,4 +1234,8 @@ Each lane: checkpoint, Main's evidence, openai-codex review, notes closed, `lane
   the reader opened and reload. Its review found the replay built a task that loaded as absent (selected meta.json). Round 9
   (Sonnet, coder-28f693a762, 94eead5) treats an absent task as a successful load, as timeline.build does. Cells 22 x 4 OK;
   real session 2 lanes, 0 problems, 0.75 s, no writes. review-coder-28f693a762-190812 APPROVED_WITH_NOTES (notes: author
-  evidence accounting); merged e18f244. Nine rounds; all findings after round 4 were tagged contrived.
+  evidence accounting); merged e18f244. Nine rounds; after round 4 only the sidecar/meta.json naming (rounds 5+6 F2) was tagged realistic.
+- H48 label correction (Main): labels-B #89, #91, #185-187 (Main's instructions to workers, found in HB7a) relabelled
+  `not-owner` in the untracked .tmux-pi/il1/labels-B.json (label_before kept). Corpus B is now 227 messages, 25 process (11%,
+  was 30 / 13%); verification kind 9 -> 6, other 3 -> 1, repeats 11 -> 9. Friction report: ungrouped label rows 12 -> 7.
+  test_friction_report + test_docs_wiring 29 OK. Row #86 (a pasted build/test summary, labelled other) left as owner-typed.

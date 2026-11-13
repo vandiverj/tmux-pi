@@ -1,6 +1,6 @@
 {
  "schema": "tp-frictions:v1",
- "about": "HB7a mapping: friction key -> trigger, scope, proposed home, source pointers. Written by Main (every key is `by main`, inferred); the owner corrects it by editing this file. Pointers only: label:<file>#<i> (the row's own i), record:<ws>/<id>, memory:<file>, doc:<repo path>#<heading>. No quoted text. Rows labels-B.json#89, #91, #185, #186, #187 are Main's instructions to workers mislabeled as owner messages (H48 label error); they are left ungrouped on purpose.",
+ "about": "HB7a mapping: friction key -> trigger, scope, proposed home, source pointers. Written by Main (every key is `by main`, inferred); the owner corrects it by editing this file. Pointers only: label:<file>#<i> (the row's own i), record:<ws>/<id>, memory:<file>, doc:<repo path>#<heading>. No quoted text. Rows labels-B.json#89, #91, #185, #186, #187 are Main's instructions to workers mislabeled as owner messages (H48 label error); they are relabelled `not-owner` in the labels file (2026-11-12), so they are no longer process rows.",
  "keys": {
   "fix-brief-states-the-rule": {
    "by": "main",

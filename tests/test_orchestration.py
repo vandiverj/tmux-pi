@@ -115,6 +115,52 @@ esac
         self.assertEqual(index["recent"][-1]["id"], item["id"])
         self.assertEqual(index["recent"][-1]["status"], "completed")
 
+    def test_profile_layer_follows_the_role_and_no_profile_is_the_default_packet(self):
+        """HB7c: TP_PROFILE=expert|guided adds agent/profiles/<name>.md right after the role text and changes nothing else;
+        unset or empty is today's packet byte for byte; a name with no profile file refuses before anything is made. The bench
+        sets it with --env, which reaches tp-spawn through tp-agent dispatch."""
+        def spawn(ident, profile=None, role=("--role", "coder")):
+            env = {k: v for k, v in self.env.items() if k != "TP_PROFILE"}   # unset means unset, whatever the caller's shell holds
+            if profile is not None:
+                env["TP_PROFILE"] = profile
+            return subprocess.run([str(ROOT / "bin/tp-spawn"), "--task-id", ident, "--worker", "pi", "--model", MODEL, "--workdir",
+                                   str(self.project), *role, "--deliverable", "Report paths and checks", "--", "Make a focused change"],
+                                  env=env, text=True, capture_output=True)
+
+        def packet(ident):
+            return (self.state / "tasks" / ident / "packet.md").read_text().replace(ident, "ID")
+
+        self.assertEqual(spawn("p-unset").returncode, 0)
+        default = packet("p-unset")
+        role = "# Worker Role\n\n" + (ROOT / "agent/roles/coder.md").read_text().rstrip("\n") + "\n"
+        self.assertEqual(default.count(role), 1)
+        self.assertNotIn("# Worker Profile", default)
+        for name in ("", "expert", "guided"):
+            with self.subTest(profile=name):
+                run = spawn(f"p-{name or 'empty'}", name)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                layer = (ROOT / "agent/profiles" / f"{name}.md").read_text().rstrip("\n") if name else None
+                expected = default if layer is None else default.replace(role, role + "\n\n" + layer + "\n", 1)
+                self.assertEqual(packet(f"p-{name or 'empty'}"), expected)
+                # a profile adds no directive the contract already gives (the report path stays stated once, as a fact)
+                self.assertEqual(expected.count("report.md"), 1)
+                self.assertNotIn("RESULT_STATUS", expected)
+        for name in ("novice", "../roles/coder", "Expert"):
+            with self.subTest(refused=name):
+                run = spawn("p-refused", name)
+                self.assertNotEqual(run.returncode, 0)
+                self.assertIn("unknown TP_PROFILE", run.stderr)
+                self.assertFalse((self.state / "tasks" / "p-refused").exists())
+        with self.subTest(row="no role, no layer"):
+            run = spawn("p-norole", "guided", role=())
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertNotIn("# Worker Profile", packet("p-norole"))
+        with self.subTest(row="through tp-agent dispatch"):
+            run = self.raw("dispatch", "--role", "coder", "--task", "Make a focused change", "--worker", "pi", "--model", MODEL,
+                           "--workdir", str(self.project), env={**self.env, "TP_PROFILE": "guided"})
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertEqual(self.packet(json.loads(run.stdout)).count("# Worker Profile: guided\n"), 1)
+
     def write_preamble(self, text):
         (self.state / "worker-preamble.md").write_text(text)
 
@@ -255,7 +301,7 @@ esac
         first = json.loads(self.raw("dispatch", "--role", "researcher", "--task", "a", "--worker", "pi", "--model", MODEL,
                                     "--thinking", "low", "--workdir", str(self.project), env=env).stdout)
         queued = json.loads(self.raw("dispatch", "--role", "coder", "--task", "b", "--worker", "pi", "--model", MODEL,
-                                     "--thinking", "low", "--after", first["id"], env=env).stdout)
+                                     "--thinking", "low", "--after", first["id"], env={**env, "TP_PROFILE": "guided"}).stdout)
         self.assertEqual(queued["status"], "queued")
         record = json.loads((self.state / "queue" / f"{queued['id']}.json").read_text())
         self.assertEqual(record["workdir"], str(self.project.resolve()))
@@ -265,6 +311,24 @@ esac
         text = self.system_prompt(self.state / "tasks" / queued["id"]) + (self.state / "tasks" / queued["id"] / "packet.md").read_text()
         self.assertIn("PROJECT_RULE", text)
         self.assertNotIn("OTHER_REPO_RULE", text)
+        # F1: the profile is the dispatch's choice (guided here), not the environment of the tick that starts the queued task
+        self.assertEqual(record["profile"], "guided")
+        self.assertEqual(text.count("# Worker Profile: guided\n"), 1)
+        self.assertNotIn("# Worker Profile: expert", text)
+
+    def test_queued_dispatch_without_profile_stays_without_when_the_tick_sets_one(self):
+        first = self.dispatch()
+        queued = self.dispatch(task="b", after=first["id"])
+        self.assertEqual(json.loads((self.state / "queue" / f"{queued['id']}.json").read_text())["profile"], None)
+        self.settle(first, "RESULT_STATUS: complete\n")
+        run = self.raw("tick", env={**self.env, "TP_PROFILE": "expert"})
+        self.assertEqual(json.loads(run.stdout)["started"], [queued["id"]])
+        self.assertNotIn("# Worker Profile", self.packet(queued))
+        bad = self.raw("dispatch", "--role", "coder", "--task", "c", "--worker", "pi", "--model", MODEL, "--thinking", "low",
+                       env={**self.env, "TP_PROFILE": "novice"})   # refused before anything is queued
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertIn("unknown TP_PROFILE", bad.stderr)
+        self.assertEqual(len(list((self.state / "queue").iterdir())), 0)
 
     def test_queue_record_that_is_not_provably_valid_is_not_launched(self):
         first = self.dispatch()
@@ -299,7 +363,8 @@ esac
                    ("route_info is a list", {"route_info": []}),
                    ("tests is a list", {"tests": []}), ("unknown role", {"role": "wizard"}),
                    ("unknown worker", {"worker": "other"}), ("thinking missing", {"thinking": None}),
-                   ("id does not match the file", {"id": "coder-0000000000"}))
+                   ("id does not match the file", {"id": "coder-0000000000"}),
+                   ("profile unknown", {"profile": "novice"}), ("profile is a number", {"profile": 3}), ("profile is a list", {"profile": ["expert"]}))
         for label, change in changes:
             with self.subTest(label):
                 path.write_text(json.dumps({**good, **change}))
@@ -310,8 +375,10 @@ esac
                 self.assertFalse((self.state / "tasks" / queued["id"]).exists())
                 rows = {row["id"]: row for row in self.cli("index")["active"]}  # the index is still written
                 self.assertEqual(rows[queued["id"]]["status"], "queued")
-        path.write_text(json.dumps(good))  # the same record, restored, starts
-        self.assertEqual(self.cli("tick")["started"], [queued["id"]])
+        # profile is optional: a record without it (queued before profiles existed, or written by another module) means no profile
+        path.write_text(json.dumps({k: v for k, v in good.items() if k != "profile"}))
+        self.assertEqual(json.loads(self.raw("tick", env={**self.env, "TP_PROFILE": "expert"}).stdout)["started"], [queued["id"]])  # the tick's own TP_PROFILE is not used
+        self.assertNotIn("# Worker Profile", self.packet(queued))
 
     def test_one_bad_queue_entry_never_stops_the_others_or_the_index(self):
         first = self.dispatch()
@@ -357,7 +424,7 @@ esac
         def add(label, content):
             entries[f"shape{len(entries):02d}"] = (label, content)
         for key in good:
-            if key not in ("queue_reason", "queue_log"):  # the optional fields may be absent
+            if key not in ("queue_reason", "queue_log", "profile"):  # the optional fields may be absent (profile: missing = no profile)
                 add(f"{key} missing", {k: v for k, v in good.items() if k != key})
             add(f"{key} wrong type", {**good, key: wrong[key]})
         add("queue_reason a list", {**good, "queue_reason": ["x"]})
@@ -484,7 +551,7 @@ esac
         self.assertEqual(agent.queue_item(clean, queued["id"]), clean)  # idempotent: tick passes its return value on
         self.assertEqual(set(clean), {"id", "created", "role", "task", "workdir", "worker", "model", "thinking",
                                       "route_info", "deliverable", "parent", "after", "context", "notes", "tests",
-                                      "queue_reason", "queue_log"})
+                                      "profile", "queue_reason", "queue_log"})
 
     def test_missing_preamble_adds_only_the_worker_contract(self):
         item = self.dispatch()

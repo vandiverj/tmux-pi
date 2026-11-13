@@ -580,7 +580,10 @@ def summary(record):
         contract = "unknown"
     else:
         entry = next((i for i in instructions if isinstance(i, dict) and i.get("name") == "contract"), None)
-        contract = "none" if entry is None else (str(entry["version"]) if entry.get("version") else "unknown")
+        if entry is None:
+            contract = "none"
+        else:
+            contract = "unknown" if "version" not in entry else (str(entry["version"]) if entry["version"] else "none")
     capabilities = record.get("capabilities")
     unsupported = capabilities.get("unsupported") if isinstance(capabilities, dict) else None
     if not isinstance(unsupported, list):

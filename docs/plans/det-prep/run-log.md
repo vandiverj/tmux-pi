@@ -1250,3 +1250,11 @@ Each lane: checkpoint, Main's evidence, openai-codex review, notes closed, `lane
   second distinct Stop complete turn 2; one Stop never credits turn 2. Main confirmed zero lag in the realistic order, and
   the contrived P1 P2 S1 P3 S2 S3 early credit is a known limit. Worker asked before using Edit on report.sh after the
   trust-store guard misread a python heredoc (granted).
+- HB4c merged 37e7a0e (review-coder-2d72f4c144-204159 APPROVED_WITH_NOTES; cells 286 x 4 on the merge tree f54c454). F1 =
+  accepted HB4c-L1, F2 -> HB4d (hb4b-known-limits.md). First repeat report under decision A: 0 s, Main's cells checked the
+  merge tree, not the lane's; in-tmux cells unread (TMUX value) -> HB5c.
+- Owner: "tq1-review abandon it". Lane removed with --abandon; tip 201c5cc (restore line in the lane archive
+  tq1-review-20261113T033209Z); its one uncommitted path (tests/test_tp_review.py) kept as a stash and as
+  $J/tq1-review-uncommitted.patch.
+- Owner: "HB4d and any other parallel next steps available". Dispatched HB4d (design, Opus, lane hub-dup-stop,
+  coder-e1560fb1e0) and HB5c (rule-first, Sonnet, lane hub-repeat-tmux, coder-15446f2f50) from f577972.

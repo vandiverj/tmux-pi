@@ -235,6 +235,30 @@ class RefusalAndRollbackTests(Scratch):
                 self.create()
         self.assertIn("not what git says", str(caught.exception))
         self.assertEqual(self.snapshot(), before)
+        # HB6d: the lease events (lib/lane_lease.py) of a lane made a moment ago are part of its record and go with it; an
+        # events.jsonl that is a link (or not a regular file) is refused and left in place, as any other such entry
+        lane_dir = Path(self.common) / "tmux-pi/lanes/alpha"
+        target = self.parent / "elsewhere-events.jsonl"
+
+        def failing_with(kind):
+            def fail(record):
+                if kind == "file":
+                    (lane_dir / "events.jsonl").write_text('{"kind": "lease.taken"}\n')
+                else:
+                    (lane_dir / "events.jsonl").symlink_to(target)
+                raise ValueError("not what git says")
+            return fail
+        with mock.patch.object(lanes, "lane_reality", side_effect=failing_with("file")):
+            with self.assertRaises(ValueError) as caught:
+                self.create()
+        self.assertIn("Nothing was left behind", str(caught.exception))
+        self.assertEqual(self.snapshot(), before)
+        with mock.patch.object(lanes, "lane_reality", side_effect=failing_with("link")):
+            with self.assertRaises(ValueError) as caught:
+                self.create()
+        self.assertIn("events.jsonl is not a regular file; left in place", str(caught.exception))
+        self.assertTrue((lane_dir / "events.jsonl").is_symlink())
+        self.assertFalse(target.exists())
 
     def test_a_failure_in_git_after_it_made_the_worktree_rolls_back_both(self):
         hooks = self.parent / "hooks"

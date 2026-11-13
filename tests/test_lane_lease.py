@@ -44,6 +44,22 @@ class LeaseCase(LaneCase):
         path = self.lane_dir() / "lease.json"
         return json.loads(path.read_text())["holders"] if path.exists() else []
 
+    def events(self, since=0):
+        """HB6d: (kind, task, how, holder kind) of every lease event in lanes/alpha/events.jsonl from line `since` on."""
+        path = self.lane_dir() / lane_lease.EVENTS
+        lines = path.read_text().splitlines() if path.exists() else []
+        out = []
+        for line in lines[since:]:
+            ev = json.loads(line)
+            self.assertEqual(sorted(ev), ["access", "at", "holder", "how", "kind", "role", "task"], ev)  # no other field
+            self.assertRegex(ev["at"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$")
+            out.append((ev["kind"], ev["task"], ev["how"], ev["holder"]))
+        return out
+
+    def event_count(self):
+        path = self.lane_dir() / lane_lease.EVENTS
+        return len(path.read_text().splitlines()) if path.exists() else 0
+
     def holder(self, task="coder-held00001", pid=None, start=None, kind="reservation", access="write", role="coder", pane=None,
                taken="2001-01-01T00:00:00Z"):
         pid = os.getpid() if pid is None else pid
@@ -85,6 +101,9 @@ class SharedOccupancyTests(LeaseCase):
         item, _ = self.lane_ok(snapshot=False)
         [holder] = self.lease()
         self.assertEqual((holder["kind"], holder["access"], holder["task"], holder["session"]), ("worker", "write", item["id"], str(self.state)))
+        # HB6d: tp-spawn's reserve and activate are recorded in the lane's events.jsonl, the activation as the worker
+        self.assertEqual(self.events(), [("lease.taken", item["id"], "reserve", "reservation"),
+                                         ("lease.activated", item["id"], "pane", "worker")])
         self.assertTrue(holder["pane"].startswith("%"))
         self.assertEqual(holder["start"], start_of(holder["pid"]))
         self.assertEqual(holder["pid"], int(self.tmux("display-message", "-p", "-t", holder["pane"], "#{pane_pid}")))
@@ -113,8 +132,12 @@ class SharedOccupancyTests(LeaseCase):
         dead = subprocess.Popen(["true"])
         dead.wait()
         self.put_lease([self.holder(pid=dead.pid, start="Mon Jan  1 00:00:00 2001")])
+        n = self.event_count()
         item, _ = self.existing(step="s1")
         self.assertNotIn("coder-held00001", [h["task"] for h in self.lease()])
+        # HB6d: the drop is recorded as found then (how stale), before the new holder's taken, under the same lock
+        self.assertEqual(self.events(n)[:2], [("lease.released", "coder-held00001", "stale", "reservation"),
+                                              ("lease.taken", item["id"], "reserve", "reservation")])
 
     def test_a_recycled_pid_with_another_start_time_is_not_the_holder(self):
         self.made_lane()
@@ -184,17 +207,35 @@ class ReservationTests(LeaseCase):
 
     def test_the_task_holds_the_lane_once(self):
         self.made_lane()
+        n = self.event_count()
         lane_lease.reserve(self.common(), "alpha", "coder-once00001", "coder", "s", os.getpid())
         with self.assertRaisesRegex(ValueError, "already"):
             lane_lease.reserve(self.common(), "alpha", "coder-once00001", "coder", "s", os.getpid())
         lane_lease.release(self.common(), "alpha", "coder-once00001")
         self.assertEqual(self.lease(), [])
+        # HB6d: one taken, one released; the refused second reserve and a release with nothing to remove add nothing
+        lane_lease.release(self.common(), "alpha", "coder-once00001")
+        self.assertEqual(self.events(n), [("lease.taken", "coder-once00001", "reserve", "reservation"),
+                                          ("lease.released", "coder-once00001", "release", "reservation")])
+        self.assertEqual(oct((self.lane_dir() / lane_lease.EVENTS).stat().st_mode & 0o777), "0o600")
+        # an events file that is a link is not followed or written, and the lease change still happens
+        events = self.lane_dir() / lane_lease.EVENTS
+        events.unlink()
+        target = self.root / "elsewhere-events.jsonl"
+        events.symlink_to(target)
+        lane_lease.reserve(self.common(), "alpha", "coder-once00002", "coder", "s", os.getpid())
+        self.assertEqual([h["task"] for h in self.lease()], ["coder-once00002"])
+        lane_lease.release(self.common(), "alpha", "coder-once00002")
+        self.assertEqual((self.lease(), target.exists(), events.is_symlink()), ([], False, True))
 
     def test_activating_a_pane_that_is_gone_leaves_nothing_alive(self):
         self.made_lane()
+        n = self.event_count()
         lane_lease.reserve(self.common(), "alpha", "coder-once00001", "coder", "s", os.getpid())
         self.assertIsNone(lane_lease.activate(self.common(), "alpha", "coder-once00001", "%9999"))  # no such pane on the server
         self.assertEqual(self.lease(), [])
+        self.assertEqual(self.events(n), [("lease.taken", "coder-once00001", "reserve", "reservation"),
+                                          ("lease.released", "coder-once00001", "pane-gone", "reservation")])
 
 
 class EveryStartGoesThroughTheReservationTests(LeaseCase):

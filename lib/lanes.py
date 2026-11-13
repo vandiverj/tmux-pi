@@ -702,7 +702,8 @@ def discard_lane_record(common_dir, name):
                 return
             try:
                 for entry in os.listdir(dir_fd):
-                    if entry != "lane.json" and not entry.startswith(".lane.json."):
+                    # events.jsonl: the lease events (lib/lane_lease.py, HB6d) of a lane made a moment ago go with it
+                    if entry not in ("lane.json", "events.jsonl") and not entry.startswith(".lane.json."):
                         raise ValueError(f"{path.parent} holds {entry}, which is not part of the record; left in place")
                     if not stat.S_ISREG(os.lstat(entry, dir_fd=dir_fd).st_mode):
                         raise ValueError(f"{path.parent}/{entry} is not a regular file; left in place")

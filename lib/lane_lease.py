@@ -19,13 +19,21 @@ found again, with no record of the task needed. Age is never a reason. A lease f
 writer); a missing file means nobody holds the lane. A writer excludes every other holder; a reader (a reviewer) excludes
 only writers.
 
+Every holder change is also appended, under the same lock and after lease.json was written, to `events.jsonl` beside it
+(HB6d), one JSON line each: {at, kind: lease.taken | lease.activated | lease.released, task, role, access, holder: the
+holder's kind, how}. how is reserve (taken), pane (activated), release (the task's own release), pane-gone (activate found
+the pane gone) or stale (a holder found dead and dropped by any of the three; `at` is when it was found, an upper bound of
+its holding). The record never decides anything: an append that fails leaves the lease change as it is.
+
     python3 lane_lease.py reserve  --lane N --workdir DIR --task ID --role R --session S --pid P [--replaces ID]
     python3 lane_lease.py activate --lane N --workdir DIR --task ID --pane %N
     python3 lane_lease.py release  --lane N --workdir DIR --task ID
 """
 import argparse
+from datetime import datetime, timezone
 import json
 import os
+import stat
 from pathlib import Path
 import shlex
 import sys
@@ -192,6 +200,42 @@ def _write(common_dir, name, holders):
     lanes.write_lane_file(common_dir, name, FILE, text)
 
 
+EVENTS = "events.jsonl"
+
+
+def _event(kind, holder, how):
+    return {"at": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"), "kind": kind,
+            "task": holder["task"], "role": holder["role"], "access": holder["access"], "holder": holder["kind"], "how": how}
+
+
+def _stale(before, kept):
+    return [_event("lease.released", h, "stale") for h in before if h not in kept]
+
+
+def _record(common_dir, name, events):
+    """Append `events` to lanes/<name>/events.jsonl, the caller holding the lane lock. Reached as lanes.py reaches a lane file
+    (no symlink followed from the common git directory), opened O_APPEND|O_NOFOLLOW|O_NONBLOCK and written only when it is a
+    regular file, one write per line. Never raises: the lease change it records has already been made."""
+    if not events:
+        return
+    try:
+        dir_fd = lanes._walk(common_dir, lanes.LANES_SUBDIR.parts + (name,))
+        if dir_fd is None:
+            return
+        try:
+            fd = os.open(EVENTS, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=dir_fd)
+        finally:
+            os.close(dir_fd)
+        try:
+            if stat.S_ISREG(os.fstat(fd).st_mode):
+                for event in events:
+                    os.write(fd, (json.dumps(event) + "\n").encode("utf-8"))
+        finally:
+            os.close(fd)
+    except (OSError, ValueError):
+        pass
+
+
 def _mine(common_dir, name, workdir):
     """(common dir, record) of lane `name` when `workdir` is inside its working tree, else a refusal: a lane tag that names no
     lane, or a tree that is not the lane's, starts nothing."""
@@ -213,7 +257,8 @@ def reserve(common_dir, name, task, role, session, pid, replaces=None):
         row = rows.get(pid)
         if not row or row[1].startswith("Z"):
             raise ValueError(f"process {pid}, which would hold lane {name}, is not running")
-        kept = live(read(common_dir, name), rows)
+        held = read(common_dir, name)
+        kept = live(held, rows)
         busy = [h for h in blocking(kept, access) if not (replaces and h["task"] == replaces and h["session"] == session)]
         if any(h["task"] == task for h in kept):
             raise ValueError(f"task {task} already holds lane {name}")
@@ -225,6 +270,7 @@ def reserve(common_dir, name, task, role, session, pid, replaces=None):
         holder = {"kind": "reservation", "access": access, "task": task, "role": worker_process.effective_role(role, task),
                   "session": session, "pid": pid, "start": row[2], "pane": None, "taken": lanes.utc_now()}
         _write(common_dir, name, kept + [holder])
+        _record(common_dir, name, _stale(held, kept) + [_event("lease.taken", holder, "reserve")])
         return holder
 
 
@@ -236,9 +282,12 @@ def release(common_dir, name, task):
         held = read(common_dir, name)
         mine = [h for h in held if h["task"] == task]
         running = [h for h in mine if worker_process.task_processes(_task_dir(h))]
-        kept = [h for h in live(held) if h["task"] != task] + running
+        alive = live(held)
+        kept = [h for h in alive if h["task"] != task] + running
         if kept != held:
             _write(common_dir, name, kept)
+            _record(common_dir, name, [_event("lease.released", h, "release") for h in mine if h not in running]
+                    + _stale([h for h in held if h["task"] != task], alive))
         if running:
             raise StillRunning(f"task {task} still has a process running, so lane {name} stays held by it. End it with "
                                f"{clear_command(running[0])}; the lane is free once it is gone")
@@ -251,7 +300,8 @@ def activate(common_dir, name, task, pane):
     table = worker_process.pane_table()
     with lanes.lane_lock(common_dir):
         rows = worker_process._ps()
-        holders = live(read(common_dir, name), rows)
+        held = read(common_dir, name)
+        holders = live(held, rows)
         mine = [h for h in holders if h["task"] == task]
         if len(mine) != 1:
             raise ValueError(f"task {task} does not hold lane {name} (no reservation to activate)")
@@ -260,9 +310,11 @@ def activate(common_dir, name, task, pane):
         row = rows.get(entry[1]) if entry and entry[0] else None
         if not row or row[1].startswith("Z"):
             _write(common_dir, name, others)
+            _record(common_dir, name, _stale(held, holders) + [_event("lease.released", mine[0], "pane-gone")])
             return None
         worker = dict(mine[0], kind="worker", pid=entry[1], start=row[2], pane=pane)
         _write(common_dir, name, others + [worker])
+        _record(common_dir, name, _stale(held, holders) + [_event("lease.activated", worker, "pane")])
         return worker
 
 

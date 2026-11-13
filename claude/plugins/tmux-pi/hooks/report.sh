@@ -14,7 +14,9 @@
 # overlapping prompts turn 1's Stop completes turn 1, never turn 2. HB4c: a prompt that arrived while an earlier reply ran
 # is owed (owedTurn); a later Stop with no open prompt whose reply is new (not empty, byte-unequal to every kept reply) is
 # that turn's own Stop and completes it; the next prompt closes an owed turn. completedTurn only goes up: a report put
-# back from heldReport, a late or duplicate Stop, and the next prompt's withdrawal of result.md never move it. A pause names
+# back from heldReport, a late or duplicate Stop, and the next prompt's withdrawal of result.md never move it. HB4d rule 2':
+# a Stop on the open prompt whose reply is byte-equal to a kept reply (a duplicate older Stop, or a reply repeated word for
+# word) ends the working state but completes nothing and leaves its turn owed (owedTurn = replyTurn). A pause names
 # the promptTurn it interrupts and is void once completedTurn reaches it (lib/contract.py pause_void).
 #
 # Does nothing outside a tp-spawn worker (no TP_TASK_DIR). Never fails the hook:

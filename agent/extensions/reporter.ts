@@ -17,7 +17,9 @@
  * (lib/result_status.py). It only goes up: the next agent_start withdraws result.md without lowering it, and a restart
  * carries both over. A pause names the promptTurn it interrupts and is void once completedTurn reaches it
  * (lib/contract.py pause_void). An agent_settled answers the turn its reply started from (replyTurn, HB4b rule 2): the
- * agent_start that opened the reply, not one that arrived while it ran; a settle with no open reply completes nothing.
+ * agent_start that opened the reply, not one that arrived while it ran. HB4c: such a prompt is owed (owedTurn); a later
+ * settle with no open reply but a new reply (an assistant message since the last settle) is the owed turn's own settle and
+ * completes it; the next agent_start closes an owed turn. Any other settle with no open reply completes nothing.
  *
  * A worker that settles waiting with a reply that has no RESULT_STATUS line waits for an answer: it opens (or finds) an
  * `input` request under $TP_TASK_DIR/requests/ through lib/hub_records.py (pi-state), and the next start resolves it
@@ -52,6 +54,8 @@ type State = {
 	promptTurn: number;
 	completedTurn: number;
 	replyTurn: number;
+	// HB4c: the oldest prompt that arrived while an earlier reply ran, whose own settle may still come (0: none).
+	owedTurn: number;
 	updated: string;
 };
 
@@ -129,10 +133,12 @@ export default function (pi: ExtensionAPI) {
 		promptTurn: 0,
 		completedTurn: 0,
 		replyTurn: 0,
+		owedTurn: 0,
 		updated: "",
 	};
 	let lastReply = "";
 	let replyOpen = false; // an agent_start opened a reply that no agent_settled has ended yet
+	let freshReply = false; // an assistant message ended since the last agent_settled: a settle with it carries a new reply
 
 	// Write via rename so the status pane never reads a half-written file.
 	const atomic = (name: string, body: string) => {
@@ -217,6 +223,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("agent_start", () => {
 		s.promptTurn += 1;
 		if (!replyOpen) s.replyTurn = s.promptTurn;
+		s.owedTurn = 0; // HB4c rule 1: a new prompt closes an owed turn; with no open reply it starts the reply that answers it
 		replyOpen = true;
 		s.state = "working";
 		s.error = "";
@@ -263,7 +270,10 @@ export default function (pi: ExtensionAPI) {
 		}
 		if (m.stopReason === "error" || m.errorMessage) s.error = String(m.errorMessage ?? "error");
 		const text = stripLeadingThink(textOf(m)).trim();
-		if (text) lastReply = text;
+		if (text) {
+			lastReply = text;
+			freshReply = true;
+		}
 		save();
 	});
 	pi.on("agent_settled", () => {
@@ -278,8 +288,13 @@ export default function (pi: ExtensionAPI) {
 				replied = true;
 			} catch {}
 		}
-		if (replyOpen && replied && STATUSED.test(lastReply)) s.completedTurn = Math.max(s.completedTurn, s.replyTurn);
+		// The turn this settle answers: the open reply's (HB4b rule 2), else the owed turn's when its reply is new (HB4c rule 3:
+		// an assistant message ended since the last settle), else none (a duplicate or late settle completes nothing).
+		const answers = replyOpen ? s.replyTurn : s.owedTurn > 0 && freshReply ? s.owedTurn : 0;
+		if (answers && replied && STATUSED.test(lastReply)) s.completedTurn = Math.max(s.completedTurn, answers);
+		if (answers) s.owedTurn = answers < s.promptTurn ? answers + 1 : 0; // HB4c rule 2: a prompt that arrived meanwhile is owed
 		replyOpen = false;
+		freshReply = false;
 		save();
 		requests(s.state, replied ? join(dir, "result.md") : undefined);
 	});

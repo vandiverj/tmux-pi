@@ -11,7 +11,9 @@
 # Turn numbers (HB4a round 5): promptTurn counts prompts (UserPromptSubmit); completedTurn is the highest promptTurn whose
 # own Stop carried a reply with a valid RESULT_STATUS line (lib/result_status.py). A Stop answers the turn its reply started
 # from (replyTurn, HB4b rule 2): the prompt that opened the reply, not a prompt that arrived while it ran, so with
-# overlapping prompts turn 1's Stop completes turn 1, never turn 2. completedTurn only goes up: a report put
+# overlapping prompts turn 1's Stop completes turn 1, never turn 2. HB4c: a prompt that arrived while an earlier reply ran
+# is owed (owedTurn); a later Stop with no open prompt whose reply is new (not empty, byte-unequal to every kept reply) is
+# that turn's own Stop and completes it; the next prompt closes an owed turn. completedTurn only goes up: a report put
 # back from heldReport, a late or duplicate Stop, and the next prompt's withdrawal of result.md never move it. A pause names
 # the promptTurn it interrupts and is void once completedTurn reaches it (lib/contract.py pause_void).
 #
@@ -106,6 +108,7 @@ already_kept() { # already_kept FILE: FILE's bytes equal a reply already kept an
   return 1
 }
 turn_done=""  # "yes" when this Stop ends an open turn with a statused reply: completedTurn becomes that turn
+owe=0  # the owed turn this Stop answers (HB4c rule 3), 0 when it answers an open prompt or none
 later_count() { local n; n="$(jq -r '.laterReplies // 0 | if type == "number" then floor else 0 end' <<<"$prev" 2>/dev/null)"; echo "${n:-0}"; }
 ext='{}'
 if [[ "$event" == UserPromptSubmit ]]; then
@@ -123,8 +126,16 @@ elif [[ "$event" == Stop ]]; then
   reply_tmp="$(mktemp "$TP_TASK_DIR/.reply.XXXXXXXX")" || exit 0
   jq -r '.last_assistant_message // empty | select(length > 0)' <<<"$input" > "$reply_tmp" 2>/dev/null || : > "$reply_tmp"
   if [[ "$active" != yes ]]; then
-    # no open prompt: duplicate (however late), late, or the second Stop of two overlapping turns. A reply byte-equal to
-    # one already kept changes nothing; any other is kept and counted, so laterReplies counts distinct later replies.
+    # No open prompt, but an owed turn (HB4c rule 3: a prompt that arrived while an earlier reply ran): a new reply, not
+    # empty and byte-unequal to every kept one, is that turn's own Stop and is handled as an open prompt's Stop below.
+    owed_turn="$(jq -rn --argjson prev "$prev" '
+      def turn: ($prev.promptTurn // 0); def settled: ($prev.settledTurn // 0);
+      $prev.owedTurn | if type == "number" and . == floor and . >= 1 and . <= turn and . <= settled then . else 0 end' 2>/dev/null)"
+    if [[ "$owed_turn" =~ ^[1-9][0-9]*$ && -s "$reply_tmp" ]] && ! already_kept "$reply_tmp"; then owe="$owed_turn"; active=yes; fi
+  fi
+  if [[ "$active" != yes ]]; then
+    # no open prompt and no owed turn: duplicate (however late), late, or empty. A reply byte-equal to one already kept
+    # changes nothing; any other is kept and counted, so laterReplies counts distinct later replies.
     if [[ -s "$reply_tmp" ]] && ! already_kept "$reply_tmp"; then
       keep_reply
       ext="$(jq -nc --argjson n "$(( $(later_count) + 1 ))" --arg p "$archived" '{laterReplies: $n, laterReplyPath: $p}')"
@@ -240,7 +251,8 @@ fi
 
 state_tmp="$(mktemp "$TP_TASK_DIR/.state.XXXXXXXX")" || exit 0
 jq -n --argjson prev "$prev" --argjson in "$input" --argjson usage "$usage" \
-  --arg id "${TP_TASK_ID:-}" --arg now "$now" --argjson record "$record" --argjson ext "$ext" --arg done "$turn_done" '
+  --arg id "${TP_TASK_ID:-}" --arg now "$now" --argjson record "$record" --argjson ext "$ext" --arg done "$turn_done" \
+  --argjson owe "$owe" '
   def turn: ($prev.promptTurn // (if $prev.state == "working" or $prev.state == "tool" or $prev.state == "permission" then 1 else 0 end));
   def settled: ($prev.settledTurn // (if $prev.state == "waiting" then turn else 0 end));
   def active: turn > settled;
@@ -248,6 +260,9 @@ jq -n --argjson prev "$prev" --argjson in "$input" --argjson usage "$usage" \
   # The turn the open reply started from (HB4b rule 2): set by the UserPromptSubmit that opens a reply, kept by one that
   # arrives while a reply is open (overlapping prompts). Missing or out of range: the oldest open turn.
   def reply: ($prev.replyTurn | if type == "number" and . == floor and . > settled and . <= turn then . else settled + 1 end);
+  # The Stop that ends a reply (HB4c): of the open prompt (active; it answers reply) or of the owed turn $owe (rule 3).
+  def ending: $in.hook_event_name == "Stop" and (active or $owe > 0);
+  def answers: (if $owe > 0 then $owe else reply end);
   def hint: ((.tool_input.file_path // .tool_input.path // .tool_input.command // .tool_input.pattern // "") | tostring);
   def clip: gsub("\\s+"; " ") | if length > 80 then .[0:79] + "…" else . end;
   # The calls in flight (HB6b1 round 2), what a permission prompt is matched to: the Claude Notification names only the tool;
@@ -267,7 +282,7 @@ jq -n --argjson prev "$prev" --argjson in "$input" --argjson usage "$usage" \
   + ( if $in.hook_event_name == "SessionStart" then { state: "starting", model: ($in.model // $prev.model // "") }
       elif $in.hook_event_name == "UserPromptSubmit" then
         { state: "working", tool: "", error: "", promptTurn: (turn + 1), settledTurn: settled,
-          replyTurn: (if active then reply else turn + 1 end),
+          replyTurn: (if active then reply else turn + 1 end), owedTurn: 0,
           promptSubmits: (($prev.promptSubmits // 0) + 1),
           promptLog: ((($prev.promptLog // []) + [{ n: (($prev.promptSubmits // 0) + 1), at: $now, tokens: $record.tokens, marks: $record.marks }]) | .[-8:]) }
       elif $in.hook_event_name == "PreToolUse" and active then
@@ -281,11 +296,12 @@ jq -n --argjson prev "$prev" --argjson in "$input" --argjson usage "$usage" \
       elif $in.hook_event_name == "Notification" and active then
         (if ($in.message // "" | test("permission"; "i")) then { state: "permission", tool: ($in.message | clip) } else {} end)
       elif $in.hook_event_name == "PermissionDenied" and active then { state: "working", tool: "" } + done_call
-      elif $in.hook_event_name == "Stop" and active then
+      elif ending then
         { state: "waiting", tool: "", promptTurn: turn, settledTurn: turn, calls: [], calls_dropped: false,
-          completedTurn: (if $done == "yes" then ([completed, reply] | max) else completed end) }
+          completedTurn: (if $done == "yes" then ([completed, answers] | max) else completed end),
+          owedTurn: (if answers < turn then answers + 1 else 0 end) }
       else {} end )
-  + ( if ($in.hook_event_name == "UserPromptSubmit" or ($in.hook_event_name == "Stop" and active)) and $usage != null
+  + ( if ($in.hook_event_name == "UserPromptSubmit" or ending) and $usage != null
       then $usage | if .model == "" then del(.model) else . end else {} end )
   + $ext
   + { updated: $now }

@@ -431,12 +431,41 @@ class ClaudeReportTests(unittest.TestCase):
         self.hook("Stop", last_assistant_message="meh")
         self.assertEqual((self.task / "result.md").read_text(), self.REPORT)
         self.assertEqual(self.later()[0], 1)
-        self.hook("Stop", last_assistant_message="second")  # the other turn's Stop: no open prompt, settles nothing
+        self.assertEqual([self.state()[k] for k in ("promptTurn", "completedTurn", "owedTurn")], [3, 1, 3])
+        self.hook("Stop", last_assistant_message="second")  # the owed turn's own Stop (HB4c rule 3); unstatused: report stays
         self.hook("Stop", last_assistant_message="second")  # a duplicate of it adds nothing
         self.assertEqual((self.task / "result.md").read_text(), self.REPORT)
         self.assertEqual(self.later()[0], 2)
         self.assertEqual((self.task / self.later()[1]).read_text(), "second\n")
         self.assertEqual(sorted(self.kept()), sorted([self.REPORT, "meh\n", "second\n"]))
+        self.assertEqual([self.state()[k] for k in ("completedTurn", "owedTurn")], [1, 0])
+
+        def turns():
+            return [self.state()[k] for k in ("state", "promptTurn", "completedTurn", "owedTurn")]
+        # HB4c (a), two statused Stops (coder-6da07903aa): each completes the turn its reply started from. A duplicate of
+        # the first, or an empty Stop, never completes the owed turn (K2).
+        four, five = "four\nRESULT_STATUS: complete", "five\nRESULT_STATUS: blocked"
+        self.hook("UserPromptSubmit", prompt="t4")
+        self.hook("UserPromptSubmit", prompt="t5")  # before turn 4's Stop
+        self.hook("Stop", last_assistant_message=four)
+        self.assertEqual(turns(), ["waiting", 5, 4, 5])
+        self.hook("Stop", last_assistant_message=four)
+        self.hook("Stop", last_assistant_message="")
+        self.assertEqual(turns(), ["waiting", 5, 4, 5])
+        self.hook("Stop", last_assistant_message=five)
+        self.assertEqual(turns(), ["waiting", 5, 5, 0])
+        self.assertEqual((self.task / "result.md").read_text(), five + "\n")
+        self.assertIn(four + "\n", self.kept())
+        # HB4c (b), one Stop answers both prompts (coder-0087076a36): the worker waits, turn 7 is owed; the next prompt
+        # closes it and turn 8's Stop completes turn 8, so a turn-7 pause is void then.
+        self.hook("UserPromptSubmit", prompt="t6")
+        self.hook("UserPromptSubmit", origin={"kind": "task-notification"})
+        self.hook("Stop", last_assistant_message="six\nRESULT_STATUS: complete")
+        self.assertEqual(turns(), ["waiting", 7, 6, 7])
+        self.hook("UserPromptSubmit", prompt="t8")
+        self.assertEqual(turns() + [self.state()["replyTurn"]], ["working", 8, 6, 0, 8])
+        self.hook("Stop", last_assistant_message="eight\nRESULT_STATUS: complete")
+        self.assertEqual(turns(), ["waiting", 8, 8, 0])
 
     def test_reply_decides_attack_table(self):
         # prior result.md x reply x turn origin (rows from evidence/attack.py; the origin never changes the answer).

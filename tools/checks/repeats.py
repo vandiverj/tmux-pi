@@ -160,9 +160,9 @@ def _word_ok(word):
 
 
 def _assign_ok(word):
-    """R4: a NAME=VALUE the tool reads: an empty value or a grammar word; a PRESENCE_KEYED name may be absolute."""
+    """R4: a NAME=VALUE the tool reads: an empty value or a grammar word; TMUX_TMPDIR (always) and a non-empty TMUX may be absolute."""
     name, value = word.split("=", 1)
-    if name in PRESENCE_KEYED and value != "":
+    if name == "TMUX_TMPDIR" or (name == "TMUX" and value != ""):
         return bool(re.fullmatch(r"/?[A-Za-z0-9_][A-Za-z0-9_.,:/+-]*", value)) and ".." not in value.split("/")
     return value == "" or _word_ok(value)
 

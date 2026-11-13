@@ -476,6 +476,24 @@ def _session(state_dir):
     return session, bad
 
 
+class _TotalReader(timeline.Reader):
+    """timeline.Reader whose json() lists a record it cannot decode however it fails (RecursionError is not a ValueError), the
+    way it lists one that decodes to the wrong shape: one bad record, one outcome on every Python version. `undecodable`
+    holds the paths that failed with an error timeline.Reader does not name."""
+
+    def __init__(self):
+        super().__init__()
+        self.undecodable = []
+
+    def json(self, path, label, need_dict=True):
+        try:
+            return super().json(path, label, need_dict)
+        except Exception:
+            self.problem(path, "malformed " + label)
+            self.undecodable.append(path)
+            return None
+
+
 def _timeline(tasks_dir, ids, now):
     """(timeline rows by task id, problems, {task directory name: why} of the tasks timeline could not read, error or None).
 
@@ -492,12 +510,16 @@ def _timeline(tasks_dir, ids, now):
         dirs = sorted(p for p in Path(tasks_dir).iterdir() if p.is_dir() and not p.is_symlink())
     except Exception:
         dirs = []
+    rows, problems = {}, []
     for d in dirs:
+        reader = _TotalReader()
         try:
-            timeline.load_task(timeline.Reader(), d)
+            timeline.load_task(reader, d)
         except Exception as error:
             culprits[d.name] = f"the timeline cannot read the task's records ({error.__class__.__name__})"
-    rows, problems = {}, []
+        if reader.undecodable:  # the record is listed under its own path, as timeline lists a wrong shape
+            culprits.setdefault(d.name, "the timeline cannot decode the task's records")
+            problems += [p for p in reader.problems if p not in problems]
     if not culprits:
         for ident in ids:
             try:

@@ -925,7 +925,8 @@ class StatusTest(unittest.TestCase):
             ("cap", "t-cap/requests/req-" + "0" * 25 + "A.json", DEEP, 10, "t-cap/requests/req-" + "0" * 25 + "A.json"),
             ("rc", "r-rc/acceptance-items.json", DEEP, 10, "r-rc"),
             ("rc", "r-rc/acceptance-items.json", '{"it', 10, "r-rc"),           # truncated: the unparseable verdict is listed
-            ("run", "t-foreign/state.json", DEEP, 4, None),   # timeline raises for every task; only the lanes of t-foreign are unknown
+            ("run", "t-foreign/state.json", DEEP, 4, "t-foreign/state.json"),   # a decoder error on 3.9, a wrong shape on 3.14: listed either way, lane run keeps its rule
+            ("run", "t-foreign/state.json", b"\xff\xfe", 4, "t-foreign/state.json"),   # undecodable on every version
             ("final", "t-run-new/meta.json", {"created": 10 ** 400}, 10, "t-run-new/meta.json"),   # timeline overflows on it
             ("run", "../queue/q-deep.json", DEEP, 4, None),   # a queue item that cannot be decoded places nothing
             # Round 5 F2: a JSON integer too large for a double is a number (contract.lifecycle only compares numbers).
@@ -969,7 +970,7 @@ class StatusTest(unittest.TestCase):
                 listed = [p["where"] for p in one["problems"]]
                 if where:
                     self.assertIn(str(self.tasks / where), listed)
-                    self.assertTrue(row["next"].startswith("unknown") or rule == 1, row)
+                    self.assertTrue(row["next"].startswith("unknown") or rule in (1, 4), row)   # (rule 4: a foreign task's record)
                 else:
                     self.assertFalse([w for w in listed if Path(w).parent.name in rel], listed)
         if os.geteuid() != 0:   # round 5: no session can be read, yet every open lane is still a row (unknown), not lanes: []

@@ -16,6 +16,7 @@ import importlib.util
 import json
 import os
 import shutil
+import sys
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -666,6 +667,367 @@ class WaitTimelineTest(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit):
                 timeline.main([str(tasks), "--now", "yesterday"])
+
+
+DEEP = "[" * 1100 + "0" + "]" * 1100  # valid JSON that json.loads cannot decode (RecursionError)
+
+
+class StatusTest(unittest.TestCase):
+    """tools/waits/status.py (HB6c): one real git repository with one lane per case and a session dir of task records; one
+    table-driven method over the lanes, one CLI check."""
+    NOW = T0 + 5000
+    COVERAGE = "\n## Coverage\n- I read the whole diff and checked every changed line\n"
+
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, str(ROOT / "lib"))
+        sys.path.insert(0, str(ROOT / "tools" / "waits"))
+        import lane_lease
+        import lanes
+        import status
+        cls.lanes, cls.status, cls.lane_lease = lanes, status, lane_lease
+        cls.tmp = tempfile.mkdtemp(prefix="hb6c.")
+        cls.base = Path(os.path.realpath(cls.tmp))
+        from lane_fixture import git
+        cls.git = staticmethod(git)
+        cls.repo = cls.make_repo(cls.base / "repo")
+        cls.common = lanes.git_common_dir(cls.repo)
+        cls.state = cls.base / "session"
+        cls.tasks = cls.state / "tasks"
+        cls.tasks.mkdir(parents=True)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    @classmethod
+    def make_repo(cls, path):
+        path.mkdir()
+        cls.git(path, "init", "-q", "-b", "main")
+        (path / "f").write_text("1")
+        cls.git(path, "add", "f")
+        cls.git(path, "commit", "-qm", "one")
+        return path
+
+    @classmethod
+    def lane(cls, repo, name, closed=None, commit=False, raw=None):
+        """A lane of `repo`: its worktree and branch, and its record (`raw`: this text instead). commit: one commit on its branch."""
+        common = cls.lanes.git_common_dir(repo)
+        wt = cls.base / (repo.name + "-wt-" + name)
+        cls.git(repo, "worktree", "add", "-q", "-b", "lane/" + name, str(wt), "HEAD")
+        if commit:
+            (wt / "g").write_text(name)
+            cls.git(wt, "add", "g")
+            cls.git(wt, "commit", "-qm", name)
+        head = cls.git(wt, "rev-parse", "HEAD")
+        record = {"schema": "tp-lane:v1", "name": name, "kind": "work", "state": "open", "repo": str(repo), "git_common_dir": common,
+                  "branch": "lane/" + name, "worktree": str(wt), "base": {"ref": "main", "commit": cls.git(repo, "rev-parse", "HEAD")},
+                  "created": iso_off(-86400 * 2), "domain": "objective of " + name, "touches": ["lib"],
+                  "closed": [], "integrated": None, "defaulted": [], "deps": "own"}
+        if closed:
+            record["closed"] = [{"step": closed, "commit": head, "tree": cls.git(wt, "rev-parse", "HEAD^{tree}"), "review": "rev-1",
+                                 "verdict": "APPROVED", "closed_at": iso_off(-100)}]
+        if raw is not None:
+            path = Path(common) / "tmux-pi" / "lanes" / name
+            path.mkdir(parents=True, exist_ok=True)
+            (path / "lane.json").write_text(raw)
+            return
+        with cls.lanes.lane_lock(common):
+            cls.lanes.write_lane(common, record)
+
+    def task(self, ident, lane, created, life="working", review_of=None, step="S1", requests=(), raw_requests=(), reply=None, bad_meta=False):
+        d = self.tasks / ident
+        d.mkdir()
+        if bad_meta:  # meta.json cannot be read: the lane tag survives only in dispatch.json (or the lane's lease)
+            (d / "meta.json").write_text("{broken")
+            (d / "dispatch.json").write_text(json.dumps({"lane": lane, "lane_step": step}))
+            return
+        meta = {"id": ident, "worker": "claude", "role": "code-reviewer" if review_of else "coder", "created": iso_s(created),
+                "workdir": "/nonexistent", "lane": lane, "lane_step": step}
+        (d / "meta.json").write_text(json.dumps(meta))
+        (d / "dispatch.json").write_text(json.dumps({"lane": lane, "lane_step": step}))  # as tp-spawn writes it once the worker starts
+        if review_of:
+            (d / "review-of").write_text(review_of + "\n")
+        state = {"id": ident, "harness": "claude", "state": "working" if life == "working" else "waiting", "updated": iso_s(created + 1)}
+        (d / "state.json").write_text(json.dumps(state))
+        if life == "failed":
+            (d / "exit").write_text("1")
+        elif life == "settled":
+            (d / "result.md").write_text((reply + "\nRESULT_STATUS: complete\n") if reply else "RESULT_STATUS: complete\ndone\n")
+        for n, kind in enumerate(requests):
+            (d / "requests").mkdir(exist_ok=True)
+            rid = "req-" + "0" * 25 + "ABCDEFGH"[n]
+            (d / "requests" / (rid + ".json")).write_text(json.dumps({"id": rid, "task": ident, "kind": kind, "status": "open",
+                                                                      "opened": iso_s(created + 2), "summary": "s"}))
+        for n, text in enumerate(raw_requests):
+            (d / "requests").mkdir(exist_ok=True)
+            (d / "requests" / ("req-" + "0" * 25 + "YZ"[n] + ".json")).write_text(text)
+
+    def footprint(self):
+        """Everything status.py must not change: the object listing, every index file, the lane worktrees' files and the session's."""
+        out = {}
+        for root in (Path(self.common), self.state, *self.base.glob("*-wt-*")):
+            for path in sorted(root.rglob("*")):
+                rel = str(path)
+                if path.is_file() and "/.git/lock" not in rel and not rel.endswith(".lock"):
+                    out[rel] = path.read_bytes() if "/objects/" not in rel else path.stat().st_size
+                elif path.is_dir() and "/objects" in rel:
+                    out[rel] = "dir"
+        return out
+
+    def test_next_action_table(self):
+        lane = type(self).lane
+        for name in ("perm", "cap", "none", "run", "revrun", "final", "rc", "appr", "unusable", "incomplete", "dead", "queued",
+                     "twotasks", "chain", "olderrev", "badreq", "closedun", "dirty", "undisp", "unlease", "unnewer", "idonly",
+                     "nokind", "capbad", "permbad", "reqlist", "reqdict", "reqnum", "wbad", "wbadtype", "rvbad", "fresh"):
+            lane(self.repo, name, commit=name == "closedun", closed="S1" if name == "closedun" else None)
+        lane(self.repo, "closedmerged", closed="S1")
+        lane(self.repo, "badlane", raw="{not json")
+        foreign = self.make_repo(self.base / "other")
+        lane(foreign, "foreign")
+        t = self.task
+        t("t-perm", "perm", 10, requests=["permission"])
+        t("t-cap", "cap", 10, requests=["capability"])
+        t("t-run", "run", 10)
+        t("t-revrun", "revrun", 10, life="settled")
+        t("r-revrun", "revrun", 20, life="working", review_of="t-revrun")
+        t("t-final", "final", 10, life="settled")
+        t("t-rc", "rc", 10, life="settled")
+        t("r-rc", "rc", 20, review_of="t-rc", life="settled", reply="REQUEST_CHANGES\n1. broken. Closes by: code\n" + self.COVERAGE)
+        t("t-appr", "appr", 10, life="settled")
+        t("r-appr", "appr", 20, review_of="t-appr", life="settled", reply="APPROVED\n" + self.COVERAGE)
+        t("t-unusable", "unusable", 10, life="settled")
+        t("r-unusable", "unusable", 20, review_of="t-unusable", life="settled",
+          reply="REQUEST_CHANGES\n1. note. Closes by: decision\n" + self.COVERAGE)
+        t("t-incomplete", "incomplete", 10, life="settled")
+        t("r-incomplete", "incomplete", 20, review_of="t-incomplete", life="settled", reply="APPROVED\n")
+        t("t-dead", "dead", 10, life="failed")
+        (self.state / "queue").mkdir(exist_ok=True)
+        (self.state / "queue" / "q-1.json").write_text(json.dumps({"lane": "queued", "lane_step": "S1", "role": "coder", "created": iso_s(10)}))
+        t("t-two-a", "twotasks", 10, life="settled")    # the older one is final with no review; the newer one is running
+        t("t-two-b", "twotasks", 30)
+        t("t-chain-1", "chain", 10, life="settled")      # retry chain: the first attempt was rejected, the retry is running
+        t("r-chain-1", "chain", 20, review_of="t-chain-1", life="settled", reply="REQUEST_CHANGES\nx Closes by: code\n" + self.COVERAGE)
+        t("t-chain-2", "chain", 30)
+        t("t-old-1", "olderrev", 10, life="settled")     # the review is of the older task; the newest has none
+        t("r-old-1", "olderrev", 20, review_of="t-old-1", life="settled", reply="APPROVED\n" + self.COVERAGE)
+        t("t-old-2", "olderrev", 30, life="settled")
+        t("t-badreq", "badreq", 10, raw_requests=["{broken"])
+        t("t-foreign", "foreign", 10)                    # a task of a lane of another repository
+        t("t-dirty", "dirty", 10, life="settled")        # finished, no review; its worktree has uncommitted work (F1)
+        (Path(self.lanes.read_lane(self.common, "dirty")["worktree"]) / "f").write_text("changed")
+        (Path(self.lanes.read_lane(self.common, "dirty")["worktree"]) / "new-file").write_text("untracked")
+        t("t-undisp", "undisp", 10, bad_meta=True)       # unreadable task the dispatch.json places in the step (F2)
+        t("t-unlease", "unlease", 10, bad_meta=True)
+        (self.tasks / "t-unlease" / "dispatch.json").unlink()   # no tag: only the lane's lease names it
+        holder = {"kind": "worker", "access": "write", "task": "t-unlease", "role": "coder", "session": str(self.state),
+                  "pid": 1, "start": "x", "pane": None, "taken": iso_s(10)}
+        with self.lanes.lane_lock(self.common):
+            self.lane_lease._write(self.common, "unlease", [holder])
+        t("t-unnew-old", "unnewer", 10, life="settled")  # an older readable task beside a newer unreadable one
+        t("t-unnew-new", "unnewer", 30, bad_meta=True)
+        os.utime(self.tasks / "t-unnew-new" / "dispatch.json", (T0 + 30, T0 + 30))
+        t("t-idonly", "idonly", 10, raw_requests=['{"id": "req-%s"}' % ("0" * 25 + "Y")])   # F3: an id and nothing else
+        t("t-nokind", "nokind", 10, raw_requests=[json.dumps({"id": "req-" + "0" * 25 + "Y", "status": "open", "opened": iso_s(12)})])
+        t("t-capbad", "capbad", 10, requests=["capability"], raw_requests=["{broken"])   # a valid request beside a corrupt one
+        t("t-permbad", "permbad", 10, requests=["permission"], raw_requests=["{broken"])  # a readable permission still decides
+        for lane_name, bad in (("reqlist", []), ("reqdict", {}), ("reqnum", 3)):   # round 3: a status of the wrong JSON type is unreadable, not a crash
+            rid = "req-" + "0" * 25 + "Y"
+            t("t-" + lane_name, lane_name, 10, raw_requests=[json.dumps({"id": rid, "kind": "capability", "status": bad, "opened": iso_s(12)})])
+        t("t-wbad", "wbad", 10)                           # a corrupt writer state.json is not "working"
+        (self.tasks / "t-wbad" / "state.json").write_text("[1")
+        t("t-wbadtype", "wbadtype", 10)
+        (self.tasks / "t-wbadtype" / "state.json").write_text(json.dumps({"state": ["working"]}))
+        t("t-rvbad", "rvbad", 10, life="settled")         # a corrupt review state.json is not "review running"
+        t("r-rvbad", "rvbad", 20, review_of="t-rvbad")
+        (self.tasks / "r-rvbad" / "state.json").write_text("{}x")
+        t("t-fresh", "fresh", 10)                         # just started: no optional marker written yet, still running
+        (self.tasks / "t-fresh" / "state.json").unlink()
+        (self.tasks / "no-meta").mkdir()
+        status = self.status
+        before = self.footprint()
+        report = status.build(self.tasks, self.repo, now=self.NOW)
+        self.assertEqual(self.footprint(), before)  # F1: read-only means no write anywhere: objects, index, source, session files
+        got = {r["lane"]: r for r in report["lanes"]}
+        want = {  # lane: (rule, who)
+            "perm": (1, "owner"), "cap": (2, "main"), "none": (3, "main"), "run": (4, "worker"), "revrun": (5, "reviewer"),
+            "final": (6, "main"), "rc": (7, "main"), "appr": (8, "main"), "closedun": (9, "main"),
+            "unusable": (10, "unknown"), "incomplete": (10, "unknown"), "dead": (10, "unknown"), "queued": (10, "unknown"),
+            "twotasks": (4, "worker"), "chain": (4, "worker"), "olderrev": (6, "main"), "badreq": (10, "unknown"),
+            "closedmerged": (10, "unknown"), "badlane": (10, "unknown"), "dirty": (6, "main"),
+            "undisp": (10, "unknown"), "unlease": (10, "unknown"), "unnewer": (10, "unknown"), "idonly": (10, "unknown"),
+            "nokind": (10, "unknown"), "capbad": (10, "unknown"), "permbad": (1, "owner"),
+            "reqlist": (10, "unknown"), "reqdict": (10, "unknown"), "reqnum": (10, "unknown"), "wbad": (10, "unknown"),
+            "wbadtype": (10, "unknown"), "rvbad": (10, "unknown"), "fresh": (4, "worker")}
+        self.assertEqual(sorted(got), sorted(want))     # the foreign lane is left out, every other open lane has a row
+        for name, (rule, who) in want.items():
+            with self.subTest(lane=name):
+                self.assertEqual((got[name]["rule"], got[name]["who"]), (rule, who), got[name])
+        self.assertEqual(got["chain"]["task"], "t-chain-2")
+        self.assertEqual(got["twotasks"]["task"], "t-two-b")
+        self.assertEqual(got["olderrev"]["review"], None)
+        self.assertEqual(got["appr"]["review"], {"id": "r-appr", "verdict": "APPROVED"})
+        self.assertEqual(got["perm"]["requests"][0]["kind"], "permission")
+        self.assertEqual(got["run"]["state"]["state"], "stalled")  # timeline's word: no first prompt in 4990 s
+        self.assertEqual((got["run"]["objective"], got["run"]["step"], got["run"]["age"]), ("objective of run", "S1", "2d"))
+        self.assertIn("t-cap", got["cap"]["next"])        # F5: the row's own values replace TASK, REQ, LANE and STEP
+        self.assertIn("req-" + "0" * 25 + "A", got["cap"]["next"])
+        self.assertIn("review t-final", got["final"]["next"])
+        self.assertIn("retry t-rc", got["rc"]["next"])
+        self.assertIn("lane close appr S1", got["appr"]["next"])
+        self.assertIn("lane remove closedun", got["closedun"]["next"])
+        self.assertIn("t-unnew-new", got["unnewer"]["next"])
+        wheres = " ".join(p["where"] + " " + p["problem"] for p in report["problems"])
+        for word in ("no-meta", "req-", "badlane", "t-undisp", "t-unnew-new"):
+            self.assertIn(word, wheres)
+        order = [r["who"] for r in report["lanes"]]
+        self.assertEqual(order, sorted(order, key=lambda w: status.WHO_ORDER[w]))  # owner, then main, then worker/reviewer, unknown last
+        text = status.render(report)
+        for name in want:
+            if name != "badlane":
+                self.assertIn("objective of " + name, text)   # F4: text mode shows every row field
+        self.assertEqual(len([line for line in text.splitlines() if "  -> " in line]), len(want))
+        for secret in ("done", "broken"):
+            self.assertNotIn(secret, text)
+        # Round 4: unreadable evidence never becomes a definite action. In-process rows over existing lanes (no new worktree):
+        # each mutates one record, reads that one lane, asserts the rule and the problem naming the record, then puts it back.
+        self.assertEqual(set(status.LIFE_READS), set(__import__("lifecycle_files").LIFECYCLE_FILES))  # every lifecycle file is read
+        mine, real = status._session(self.state)[0], status.lane_steps.Session(self.state)   # round 5: the snapshot is Session's
+        self.assertEqual((mine.tasks, mine.queued, mine.unreadable), (real.tasks, real.queued, real.unreadable))
+        t("t-run-new", "final", 30)                       # a newer running writer: the step is at it (rule 4), not at t-final
+        t("r-appr-new", "appr", 30, review_of="t-appr")   # a newer running review of t-appr (rule 5), not the older approval
+        rows = [  # (lane, file, contents or None to delete, rule, record named under problems)
+            ("run", "t-run/state.json", "{}", 10, "t-run/state.json"),
+            ("run", "t-run/state.json", '{"state": null, "updated": "%s"}' % iso_s(11), 10, "t-run/state.json"),
+            ("run", "t-run/state.json", '{"state": 7, "updated": "%s"}' % iso_s(11), 10, "t-run/state.json"),
+            ("run", "t-run/state.json", '{"state": "working", "updated": "soon"}', 10, "t-run/state.json"),
+            ("run", "t-run/checkpoints.json", '{"events": [3]}', 10, "t-run/checkpoints.json"),
+            ("run", "t-run/checkpoints.json", '{"events": [{"action": "pause", "tools": "x"}]}', 10, "t-run/checkpoints.json"),
+            ("run", "t-run/checkpoints.json", "{bad", 10, "t-run/checkpoints.json"),
+            ("run", "t-run/completed", "bad", 10, "t-run/completed"),
+            ("run", "t-run/result.md", b"\xff\xfe\xfa", 10, "t-run/result.md"),
+            ("run", "t-run/permission-request.json", "{bad", 10, "t-run/permission-request.json"),
+            ("run", "t-run/capability-request.json", "{bad", 10, "t-run/capability-request.json"),
+            ("revrun", "r-revrun/checkpoints.json", '{"events": [3]}', 10, "r-revrun/checkpoints.json"),   # the review's too
+            ("perm", "t-perm/capability-request.json", "{bad", 1, "t-perm/capability-request.json"),  # a readable permission decides
+            ("final", "t-run-new/meta.json", None, 4, None),  # baseline: the newest writer is at work
+            ("final", "t-run-new/meta.json", {"created": []}, 10, "t-run-new/meta.json"),
+            ("final", "t-run-new/meta.json", {"created": "broken"}, 10, "t-run-new/meta.json"),
+            ("final", "t-run-new/meta.json", {"lane_step": []}, 10, "t-run-new/meta.json"),
+            ("appr", "r-appr-new/meta.json", None, 5, None),
+            ("appr", "r-appr-new/meta.json", {"created": []}, 10, "r-appr-new/meta.json"),
+            ("fresh", "t-fresh/state.json", None, 4, None),   # just started, no optional file: running, nothing listed
+            # Round 5 F1: a record a shared reader cannot decode keeps its lane as a row, unknown, with the record listed.
+            ("run", "t-run/review-of", b"\xff\n", 10, "t-run/review-of"),          # undecodable review-of, writer
+            ("appr", "r-appr/review-of", b"\xff\n", 10, "r-appr/review-of"),       # and review
+            ("run", "t-run/meta.json", DEEP, 10, "t-run/meta.json"),                # too deep to decode: unreadable, placed by dispatch.json
+            ("run", "t-run/state.json", DEEP, 10, "t-run/state.json"),
+            ("cap", "t-cap/requests/req-" + "0" * 25 + "A.json", DEEP, 10, "t-cap/requests/req-" + "0" * 25 + "A.json"),
+            ("rc", "r-rc/acceptance-items.json", DEEP, 10, "r-rc/acceptance-items.json"),
+            ("rc", "r-rc/acceptance-items.json", '{"it', 10, "r-rc/acceptance-items.json"),   # truncated: listed by the file
+            # Round 7 F2: a failed record is listed by its file, not only its directory.
+            ("rc", "r-rc/sweep-rows.json", "{bad", 10, "r-rc/sweep-rows.json"),   # (r-appr is shadowed by a newer review; r-rc is the one read)
+            ("run", "t-run/meta.json", "{broken", 10, "t-run/meta.json"),       # the only writer; its dispatch tag is valid
+            ("run", "t-foreign/state.json", DEEP, 4, "t-foreign/state.json"),   # a decoder error on 3.9, a wrong shape on 3.14: listed either way, lane run keeps its rule
+            ("run", "t-foreign/state.json", b"\xff\xfe", 4, "t-foreign/state.json"),   # undecodable on every version
+            ("final", "t-run-new/meta.json", {"created": 10 ** 400}, 10, "t-run-new/meta.json"),   # timeline overflows on it
+            ("run", "../queue/q-deep.json", DEEP, 4, None),   # a queue item that cannot be decoded places nothing
+            # Round 5 F2: a JSON integer too large for a double is a number (contract.lifecycle only compares numbers).
+            ("run", "t-run/state.json", '{"state": "working", "updated": "%s", "tools": %d}' % (iso_s(11), 10 ** 400), 4, None),
+            ("run", "t-run/checkpoints.json", '{"events": [{"action": "nudge-stall", "tools": %d}]}' % 10 ** 400, 4, None),
+            # Round 5 F3: each check round 4 added, one row each.
+            ("run", "t-run/state.json", '{"state": "working", "updated": "%s", "tools": "x"}' % iso_s(11), 10, "t-run/state.json"),
+            ("run", "t-run/state.json", '{"state": "working", "updated": "%s", "completedTurn": 1.5}' % iso_s(11), 10, "t-run/state.json"),
+            ("run", "t-run/checkpoints.json", '{"events": [{"action": "pause", "turn": "x"}]}', 10, "t-run/checkpoints.json"),
+            ("run", "t-run/exit", "\n", 10, "t-run/exit"),
+            ("run", "t-run/requests", "x", 10, "t-run/requests"),                  # requests/ is a file
+            ("run", "t-run/requests", ("link", "t-cap/requests"), 10, "t-run/requests"),   # or a symlink
+            ("final", "t-run-new/meta.json", {"role": 7}, 10, "t-run-new/meta.json"),
+            ("run", "t-run/review-of", "not a task id\n", 10, "t-run/review-of"),
+            ("final", "t-run-new/meta.json", {"role": ...}, 4, None),           # a missing role is valid (tp-spawn omits an empty one)
+            # Round 8: a value that parses but cannot be used (no decoder error names a file) is found by elimination.
+            ("run", "t-foreign/meta.json", {"created": 10 ** 400}, 4, "t-foreign/meta.json"),   # contrived
+            ("run", "t-foreign/collected.json", '{"collected": %d}' % 10 ** 400, 4, "t-foreign/collected.json"),   # a marker time; contrived
+            ("run", "t-run/gate.json", '{"started": %d, "finished": 5}' % 10 ** 400, 10, "t-run/gate.json"),   # a gate time of the lane's own task; contrived
+            # Round 9: selected and foreign tasks give the same attribution; a replayed absent task is absent, not built.
+            ("run", "t-foreign/meta.json", {"queued_at": 10 ** 400}, 4, "t-foreign/meta.json"),   # contrived
+            ("run", "t-run/meta.json", {"created": 10 ** 400}, 10, "t-run/meta.json"),            # contrived
+            ("run", "t-run/meta.json", {"queued_at": 10 ** 400}, 10, "t-run/meta.json"),          # contrived; failed before the fix
+        ]
+        baseline = {r["lane"]: r for r in status.build(self.tasks, self.repo, now=self.NOW, rows=[{"name": n, "state": "open"} for n in ("run", "perm")])["lanes"]}
+        witness_state = baseline["perm"]["state"]
+        baseline = baseline["run"]
+        for lane_name, rel, body, rule, where in rows:
+            with self.subTest(lane=lane_name, record=rel, body=body):
+                path = self.tasks / rel
+                saved = path.read_bytes() if path.exists() else None
+                if isinstance(body, dict):   # these fields changed; a field set to ... is removed
+                    fields = dict(json.loads(saved), **body)
+                    path.write_text(json.dumps({k: v for k, v in fields.items() if v is not ...}))
+                elif isinstance(body, tuple):
+                    path.symlink_to(self.tasks / body[1])
+                elif isinstance(body, bytes):
+                    path.write_bytes(body)
+                elif body is not None:
+                    path.write_text(body)
+                witness = "perm" if lane_name != "perm" else "cap"   # another open lane: its definite rule is unchanged
+                try:
+                    one = status.build(self.tasks, self.repo, now=self.NOW, rows=[{"name": n, "state": "open"} for n in (lane_name, witness)])
+                finally:
+                    if saved is not None:
+                        path.write_bytes(saved)
+                    elif os.path.lexists(path):
+                        path.unlink()
+                row, other = sorted(one["lanes"], key=lambda r: r["lane"] != lane_name)
+                self.assertEqual(row["rule"], rule, row)
+                if rule == 4 and lane_name == "run" and "foreign" in rel:   # the healthy lane keeps its whole state, `since` too
+                    self.assertEqual(row["state"], baseline["state"], row)
+                self.assertEqual(other["rule"], want[witness][0], other)
+                if isinstance(body, dict) and 10 ** 400 in body.values():
+                    self.assertEqual(other["state"], witness_state, other)   # round 9: the healthy lane keeps {state, since}
+                listed = [p["where"] for p in one["problems"]]
+                if where:
+                    self.assertIn(str(self.tasks / where), listed)
+                    self.assertTrue(row["next"].startswith("unknown") or rule in (1, 4), row)   # (rule 4: a foreign task's record)
+                else:
+                    self.assertFalse([w for w in listed if Path(w).parent.name in rel], listed)
+        # Round 7 F1: a foreign task's undecodable record and another's malformed one cost the healthy lane nothing, and both are listed.
+        t("t-foreign-b", "foreign", 12)
+        saved = {n: (self.tasks / n / "state.json").read_bytes() for n in ("t-foreign", "t-foreign-b")}
+        (self.tasks / "t-foreign" / "state.json").write_text(DEEP)    # a decoder error on 3.9, a wrong shape on 3.14
+        (self.tasks / "t-foreign-b" / "state.json").write_text("{bad")
+        try:
+            one = status.build(self.tasks, self.repo, now=self.NOW, rows=[{"name": n, "state": "open"} for n in ("run", "perm")])
+        finally:
+            for n, body in saved.items():
+                (self.tasks / n / "state.json").write_bytes(body)
+        row = {r["lane"]: r for r in one["lanes"]}["run"]
+        self.assertEqual((row["rule"], row["state"]["state"], sorted(row["state"])), (4, "stalled", ["since", "state"]), row)
+        listed = [p["where"] for p in one["problems"]]
+        for n in ("t-foreign", "t-foreign-b"):
+            self.assertIn(str(self.tasks / n / "state.json"), listed)
+        self.assertFalse([p for p in one["problems"] if p["where"] == str(self.tasks / "t-run") and "no timeline" in p["problem"]])
+        if os.geteuid() != 0:   # round 5: no session can be read, yet every open lane is still a row (unknown), not lanes: []
+            os.chmod(self.tasks, 0)
+            try:
+                one = status.build(self.tasks, self.repo, now=self.NOW, rows=[{"name": "run", "state": "open"}])
+            finally:
+                os.chmod(self.tasks, 0o755)
+            self.assertEqual([(r["lane"], r["rule"]) for r in one["lanes"]], [("run", 10)])
+            self.assertIn(str(self.state), [p["where"] for p in one["problems"]])
+
+    def test_cli(self):
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(self.status.main([str(self.tasks), "--repo", str(self.repo), "--json", "--now", iso_s(5000)]), 0)
+        self.assertIn("lanes", json.loads(buf.getvalue()))
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                self.status.main([str(self.tasks), "--now", "yesterday"])
+            with self.assertRaises(SystemExit):
+                self.status.main([str(self.base / "nope")])
 
 
 if __name__ == "__main__":

@@ -33,3 +33,18 @@ with the owner's `tp-agent lane close hub-correct HB4a --override-review` at a t
 - **Integration check done:** main 16b8d4d merged with lane/hub-correct b17720d and the two "keep both" resolutions (combo
   7ade220, tree fa5e9d8): full parallel discovery `Ran 5401 tests in 585.707s`, `OK (skipped=78)`. Merging after the owner's
   override must produce tree fa5e9d8 (if main has not moved).
+
+## HB4c (merged 37e7a0e; review-coder-2d72f4c144-204159 APPROVED_WITH_NOTES)
+K2 is fixed for two distinct Stops: a prompt that arrived while an earlier reply ran is owed (`owedTurn`), and a later
+distinct Stop completes it (report.sh and reporter.ts). Step 1 found one Stop for all prompts in about 47 of 50 overlapping
+groups (Claude Code injects the later prompt into the running turn) and two Stops in 1 certain case. In the one-Stop case turn
+2 closes without its own completion; its pause stays live until a later turn completes (fails safe).
+- **HB4c-L1 (review F1, medium, contrived, 0 seen): accepted.** P1 P2 S1 P3 S2 credits turn 3 at S2, before turn 3's reply
+  exists. Up to S2 it is the same event order as the common "one Stop, then a new prompt", which must credit 3 there; the
+  only hook-only alternative lags every later completion by one turn (F1's symptom). Direction if it is ever seen: the reply
+  names the turn it answers (reply identity), not a hook rule. Main's decision, 2026-11-12.
+- **HB4c-L2 (review F2, low, pre-existing): follow-up.** After a new prompt, a duplicate of an older statused Stop is taken
+  as the open prompt's Stop and can complete the new turn (report.sh:127-149; traced, not run). Direction: check
+  `already_kept` for an active Stop too. Named follow-up HB4d; not started.
+- The trust-store guard again refused an edit whose text only named the trust store (the F5 tooling follow-up above); this
+  worker asked first and used Edit on Main's grant.

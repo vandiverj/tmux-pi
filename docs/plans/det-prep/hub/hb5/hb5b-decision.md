@@ -31,3 +31,12 @@ is a line in claude/main-prompt.md, which needs the owner's OK.
 **Decided 2026-11-12: A** (owner: "A"). claude/main-prompt.md, Lanes section, now tells Main to run its own checks through
 `tools/agent/test-run.sh WORKTREE --main --lane L --step S -- CMD`. Main's cell script records each module run in
 SESSION/main-runs with lane, step and interpreter. Next: once a few lanes have records, read the repeat report and decide on reuse.
+
+**First lane under A (HB4c, lane hub-overlap), repeats.py --lane hub-overlap:** 59 runs, 677 s; 0 s counted as repeats.
+- Main's 52 cell runs were all on tree f54c454 (main 1d22a24 + the lane), the worker's 6 and the reviewer's 1 on the lane's
+  own tree cdbfd86. Main had committed two docs commits after the lane's base, so the trees differ and nothing can match. A
+  repeat shows only when main has not moved since the lane's base (then the merge tree is the lane's tree).
+- Main's 26 in-tmux cell runs are "not understood": the cell sets TMUX=/tmp/x,1,1, and a value starting with "/" is outside
+  the report's word grammar (tools/checks/repeats.py WORD). The out-of-tmux cells are understood.
+- So far the evidence says: Main's cells mostly check a different tree from the worker's (a real integration check, not a
+  pure repeat). More lanes are needed before a reuse decision.

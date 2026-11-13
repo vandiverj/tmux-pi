@@ -1239,3 +1239,14 @@ Each lane: checkpoint, Main's evidence, openai-codex review, notes closed, `lane
   `not-owner` in the untracked .tmux-pi/il1/labels-B.json (label_before kept). Corpus B is now 227 messages, 25 process (11%,
   was 30 / 13%); verification kind 9 -> 6, other 3 -> 1, repeats 11 -> 9. Friction report: ungrouped label rows 12 -> 7.
   test_friction_report + test_docs_wiring 29 OK. Row #86 (a pasted build/test summary, labelled other) left as owner-typed.
+
+## 2026-11-12 — HB2c merged; full run; HB5b decision A; HB4c dispatched
+- HB2c (lane hub-launch-summary): three rounds (66711f1, 3c4ff44, 0d1201e); review-coder-33998c9783-194108
+  APPROVED_WITH_NOTES (F1 reporting note only); merged 46826a6. Full run on main 46826a6: 5561 tests OK (skipped 78), 2891 s.
+- HB5b owner decision A ("A"): claude/main-prompt.md tells Main to run its own checks through test-run.sh --main; Main's
+  cell script now records each module run in SESSION/main-runs (e1ec599).
+- HB4c (design, Opus, lane hub-overlap, coder-2d72f4c144) on HB4b F1. Step 1 over 419 Claude workers: of 50 overlapping
+  prompt groups, about 47 got one Stop for all prompts and 1 certainly got two (1 ambiguous). Rule: a new owedTurn lets a
+  second distinct Stop complete turn 2; one Stop never credits turn 2. Main confirmed zero lag in the realistic order, and
+  the contrived P1 P2 S1 P3 S2 S3 early credit is a known limit. Worker asked before using Edit on report.sh after the
+  trust-store guard misread a python heredoc (granted).

@@ -626,7 +626,7 @@ class LaneSnapshotTests(LaneCase):
 
     def normalized(self, text, task_id):
         text = text.replace(str(self.root), "<root>").replace(task_id, "<task>")
-        text = re.sub(r"\d{4}-\d\d-\d\dT[\d:]+(?:Z|\+00:00)", "<time>", text)
+        text = re.sub(r"\d{4}-\d\d-\d\dT[\d:]+(?:\.\d+)?(?:Z|\+00:00)", "<time>", text)
         text = re.sub(r"\d{8}T\d{6}Z", "<time>", text)  # the archive name's compact stamp
         text = re.sub(r'"age": "[^"]*"', '"age": "<age>"', text)  # `lanes` shows the lane's age: a restored lane is older than a fresh one
         return re.sub(r"sel-[0-9a-f]{32}", "<selection>", text)

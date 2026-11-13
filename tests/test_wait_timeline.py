@@ -945,7 +945,12 @@ class StatusTest(unittest.TestCase):
             ("final", "t-run-new/meta.json", {"role": 7}, 10, "t-run-new/meta.json"),
             ("run", "t-run/review-of", "not a task id\n", 10, "t-run/review-of"),
             ("final", "t-run-new/meta.json", {"role": ...}, 4, None),           # a missing role is valid (tp-spawn omits an empty one)
+            # Round 8: a value that parses but cannot be used (no decoder error names a file) is found by elimination.
+            ("run", "t-foreign/meta.json", {"created": 10 ** 400}, 4, "t-foreign/meta.json"),   # contrived
+            ("run", "t-foreign/collected.json", '{"collected": %d}' % 10 ** 400, 4, "t-foreign/collected.json"),   # a marker time; contrived
+            ("run", "t-run/gate.json", '{"started": %d, "finished": 5}' % 10 ** 400, 10, "t-run/gate.json"),   # a gate time of the lane's own task; contrived
         ]
+        baseline = {r["lane"]: r for r in status.build(self.tasks, self.repo, now=self.NOW, rows=[{"name": "run", "state": "open"}])["lanes"]}["run"]
         for lane_name, rel, body, rule, where in rows:
             with self.subTest(lane=lane_name, record=rel, body=body):
                 path = self.tasks / rel
@@ -969,6 +974,8 @@ class StatusTest(unittest.TestCase):
                         path.unlink()
                 row, other = sorted(one["lanes"], key=lambda r: r["lane"] != lane_name)
                 self.assertEqual(row["rule"], rule, row)
+                if rule == 4 and lane_name == "run" and "foreign" in rel:   # the healthy lane keeps its whole state, `since` too
+                    self.assertEqual(row["state"], baseline["state"], row)
                 self.assertEqual(other["rule"], want[witness][0], other)
                 listed = [p["where"] for p in one["problems"]]
                 if where:

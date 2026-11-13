@@ -494,19 +494,58 @@ def _session(state_dir):
 class _TotalReader(timeline.Reader):
     """timeline.Reader whose json() lists a record it cannot decode however it fails (RecursionError is not a ValueError), the
     way it lists one that decodes to the wrong shape: one bad record, one outcome on every Python version. `undecodable`
-    holds the paths that failed with an error timeline.Reader does not name."""
+    holds the paths that failed with an error timeline.Reader does not name. `opened` holds every path a read was asked for;
+    `hidden` are paths this reader treats as absent (elimination on the failure path, see _explain)."""
 
-    def __init__(self):
+    def __init__(self, hidden=()):
         super().__init__()
         self.undecodable = []
+        self.opened = []
+        self.hidden = frozenset(hidden)
+
+    def _asked(self, path):
+        path = Path(path)
+        if path not in self.opened:
+            self.opened.append(path)
+        return path in self.hidden
 
     def json(self, path, label, need_dict=True):
+        if self._asked(path):
+            return None
         try:
             return super().json(path, label, need_dict)
         except Exception:
             self.problem(path, "malformed " + label)
             self.undecodable.append(path)
             return None
+
+    def mtime(self, path):
+        return None if self._asked(path) else super().mtime(path)
+
+    def text(self, path, limit=4096):
+        return None if self._asked(path) else super().text(path, limit)
+
+    def jsonl(self, path, label):
+        return [] if self._asked(path) else super().jsonl(path, label)
+
+
+def _explain(directory, opened, attempt):
+    """The files of a culprit task that explain its failure, by elimination. `opened` are the files the failed load read;
+    attempt(reader) reloads the task with that reader and raises when it still fails. Each file is hidden alone (a reader
+    that treats it as absent); those whose hiding lets the load succeed are returned. Worst case: one reload per opened
+    file (the files the timeline reads for one task, about a dozen), and none for a healthy task."""
+    found = []
+    for path in opened:
+        if path == directory or not path.exists():
+            continue
+        reader = _TotalReader(hidden=[path])
+        try:
+            attempt(reader)
+        except Exception:
+            continue
+        if not reader.undecodable:
+            found.append(path)
+    return found
 
 
 def _timeline(tasks_dir, ids, now):
@@ -515,8 +554,10 @@ def _timeline(tasks_dir, ids, now):
     timeline.build reads every task directory, so one record it cannot take (a state.json too deep to decode) raises out of it
     for every lane. When it raises, each directory is loaded alone to find the culprits (a task whose records cannot be
     decoded), and the timeline is rebuilt over every other task, so a healthy lane keeps its row. A culprit's lanes are unknown.
-    Every problem found is returned, decodable or not. A failure no task can be named for is returned as `error` (every lane
-    is then unknown)."""
+    A culprit whose error names no file (a value that parses but cannot be used) is explained by elimination (_explain): the
+    file whose hiding lets the task load is listed under problems with its path; the culprit's why then says so, and the
+    directory is listed only when no single file explains it. Every problem found is returned, decodable or not. A failure no
+    task can be named for is returned as `error` (every lane is then unknown)."""
     try:
         report = timeline.build(tasks_dir, ids, now)
         return {r["task"]: r for r in report["tasks"]}, report["problems"], {}, None
@@ -527,7 +568,7 @@ def _timeline(tasks_dir, ids, now):
         dirs = sorted(p for p in Path(tasks_dir).iterdir() if p.is_dir() and not p.is_symlink())
     except Exception:
         dirs = []
-    tasks, by_review = {}, {}
+    tasks, by_review, opened, unnamed = {}, {}, {}, set()
     for d in dirs:
         reader = _TotalReader()
         task = None
@@ -535,8 +576,10 @@ def _timeline(tasks_dir, ids, now):
             task = timeline.load_task(reader, d)
         except Exception as error:
             culprits[d.name] = f"the timeline cannot read the task's records ({error.__class__.__name__})"
+            unnamed.add(d.name)
         if reader.undecodable:  # the record is listed under its own path, as timeline lists a wrong shape
             culprits.setdefault(d.name, "the timeline cannot decode the task's records")
+        opened[d.name] = reader.opened
         problems += reader.problems
         if task is not None and d.name not in culprits:
             tasks[task["id"]] = task
@@ -555,7 +598,24 @@ def _timeline(tasks_dir, ids, now):
                 rows[row["task"]] = row
         except Exception as error:
             culprits[ident] = f"the timeline cannot read the task's records ({error.__class__.__name__})"
+            unnamed.add(ident)
+            opened[ident] = opened.get(ident, []) + [p for p in reader.opened if p not in opened.get(ident, [])]
         problems += reader.problems
+    for name in sorted(unnamed & set(culprits)):
+        directory = Path(tasks_dir) / name
+
+        def attempt(reader, directory=directory, name=name):
+            task = timeline.load_task(reader, directory)
+            if name in ids:
+                timeline.build_task(reader, task, by_review, now, {}, None)
+        files = _explain(directory, opened.get(name, []), attempt)
+        for path in files:
+            problems.append({"where": str(path), "problem": "the timeline cannot use this record (hiding it lets the task load)"})
+        if files:
+            culprits[name] = "the timeline cannot read the task's records, explained by: " + ", ".join(p.name for p in files)
+            unnamed.discard(name)
+        else:
+            culprits[name] += "; no single file explains it"
     return rows, problems, culprits, (failure if not culprits else None)
 
 
@@ -637,7 +697,8 @@ def build(tasks_dir, repo, now=None, rows=None):
         for entry in found:
             problem(entry["where"], entry["problem"])
         for name, why in culprits.items():
-            problem(state_dir / "tasks" / name, why)
+            if "explained by" not in why:  # a file named under problems explains the culprit; the directory is listed otherwise
+                problem(state_dir / "tasks" / name, why)
         if failure is not None:
             problems.append({"where": str(state_dir / "tasks"), "problem": f"timeline unreadable ({failure.__class__.__name__})"})
             chosen = [(n, r, t, s, why or f"the session's timeline cannot be built ({failure.__class__.__name__})") for n, r, t, s, why in chosen]

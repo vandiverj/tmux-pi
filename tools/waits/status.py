@@ -606,7 +606,7 @@ def _timeline(tasks_dir, ids, now):
 
         def attempt(reader, directory=directory, name=name):
             task = timeline.load_task(reader, directory)
-            if name in ids:
+            if task is not None and name in ids:  # an absent task is a successful load, as timeline.build treats it
                 timeline.build_task(reader, task, by_review, now, {}, None)
         files = _explain(directory, opened.get(name, []), attempt)
         for path in files:

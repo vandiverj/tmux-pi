@@ -949,8 +949,14 @@ class StatusTest(unittest.TestCase):
             ("run", "t-foreign/meta.json", {"created": 10 ** 400}, 4, "t-foreign/meta.json"),   # contrived
             ("run", "t-foreign/collected.json", '{"collected": %d}' % 10 ** 400, 4, "t-foreign/collected.json"),   # a marker time; contrived
             ("run", "t-run/gate.json", '{"started": %d, "finished": 5}' % 10 ** 400, 10, "t-run/gate.json"),   # a gate time of the lane's own task; contrived
+            # Round 9: selected and foreign tasks give the same attribution; a replayed absent task is absent, not built.
+            ("run", "t-foreign/meta.json", {"queued_at": 10 ** 400}, 4, "t-foreign/meta.json"),   # contrived
+            ("run", "t-run/meta.json", {"created": 10 ** 400}, 10, "t-run/meta.json"),            # contrived
+            ("run", "t-run/meta.json", {"queued_at": 10 ** 400}, 10, "t-run/meta.json"),          # contrived; failed before the fix
         ]
-        baseline = {r["lane"]: r for r in status.build(self.tasks, self.repo, now=self.NOW, rows=[{"name": "run", "state": "open"}])["lanes"]}["run"]
+        baseline = {r["lane"]: r for r in status.build(self.tasks, self.repo, now=self.NOW, rows=[{"name": n, "state": "open"} for n in ("run", "perm")])["lanes"]}
+        witness_state = baseline["perm"]["state"]
+        baseline = baseline["run"]
         for lane_name, rel, body, rule, where in rows:
             with self.subTest(lane=lane_name, record=rel, body=body):
                 path = self.tasks / rel
@@ -977,6 +983,8 @@ class StatusTest(unittest.TestCase):
                 if rule == 4 and lane_name == "run" and "foreign" in rel:   # the healthy lane keeps its whole state, `since` too
                     self.assertEqual(row["state"], baseline["state"], row)
                 self.assertEqual(other["rule"], want[witness][0], other)
+                if isinstance(body, dict) and 10 ** 400 in body.values():
+                    self.assertEqual(other["state"], witness_state, other)   # round 9: the healthy lane keeps {state, since}
                 listed = [p["where"] for p in one["problems"]]
                 if where:
                     self.assertIn(str(self.tasks / where), listed)

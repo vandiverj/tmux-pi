@@ -466,6 +466,39 @@ class ClaudeReportTests(unittest.TestCase):
         self.assertEqual(turns() + [self.state()["replyTurn"]], ["working", 8, 6, 0, 8])
         self.hook("Stop", last_assistant_message="eight\nRESULT_STATUS: complete")
         self.assertEqual(turns(), ["waiting", 8, 8, 0])
+        # HB4d rule 2': an open prompt's Stop whose reply is byte-equal to a kept one ends the working state (never stuck)
+        # but completes nothing, and its turn stays owed. (a) a duplicate of turn 8's Stop after prompt 9 (HB4c-L2,
+        # contrived): turn 9's own new Stop then completes 9. Statused and unstatused duplicates alike.
+        nine = "nine\nRESULT_STATUS: complete"
+        self.hook("UserPromptSubmit", prompt="t9")
+        self.hook("Stop", last_assistant_message="eight\nRESULT_STATUS: complete")
+        self.assertEqual(turns(), ["waiting", 9, 8, 9])
+        self.hook("Stop", last_assistant_message="meh")  # an older unstatused reply again: no open prompt, nothing changes
+        self.assertEqual(turns(), ["waiting", 9, 8, 9])
+        self.hook("Stop", last_assistant_message=nine)
+        self.assertEqual(turns(), ["waiting", 9, 9, 0])
+        self.assertEqual((self.task / "result.md").read_text(), nine + "\n")
+        # (b) turn 10's own reply repeats turn 9's word for word (coder-61108a8b31, realistic): the worker waits, turn 10
+        # is owed, not completed; the next prompt closes it and turn 11's new Stop completes 11.
+        self.hook("UserPromptSubmit", prompt="t10")
+        self.hook("Stop", last_assistant_message=nine)
+        self.assertEqual(turns(), ["waiting", 10, 9, 10])
+        self.assertEqual((self.task / "result.md").read_text(), nine + "\n")
+        self.hook("UserPromptSubmit", prompt="t11")
+        self.assertEqual(turns() + [self.state()["replyTurn"]], ["working", 11, 9, 0, 11])
+        self.hook("Stop", last_assistant_message="eleven\nRESULT_STATUS: complete")
+        self.assertEqual(turns(), ["waiting", 11, 11, 0])
+        # overlapping prompts, then a duplicate: it answers nothing, so turn 12 stays owed and each own Stop completes its
+        # turn; an unstatused duplicate (meh) on an open prompt also keeps the turn owed.
+        self.hook("UserPromptSubmit", prompt="t12")
+        self.hook("UserPromptSubmit", prompt="t13")
+        self.hook("Stop", last_assistant_message="meh")
+        self.assertEqual(turns(), ["waiting", 13, 11, 12])
+        self.hook("Stop", last_assistant_message="twelve\nRESULT_STATUS: complete")
+        self.assertEqual(turns(), ["waiting", 13, 12, 13])
+        self.hook("Stop", last_assistant_message="thirteen\nRESULT_STATUS: complete")
+        self.assertEqual(turns(), ["waiting", 13, 13, 0])
+        self.assertEqual((self.task / "result.md").read_text(), "thirteen\nRESULT_STATUS: complete\n")
 
     def test_reply_decides_attack_table(self):
         # prior result.md x reply x turn origin (rows from evidence/attack.py; the origin never changes the answer).

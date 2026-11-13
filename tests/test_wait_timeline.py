@@ -669,6 +669,9 @@ class WaitTimelineTest(unittest.TestCase):
                 timeline.main([str(tasks), "--now", "yesterday"])
 
 
+DEEP = "[" * 1100 + "0" + "]" * 1100  # valid JSON that json.loads cannot decode (RecursionError)
+
+
 class StatusTest(unittest.TestCase):
     """tools/waits/status.py (HB6c): one real git repository with one lane per case and a session dir of task records; one
     table-driven method over the lanes, one CLI check."""
@@ -742,6 +745,7 @@ class StatusTest(unittest.TestCase):
         meta = {"id": ident, "worker": "claude", "role": "code-reviewer" if review_of else "coder", "created": iso_s(created),
                 "workdir": "/nonexistent", "lane": lane, "lane_step": step}
         (d / "meta.json").write_text(json.dumps(meta))
+        (d / "dispatch.json").write_text(json.dumps({"lane": lane, "lane_step": step}))  # as tp-spawn writes it once the worker starts
         if review_of:
             (d / "review-of").write_text(review_of + "\n")
         state = {"id": ident, "harness": "claude", "state": "working" if life == "working" else "waiting", "updated": iso_s(created + 1)}
@@ -888,6 +892,8 @@ class StatusTest(unittest.TestCase):
         # Round 4: unreadable evidence never becomes a definite action. In-process rows over existing lanes (no new worktree):
         # each mutates one record, reads that one lane, asserts the rule and the problem naming the record, then puts it back.
         self.assertEqual(set(status.LIFE_READS), set(__import__("lifecycle_files").LIFECYCLE_FILES))  # every lifecycle file is read
+        mine, real = status._session(self.state)[0], status.lane_steps.Session(self.state)   # round 5: the snapshot is Session's
+        self.assertEqual((mine.tasks, mine.queued, mine.unreadable), (real.tasks, real.queued, real.unreadable))
         t("t-run-new", "final", 30)                       # a newer running writer: the step is at it (rule 4), not at t-final
         t("r-appr-new", "appr", 30, review_of="t-appr")   # a newer running review of t-appr (rule 5), not the older approval
         rows = [  # (lane, file, contents or None to delete, rule, record named under problems)
@@ -911,32 +917,69 @@ class StatusTest(unittest.TestCase):
             ("appr", "r-appr-new/meta.json", None, 5, None),
             ("appr", "r-appr-new/meta.json", {"created": []}, 10, "r-appr-new/meta.json"),
             ("fresh", "t-fresh/state.json", None, 4, None),   # just started, no optional file: running, nothing listed
+            # Round 5 F1: a record a shared reader cannot decode keeps its lane as a row, unknown, with the record listed.
+            ("run", "t-run/review-of", b"\xff\n", 10, "t-run/review-of"),          # undecodable review-of, writer
+            ("appr", "r-appr/review-of", b"\xff\n", 10, "r-appr/review-of"),       # and review
+            ("run", "t-run/meta.json", DEEP, 10, "t-run"),                          # too deep to decode: unreadable, placed by dispatch.json
+            ("run", "t-run/state.json", DEEP, 10, "t-run/state.json"),
+            ("cap", "t-cap/requests/req-" + "0" * 25 + "A.json", DEEP, 10, "t-cap/requests/req-" + "0" * 25 + "A.json"),
+            ("rc", "r-rc/acceptance-items.json", DEEP, 10, "r-rc"),
+            ("rc", "r-rc/acceptance-items.json", '{"it', 10, "r-rc"),           # truncated: the unparseable verdict is listed
+            ("run", "t-foreign/state.json", DEEP, 4, None),   # timeline raises for every task; only the lanes of t-foreign are unknown
+            ("final", "t-run-new/meta.json", {"created": 10 ** 400}, 10, "t-run-new/meta.json"),   # timeline overflows on it
+            ("run", "../queue/q-deep.json", DEEP, 4, None),   # a queue item that cannot be decoded places nothing
+            # Round 5 F2: a JSON integer too large for a double is a number (contract.lifecycle only compares numbers).
+            ("run", "t-run/state.json", '{"state": "working", "updated": "%s", "tools": %d}' % (iso_s(11), 10 ** 400), 4, None),
+            ("run", "t-run/checkpoints.json", '{"events": [{"action": "nudge-stall", "tools": %d}]}' % 10 ** 400, 4, None),
+            # Round 5 F3: each check round 4 added, one row each.
+            ("run", "t-run/state.json", '{"state": "working", "updated": "%s", "tools": "x"}' % iso_s(11), 10, "t-run/state.json"),
+            ("run", "t-run/state.json", '{"state": "working", "updated": "%s", "completedTurn": 1.5}' % iso_s(11), 10, "t-run/state.json"),
+            ("run", "t-run/checkpoints.json", '{"events": [{"action": "pause", "turn": "x"}]}', 10, "t-run/checkpoints.json"),
+            ("run", "t-run/exit", "\n", 10, "t-run/exit"),
+            ("run", "t-run/requests", "x", 10, "t-run/requests"),                  # requests/ is a file
+            ("run", "t-run/requests", ("link", "t-cap/requests"), 10, "t-run/requests"),   # or a symlink
+            ("final", "t-run-new/meta.json", {"role": 7}, 10, "t-run-new/meta.json"),
+            ("run", "t-run/review-of", "not a task id\n", 10, "t-run/review-of"),
+            ("final", "t-run-new/meta.json", {"role": ...}, 4, None),           # a missing role is valid (tp-spawn omits an empty one)
         ]
         for lane_name, rel, body, rule, where in rows:
             with self.subTest(lane=lane_name, record=rel, body=body):
                 path = self.tasks / rel
                 saved = path.read_bytes() if path.exists() else None
-                if isinstance(body, dict):
-                    path.write_text(json.dumps(dict(json.loads(saved), **body)))
+                if isinstance(body, dict):   # these fields changed; a field set to ... is removed
+                    fields = dict(json.loads(saved), **body)
+                    path.write_text(json.dumps({k: v for k, v in fields.items() if v is not ...}))
+                elif isinstance(body, tuple):
+                    path.symlink_to(self.tasks / body[1])
                 elif isinstance(body, bytes):
                     path.write_bytes(body)
                 elif body is not None:
                     path.write_text(body)
+                witness = "perm" if lane_name != "perm" else "cap"   # another open lane: its definite rule is unchanged
                 try:
-                    one = status.build(self.tasks, self.repo, now=self.NOW, rows=[{"name": lane_name, "state": "open"}])
+                    one = status.build(self.tasks, self.repo, now=self.NOW, rows=[{"name": n, "state": "open"} for n in (lane_name, witness)])
                 finally:
                     if saved is not None:
                         path.write_bytes(saved)
-                    elif path.exists():
+                    elif os.path.lexists(path):
                         path.unlink()
-                row, = one["lanes"]
+                row, other = sorted(one["lanes"], key=lambda r: r["lane"] != lane_name)
                 self.assertEqual(row["rule"], rule, row)
+                self.assertEqual(other["rule"], want[witness][0], other)
                 listed = [p["where"] for p in one["problems"]]
                 if where:
                     self.assertIn(str(self.tasks / where), listed)
                     self.assertTrue(row["next"].startswith("unknown") or rule == 1, row)
                 else:
                     self.assertFalse([w for w in listed if Path(w).parent.name in rel], listed)
+        if os.geteuid() != 0:   # round 5: no session can be read, yet every open lane is still a row (unknown), not lanes: []
+            os.chmod(self.tasks, 0)
+            try:
+                one = status.build(self.tasks, self.repo, now=self.NOW, rows=[{"name": "run", "state": "open"}])
+            finally:
+                os.chmod(self.tasks, 0o755)
+            self.assertEqual([(r["lane"], r["rule"]) for r in one["lanes"]], [("run", 10)])
+            self.assertIn(str(self.state), [p["where"] for p in one["problems"]])
 
     def test_cli(self):
         import contextlib

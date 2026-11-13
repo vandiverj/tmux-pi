@@ -1210,3 +1210,19 @@ Each lane: checkpoint, Main's evidence, openai-codex review, notes closed, `lane
 - HB5b round 1 (0fd8e0e) REQUEST_CHANGES: Main reruns undercounted, relative PATH resolved against the caller's cwd, no real
   overlap in the concurrency test. Round 2 (ee7cbef) fixed F2/F3; F1 recurred: equal end times broke by task name, so Main was
   charged a rerun on a tie. Round 3 rule-first (hb5b-round3.md): strictly earlier end time only, coder-5243a36008.
+- HB5b round 3 (cfa764f) cells 395 x 4 OK; review-coder-5243a36008-165341 APPROVED_WITH_NOTES; merged b2c9f3a. Whether Main
+  uses `test-run.sh --main` is the owner's call (hub/hb5/hb5b-decision.md, options A/B/C).
+- HB3d (lane hub-trial-rules, coder-3832b32859, 089283d): a shadow trial gets its source coder's `# Rules in force` section via
+  `--rules-file`. Cells 203 x 4 OK. Main granted the worker's capability request with a plain message, which left the request
+  open; review then refused, and the collected worker could not be messaged, so a no-change round 2 ran (coder-35979bd031).
+  Lesson: answer every request with `tp-agent message ID --resolves REQ`. review-coder-35979bd031-170138 APPROVED_WITH_NOTES;
+  merged acf5c30.
+- Full run on acf5c30 (HB3c, SN1, FL1, HB5b, HB3d): 5559 tests OK (skipped 78), 2916 s.
+- HB6c (lane hub-status): tools/waits/status.py, one row per open lane with where it waits and the next valid action.
+  Round 1 (d9d6225) REQUEST_CHANGES: the view wrote git objects for a dirty worktree; unreadable records were read as absent.
+  Rounds 2 (702c851) and 3 (774e7de, rule first) each closed the cited cases, but the unreadable-evidence family recurred:
+  shared readers (task_lifecycle, is_pending, Session) default bad records, and the view turned those defaults into advice.
+  Round 4 (design, Opus, 88040f4) builds lifecycle from validated inputs. Its review found exceptions that escape earlier
+  readers (deep JSON, huge integers, undecodable bytes) and abort or empty the view. Round 5 (design, coder-639c1c36e9)
+  isolates each lane and record so no record can abort or erase the view, and tags cases realistic or contrived.
+  Main ruled on a reviewer request: a field its producer may omit (role, review-of) is valid when absent.

@@ -140,12 +140,17 @@ def _env_ops(args):
     return ops, args[i:]
 
 
+# N3: names keyed by presence only. Their value says which server a run sat under (a socket path, a server pid and a session
+# index), not what it checked; set versus unset still separates an in-session run from an out-of-session one (HB5c).
+PRESENCE_KEYED = ("TMUX_TMPDIR", "TMUX")
+
+
 def _assign(a):
-    """("set", NAME, VALUE) for a NAME=VALUE word, else None. N3: TMUX_TMPDIR is keyed by its presence only."""
+    """("set", NAME, VALUE) for a NAME=VALUE word, else None. N3: a PRESENCE_KEYED name is keyed by its presence only."""
     if "=" not in a or not ENV_NAME.fullmatch(a.split("=", 1)[0]):
         return None
     name, value = a.split("=", 1)
-    return ("set", name, "<set>" if name == "TMUX_TMPDIR" else value)
+    return ("set", name, "<set>" if name in PRESENCE_KEYED else value)
 
 
 def _word_ok(word):
@@ -155,9 +160,9 @@ def _word_ok(word):
 
 
 def _assign_ok(word):
-    """R4: a NAME=VALUE the tool reads: an empty value or a grammar word; TMUX_TMPDIR (keyed by presence) may be absolute."""
+    """R4: a NAME=VALUE the tool reads: an empty value or a grammar word; a PRESENCE_KEYED name may be absolute."""
     name, value = word.split("=", 1)
-    if name == "TMUX_TMPDIR":
+    if name in PRESENCE_KEYED and value != "":
         return bool(re.fullmatch(r"/?[A-Za-z0-9_][A-Za-z0-9_.,:/+-]*", value)) and ".." not in value.split("/")
     return value == "" or _word_ok(value)
 

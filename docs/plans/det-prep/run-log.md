@@ -1226,3 +1226,12 @@ Each lane: checkpoint, Main's evidence, openai-codex review, notes closed, `lane
   readers (deep JSON, huge integers, undecodable bytes) and abort or empty the view. Round 5 (design, coder-639c1c36e9)
   isolates each lane and record so no record can abort or erase the view, and tags cases realistic or contrived.
   Main ruled on a reviewer request: a field its producer may omit (role, review-of) is valid when absent.
+- HB6c round 5 (1b01882) failed the py3.14 cells: 3.14 parses 1100-deep JSON that 3.9 rejects, so one bad record got two
+  `problems` outcomes. Round 6 (Sonnet, bdd88dc): any unusable record is listed by path on both versions. Review (rounds 5+6)
+  REQUEST_CHANGES: the fallback dropped healthy rows; review sidecars and meta.json were listed by directory only. Round 7
+  (e8d3ab5) rebuilt healthy rows and named those files; interpretation errors (a value that parses but cannot be used) were
+  still listed by directory. Round 8 (design, 92c6788) finds the file by elimination: on the failure path only, hide each file
+  the reader opened and reload. Its review found the replay built a task that loaded as absent (selected meta.json). Round 9
+  (Sonnet, coder-28f693a762, 94eead5) treats an absent task as a successful load, as timeline.build does. Cells 22 x 4 OK;
+  real session 2 lanes, 0 problems, 0.75 s, no writes. review-coder-28f693a762-190812 APPROVED_WITH_NOTES (notes: author
+  evidence accounting); merged e18f244. Nine rounds; all findings after round 4 were tagged contrived.
